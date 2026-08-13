@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD SCSI Fencing v7: GETDEVICEINFO Fence Clearing and Refactoring, Reviewed by Hellwig</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-22</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD SCSI Fencing v7: GETDEVICEINFO Fence Clearing and Refactoring, Reviewed by Hellwig</h1>
+<h2>Summary</h2>
+<h1>NFSD: SCSI Persistent Registration Fencing per Client with xarray — v7 Posted and Reviewed</h1>
+<h2>Overview</h2>
+<p>This thread covers version 7 of the patch series "NFSD: Track SCSI Persistent Registration Fencing per Client with xarray," authored by Dai Ngo and Chuck Lever. This is a <strong>bug fix</strong> for the NFS server's pNFS block layout implementation, addressing redundant and failing fence operations when handling unresponsive clients.</p>
+<h2>Background: The Problem</h2>
+<p>The core issue arises in pNFS SCSI block layout deployments when an NFS client becomes unresponsive. As described in the patch cover letter [id://20260119154126.121360-1-cel@kernel.org]:</p>
+<blockquote>
+<p>"When a client holding pNFS SCSI layouts becomes unresponsive, the server revokes access by preempting the client's SCSI persistent reservation key. A layout recall is issued for each layout the client holds; if the client fails to respond, each recall triggers a fence operation. The first preempt for a given device succeeds and removes the client's key registration. Subsequent preempts for the same device fail because the key is no longer registered."</p>
+</blockquote>
+<p>In practical terms: when a layout recall triggers fencing on an unresponsive client, the server attempts to preempt the client's SCSI persistent reservation key. The first such operation succeeds, but subsequent recalls for other layouts on the same device attempt to fence again — and fail, because the key was already removed by the first preempt. This results in unnecessary error conditions and misleading log output.</p>
+<h2>Prior Weeks: Evolution Through Six Versions (Bridge)</h2>
+<p>This patch has evolved through six prior versions since its initial posting on December 26, 2025. The v6 submission was posted on January 8th, received Christoph Hellwig's review ("Looks good:"), and was promptly applied to the <code>nfsd-testing</code> tree that same day. See the <a href="2026-01-08/thread/%3C20260108144421.3955020-1-cel%40kernel.org%3E.html">prior week's summary</a> for full details on v6's application.</p>
+<p>Key prior review feedback included:</p>
+<ul>
+<li><strong>NeilBrown</strong> (v4): Raised a semantic concern about the fenced flag representing a <em>commitment</em> to fence rather than a <em>completed</em> fence operation. Dai Ngo confirmed: "Yes, that is correct - it's either the device has been fenced or it's in the processed of being fenced."</li>
+<li><strong>Christoph Hellwig</strong> (v5): Recommended switching from <code>xa_store()</code> to <code>xa_insert()</code>, noting the latter "seems like a lot less heavy handed" for non-initial GETDEVICEINFO operations.</li>
+</ul>
+<h2>This Week's Activity: v7 Posted and Reviewed</h2>
+<h3>Patch Submission (January 19)</h3>
+<p>Chuck Lever posted version 7 on January 19th [id://20260119154126.121360-1-cel@kernel.org], building on the already-applied v6. The v7 changelog outlines two significant improvements:</p>
+<blockquote>
+<p>"V7:
+. GETDEVICEINFO must clear existing fences
+. Refactor for separation of concerns"</p>
+</blockquote>
+<p>The patch modifies three files with 81 lines of additions:</p>
+<ul>
+<li><code>fs/nfsd/blocklayout.c</code> (+72 lines): Core fencing logic with xarray tracking, including the new fence-clearing behavior in GETDEVICEINFO</li>
+<li><code>fs/nfsd/nfs4state.c</code> (+6 lines): xarray initialization and cleanup in client lifecycle</li>
+<li><code>fs/nfsd/state.h</code> (+3 lines): New <code>cl_dev_fences</code> field on <code>nfs4_client</code></li>
+</ul>
+<p>The mechanism works as follows: when the server issues a persistent registration key to a client, it creates an xarray entry at the device's <code>dev_t</code> index with a fenced flag initialized to 0. Before performing a fence via <code>nfsd4_scsi_fence_client</code>, the server checks this flag — if already set, the fence is skipped; otherwise, it sets the flag and proceeds with fencing. The xarray is destroyed when the client is released in <code>__destroy_client</code>.</p>
+<p><strong>Notable v7 enhancements:</strong></p>
+<ol>
+<li><strong>GETDEVICEINFO clears existing fences</strong>: This ensures that when a new device info request is processed, any stale fencing state from prior operations is cleared, preventing incorrect skip behavior for newly registered devices.</li>
+<li><strong>Refactored for separation of concerns</strong>: The code has been reorganized to improve maintainability and clarity of the fencing logic.</li>
+</ol>
+<h3>Review (January 20)</h3>
+<p>Christoph Hellwig reviewed the v7 submission on January 20th [id://20260120070725.GA5001@lst.de], providing an enthusiastic endorsement:</p>
+<blockquote>
+<p>"This looks good, or rather much better than before, thanks!"</p>
+</blockquote>
+<p>His review carries particular weight given his prior involvement in the v5 and v6 reviews, where he provided detailed API-level feedback on xarray usage. His statement that the patch is "much better than before" suggests the v7 refinements — particularly the GETDEVICEINFO fence-clearing and refactoring — have addressed any remaining concerns.</p>
+<h2>Technical Significance for NFS Client Development</h2>
+<p>This fix has important implications for NFS server deployments using pNFS block layouts:</p>
+<ol>
+<li>
+<p><strong>Data integrity protection</strong>: SCSI persistent registration fencing is a critical mechanism for preventing data corruption when multiple clients access the same underlying block device. The fence operation ensures that only one client can interact with a device at a time during layout conflicts.</p>
+</li>
+<li>
+<p><strong>Elimination of spurious errors</strong>: Without this fix, the server would generate repeated failure messages when attempting to fence an already-fenced device — noise that could obscure genuine problems in production environments.</p>
+</li>
+<li>
+<p><strong>Correctness under concurrent recalls</strong>: When multiple layouts are held by an unresponsive client, each layout recall independently triggers fencing logic. The xarray-based tracking ensures idempotent fencing behavior regardless of how many times the operation is invoked for the same device-client pair.</p>
+</li>
+<li>
+<p><strong>GETDEVICEINFO fence clearing (v7)</strong>: The new requirement that GETDEVICEINFO clears existing fences ensures that when a client re-registers with the server, any stale fencing state from prior operations is properly reset — preventing incorrect skip behavior for newly registered devices.</p>
+</li>
+</ol>
+<h2>Status and Outlook</h2>
+<p>The v7 patch has been posted and received Christoph Hellwig's positive review. Given his prior <code>Reviewed-by</code> on v6 and his enthusiastic endorsement of v7 ("much better than before"), the patch appears to be in strong shape for eventual inclusion. The v6 was already applied to <code>nfsd-testing</code>, so this v7 likely represents a refined version intended to replace or supplement that earlier submission with the additional GETDEVICEINFO fence-clearing logic and refactoring improvements.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260119154126.121360-1-cel@kernel.org/">2026-01-19 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v7] NFSD: Track SCSI Persistent Registration Fencing per Client with xarray</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260120070725.GA5001@lst.de/">2026-01-20 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: [PATCH v7] NFSD: Track SCSI Persistent Registration Fencing per Client with xarray</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260119154126.121360-1-cel@kernel.org/">2026-01-19 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v7] NFSD: Track SCSI Persistent Registration Fencing per Client with xarray</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260120070725.GA5001@lst.de/">2026-01-20 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: [PATCH v7] NFSD: Track SCSI Persistent Registration Fencing per Client with xarray</a></li>
+</ul>
+  </main>
+</body>
+</html>

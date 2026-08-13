@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fix: Stale XA_MARK_0 Prevents Re-fencing in nfsd4_block_get_device_info_scsi</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-22</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Fix: Stale XA_MARK_0 Prevents Re-fencing in nfsd4_block_get_device_info_scsi</h1>
+<h2>Summary</h2>
+<h1>Bug in nfsd4_block_get_device_info_scsi in nfsd-testing branch</h1>
+<h2>Classification: Bug Fix (NFSv4 pNFS Block Layout Server)</h2>
+<h3>Overview</h3>
+<p>Dai Ngo reported a critical bug in the NFS server's pNFS block layout SCSI device fencing logic, specifically in <code>nfsd4_block_get_device_info_scsi</code> in the nfsd-testing branch. The bug prevented proper re-fencing of clients after SCSI reservation conflicts were resolved.</p>
+<hr />
+<h3>The Bug</h3>
+<p>Dai Ngo opened the thread by describing the core issue <a href="https://lore.kernel.org/linux-nfs/45f16856-b71d-4844-bf11-fc9aa5c2feed@oracle.com/">on January 16</a>:</p>
+<blockquote>
+<p>"After the entry in the xarray was marked with XA_MARK_0, xa_insert will not update the entry when nfsd4_block_get_device_info_scsi is called again leaving the entry with XA_MARK_0."</p>
+</blockquote>
+<p>The consequence was severe:</p>
+<blockquote>
+<p>"When the server needs to fence the client again, since the entry still has XA_MARK_0, it skips the fence operation."</p>
+</blockquote>
+<p>This meant that once a device entry in the xarray was marked as fenced (via <code>XA_MARK_0</code>), subsequent calls to <code>xa_insert</code> would not update the entry. The mark persisted indefinitely, preventing the server from re-fencing clients when needed.</p>
+<h3>Discussion: API Contract Clarification</h3>
+<p>Chuck Lever initially questioned whether the fix was correct, noting <a href="https://lore.kernel.org/linux-nfs/a1442149-fdc2-4f66-b73a-499a2e192960@app.fastmail.com/">on January 16</a>:</p>
+<blockquote>
+<p>"The mark is cleared only when a pr_unregister is done. I didn't think that an additional GETDEVICEINFO should clear an existing registration."</p>
+</blockquote>
+<blockquote>
+<p>"So, did I misunderstand the API contract?"</p>
+</blockquote>
+<p>Dai Ngo clarified the operational model <a href="https://lore.kernel.org/linux-nfs/108fb719-8654-42b8-9e37-275726f4b5d8@oracle.com/">on January 16</a>:</p>
+<blockquote>
+<p>"The nfsd server never issues pr_unregister. It uses fence to stop client from accessing the device."</p>
+</blockquote>
+<p>He then explained the pNFS block layout error recovery flow:</p>
+<blockquote>
+<p>"When the client detects I/O error, due to SCSI reservation conflict, it retries the I/O to the MDS. On new I/O, the client sends LAYOUTGET then GETDEVICEINFO and send I/O to the DS again. This is why the nfsd server needs to clear the mark on the xarray entry on GETDEVICEINFO in case it needs to fence the client again."</p>
+</blockquote>
+<p>This clarified that the NFS server's fencing model relies on re-fencing via <code>GETDEVICEINFO</code> rather than explicit unregistration, making the mark-clearing behavior essential for correct operation.</p>
+<h3>The Fix</h3>
+<p>Dai Ngo proposed and tested a fix <a href="https://lore.kernel.org/linux-nfs/08c33c91-abda-42de-8771-e61d48b50cc7@oracle.com/">on January 17</a>. The patch involved clearing the <code>XA_MARK_0</code> mark on the xarray entry when <code>GETDEVICEINFO</code> is called, allowing the server to properly re-fence clients as needed.</p>
+<p>Chuck Lever applied the fix with an additional concurrency safeguard <a href="https://lore.kernel.org/linux-nfs/a7493441-cc53-4b99-bb62-9092650d61f2@app.fastmail.com/">on January 17</a>:</p>
+<blockquote>
+<p>"I applied this fix, wrapped it in xa_lock to make the update atomic, and pushed to nfsd-testing."</p>
+</blockquote>
+<p>Dai confirmed the resolution <a href="https://lore.kernel.org/linux-nfs/25b3e4a2-700c-40ee-9b7c-a627e1c42f01@oracle.com/">on January 17</a>:</p>
+<blockquote>
+<p>"Thank you Chuck!"</p>
+</blockquote>
+<h3>Code Quality Review</h3>
+<p>Christoph Hellwig reviewed the patch <a href="https://lore.kernel.org/linux-nfs/aW3jGVAHrEusJyBk@infradead.org/">on January 19</a> and suggested improvements to code clarity:</p>
+<blockquote>
+<p>"This looks reasonable. But looking at this, I think it would really help to add a named constant for XA_MARK_0 to make it more clear what the bit stands for, and maybe even add little inline helpers for setting/clearing the mark."</p>
+</blockquote>
+<p>Chuck Lever agreed to add the named constant <a href="https://lore.kernel.org/linux-nfs/453f0d57-5230-432e-90c3-df0308f7fddd@app.fastmail.com/">on January 19</a>:</p>
+<blockquote>
+<p>"Sure, that idea has been in and out of my private working copies of this patch. I'll add it."</p>
+</blockquote>
+<p>A brief exchange followed about the value of inline helper functions. Chuck noted Christoph's historical skepticism:</p>
+<blockquote>
+<p>"In the past you've actively hated 'adding little inline helpers' so I don't suggest that any more. But I actually prefer that."</p>
+</blockquote>
+<p>Christoph clarified his position <a href="https://lore.kernel.org/linux-nfs/aW8p1e3hIM5HHvbo@infradead.org/">on January 20</a>:</p>
+<blockquote>
+<p>"I like them when they provide a useful abstraction, and not when they don't. Of course the 'useful' might sometimes be in the eye of the beholder."</p>
+</blockquote>
+<hr />
+<h3>Conclusion</h3>
+<p>The bug was identified, understood, and fixed within two days. The fix ensures that when an NFS client re-requests device information after a SCSI reservation conflict, the server can properly re-fence the client by clearing the stale <code>XA_MARK_0</code> mark on the xarray entry. The fix was applied to the nfsd-testing branch with proper locking (via <code>xa_lock</code>) to ensure atomicity of the update. A follow-up improvement to add a named constant for <code>XA_MARK_0</code> is planned to improve code readability.</p>
+<p>This bug fix is important for NFS clients using pNFS block layouts with SCSI devices, as it ensures correct error recovery when reservation conflicts occur during direct I/O operations.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/45f16856-b71d-4844-bf11-fc9aa5c2feed@oracle.com/">2026-01-16 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — Bug in nfsd4_block_get_device_info_scsi in nfsd-testing branch</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/a1442149-fdc2-4f66-b73a-499a2e192960@app.fastmail.com/">2026-01-16 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: Bug in nfsd4_block_get_device_info_scsi in nfsd-testing branch</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/108fb719-8654-42b8-9e37-275726f4b5d8@oracle.com/">2026-01-16 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — Re: Bug in nfsd4_block_get_device_info_scsi in nfsd-testing branch</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/08c33c91-abda-42de-8771-e61d48b50cc7@oracle.com/">2026-01-17 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — Re: Bug in nfsd4_block_get_device_info_scsi in nfsd-testing branch</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/a7493441-cc53-4b99-bb62-9092650d61f2@app.fastmail.com/">2026-01-17 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: Bug in nfsd4_block_get_device_info_scsi in nfsd-testing branch</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/25b3e4a2-700c-40ee-9b7c-a627e1c42f01@oracle.com/">2026-01-17 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — Re: Bug in nfsd4_block_get_device_info_scsi in nfsd-testing branch</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aW3jGVAHrEusJyBk@infradead.org/">2026-01-19 Christoph Hellwig <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: Bug in nfsd4_block_get_device_info_scsi in nfsd-testing branch</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/453f0d57-5230-432e-90c3-df0308f7fddd@app.fastmail.com/">2026-01-19 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: Bug in nfsd4_block_get_device_info_scsi in nfsd-testing branch</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aW8p1e3hIM5HHvbo@infradead.org/">2026-01-20 Christoph Hellwig <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: Bug in nfsd4_block_get_device_info_scsi in nfsd-testing branch</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Case Folding v7: Memset Removal Fixes Initialization Bug; Series Ready for VFS Tree Submission</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-22</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Case Folding v7: Memset Removal Fixes Initialization Bug; Series Ready for VFS Tree Submission</h1>
+<h2>Summary</h2>
+<h1>Case Folding v7: Final Memset Removal Posted, Series Nears Readiness for VFS Tree</h1>
+<p><strong>Type:</strong> New feature / protocol enhancement (continued from prior weeks)</p>
+<h2>Prior Weeks Recap</h2>
+<p>Chuck Lever's 16-patch series "Exposing case folding behavior" has progressed through six versions since early January. The series introduces a kernel-wide <code>fileattr_get</code> mechanism enabling filesystems to report their case sensitivity and case preservation characteristics, allowing NFSD, ksmbd, and NFS clients to accurately convey filename semantics across protocol boundaries. Prior review rounds addressed struct layout optimization (packing flags into <code>FS_XFLAG_*</code> rather than dedicated fields), FAT's <code>nocase</code> mount option edge case, a UAPI collision with fsverity xflags, and an initialization bug flagged by Jan Kara regarding the <code>flags_valid</code> hint in <code>ioctl_getflags()</code>. See <a href="2026-01-22/thread/%3C20260114142900.3945054-1-cel%40kernel.org%3E.html">v4 summary</a>, <a href="2026-01-22/thread/%3C20260116144616.2098618-1-cel%40kernel.org%3E.html">v5 summary</a>, and <a href="2026-01-22/thread/%3C20260120142439.1821554-1-cel%40kernel.org%3E.html">v6 summary</a> for full history.</p>
+<h2>This Week's Activity: v7 Series Posted</h2>
+<p>On January 22nd, Chuck Lever posted version 7 of the series [id://20260122160311.1117669-1-cel@kernel.org], based on v6.19-rc6. The sole change since v6 is surgical but significant:</p>
+<blockquote>
+<p>"Changes since v6:</p>
+<ul>
+<li>Remove the memset from vfs_fileattr_get"</li>
+</ul>
+</blockquote>
+<p>This addresses Jan Kara's earlier concern that relocated struct initialization was inadvertently zeroing out the <code>flags_valid</code> hint before the filesystem's <code>-&gt;fileattr_get()</code> callback could read it. By removing the <code>memset</code> from <code>vfs_fileattr_get()</code>, callers at ioctl/syscall entry points now zero-initialize the struct themselves, preserving hints passed to filesystem callbacks — a refinement that resolves the initialization bug without requiring "a bit more careful surgery" as Kara had suggested.</p>
+<h2>Key Technical Arguments</h2>
+<h3>1. VFS Infrastructure: Cleaned-up <code>file_kattr</code> Initialization (Patch 01/16)</h3>
+<p>The foundational patch [id://20260122160311.1117669-2-cel@kernel.org] continues to encode case sensitivity through <code>FS_XFLAG_CASEFOLD</code> and <code>FS_XFLAG_CASENONPRESERVING</code> in <code>fa-&gt;fsx_xflags</code>. Lever explains:</p>
+<blockquote>
+<p>"Filesystems report case-insensitive or case-nonpreserving behavior by setting these flags directly in fa-&gt;fsx_xflags. The default (flags unset) indicates POSIX semantics: case-sensitive and case-preserving. These flags are read-only; userspace cannot set them via ioctl."</p>
+</blockquote>
+<p>The v7 change relocates <code>struct file_kattr</code> initialization from <code>fileattr_fill_xflags()</code> and <code>fileattr_fill_flags()</code> to the callers at ioctl/syscall entry points, allowing hints (<code>flags_valid</code>, <code>fsx_valid</code>) to be passed through to filesystem callbacks without being zeroed out.</p>
+<h3>2. NFS Client: <code>fileattr_get</code> for Case Sensitivity (Patch 10/16) — Critical for Re-export</h3>
+<p>The NFS client patch [id://20260122160311.1117669-11-cel@kernel.org] remains a cornerstone of the series for NFS infrastructure. As Lever explains in the commit message:</p>
+<blockquote>
+<p>"An NFS server re-exporting an NFS mount point needs to report the case sensitivity behavior of the underlying filesystem to its clients. Without this, re-export servers cannot accurately convey case handling semantics, potentially causing client applications to make incorrect assumptions about filename collisions and lookups."</p>
+</blockquote>
+<p>The implementation exposes case sensitivity information the NFS client already retrieves from servers during mount — via PATHCONF for NFSv3 or <code>FATTR4_CASE_INSENSITIVE</code>/<code>FATTR4_CASE_PRESERVING</code> attributes for NFSv4. NFSv2 mounts default to POSIX behavior since that protocol lacks PATHCONF support. The patch touches nine files across the NFS client codebase (<code>client.c</code>, <code>inode.c</code>, <code>internal.h</code>, <code>nfs3proc.c</code>, <code>nfs3xdr.c</code>, <code>nfs4proc.c</code>, <code>proc.c</code>, <code>symlink.c</code>, and <code>include/linux/nfs_xdr.h</code>).</p>
+<h3>3. NFSD: Dynamic Case Sensitivity Reporting (Patches 14-15/16)</h3>
+<p><strong>NFSv3 PATHCONF</strong> [id://20260122160311.1117669-15-cel@kernel.org]: Replaces the hard-coded <code>MSDOS_SUPER_MAGIC</code> check with a dynamic query through <code>-&gt;fileattr_get</code>. Lever notes:</p>
+<blockquote>
+<p>"The hard-coded MSDOS_SUPER_MAGIC check in nfsd3_proc_pathconf() only recognizes FAT filesystems as case-insensitive. Modern filesystems like F2FS, exFAT, and CIFS support case-insensitive directories, but NFSv3 clients cannot discover this capability."</p>
+</blockquote>
+<p><strong>NFSv4 FATTR4 attributes</strong> [id://20260122160311.1117669-16-cel@kernel.org]: Replaces hard-coded responses with actual filesystem queries via <code>nfsd_get_case_info()</code>, supporting per-directory settings for filesystems that allow mixing case-sensitive and case-insensitive directories within an export. A v6 carryover improvement ensures the NFSv4 GETATTR clears the attribute mask bit if <code>nfsd_get_case_info()</code> fails, preventing stale or incorrect defaults from reaching clients.</p>
+<h3>4. Twelve Filesystem Implementations (Patches 02-13/16)</h3>
+<p>The series implements <code>fileattr_get</code> callbacks across twelve filesystems: FAT/exFAT, NTFS3, HFS/HFS+, ext4, XFS, CIFS, NFS client, f2fs, vboxsf, and ISO9660. The CIFS implementation is notable for multi-protocol environments where a Linux NFS server may re-export an SMB mount point and needs to accurately report its case handling semantics.</p>
+<h3>5. ksmbd Integration (Patch 16/16)</h3>
+<p>The in-kernel SMB server [id://20260122160311.1117669-17-cel@kernel.org] reports filesystem case sensitivity via <code>FS_ATTRIBUTE_INFORMATION</code>, enabling consistent multi-protocol file serving environments.</p>
+<h2>Significance for NFS Client Development</h2>
+<p>This series addresses several critical interoperability challenges:</p>
+<ol>
+<li>
+<p><strong>Windows/macOS NFS client support</strong>: As Lever emphasized in the cover letter, Windows-based NFS clients such as <a href="https://github.com/kofemann/ms-nfs41-client">ms-nfs41-client</a> "explicitly require servers to report FATTR4_WORD0_CASE_INSENSITIVE = TRUE for proper operation, a hard requirement for Windows client interoperability because Windows applications expect case-insensitive behavior."</p>
+</li>
+<li>
+<p><strong>Linux NFS client caching correctness</strong>: Lever noted that "when a client detects a case-insensitive NFS share, negative dentry caching must be disabled (a lookup for 'FILE.TXT' failing shouldn't cache a negative entry when 'file.txt' exists) and directory change invalidation must clear all cached case-folded file name variants."</p>
+</li>
+<li>
+<p><strong>Re-export accuracy</strong>: The NFS client's <code>fileattr_get</code> implementation enables NFSD to accurately report the case sensitivity of re-exported NFS mounts — essential for file service proxies and multi-protocol gateways.</p>
+</li>
+<li>
+<p><strong>Multi-protocol environments</strong>: "Hammerspace servers and several other NFS server implementations operate in multi-protocol environments, where a single file service instance caters to both NFS and SMB clients. In those cases, things work more smoothly for everyone when the NFS client can see and adapt to the case folding behavior that SMB users rely on and expect."</p>
+</li>
+</ol>
+<h2>Status and Outlook</h2>
+<p>The v7 series is posted and represents a refinement of the v6 submission, with the initialization bug resolved through the <code>memset</code> removal. The series remains on track to proceed through Christian Brauner's VFS tree rather than the NFSD subtree, targeting kernel version v6.20 or later (v6.19 is closed to new features). Two items from prior rounds remain noted:</p>
+<ul>
+<li><strong>UAPI collision</strong>: <code>FS_XFLAG_CASEFOLD</code> collides with Andrey's fsverity xflag patch. Darrick J. Wong indicated in the prior round that "whoever decides to merge them [can] fix up the conflicts whenever they merge them."</li>
+<li><strong>Struct initialization correctness</strong>: The v7 change directly addresses Jan Kara's concern about <code>flags_valid</code> being zeroed out prematurely.</li>
+</ul>
+<p>The series has broad support across filesystem maintainers from prior rounds and appears well-positioned for eventual merge, representing a significant step forward in NFS client-server interoperability for cross-platform file serving environments.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260122160311.1117669-1-cel@kernel.org/">2026-01-22 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v7 00/16] Exposing case folding behavior</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260122160311.1117669-2-cel@kernel.org/">2026-01-22 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v7 01/16] fs: Add case sensitivity flags to file_kattr</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260122160311.1117669-3-cel@kernel.org/">2026-01-22 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v7 02/16] fat: Implement fileattr_get for case sensitivity</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260122160311.1117669-4-cel@kernel.org/">2026-01-22 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v7 03/16] exfat: Implement fileattr_get for case sensitivity</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260122160311.1117669-5-cel@kernel.org/">2026-01-22 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v7 04/16] ntfs3: Implement fileattr_get for case sensitivity</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260122160311.1117669-6-cel@kernel.org/">2026-01-22 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v7 05/16] hfs: Implement fileattr_get for case sensitivity</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260122160311.1117669-7-cel@kernel.org/">2026-01-22 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v7 06/16] hfsplus: Report case sensitivity in fileattr_get</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260122160311.1117669-8-cel@kernel.org/">2026-01-22 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v7 07/16] ext4: Report case sensitivity in fileattr_get</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260122160311.1117669-9-cel@kernel.org/">2026-01-22 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v7 08/16] xfs: Report case sensitivity in fileattr_get</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260122160311.1117669-10-cel@kernel.org/">2026-01-22 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v7 09/16] cifs: Implement fileattr_get for case sensitivity</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260122160311.1117669-11-cel@kernel.org/">2026-01-22 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v7 10/16] nfs: Implement fileattr_get for case sensitivity</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260122160311.1117669-12-cel@kernel.org/">2026-01-22 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v7 11/16] f2fs: Add case sensitivity reporting to fileattr_get</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260122160311.1117669-13-cel@kernel.org/">2026-01-22 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v7 12/16] vboxsf: Implement fileattr_get for case sensitivity</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260122160311.1117669-14-cel@kernel.org/">2026-01-22 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v7 13/16] isofs: Implement fileattr_get for case sensitivity</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260122160311.1117669-15-cel@kernel.org/">2026-01-22 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v7 14/16] nfsd: Report export case-folding via NFSv3 PATHCONF</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260122160311.1117669-16-cel@kernel.org/">2026-01-22 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v7 15/16] nfsd: Implement NFSv4 FATTR4_CASE_INSENSITIVE and FATTR4_CASE_PRESERVING</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260122160311.1117669-17-cel@kernel.org/">2026-01-22 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v7 16/16] ksmbd: Report filesystem case sensitivity via FS_ATTRIBUTE_INFORMATION</a></li>
+</ul>
+  </main>
+</body>
+</html>

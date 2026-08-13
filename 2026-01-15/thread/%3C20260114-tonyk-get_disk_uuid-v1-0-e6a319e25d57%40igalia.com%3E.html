@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>btrfs/overlayfs: Rejected get_disk_uuid() Approach for Cloned Image Support</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-15</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>btrfs/overlayfs: Rejected get_disk_uuid() Approach for Cloned Image Support</h1>
+<h2>Summary</h2>
+<h1>btrfs/overlayfs: Support for Cloned Images via <code>get_disk_uuid()</code> — Rejected Approach</h1>
+<h2>Summary</h2>
+<h2>Overview</h2>
+<p>André Almeida submitted a 3-patch series, <strong>[PATCH 0/3] fs: Support btrfs cloned images and overlayfs</strong> [id://20260114-tonyk-get_disk_uuid-v1-0-e6a319e25d57@igalia.com], aimed at resolving a compatibility problem between btrfs cloned images and overlayfs's "index" feature. This is a <strong>new feature / bug fix</strong> targeting the interaction between btrfs, overlayfs, and the NFS export subsystem. The series was met with significant pushback from Christoph Hellwig, who fundamentally disagreed with the approach — arguing that the underlying problem should be solved in btrfs itself rather than through kernel infrastructure repurposing.</p>
+<h2>Problem Statement</h2>
+<p>The core issue stems from how btrfs handles cloned disk images. As Almeida explained in his cover letter:</p>
+<blockquote>
+<p>"Every time the same image cloned is mounted, btrfs assigns a new random UUID for it to avoid clashing with the exist UUID. This UUID is then used by overlayfs origin check, to avoid reusing the same directory for a different filesystem. Remounting the same filesystem in the same directory is supported, but the different random UUIDs will make the check fail." [id://20260114-tonyk-get_disk_uuid-v1-0-e6a319e25d57@igalia.com]</p>
+</blockquote>
+<p>The practical use case driving this work is <strong>SteamOS A/B partitioning</strong> on the Steam Deck. The device maintains two partitions for atomic updates: when updating from partition A, the new image is written to partition B (and vice versa). Both partitions are cloned btrfs images with identical UUIDs. During installation, overlayfs is used to mount these images multiple times, and each remount triggers a new random temporary UUID — breaking overlayfs's origin file handle validation.</p>
+<p>Almeida clarified the exact failure scenario:</p>
+<blockquote>
+<p>"The problem happens <em>before</em> switching from A to B, it happens when trying to install the same image from A on B. During the image installation process, while running in A, the B image will be mounted more than once for some setup steps, and overlayfs is used for this. Because A have the same UUID, each time B is remouted will get a new UUID and then the installation scripts fails mounting the image." [id://0241e2c4-bf11-4372-9eda-cccaba4a6d7d@igalia.com]</p>
+</blockquote>
+<h2>Proposed Solution (Rejected)</h2>
+<p>The 3-patch series attempted to solve this by repurposing the existing <code>export_operations::get_uuid()</code> mechanism:</p>
+<ol>
+<li><strong>Patch 1/3</strong>: Rename <code>get_uuid()</code> to <code>get_disk_uuid()</code> in exportfs, expanding documentation to clarify it can serve filesystems with cloned devices [id://20260114-tonyk-get_disk_uuid-v1-1-e6a319e25d57@igalia.com].</li>
+<li><strong>Patch 2/3</strong>: Implement <code>get_disk_uuid()</code> for btrfs to return the original image UUID rather than the random temporary one [id://20260114-tonyk-get_disk_uuid-v1-2-e6a319e25d57@igalia.com].</li>
+<li><strong>Patch 3/3</strong>: Modify overlayfs to use <code>get_disk_uuid()</code> for origin file handle validation instead of <code>sb-&gt;s_uuid</code> [id://20260114-tonyk-get_disk_uuid-v1-3-e6a319e25d57@igalia.com].</li>
+</ol>
+<h2>Key Technical Arguments</h2>
+<h3>Christoph Hellwig's Opposition to Repurposing <code>get_uuid()</code></h3>
+<p>Christoph Hellwig delivered the strongest critique, fundamentally rejecting the approach on multiple grounds. First, he questioned the semantics of "disk UUID":</p>
+<blockquote>
+<p>"I'm not sure what a 'disk uuid' is -- XFS can store two of them in the ondisk superblock: the admin-modifiable one that blkid reports, and the secret one that's stamped in all the metadata and cannot change." [id://20260114061028.GF15551@frogsfrogsfrogs]</p>
+</blockquote>
+<p>More critically, Hellwig argued that <code>get_uuid()</code> serves a very specific purpose for pNFS block layout — not general filesystem identification:</p>
+<blockquote>
+<p>"Totally independent of the rest of the discussion, the get_uuid exportfs operation is not useful for anything but the original pNFS block layout. Which is actually pretty broken and should be slowly phased out." [id://20260114062424.GA10805@lst.de]</p>
+</blockquote>
+<p>He further warned against spreading this pattern:</p>
+<blockquote>
+<p>"That method does not just return an uuid, but in fact a unique identifier of the file systems choice and the offset/len where to look for it on disk, as that is how pnfs/block finds the matching device. It is a dangerous concept and should not spread further." [id://20260114131130.GA6967@lst.de]</p>
+</blockquote>
+<h3>Hellwig's Preferred Fix: Solve It in btrfs</h3>
+<p>Hellwig consistently argued that the right fix lies within btrfs, not in overlayfs or exportfs infrastructure:</p>
+<blockquote>
+<p>"... and the fix is to not assign random uuid, but to assign a new uuid to the cloned image that is persisted. That might need a new field to distinguish the stamped into the format uuid from the visible uuid like the xfs metauuid, but not hacks like this." [id://20260114062608.GB10805@lst.de]</p>
+</blockquote>
+<p>When Almeida asked how to create a non-random persistent UUID, Hellwig pointed to XFS's precedent:</p>
+<blockquote>
+<p>"Just allocate an entirely new uuid? That's what XFS did with the metadata uuid (persistent and stamped into all metadata headers) vs user visible uuid that can be changed." [id://20260115062944.GA9590@lst.de]</p>
+</blockquote>
+<p>Hellwig also challenged btrfs's fundamental behavior of allowing duplicate fsids:</p>
+<blockquote>
+<p>"And btrfs developers, I think the main problem is indeed that btrfs simply allows mounting the same fsid twice. Which is really fatal for anything using the fsid/uuid, such NFS exports, mount by fs uuid or any sb-&gt;s_uuid user." [id://20260115072311.GA10352@lst.de]</p>
+</blockquote>
+<h3>Amir Goldstein's Alternative: Delegate to <code>encode_fh()</code></h3>
+<p>Amir Goldstein acknowledged the conceptual need for a "domain UUID" but suggested a different architectural approach. He proposed extending <code>-&gt;encode_fh()</code> with a flags argument, delegating the encoding of globally unique file handles directly to the filesystem:</p>
+<blockquote>
+<p>"Perhaps this is the wrong way to abstract what overlayfs needs from real fs. Maybe better to extend -&gt;encode_fh() to take a flags argument... This essentially delegates the encoding of a 'globally unique file handle' to the filesystem without specifying this or that version of uuid." [id://CAOQ4uxjAQu9sQt3qOOVWS5cz5B51Hg0m4RAjsreBkmPhg-2cyw@mail.gmail.com]</p>
+</blockquote>
+<p>Hellwig endorsed this direction, noting it would benefit NFS as well:</p>
+<blockquote>
+<p>"Encoding the uuid into the file handle in the kernel is the right thing for NFS as well. Hacking in the uuids in userspace instead of the kernel was done initially because there was no good kernel uuid infrastructure. So doing this in general and have NFS use it when available would be beneficial for everyone." [id://20260115063630.GA9671@lst.de]</p>
+</blockquote>
+<h3>Qu Wenruo's btrfs Perspective: The temp_fsid Hack</h3>
+<p>Qu Wenruo, a btrfs maintainer, provided crucial context on the btrfs side. He explained that the automatic temporary fsid generation was merged despite his earlier proposal for an opt-in mechanism:</p>
+<blockquote>
+<p>"My initial idea for this problem is to let btrfs not generate a tempfsid automatically, but put some special flag (e.g. SINGLE_DEV compat ro flag) on those fses that want duplicated fsid... Unfortunately that idea is not accepted and the current automatic new tempfsid solution is merged." [id://633bb5f3-4582-416c-b8b9-fd1f3b3452ab@suse.com]</p>
+</blockquote>
+<p>He suggested reverting this behavior before it becomes too entrenched:</p>
+<blockquote>
+<p>"I'm wondering will that behavior (returning the same fsid) be acceptable for overlayfs? If so, I think it's time to revert the behavior before it's too late." [id://633bb5f3-4582-416c-b8b9-fd1f3b3452ab@suse.com]</p>
+</blockquote>
+<h3>Amir Goldstein Questions the Use Case</h3>
+<p>Amir raised important questions about whether overlayfs with index is even appropriate for this SteamOS A/B scenario:</p>
+<blockquote>
+<p>"And what do you expect to happen wrt overlayfs when switching from image A to B? What are the origin file handles recorded in overlayfs index from image A lower worth when the lower image is B? Is there any guarantee that file handles are relevant and point to the same objects?" [id://CAOQ4uxhbz7=XT=C3R8XqL0K_o7KwLKsoNwgk=qJGuw2375MTJw@mail.gmail.com]</p>
+</blockquote>
+<p>He noted a similar precedent with squashfs and OpenWRT, which led to the <code>uuid=off</code> mount option:</p>
+<blockquote>
+<p>"FWIW, the setup you are describing sounds very familiar. I am pretty sure that a similar setup with squashfs and OpenWRT was the use case to add the uuid=off overlayfs mount options." [id://CAOQ4uxhbz7=XT=C3R8XqL0K_o7KwLKsoNwgk=qJGuw2375MTJw@mail.gmail.com]</p>
+</blockquote>
+<h2>Evolution of the Discussion</h2>
+<p>The discussion unfolded in three distinct phases:</p>
+<p><strong>Phase 1 (Jan 14 morning):</strong> Almeida's patches were posted. Darrick J. Wong and Christoph Hellwig immediately raised concerns about the <code>get_disk_uuid()</code> naming and semantics. Hellwig declared the existing <code>get_uuid()</code> infrastructure unsuitable for repurposing.</p>
+<p><strong>Phase 2 (Jan 14 afternoon):</strong> Amir Goldstein entered the conversation, proposing an alternative abstraction via <code>encode_fh()</code> flags. Almeida sought clarification on how to implement a persistent non-random UUID in btrfs and asked whether this should be a super_block member. Hellwig reiterated that XFS's approach — requiring <code>nouuid</code> for duplicate mounts — was the correct model.</p>
+<p><strong>Phase 3 (Jan 15):</strong> Qu Wenruo joined, explaining btrfs's temp_fsid history and suggesting an opt-in flag mechanism. Hellwig pressed on the fundamental issue: btrfs allowing same-fsid mounts is "really fatal" for UUID consumers. Almeida clarified the SteamOS A/B use case, noting the failure occurs during installation (remounting the same image multiple times), not at runtime switching. Hellwig concluded firmly:</p>
+<blockquote>
+<p>"Then you'll really need to assign them different (persistent) fsids/uuids." [id://20260115160816.GA16080@lst.de]</p>
+</blockquote>
+<h2>Final Conclusions</h2>
+<p>By the end of this week's activity, the consensus was clear: <strong>the proposed approach of repurposing <code>get_uuid()</code> / <code>get_disk_uuid()</code> was rejected</strong>. The key conclusions were:</p>
+<ol>
+<li>
+<p><strong><code>get_uuid()</code> is not suitable for general filesystem identification.</strong> It serves a specific pNFS block layout purpose and should not be spread further. [id://20260114131130.GA6967@lst.de]</p>
+</li>
+<li>
+<p><strong>The fix belongs in btrfs, not overlayfs or exportfs.</strong> btrfs should either assign persistent (non-random) UUIDs to cloned images — similar to XFS's metadata UUID approach — or require an explicit opt-in flag for same-fsid mounts. [id://20260114062608.GB10805@lst.de], [id://20260115062944.GA9590@lst.de]</p>
+</li>
+<li>
+<p><strong>btrfs allowing same-fsid mounts by default is problematic.</strong> This behavior is "really fatal for anything using the fsid/uuid" and should require explicit opt-in (like XFS's <code>nouuid</code> mount option). [id://20260115072311.GA10352@lst.de]</p>
+</li>
+<li>
+<p><strong>An alternative overlayfs approach may be viable.</strong> Amir Goldstein's suggestion to extend <code>-&gt;encode_fh()</code> with flags for encoding globally unique file handles was endorsed by Hellwig as beneficial for both overlayfs and NFS. [id://CAOQ4uxjAQu9sQt3qOOVWS5cz5B51Hg0m4RAjsreBkmPhg-2cyw@mail.gmail.com], [id://20260115063630.GA9671@lst.de]</p>
+</li>
+<li>
+<p><strong>The SteamOS use case may not need overlayfs index at all.</strong> Amir questioned whether origin file handles from image A would be meaningful when switching to image B, suggesting <code>uuid=off</code> might be the appropriate solution instead. [id://CAOQ4uxhbz7=XT=C3R8XqL0K_o7KwLKsoNwgk=qJGuw2375MTJw@mail.gmail.com]</p>
+</li>
+</ol>
+<p>The thread continued beyond this week (through February 2026) with further iteration, but no patches from this series were accepted in their current form. The discussion highlights the tension between specialized use cases (SteamOS A/B partitioning) and kernel infrastructure cleanliness — a recurring theme in Linux filesystem development.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260114-tonyk-get_disk_uuid-v1-1-e6a319e25d57@igalia.com/">2026-01-14 André Almeida <a href="mailto:andrealmeid@igalia.com">andrealmeid@igalia.com</a> — [PATCH 1/3] exportfs: Rename get_uuid() to get_disk_uuid()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260114-tonyk-get_disk_uuid-v1-0-e6a319e25d57@igalia.com/">2026-01-14 André Almeida <a href="mailto:andrealmeid@igalia.com">andrealmeid@igalia.com</a> — [PATCH 0/3] fs: Support btrfs cloned images and overlayfs</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260114-tonyk-get_disk_uuid-v1-2-e6a319e25d57@igalia.com/">2026-01-14 André Almeida <a href="mailto:andrealmeid@igalia.com">andrealmeid@igalia.com</a> — [PATCH 2/3] btrfs: Implement get_disk_uuid()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260114-tonyk-get_disk_uuid-v1-3-e6a319e25d57@igalia.com/">2026-01-14 André Almeida <a href="mailto:andrealmeid@igalia.com">andrealmeid@igalia.com</a> — [PATCH 3/3] ovl: Use real disk UUID for origin file handles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260114061028.GF15551@frogsfrogsfrogs/">2026-01-14 "Darrick J. Wong" <a href="mailto:djwong@kernel.org">djwong@kernel.org</a> — Re: [PATCH 1/3] exportfs: Rename get_uuid() to get_disk_uuid()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260114062424.GA10805@lst.de/">2026-01-14 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: [PATCH 1/3] exportfs: Rename get_uuid() to get_disk_uuid()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260114062608.GB10805@lst.de/">2026-01-14 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: [PATCH 3/3] ovl: Use real disk UUID for origin file handles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxjUKnD3-PHW5fOiTCeFVEvLkbVuviLAQc7tsKrN36Rm+A@mail.gmail.com/">2026-01-14 Amir Goldstein <a href="mailto:amir73il@gmail.com">amir73il@gmail.com</a> — Re: [PATCH 1/3] exportfs: Rename get_uuid() to get_disk_uuid()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260114131130.GA6967@lst.de/">2026-01-14 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: [PATCH 1/3] exportfs: Rename get_uuid() to get_disk_uuid()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/5334ebc6-ceee-4262-b477-6b161c5ca704@igalia.com/">2026-01-14 André Almeida <a href="mailto:andrealmeid@igalia.com">andrealmeid@igalia.com</a> — Re: [PATCH 3/3] ovl: Use real disk UUID for origin file handles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/cb5a8880-ed0c-495f-b216-090ee8ff1425@igalia.com/">2026-01-14 André Almeida <a href="mailto:andrealmeid@igalia.com">andrealmeid@igalia.com</a> — Re: [PATCH 1/3] exportfs: Rename get_uuid() to get_disk_uuid()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxjAQu9sQt3qOOVWS5cz5B51Hg0m4RAjsreBkmPhg-2cyw@mail.gmail.com/">2026-01-14 Amir Goldstein <a href="mailto:amir73il@gmail.com">amir73il@gmail.com</a> — Re: [PATCH 3/3] ovl: Use real disk UUID for origin file handles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxh80eLc5jARydpayXMA7Wx8b__CR5BRLbkG5KjLy1j_sA@mail.gmail.com/">2026-01-14 Amir Goldstein <a href="mailto:amir73il@gmail.com">amir73il@gmail.com</a> — Re: [PATCH 1/3] exportfs: Rename get_uuid() to get_disk_uuid()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115062944.GA9590@lst.de/">2026-01-15 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: [PATCH 3/3] ovl: Use real disk UUID for origin file handles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115063630.GA9671@lst.de/">2026-01-15 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: [PATCH 3/3] ovl: Use real disk UUID for origin file handles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/633bb5f3-4582-416c-b8b9-fd1f3b3452ab@suse.com/">2026-01-15 Qu Wenruo <a href="mailto:wqu@suse.com">wqu@suse.com</a> — Re: [PATCH 3/3] ovl: Use real disk UUID for origin file handles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115072311.GA10352@lst.de/">2026-01-15 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: [PATCH 3/3] ovl: Use real disk UUID for origin file handles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/461fc582-71ba-4238-9696-3d8bdd8a0207@suse.com/">2026-01-15 Qu Wenruo <a href="mailto:wqu@suse.com">wqu@suse.com</a> — Re: [PATCH 3/3] ovl: Use real disk UUID for origin file handles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115083131.GA12267@lst.de/">2026-01-15 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: [PATCH 3/3] ovl: Use real disk UUID for origin file handles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/22b16e24-d10e-43f6-bc2b-eeaa94310e3a@igalia.com/">2026-01-15 André Almeida <a href="mailto:andrealmeid@igalia.com">andrealmeid@igalia.com</a> — Re: [PATCH 3/3] ovl: Use real disk UUID for origin file handles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxhbz7=XT=C3R8XqL0K_o7KwLKsoNwgk=qJGuw2375MTJw@mail.gmail.com/">2026-01-15 Amir Goldstein <a href="mailto:amir73il@gmail.com">amir73il@gmail.com</a> — Re: [PATCH 3/3] ovl: Use real disk UUID for origin file handles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115160816.GA16080@lst.de/">2026-01-15 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: [PATCH 3/3] ovl: Use real disk UUID for origin file handles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/0241e2c4-bf11-4372-9eda-cccaba4a6d7d@igalia.com/">2026-01-15 André Almeida <a href="mailto:andrealmeid@igalia.com">andrealmeid@igalia.com</a> — Re: [PATCH 3/3] ovl: Use real disk UUID for origin file handles</a></li>
+</ul>
+  </main>
+</body>
+</html>

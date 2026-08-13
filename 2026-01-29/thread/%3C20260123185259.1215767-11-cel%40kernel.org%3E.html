@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Build Failures Expose Hidden Header Dependencies in NFS Client During lockd API Cleanup</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-29</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Build Failures Expose Hidden Header Dependencies in NFS Client During lockd API Cleanup</h1>
+<h2>Summary</h2>
+<h1>Build Failures Reported for lockd Header Relocation Patch</h1>
+<p><strong>Type:</strong> Bug fix (build breakage caused by API refactoring)</p>
+<h2>Overview</h2>
+<p>This thread consists of two automated build failure reports from the kernel test robot (<a href="https://lore.kernel.org/linux-nfs/202601240901.DyDjt2Ka-lkp@intel.com/">lkp@intel.com</a>) against <a href="https://lore.kernel.org/linux-nfs/20260123185259.1215767-11-cel@kernel.org/">PATCH v2 10/42</a> of Chuck Lever's 42-patch series to clarify lockd module API boundaries. The patch in question moves <code>xdr.h</code> from <code>include/linux/lockd/</code> to <code>fs/lockd/</code>, effectively removing it from the public header surface. This relocation inadvertently exposed a pre-existing dependency in the NFS client code that relied on definitions previously accessible through this now-internalized header.</p>
+<h2>Context from Prior Summary</h2>
+<p>As detailed in the prior week's summary of the cover letter thread, Chuck Lever's series aims to separate lockd's public API from internal implementation details (patches 01–13) and modernize NLMv4 XDR handling using xdrgen (patches 14–42). Patch 10/42 is part of the header relocation effort, moving <code>xdr.h</code> — an internal lockd XDR header — out of the public include path.</p>
+<h2>Key Technical Arguments</h2>
+<h3>Build Errors on Alpha and Hexagon Architectures</h3>
+<p>The kernel test robot reported two distinct build failures on different architectures and compilers:</p>
+<p><strong>Alpha (GCC 15.2.0):</strong></p>
+<blockquote>
+<p>"fs/nfs/nfs3proc.c:1009:15: error: invalid use of undefined type 'struct file_lock'" <a href="https://lore.kernel.org/linux-nfs/202601240901.DyDjt2Ka-lkp@intel.com//">kernel test robot</a></p>
+</blockquote>
+<blockquote>
+<p>"fs/nfs/nfs3proc.c:1009:31: error: 'FL_CLOSE' undeclared (first use in this function); did you mean 'OP_CLOSE'?" <a href="https://lore.kernel.org/linux-nfs/202601240901.DyDjt2Ka-lkp@intel.com//">kernel test robot</a></p>
+</blockquote>
+<p><strong>Hexagon (Clang 22.0.0git):</strong></p>
+<blockquote>
+<p>"fs/nfs/nfs3proc.c:1009:8: error: incomplete definition of type 'struct file_lock'" <a href="https://lore.kernel.org/linux-nfs/202601241020.YgD8ze9Q-lkp@intel.com//">kernel test robot</a></p>
+</blockquote>
+<blockquote>
+<p>"fs/nfs/nfs3proc.c:1009:24: error: use of undeclared identifier 'FL_CLOSE'; did you mean 'OP_CLOSE'?" <a href="https://lore.kernel.org/linux-nfs/202601241020.YgD8ze9Q-lkp@intel.com//">kernel test robot</a></p>
+</blockquote>
+<p>Both reports point to the same problematic line in <code>fs/nfs/nfs3proc.c</code> at line 1009, within the <code>nfs3_proc_lock()</code> function:</p>
+<pre><code class="language-c">if (fl-&gt;c.flc_flags &amp; FL_CLOSE) {
+</code></pre>
+<p>This code dereferences <code>struct file_lock</code> internals and references the <code>FL_CLOSE</code> flag — both of which were previously accessible through headers transitively included via <code>include/linux/lockd/xdr.h</code>. With that header moved to <code>fs/lockd/</code>, these definitions are no longer available to the NFS client source file.</p>
+<h3>Significance for NFS Client Development</h3>
+<p>This build failure highlights a <strong>layering violation in the NFS client</strong>: code in <code>nfs3proc.c</code> was depending on internal lockd headers to access <code>struct file_lock</code> and related locking constants. This is precisely the kind of implicit API contract that Chuck Lever's series seeks to eliminate. The error reveals that the NFS client needs its own proper includes for file locking definitions rather than relying on transitive inclusion through lockd's public headers.</p>
+<h2>Evolution of the Discussion</h2>
+<p>This thread contains only automated reports from the kernel test robot, with no human responses during this week's window. The two messages are near-identical in content, differing only in architecture (alpha vs. hexagon) and compiler (GCC vs. Clang). Both serve as actionable bug reports that Chuck Lever will need to address before the series can be merged.</p>
+<h2>Final Conclusions</h2>
+<p>The build failures reported here indicate that:</p>
+<ol>
+<li>
+<p><strong>Patch 10/42 requires a companion fix</strong> for the NFS client side. The <code>fs/nfs/nfs3proc.c</code> file needs to include the appropriate headers directly (likely <code>include/linux/fs.h</code> or another header that fully defines <code>struct file_lock</code> and <code>FL_CLOSE</code>) rather than relying on transitive inclusion through lockd's now-internalized <code>xdr.h</code>.</p>
+</li>
+<li>
+<p><strong>This is a pre-existing dependency</strong>, not a new bug introduced by the patch. The code in <code>nfs3proc.c</code> was already depending on these definitions; the patch merely removed the implicit include path that was masking the missing explicit includes.</p>
+</li>
+<li>
+<p><strong>The fix should be straightforward</strong>: adding the correct <code>#include</code> directives to <code>fs/nfs/nfs3proc.c</code> (and potentially other NFS client files with similar dependencies) before or alongside patch 10/42.</p>
+</li>
+</ol>
+<p>These automated reports underscore the value of cross-architecture CI testing in uncovering hidden header dependencies that may not manifest on more commonly tested configurations.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/202601240901.DyDjt2Ka-lkp@intel.com/">2026-01-24 kernel test robot <a href="mailto:lkp@intel.com">lkp@intel.com</a> — Re: [PATCH v2 10/42] lockd: Move xdr.h from include/linux/lockd/ to fs/lockd/</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/202601241020.YgD8ze9Q-lkp@intel.com/">2026-01-24 kernel test robot <a href="mailto:lkp@intel.com">lkp@intel.com</a> — Re: [PATCH v2 10/42] lockd: Move xdr.h from include/linux/lockd/ to fs/lockd/</a></li>
+</ul>
+  </main>
+</body>
+</html>

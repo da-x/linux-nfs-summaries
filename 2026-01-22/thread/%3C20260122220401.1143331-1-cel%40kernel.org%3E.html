@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>bio_vec RDMA API v3: Iterator Adoption, SQ Sizing Bug Fix, and svcrdma Conversion Posted</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-22</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>bio_vec RDMA API v3: Iterator Adoption, SQ Sizing Bug Fix, and svcrdma Conversion Posted</h1>
+<h2>Summary</h2>
+<h1>bio_vec RDMA API v3: Iterator Adoption, SQ Sizing Bug Fix, and svcrdma Conversion Posted</h1>
+<p><strong>Type:</strong> New feature / API addition with an important bug fix (continued from prior weeks)</p>
+<h2>Prior Weeks Recap</h2>
+<p>Chuck Lever's series to add a <code>bio_vec</code>-based RDMA read/write API in the kernel's RDMA core subsystem (<code>drivers/infiniband/core/rw.c</code>) has progressed through three versions since January 14th. The series eliminates unnecessary scatterlist conversions for callers like svcrdma that already maintain data in <code>bio_vec</code> format, reducing CPU overhead and memory footprint. Prior review rounds (see <a href="2026-01-22/thread/%3C20260114143948.3946615-1-cel%40kernel.org%3E.html">v1 summary</a> and <a href="2026-01-22/thread/%3C20260120143124.1822121-1-cel%40kernel.org%3E.html">v2 summary</a>) established consensus on eventually removing scatterlist support from <code>rw.c</code> entirely, deferred P2P RDMA support to a future nvmet conversion effort, and refined the iterator design based on Christoph Hellwig's feedback.</p>
+<h2>This Week's Activity: v3 Series Posted</h2>
+<p>On January 22nd, Chuck Lever posted version 3 of the series [id://20260122220401.1143331-1-cel@kernel.org], expanding from four to five patches. The cover letter summarizes the motivation:</p>
+<blockquote>
+<p>"Current users of rdma_rw_ctx_init() must convert their native data structures into scatterlists. For subsystems like svcrdma that maintain data in bvec format, this conversion adds overhead both in CPU cycles and memory footprint. The new API accepts bvec arrays directly."</p>
+</blockquote>
+<p>The series is based on v6.19-rc6 and touches seven files across the RDMA core, isert, nvmet, and svcrdma subsystems, adding 699 lines while removing 141.</p>
+<h3>Changes Since v2</h3>
+<p>Lever outlined four key improvements:</p>
+<blockquote>
+<p>"Changes since v2:</p>
+<ul>
+<li>Add bvec iter arguments to the new API</li>
+<li>Add a synthetic SGL in the MR mapping function</li>
+<li>Try IOVA coalescing before max_sgl_rd triggers MR in bvec path</li>
+<li>Attempt once again to address SQ/CQ/max_rdma_ctxs sizing issues"</li>
+</ul>
+</blockquote>
+<p>The first three items directly address Christoph Hellwig's v2 review feedback, while the fourth introduces a new patch targeting an important bug fix.</p>
+<h2>Key Technical Arguments and Patch Breakdown</h2>
+<h3>1. Core bvec RDMA API with Iterator Support (Patch 1/5) [id://20260122220401.1143331-2-cel@kernel.org]</h3>
+<p>This patch introduces <code>rdma_rw_ctx_init_bvec()</code> and <code>rdma_rw_ctx_destroy_bvec()</code> to accept <code>bio_vec</code> arrays directly. The v3 refinement incorporates Hellwig's suggestion to pass <code>bvec_iter</code> from API consumers into <code>rw.c</code>, aligning with established kernel conventions:</p>
+<blockquote>
+<p>"I mean passing the iter from the API consumer into rw.c. In general that is the sanes way to deal with a collection of bvecs." <a href="https://lore.kernel.org/linux-nfs/20260121145702.GA13953@lst.de/">Christoph Hellwig, v2 review</a></p>
+</blockquote>
+<p>The implementation uses <code>dma_map_phys()</code> for hardware RDMA devices and virtual addressing for software RDMA devices (rxe, siw). The MR path returns <code>-EOPNOTSUPP</code> at this stage, deferred to patch 3/5. Notably, Christoph Hellwig provided a <strong>Reviewed-by</strong> tag on this patch:</p>
+<blockquote>
+<p>"Reviewed-by: Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a>"</p>
+</blockquote>
+<h3>2. IOVA-Based DMA Mapping (Patch 2/5) [id://20260122220401.1143331-3-cel@kernel.org]</h3>
+<p>This patch introduces the two-step IOVA API (<code>dma_iova_try_alloc</code> / <code>dma_iova_link</code> / <code>dma_iova_sync</code>) to reduce IOTLB synchronization overhead from O(n) per-page syncs to a single O(1) sync:</p>
+<blockquote>
+<p>"The two-step IOVA API allocates a contiguous IOVA range upfront, links all physical pages without IOTLB syncs, then performs a single sync at the end. This reduces IOTLB flushes from O(n) to O(1)."</p>
+</blockquote>
+<p>Hellwig noted an additional benefit in his v2 review:</p>
+<blockquote>
+<p>"... and requires only a single output dma_addr_t compared to extra per-input element storage in struct scatterlist." [id://20260121085159.GB16458@lst.de]</p>
+</blockquote>
+<p>The v3 change adds IOVA coalescing before <code>max_sgl_rd</code> triggers MR in the bvec path, optimizing the decision logic for when to use memory registration versus direct scattering.</p>
+<h3>3. MR Support for bvec Operations (Patch 3/5) [id://20260122220401.1143331-4-cel@kernel.org]</h3>
+<p>This patch enables iWARP devices (which require Memory Region registration for RDMA READ operations) and the <code>force_mr</code> debug parameter to use the bvec path. The approach creates a synthetic scatterlist populated with DMA addresses from the bvecs, reusing existing <code>ib_map_mr_sg()</code> infrastructure:</p>
+<blockquote>
+<p>"The approach creates a synthetic scatterlist populated with DMA addresses from the bvecs, then reuses the existing ib_map_mr_sg() infrastructure. This avoids driver changes while keeping the implementation small."</p>
+</blockquote>
+<p>This directly addresses Hellwig's v2 observation that the MR path should use <code>bvec_iter</code> like the other paths, and his suggestion to construct a synthetic scatterlist similar to <code>__blk_rq_map_sg</code>. The patch also updates isert and nvmet callers to use the new helper.</p>
+<h3>4. SQ Sizing Bug Fix: rdma_rw_max_sge() Helper (Patch 4/5) [id://20260122220401.1143331-5-cel@kernel.org] — <strong>IMPORTANT BUG FIX</strong></h3>
+<p>This is a new patch in v3 that addresses a critical sizing bug in the svcrdma Send Queue allocation:</p>
+<blockquote>
+<p>"svc_rdma_accept() computes sc_sq_depth as the sum of rq_depth and the number of rdma_rw contexts (ctxts). This value is used to allocate the Send CQ and to initialize the sc_sq_avail credit pool."</p>
+</blockquote>
+<p>The problem arises when memory registration is used for RDMA operations:</p>
+<blockquote>
+<p>"However, when the device uses memory registration for RDMA operations, rdma_rw_init_qp() inflates the QP's max_send_wr by a factor of three per context to account for REG and INV work requests. The Send CQ and credit pool remain sized for only one work request per context, causing Send Queue exhaustion under heavy NFS WRITE workloads."</p>
+</blockquote>
+<p>The fix introduces <code>rdma_rw_max_sge()</code> to compute the actual number of Send Queue entries required:</p>
+<blockquote>
+<p>"Introduce rdma_rw_max_sge() to compute the actual number of Send Queue entries required for a given number of rdma_rw contexts. Upper layer protocols call this helper before creating a Queue Pair so that their Send CQs and credit accounting match the QP's true capacity."</p>
+</blockquote>
+<p>This patch carries a <strong>Fixes</strong> tag:</p>
+<blockquote>
+<p>"Fixes: 00bd1439f464 ("RDMA/rw: Support threshold for registration vs scattering to local pages")"</p>
+</blockquote>
+<p>This is a significant bug fix for NFS server stability under heavy WRITE workloads when memory registration is enabled — a scenario that becomes more relevant as iWARP adoption grows and the <code>force_mr</code> debug/testing parameter is exercised.</p>
+<h3>5. svcrdma Consumer Conversion (Patch 5/5) [id://20260122220401.1143331-6-cel@kernel.org]</h3>
+<p>The final patch converts svcrdma to the new bvec-based API, eliminating intermediate scatterlist conversion:</p>
+<blockquote>
+<p>"The bvec-based RDMA API eliminates the intermediate scatterlist conversion step, allowing direct DMA mapping from bio_vec arrays. This simplifies the svc_rdma_rw_ctxt structure by removing the chained SG table management."</p>
+</blockquote>
+<p>Lever emphasizes the preservation of performance-critical behavior:</p>
+<blockquote>
+<p>"The structure retains an inline array approach similar to the previous scatterlist implementation: an inline bvec array sized to max_send_sge handles most I/O operations without additional allocation. Larger requests fall back to dynamic allocation. This preserves the allocation-free fast path for typical NFS operations while supporting arbitrarily large transfers."</p>
+</blockquote>
+<p>Importantly, the conversion removes the need for explicit fallback paths:</p>
+<blockquote>
+<p>"The bvec API handles all device types internally, including iWARP devices which require memory registration. No explicit fallback path is needed."</p>
+</blockquote>
+<h2>Evolution of the Discussion</h2>
+<p>The series has evolved significantly across three versions:</p>
+<ul>
+<li><strong>v1 (Jan 14)</strong>: Initial proposal with four patches. Review from Hellwig and Leon Romanovsky established consensus on scatterlist removal direction, page alignment constraints, and P2P deferral.</li>
+<li><strong>v2 (Jan 20)</strong>: Incorporated bvec iterator usage internally, IOVA contiguous mapping, clarified documentation, and added pre-allocated bvec arrays in svcrdma. Hellwig provided detailed API design feedback advocating for consumer-passed iterators.</li>
+<li><strong>v3 (Jan 22)</strong>: Expanded to five patches. Adopted consumer-passed <code>bvec_iter</code> as requested, added synthetic SGL in MR path, improved IOVA coalescing logic, and — most notably — introduced a new patch fixing the SQ sizing bug that causes Send Queue exhaustion under heavy WRITE workloads with memory registration.</li>
+</ul>
+<h2>Significance for NFS Server Development</h2>
+<p>This series is directly relevant to NFS server-side performance and correctness via svcrdma:</p>
+<ol>
+<li>
+<p><strong>Eliminated overhead</strong>: By removing the scatterlist conversion step, svcrdma avoids both CPU cycles and memory allocations on every RDMA operation — a measurable improvement for high-throughput NFS servers.</p>
+</li>
+<li>
+<p><strong>IOVA optimization</strong>: The O(1) IOTLB sync for multi-bvec transfers benefits large NFS compound operations that span many pages.</p>
+</li>
+<li>
+<p><strong>iWARP support</strong>: Patch 3/5 enables iWARP devices to use the bvec path, broadening hardware compatibility without requiring a fallback to the scatterlist API.</p>
+</li>
+<li>
+<p><strong>SQ sizing bug fix</strong>: The new patch 4/5 fixes Send Queue exhaustion under heavy NFS WRITE workloads when memory registration is enabled — a correctness issue that could cause server-side stalls or errors in production environments using iWARP or with <code>force_mr</code> testing.</p>
+</li>
+<li>
+<p><strong>Inline fast path preservation</strong>: The pre-allocated inline bvec array in svcrdma preserves an allocation-free fast path for typical NFS operations, maintaining the performance characteristics of the existing implementation.</p>
+</li>
+</ol>
+<h2>Status and Outlook</h2>
+<p>The v3 series is freshly posted with no review feedback yet within this week's window (responses from Zhu Yanjun, Christoph Hellwig, and Jason Gunthorpe appear starting January 23rd, outside the current scope). The series carries a <strong>Reviewed-by</strong> from Christoph Hellwig on patch 1/5 and a <strong>Fixes</strong> tag on patch 4/5.</p>
+<p>The broader roadmap context remains unchanged: all participants agree that scatterlist-based APIs in <code>rw.c</code> should eventually be eliminated in favor of <code>bio_vec</code>, with other consumers (isert, srpt, nvmet, ksmbd) to be converted separately by their domain experts. As Leon Romanovsky noted in the prior round:</p>
+<blockquote>
+<p>"The remaining big item which is left is removing SG from RDMA." [id://20260119183420.GP13201@unreal]</p>
+</blockquote>
+<p>The series is expected to proceed through the RDMA subsystem tree, targeting v6.19 or later depending on review timing and merge window constraints.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260122220401.1143331-1-cel@kernel.org/">2026-01-22 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 0/5] Add a bio_vec based API to core/rw.c</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260122220401.1143331-2-cel@kernel.org/">2026-01-22 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 1/5] RDMA/core: add bio_vec based RDMA read/write API</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260122220401.1143331-3-cel@kernel.org/">2026-01-22 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 2/5] RDMA/core: use IOVA-based DMA mapping for bvec RDMA operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260122220401.1143331-4-cel@kernel.org/">2026-01-22 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 3/5] RDMA/core: add MR support for bvec-based RDMA operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260122220401.1143331-5-cel@kernel.org/">2026-01-22 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 4/5] RDMA/core: add rdma_rw_max_sge() helper for SQ sizing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260122220401.1143331-6-cel@kernel.org/">2026-01-22 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 5/5] svcrdma: use bvec-based RDMA read/write API</a></li>
+</ul>
+  </main>
+</body>
+</html>

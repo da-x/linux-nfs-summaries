@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FS_USERNS_DELEGATABLE: Fixing Containerized NFS Mount Regression</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-29</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>FS_USERNS_DELEGATABLE: Fixing Containerized NFS Mount Regression</h1>
+<h2>Summary</h2>
+<h1>NFS Container Mount Regression Fix: Introducing FS_USERNS_DELEGATABLE</h1>
+<h2>Summary</h2>
+<p><strong>Type:</strong> Bug fix (regression in containerized NFS mounting)</p>
+<p>This thread contains a single patch submission from Jeff Layton addressing a regression that broke NFS mounts inside Linux containers. The patch introduces a new VFS filesystem flag, <code>FS_USERNS_DELEGATABLE</code>, enabling a secure delegation model for privileged mount daemons — an important fix for users relying on containerized NFS clients with delegated mount services.</p>
+<h2>Background and Problem Statement</h2>
+<p>The issue stems from commit <code>e1c5ae59c0f2</code> ("fs: don't allow non-init s_user_ns for filesystems without FS_USERNS_MOUNT"), which tightened VFS security by preventing filesystems lacking the <code>FS_USERNS_MOUNT</code> flag from being mounted inside user namespaces (containers). While well-intentioned, this change inadvertently broke a legitimate deployment pattern used by some organizations.</p>
+<p>Jeff Layton described the affected use case in his patch submission:</p>
+<blockquote>
+<p>"This broke NFS mounts in our containerized environment. We have a daemon somewhat like systemd-mountfsd running in the init_ns. A process does a fsopen() inside the container and passes it to the daemon via unix socket." <a href="https://lore.kernel.org/linux-nfs/20260129-twmount-v1-1-4874ed2a15c4@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<p>The architecture works as follows:</p>
+<ol>
+<li>A process inside a container calls <code>fsopen()</code> for NFS, which creates a filesystem context with the container's user namespace (<code>fc-&gt;user_ns</code>).</li>
+<li>This context is passed via Unix socket to a privileged mount daemon running in the initial (init) user namespace.</li>
+<li>The daemon validates the request — checking that it targets an allowed NFS server — and performs the actual mount.</li>
+</ol>
+<p>This delegation model provides security: containers cannot directly mount arbitrary NFS servers, but can request mounts from a vetted daemon. However, the VFS change blocked this because NFS does not set <code>FS_USERNS_MOUNT</code>, and the filesystem context carries the container's user namespace rather than init's.</p>
+<p>As Jeff explained the security dilemma:</p>
+<blockquote>
+<p>"We don't want to add FS_USERNS_MOUNT to NFS since that would allow the container to mount any NFS server (even malicious ones)." <a href="https://lore.kernel.org/linux-nfs/20260129-twmount-v1-1-4874ed2a15c4@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<p>Adding <code>FS_USERNS_MOUNT</code> directly to NFS would defeat the security purpose of the original VFS change, as it would permit unprivileged containers to mount arbitrary NFS servers without any vetting.</p>
+<h2>The Fix: FS_USERNS_DELEGATABLE</h2>
+<p>The patch introduces a new filesystem flag, <code>FS_USERNS_DELEGATABLE</code>, which occupies a middle ground between <code>FS_USERNS_MOUNT</code> (fully unprivileged mounting) and no flag at all (only init namespace mounts). The semantics are:</p>
+<ul>
+<li>Filesystems with <code>FS_USERNS_DELEGATABLE</code> can be mounted from non-init user namespaces <strong>when the mount is performed via a delegated mechanism</strong> (i.e., the filesystem context's user namespace differs from the mounter's, indicating a privileged daemon is acting on behalf of the container).</li>
+<li>This preserves the security boundary: containers still cannot directly mount NFS; they must go through the vetted daemon.</li>
+</ul>
+<p>The patch modifies three files:</p>
+<ul>
+<li><strong><code>include/linux/fs.h</code></strong>: Adds the <code>FS_USERNS_DELEGATABLE</code> flag definition.</li>
+<li><strong><code>fs/super.c</code></strong>: Updates the VFS mount validation logic to recognize and permit delegatable filesystems.</li>
+<li><strong><code>fs/nfs/fs_context.c</code></strong>: Sets the <code>FS_USERNS_DELEGATABLE</code> flag on the NFS filesystem type.</li>
+</ul>
+<p>The patch carries a <code>Fixes:</code> tag pointing to commit <code>e1c5ae59c0f2</code>, marking it as a regression fix.</p>
+<h2>Significance for NFS Client Development</h2>
+<p>This is an important fix for organizations using containerized NFS clients with delegated mount architectures:</p>
+<ol>
+<li>
+<p><strong>Restores functionality</strong>: Container-based workloads that rely on privileged mount daemons to perform NFS mounts can function again without reverting the VFS security hardening.</p>
+</li>
+<li>
+<p><strong>Maintains security posture</strong>: Unlike simply adding <code>FS_USERNS_MOUNT</code>, this approach preserves the principle that containers cannot independently mount arbitrary NFS servers — they must still go through a trusted daemon that validates server identity.</p>
+</li>
+<li>
+<p><strong>VFS-level change</strong>: The new flag is generic and could benefit other network filesystems with similar delegation requirements (e.g., CIFS, 9P) in the future.</p>
+</li>
+</ol>
+<h2>Discussion Status</h2>
+<p>As of this week's window close, <strong>no replies have been posted</strong> to this patch. The thread shows subsequent discussion activity on February 3rd (outside the current week), including responses from Christian Brauner, Anna Schumaker, and Alexander Mikhalitsyn, but those fall outside the scope of this summary.</p>
+<h2>Messages This Week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260129-twmount-v1-1-4874ed2a15c4@kernel.org/">2026-01-29 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH] vfs: add FS_USERNS_DELEGATABLE flag and set it for NFS</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260129-twmount-v1-1-4874ed2a15c4@kernel.org/">2026-01-29 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH] vfs: add FS_USERNS_DELEGATABLE flag and set it for NFS</a></li>
+</ul>
+  </main>
+</body>
+</html>

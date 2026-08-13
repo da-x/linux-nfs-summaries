@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>kNFSD Signed Filehandles: Security Enhancement Proposal Under Review</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-22</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>kNFSD Signed Filehandles: Security Enhancement Proposal Under Review</h1>
+<h2>Summary</h2>
+<h1>kNFSD Signed Filehandles: A New Security Mechanism Under Scrutiny</h1>
+<p><strong>Discussion type:</strong> New feature (NFS server security enhancement)</p>
+<h2>Overview</h2>
+<p>Benjamin Coddington <a href="https://lore.kernel.org/linux-nfs/cover.1768573690.git.bcodding@hammerspace.com/">introduced a 4-patch series</a> this week proposing to add Message Authentication Code (MAC) signing to NFS filehandles in the kernel NFS server (kNFSD). The goal is to prevent filehandle guessing attacks, where an attacker fabricates valid filehandles to access files they shouldn't be able to reach through normal directory permission checks.</p>
+<p>The series comprises:</p>
+<ol>
+<li><strong>Patch 1/4</strong>: Convert export flags to use <code>BIT()</code> macro (cleanup)</li>
+<li><strong>Patch 2/4</strong>: Add a key for signing filehandles via netlink and nfsctl filesystem</li>
+<li><strong>Patch 3/4</strong>: Add <code>sign_fh</code> export option</li>
+<li><strong>Patch 4/4</strong>: Implement actual signing and verification of filehandles using siphash</li>
+</ol>
+<h2>The Problem: Filehandle Guessing Attacks</h2>
+<p>Coddington explained the vulnerability in detail <a href="https://lore.kernel.org/linux-nfs/cover.1768573690.git.bcodding@hammerspace.com/">in the cover letter</a>: filesystem filehandles are well-formed and predictable — for example, an XFS filehandle consists of a 64-bit inode number and a 32-bit generation number. While local systems protect against guessing via <code>CAP_DAC_READ_SEARCH</code> on <code>open_by_handle_at(2)</code>, the NFS server must permissively accept remote filehandles without verifying the caller's local privileges.</p>
+<blockquote>
+<p>"An NFS client holding a valid filehandle can remotely open and read the contents of the file referred to by the filehandle."</p>
+</blockquote>
+<p>Coddington demonstrated the practicality of this attack: using a modified version of the <code>t_open_by_handle_at.c</code> example from the man page, he averaged 16 microseconds per <code>open</code> attempt on a local client-server setup and discovered his target filehandle in less than an hour. He also cited Trond Myklebust's estimate that with a 1ms round-trip and 50 parallel GETATTRs, it would take only one day to brute-force a 32-bit generation number.</p>
+<p>NeilBrown reframed the problem elegantly <a href="https://lore.kernel.org/linux-nfs/176861309837.16766.10645274004289940807@noble.neil.brown.name/">in his analysis</a>:</p>
+<blockquote>
+<p>"You are trying to enforce path-based restriction in NFS... this effectively means you need a capability framework. So you are enhancing the filehandle to act as a capability by adding a MAC."</p>
+</blockquote>
+<h2>Key Technical Arguments</h2>
+<h3>Chuck Lever's Skepticism About Threat Model</h3>
+<p>Chuck Lever provided <a href="https://lore.kernel.org/linux-nfs/f8e2d466-7280-4a21-ad71-21bf1e546300@app.fastmail.com/">the most thorough critique</a> of the proposal, questioning whether filehandle fabrication is truly the premier attack vector:</p>
+<blockquote>
+<p>"I'm unconvinced that this provides any real security. There are other ways of obtaining a filehandle besides guessing, and nothing here suggests that guessing is the premier attack methodology."</p>
+</blockquote>
+<p>He raised several concerns:</p>
+<ul>
+<li><strong>Key stability</strong>: Nothing prevents userspace from providing a different key after reboot, since destroying the net namespace removes the server's ability to remember the previously set <code>fh_key</code>.</li>
+<li><strong>Rekeying</strong>: Changing the key would invalidate all existing filehandles, which is problematic given their long-lived nature. He noted: "An fh_key change is safe to do once all exported file systems are unexported and unmounted."</li>
+<li><strong>AUTH_SYS limitations</strong>: The fundamental issue is that NFS READ and WRITE lack authorization checks, a classic limitation of the AUTH_SYS security model.</li>
+</ul>
+<p>Coddington responded <a href="https://lore.kernel.org/linux-nfs/1D003BD7-1102-4355-961A-7564E5368567@hammerspace.com/">patiently</a>, clarifying that network security is assumed solved (via transport encryption) and the threat model assumes the client implementation may be compromised or buggy:</p>
+<blockquote>
+<p>"We assume it might be able to send guessed filehandles because the client implementation is out of the server's control and scope of trust."</p>
+</blockquote>
+<h3>NeilBrown's Alternative Approach</h3>
+<p>NeilBrown proposed <a href="https://lore.kernel.org/linux-nfs/176890400475.16766.10882526298387036216@noble.neil.brown.name/">an alternative design</a> that would avoid API changes to nfs-utils entirely:</p>
+<blockquote>
+<p>"The problem can be rephrased as saying that 32 bits is too small for a generation number as it allows guessing in a modest time. A 64bit generation number would provide sufficient protection."</p>
+</blockquote>
+<p>His proposal: filesystems could combine their existing 32-bit generation numbers with stable, non-NFS-visible superblock UUIDs (e.g., ext4's <code>s_journal_uuid</code>, XFS's <code>sb_meta_uuid</code>) to produce effectively unguessable 64-bit generation numbers embedded directly in filehandles. This would require per-filesystem changes but avoid the need for a signing key infrastructure.</p>
+<p>Coddington acknowledged this as "good pondering" and noted the challenge of managing per-fs unique values across cloned/golden-image deployments:</p>
+<blockquote>
+<p>"If so, it would be nice to find a way to unify setting/changing the per-fs unique value because cloning and 'golden image' approaches are often used in deployments."</p>
+</blockquote>
+<h3>Netlink Interface Design Debate</h3>
+<p>Jeff Layton <a href="https://lore.kernel.org/linux-nfs/3db40beb64cb3663d9e8c83f498557bf8fbc0924.camel@kernel.org/">suggested</a> integrating the fh-key into the existing "threads" netlink operation as an optional attribute, rather than creating a new dedicated operation:</p>
+<blockquote>
+<p>"Rather than a new netlink operation, I think we might be better served with just sending the fh-key down as an optional attribute in the 'threads' op."</p>
+</blockquote>
+<p>Chuck Lever <a href="https://lore.kernel.org/linux-nfs/703f29f8-a9e5-4947-9d93-a3cbde5cbdcc@app.fastmail.com/">disagreed</a>, arguing for separation of concerns:</p>
+<blockquote>
+<p>"I'd much rather set a precedent of several small ops rather than one or two Swiss army knives."</p>
+</blockquote>
+<p>Coddington agreed to adopt Jeff's suggestion for v2, while the broader debate about netlink interface design continued.</p>
+<h3>Layering and Code Structure</h3>
+<p>Chuck Lever <a href="https://lore.kernel.org/linux-nfs/2b28af6e-a6da-4f10-a589-6dd20d2f2c6c@app.fastmail.com/">flagged</a> a layering violation in patch 4/4, where signing logic was embedded in XDR encoding code:</p>
+<blockquote>
+<p>"This is a layering violation. XDR encoding never alters the content in the local data structures, and this will be impossible to convert to xdrgen down the line."</p>
+</blockquote>
+<p>He recommended containing the signing logic within <code>fh_compose()</code> and <code>fh_verify()</code>. Coddington acknowledged this was feasible but noted that <code>fh_compose()</code> creates partial handles requiring <code>fh_update()</code> after file creation, making it more complex. He also accepted Chuck's suggestions to use <code>crypto_memneq()</code> for timing-safe comparison, <code>pr_warn_ratelimited()</code>, and symbolic constants.</p>
+<h3>NeilBrown on Root Filehandles</h3>
+<p>NeilBrown <a href="https://lore.kernel.org/linux-nfs/176861129903.16766.18207157056062198907@noble.neil.brown.name/">corrected</a> a misleading comment in the code about why root filehandles remain unsigned:</p>
+<blockquote>
+<p>"rpc.mountd always asks the kernel for a filehandle, so it doesn't need a key. However signing the root filehandle would be pointless as the client can 'PUT_ROOTFH' without needing to provide a signature."</p>
+</blockquote>
+<p>Coddington agreed to drop the comment.</p>
+<h2>Broader Interest</h2>
+<p>Christian Brauner <a href="https://lore.kernel.org/linux-nfs/20260119-reingehen-gelitten-a5e364f704fa@brauner/">expressed enthusiasm</a> for the concept, noting its potential applicability to pseudo-filesystems like nsfs and pidfs:</p>
+<blockquote>
+<p>"I really like this concept... For new types of file handles for such pseudo-fses I think this would be very lovely to have."</p>
+</blockquote>
+<p>Miklos Szeredi <a href="https://lore.kernel.org/linux-nfs/CAJfpegt=eV=2OxgfiVYG7drw_yN14b7edJhj+bsF_ku7cVGuig@mail.gmail.com/">asked</a> whether the signing mechanism could be generalized as a utility in <code>fs/exportfs/</code>, with an eye toward enabling unprivileged <code>open_by_handle_at(2)</code>:</p>
+<blockquote>
+<p>"The ultimate use case for me would be unprivileged open_by_handle_at(2)."</p>
+</blockquote>
+<h2>Defense-in-Depth: Attack Detection</h2>
+<p>NeilBrown <a href="https://lore.kernel.org/linux-nfs/176879668905.16766.5840486885381698639@noble.neil.brown.name/">proposed</a> an additional defense-in-depth measure: monitoring the ratio of stale filehandle errors per client/export and imposing delays when suspicious patterns emerge:</p>
+<blockquote>
+<p>"We would need to monitor the result of exportfs_decode_fh_raw() for stale vs non-stale, and if the proportion of stale filehandles (on a given export) exceeds some low threshold (1%?) over a modest time period (5 minutes?) then .... what?"</p>
+</blockquote>
+<h2>Export Flags Cleanup</h2>
+<p>Patch 1/4's attempt to convert export flags to <code>BIT()</code> macro was <a href="https://lore.kernel.org/linux-nfs/15993494-ddd8-4656-8815-2693ee3b7fb3@app.fastmail.com/">flagged by Chuck Lever</a> as a potential UAPI breakage since <code>BIT()</code> is a kernel convention. Coddington agreed to drop this patch in v2:</p>
+<blockquote>
+<p>"I'm happy leaving these as hex constants."</p>
+</blockquote>
+<h2>Status and Next Steps</h2>
+<p>The thread concluded with no formal acceptance or rejection. The discussion remains open-ended, with several directions identified for future work:</p>
+<ol>
+<li><strong>Coddington</strong> will iterate on the design, addressing Chuck's review comments (layering, timing-safe comparison, mutex protection for key setting) and adopting Jeff Layton's netlink suggestion.</li>
+<li><strong>NeilBrown's alternative approach</strong> of embedding per-filesystem UUIDs into generation numbers warrants further exploration as a potentially simpler solution avoiding nfs-utils changes.</li>
+<li><strong>Attack detection</strong> as defense-in-depth was identified as worth pursuing regardless of the signing approach chosen.</li>
+<li><strong>Generalization</strong> of filehandle signing to <code>fs/exportfs/</code> for broader use (including unprivileged <code>open_by_handle_at</code>) remains an open question.</li>
+</ol>
+<p>Coddington <a href="https://lore.kernel.org/linux-nfs/36C9CBEF-1ADF-47F6-ADDB-85E7C297BD0D@hammerspace.com/">summarized</a>:</p>
+<blockquote>
+<p>"Good pondering, I'm hoping this discussion continues a bit and we can figure it out — I'll still iterate on this design in the meantime."</p>
+</blockquote>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/cover.1768573690.git.bcodding@hammerspace.com/">2026-01-16 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — [PATCH v1 0/4] kNFSD Signed Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/c8735411d66dd7db9c5abb2b5a1c4d9b98ea174a.1768573690.git.bcodding@hammerspace.com/">2026-01-16 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — [PATCH v1 1/4] nfsd: Convert export flags to use BIT() macro</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/c49d28aade36c044f0533d03b564ff65e00d9e05.1768573690.git.bcodding@hammerspace.com/">2026-01-16 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — [PATCH v1 2/4] nfsd: Add a key for signing filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/455770c55ed3500a65a0d5d30133f5f23515a1cc.1768573690.git.bcodding@hammerspace.com/">2026-01-16 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — [PATCH v1 3/4] NFSD/export: Add sign_fh export option</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/9c9cd6131574a45f2603c9248ba205a79b00fea3.1768573690.git.bcodding@hammerspace.com/">2026-01-16 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — [PATCH v1 4/4] NFSD: Sign filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/3db40beb64cb3663d9e8c83f498557bf8fbc0924.camel@kernel.org/">2026-01-16 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v1 2/4] nfsd: Add a key for signing filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/3fc1c84e-3f0b-4342-9034-93e7fb441756@app.fastmail.com/">2026-01-16 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v1 2/4] nfsd: Add a key for signing filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/AB5CB215-13F6-4EA3-B4DE-A43105BFD62C@hammerspace.com/">2026-01-16 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — Re: [PATCH v1 2/4] nfsd: Add a key for signing filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/3c5af19d8793c34022bde2cb7fcca1855d1ea080.camel@kernel.org/">2026-01-16 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v1 2/4] nfsd: Add a key for signing filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/15993494-ddd8-4656-8815-2693ee3b7fb3@app.fastmail.com/">2026-01-16 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v1 1/4] nfsd: Convert export flags to use BIT() macro</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/8F2645AA-9CB4-44D5-9121-8699216EF7CD@hammerspace.com/">2026-01-16 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — Re: [PATCH v1 1/4] nfsd: Convert export flags to use BIT() macro</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/d548815e-bab2-4f1a-8c41-003aaf4f7c14@kernel.org/">2026-01-16 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v1 1/4] nfsd: Convert export flags to use BIT() macro</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/22558AE3-3779-4671-8E2F-40A999385499@hammerspace.com/">2026-01-16 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — Re: [PATCH v1 1/4] nfsd: Convert export flags to use BIT() macro</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/703f29f8-a9e5-4947-9d93-a3cbde5cbdcc@app.fastmail.com/">2026-01-16 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v1 2/4] nfsd: Add a key for signing filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/4227ce184b668d857fc495f61c6e3526dd8862b2.camel@kernel.org/">2026-01-16 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v1 2/4] nfsd: Add a key for signing filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/bb62acdd-4185-41ed-8e91-001f96c78602@app.fastmail.com/">2026-01-16 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v1 2/4] nfsd: Add a key for signing filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/d2c5b2df-ddb2-49d0-9c41-422449d123ab@app.fastmail.com/">2026-01-16 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v1 2/4] nfsd: Add a key for signing filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/69621716-f4f2-481e-b0af-0339f21bb139@app.fastmail.com/">2026-01-16 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v1 3/4] NFSD/export: Add sign_fh export option</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/4A6213D5-BEFD-4090-9134-8D397C3F2ECE@hammerspace.com/">2026-01-16 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — Re: [PATCH v1 2/4] nfsd: Add a key for signing filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/f8e2d466-7280-4a21-ad71-21bf1e546300@app.fastmail.com/">2026-01-16 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v1 0/4] kNFSD Signed Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/2b28af6e-a6da-4f10-a589-6dd20d2f2c6c@app.fastmail.com/">2026-01-16 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v1 4/4] NFSD: Sign filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/C69B1F13-7248-4CAF-977C-5F0236B0923A@hammerspace.com/">2026-01-16 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — Re: [PATCH v1 0/4] kNFSD Signed Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/FA695E2C-7563-4083-91CF-69DC0CF88F26@hammerspace.com/">2026-01-16 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — Re: [PATCH v1 4/4] NFSD: Sign filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/683798bf-b7f3-4418-99ce-b15b0788c960@kernel.org/">2026-01-16 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v1 0/4] kNFSD Signed Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/7951f103-8e2a-49f9-a053-5c9df12aeedf@app.fastmail.com/">2026-01-16 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v1 2/4] nfsd: Add a key for signing filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/72edd2f60b4a91437c73a9b49ec85a37586512a5.camel@kernel.org/">2026-01-16 Trond Myklebust <a href="mailto:trondmy@kernel.org">trondmy@kernel.org</a> — Re: [PATCH v1 0/4] kNFSD Signed Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/1D003BD7-1102-4355-961A-7564E5368567@hammerspace.com/">2026-01-16 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — Re: [PATCH v1 0/4] kNFSD Signed Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/176861129903.16766.18207157056062198907@noble.neil.brown.name/">2026-01-17 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v1 4/4] NFSD: Sign filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/176861309837.16766.10645274004289940807@noble.neil.brown.name/">2026-01-17 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v1 0/4] kNFSD Signed Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/8C67F451-980D-4739-B044-F8562B2A8B74@hammerspace.com/">2026-01-17 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — Re: [PATCH v1 0/4] kNFSD Signed Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/EE266593-BC82-4629-9277-6DF13F809FF8@hammerspace.com/">2026-01-17 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — Re: [PATCH v1 4/4] NFSD: Sign filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/176879668905.16766.5840486885381698639@noble.neil.brown.name/">2026-01-19 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v1 0/4] kNFSD Signed Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260119-reingehen-gelitten-a5e364f704fa@brauner/">2026-01-19 Christian Brauner <a href="mailto:brauner@kernel.org">brauner@kernel.org</a> — Re: [PATCH v1 0/4] kNFSD Signed Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/5E2A23BF-83A8-4991-9014-99389BFCE237@hammerspace.com/">2026-01-19 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — Re: [PATCH v1 2/4] nfsd: Add a key for signing filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/176885678653.16766.8436118850581649792@noble.neil.brown.name/">2026-01-19 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v1 0/4] kNFSD Signed Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/937fea401a129217af5b6c7c5cb0b45f738456d6.camel@kernel.org/">2026-01-19 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v1 0/4] kNFSD Signed Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260120-tratsch-luftfahrt-d447fdd12c10@brauner/">2026-01-20 Christian Brauner <a href="mailto:brauner@kernel.org">brauner@kernel.org</a> — Re: [PATCH v1 0/4] kNFSD Signed Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/176890236169.16766.7338555258291967939@noble.neil.brown.name/">2026-01-20 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v1 0/4] kNFSD Signed Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/176890400475.16766.10882526298387036216@noble.neil.brown.name/">2026-01-20 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v1 0/4] kNFSD Signed Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260120-irrelevant-zeilen-b3c40a8e6c30@brauner/">2026-01-20 Christian Brauner <a href="mailto:brauner@kernel.org">brauner@kernel.org</a> — Re: [PATCH v1 0/4] kNFSD Signed Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/176890489330.16766.1807342797736472831@noble.neil.brown.name/">2026-01-20 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v1 0/4] kNFSD Signed Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260120-kundgeben-privat-e9077477f862@brauner/">2026-01-20 Christian Brauner <a href="mailto:brauner@kernel.org">brauner@kernel.org</a> — Re: [PATCH v1 0/4] kNFSD Signed Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAJfpegt=eV=2OxgfiVYG7drw_yN14b7edJhj+bsF_ku7cVGuig@mail.gmail.com/">2026-01-20 Miklos Szeredi <a href="mailto:miklos@szeredi.hu">miklos@szeredi.hu</a> — Re: [PATCH v1 0/4] kNFSD Signed Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/36C9CBEF-1ADF-47F6-ADDB-85E7C297BD0D@hammerspace.com/">2026-01-20 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — Re: [PATCH v1 0/4] kNFSD Signed Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/223B0693-49B1-4370-9F17-A1A71F231EF3@hammerspace.com/">2026-01-20 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — Re: [PATCH v1 0/4] kNFSD Signed Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAJfpegsDTopCcAQzxfqvrMJajfCRt5MnTzEM0oCmVSM=1ik3gw@mail.gmail.com/">2026-01-20 Miklos Szeredi <a href="mailto:miklos@szeredi.hu">miklos@szeredi.hu</a> — Re: [PATCH v1 0/4] kNFSD Signed Filehandles</a></li>
+</ul>
+  </main>
+</body>
+</html>

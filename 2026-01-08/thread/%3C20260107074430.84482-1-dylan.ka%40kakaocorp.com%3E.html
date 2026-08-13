@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSv4.1 Migration Bug: Stale Session Credentials Cause Kernel Panic</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-08</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSv4.1 Migration Bug: Stale Session Credentials Cause Kernel Panic</h1>
+<h2>Summary</h2>
+<h2>Bug Report: Stale Session Credentials During NFSv4.1 Transparent State Migration</h2>
+<h3>Overview</h3>
+<p>This week, Wonju Ka of Kakao Corp. reported a critical bug in the Linux NFS client's handling of <strong>NFSv4.1 transparent state migration</strong>. The issue manifests as a kernel panic caused by a use-after-free condition when in-flight RPC requests are retried with stale session credentials after migration completes.</p>
+<h3>Problem Classification: Bug Fix</h3>
+<p>This is a <strong>bug report</strong> (not a new feature or protocol change). The reporter identified a race condition in the NFS client's migration path that leads to data corruption and kernel panics under heavy I/O load during server-to-server state migration.</p>
+<h3>Technical Details</h3>
+<p>The bug occurs when the NFSv4.1 client performs a transparent state migration while many WRITE operations are in-flight (all 16 session slots fully utilized). <a href="https://lore.kernel.org/linux-nfs/20260107074430.84482-1-dylan.ka@kakaocorp.com/">As described by Wonju Ka</a>, the problematic sequence unfolds as follows:</p>
+<blockquote>
+<p>"During migration, when many WRITE operations are in-flight (16 slots fully utilized), the following sequence occurs:</p>
+<ol>
+<li>Client detects LEASE_MOVED flag from source server</li>
+<li>Client performs migration recovery (FS_LOCATIONS, CREATE_SESSION on target)</li>
+<li>Migration completes - nfs_server now points to target server's nfs_client</li>
+<li>rpc_xprt is switched to target server connection</li>
+<li>In-flight RPCs on source connection receive NFS4ERR_BADSESSION</li>
+<li>These RPCs are retried using the NEW transport (target server) but with OLD session credentials (source server's session ID)</li>
+<li>Target server receives requests with foreign session ID -&gt; "client not found"</li>
+<li>Eventually leads to use-after-free panic"</li>
+</ol>
+</blockquote>
+<p>The core issue is that when <code>rpc_switch_client_transport()</code> switches the RPC transport to the target server, pending RPC tasks retain their original session credentials from the source server. When these tasks are retried after failing on the old connection, they arrive at the <strong>target</strong> server with the <strong>source</strong> server's session ID — a credential mismatch that the target cannot resolve.</p>
+<h3>Evidence and Timeline</h3>
+<p>The reporter provided detailed logs showing the exact sequence of events:</p>
+<blockquote>
+<p>"07:28:57.069 LEASE_MOVED flag detected (source server)
+07:28:58.251 CREATE_SESSION on target (new ClientID: 2:1767652138)
+07:28:58.252 RECLAIM_COMPLETE
+07:28:58.5xx WRITEs still processing on source (session 5:1767650393:0:1)
+07:28:58.5xx New WRITEs on target (session 2:1767652138:0:1)
+07:28:59.248 Target receives request with SOURCE session ID!
+ERROR: client not found {"clientId": "5:1767650393", "sessionId": "5:1767650393:0:1"}
+07:28:59.489 PANIC: "refcount_t: addition on 0; use-after-free""</p>
+</blockquote>
+<p>The target server logs confirm that requests arrived on the <strong>target connection port</strong> (59244) rather than the source port (56768), proving that the transport was correctly updated but session credentials were not.</p>
+<h3>Kernel Panic Trace</h3>
+<p>The bug culminates in a kernel panic with a use-after-free error:</p>
+<blockquote>
+<p>"refcount_t: addition on 0; use-after-free.
+WARNING: CPU: 7 PID: 33665 at lib/refcount.c:25 refcount_warn_saturate+0x9f/0x150
+Workqueue: rpciod rpc_async_schedule [sunrpc]
+Call Trace:
+nfs4_schedule_state_manager+0x...
+nfs4_schedule_session_recovery+0x...
+nfs41_sequence_process+0x...
+nfs4_sequence_done+0x...
+nfs4_write_done+0x..."</p>
+</blockquote>
+<h3>Root Cause Analysis</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260107074430.84482-1-dylan.ka@kakaocorp.com/">Wonju Ka identifies the root cause</a>:</p>
+<blockquote>
+<p>"In fs/nfs/nfs4state.c, nfs4_try_migration() switches the nfs_server to point to the new nfs_client and updates the RPC transport. However, RPC tasks that are already in-flight retain references to the old session."</p>
+</blockquote>
+<p>The session ID embedded in the SEQUENCE operation comes from the <code>rpc_task</code>'s credentials, which were established before migration began and are not refreshed when the transport is switched.</p>
+<h3>Proposed Fix Directions</h3>
+<p>The reporter suggests three potential remediation strategies:</p>
+<blockquote>
+<p>"1. Drain all in-flight RPCs before completing migration
+2. When retrying failed RPCs after migration, refresh session credentials
+3. Mark pending RPCs for re-authentication after transport switch"</p>
+</blockquote>
+<h3>Related History</h3>
+<p>The reporter notes that this issue is related to a previously reported problem on the mailing list, indicating this may be a long-standing or recurring class of bugs in the NFSv4.1 migration path.</p>
+<h3>Current Status</h3>
+<p>This thread contains only the initial bug report as of this week. No responses from maintainers (Trond Myklebust, Chuck Lever, Anna Schumaker, or others) have been recorded yet. The community awaits further discussion on which fix direction is most appropriate and whether a patch will be submitted.</p>
+<h3>Significance for NFS Client Development</h3>
+<p>This bug highlights a subtle but dangerous race condition in the NFSv4.1 client's state migration implementation. It affects systems relying on transparent server failover or load balancing, where session state must be migrated between servers without disrupting clients. The use-after-free panic represents a serious reliability concern that could lead to data loss or system crashes in production environments using NFSv4.1 with pNFS or clustered server deployments.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107074430.84482-1-dylan.ka@kakaocorp.com/">2026-01-07 Wonju Ka <a href="mailto:dylan.ka@kakaocorp.com">dylan.ka@kakaocorp.com</a> — [BUG] NFS4.1 migration: in-flight RPCs retried with stale session credentials to new server</a></li>
+</ul>
+  </main>
+</body>
+</html>

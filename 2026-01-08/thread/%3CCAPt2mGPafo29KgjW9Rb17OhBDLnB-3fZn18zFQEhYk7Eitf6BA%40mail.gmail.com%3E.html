@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS Server refcount_t Underflow Debugging: nfsd4_sequence_done Crash on v6.18 Re-export</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-08</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS Server refcount_t Underflow Debugging: nfsd4_sequence_done Crash on v6.18 Re-export</h1>
+<h2>Summary</h2>
+<h1>NFS Server refcount_t Underflow in nfsd4_sequence_done — Debugging Guidance for v6.18 Re-export Crash</h1>
+<h2>Classification: Bug fix (ongoing investigation)</h2>
+<h2>Summary</h2>
+<p>This thread, initiated on December 23, 2025, continues an ongoing investigation into a kernel crash affecting NFS server (NFSD) re-export deployments running Linux v6.18. The bug manifests as a <code>refcount_t</code> underflow in the NFSv4.1+ session sequence completion path (<code>nfsd4_sequence_done</code>), leading to a use-after-free warning and system instability. This week's activity focused on refining debugging methodology after initial trace data proved too voluminous to be practically useful.</p>
+<h2>Background (Prior Weeks)</h2>
+<p>The thread was opened by Daire Byrne, who reported intermittent kernel crashes after upgrading NFS re-export servers from v6.4 to v6.18.0:</p>
+<blockquote>
+<p>"We recently upgraded our NFS re-export servers from a heavily patched (but stable) v6.4 kernel to pretty virgin v6.18.0. But we have started to record a fairly infrequent (once every 2 weeks) crash of the form: refcount_t: underflow; use-after-free." <a href="https://lore.kernel.org/linux-nfs/CAPt2mGPafo29KgjW9Rb17OhBDLnB-3fZn18zFQEhYk7Eitf6BA@mail.gmail.com/">Daire Byrne</a></p>
+</blockquote>
+<p>The crash occurs in the <code>nfsd</code> kernel thread, with a call trace pointing to <code>nfsd4_sequence_done</code>:</p>
+<pre><code>Call Trace:
+  nfsd4_sequence_done+0x1d6/0x210 [nfsd]
+  nfs4svc_encode_compoundres+0x50/0x60 [nfsd]
+  nfsd_dispatch+0x111/0x210 [nfsd]
+</code></pre>
+<p>The environment is notable for its high throughput ("constant 50gbit") and re-export configuration, where NetApp NFSv3 mounts are re-exported as NFSv4 to Linux clients.</p>
+<p>In the initial exchange (December 24), Chuck Lever advised against a full bisect given the two-week reproduction window, instead recommending kernel debug options (<code>CONFIG_DEBUG_OBJECTS</code>, <code>CONFIG_KFENCE</code>) and targeted ftrace tracepoints for session slot and client lifecycle events:</p>
+<blockquote>
+<p>"Given the two-week reproduction window, bisecting would be painful, especially because it's difficult to tell if the problem is present and just not triggering." <a href="https://lore.kernel.org/linux-nfs/f760b3a2-6e53-4143-9bb4-e56b030c6bba@app.fastmail.com/">Chuck Lever</a></p>
+</blockquote>
+<p>Daire Byrne confirmed the debugging infrastructure was deployed: "I have put this all in place so now we wait..." <a href="https://lore.kernel.org/linux-nfs/CAPt2mGOy+ThM7tJDddrWRqFPq5Ljt1hhu==ydArdT7RYK82OBw@mail.gmail.com/">Daire Byrne</a></p>
+<h2>This Week's Activity (January 8, 2026)</h2>
+<h3>Trace Data Volume Problem</h3>
+<p>On January 8, Daire Byrne reported that additional crashes had occurred but the ftrace buffer output was impractically large — approximately 8MB of text:</p>
+<blockquote>
+<p>"So I have had a couple more of these, but I'm not entirely sure what to do with the ftrace buffer output - it's somewhat larger (8MB of text) than I anticipated." <a href="https://lore.kernel.org/linux-nfs/CAPt2mGO_gSfO4He7XeeENKuWD_+rbxa_z+hRJxNgQ8eC0XzZWw@mail.gmail.com/">Daire Byrne</a></p>
+</blockquote>
+<p>The dump revealed a critical issue: the trace buffer had lost over 4 million events, and the VM reset itself during the console dump before reaching the end of the buffer:</p>
+<blockquote>
+<p>"[373929.683722] CPU:9 [LOST 4084645 EVENTS]"</p>
+</blockquote>
+<p>The captured data consisted almost entirely of <code>nfsd_slot_seqid_sequence</code> tracepoint entries — one per NFSv4.1+ compound operation — which at 50 Gbps throughput saturates any reasonably-sized buffer.</p>
+<h3>Chuck Lever's Refined Debugging Recommendations</h3>
+<p>Chuck Lever responded with a comprehensive set of improved debugging strategies:</p>
+<p><strong>1. Buffer sizing and tracepoint filtering:</strong> He identified that the <code>nfsd_slot_seqid_sequence</code> tracepoint fires on every compound operation, making it too noisy for high-throughput environments:</p>
+<blockquote>
+<p>"The 'LOST 4084645 EVENTS' message strongly suggests the trace data is incomplete -- the events immediately preceding the crash were likely among those lost. The nfsd_slot_seqid_sequence tracepoint fires on every NFSv4.1+ compound, which at 50 Gbps throughput will saturate any reasonably-sized buffer." <a href="https://lore.kernel.org/linux-nfs/89582fe2-2ee0-452a-9226-063f4b20ef5a@app.fastmail.com/">Chuck Lever</a></p>
+</blockquote>
+<p>He recommended:</p>
+<ul>
+<li>Increasing the buffer size to 200MB per CPU</li>
+<li>Disabling the high-volume <code>nfsd_slot_seqid_sequence</code> tracepoint</li>
+<li>Enabling only client lifecycle events (<code>nfsd_clid_expired</code>, <code>nfsd_clid_destroyed</code>)</li>
+</ul>
+<p><strong>2. Single-CPU dump:</strong> To avoid the multi-gigabyte dump that caused the reboot timeout:</p>
+<blockquote>
+<p>"Dump only the triggering CPU's buffer: echo orig_cpu &gt; /proc/sys/kernel/ftrace_dump_on_oops" <a href="https://lore.kernel.org/linux-nfs/89582fe2-2ee0-452a-9226-063f4b20ef5a@app.fastmail.com/">Chuck Lever</a></p>
+</blockquote>
+<p><strong>3. Direct refcount underflow capture via kprobe:</strong> A targeted approach to catch the exact moment of the underflow:</p>
+<blockquote>
+<p>"Add a kprobe to catch the refcount underflow directly: echo 'p:kprobes/refcount_warn refcount_warn_saturate' &gt; /sys/kernel/debug/tracing/kprobe_events" <a href="https://lore.kernel.org/linux-nfs/89582fe2-2ee0-452a-9226-063f4b20ef5a@app.fastmail.com/">Chuck Lever</a></p>
+</blockquote>
+<p><strong>4. Extended panic timeout:</strong> To allow more time for trace buffer dumps:</p>
+<blockquote>
+<p>"Extend panic timeout: echo 300 &gt; /proc/sys/kernel/panic" <a href="https://lore.kernel.org/linux-nfs/89582fe2-2ee0-452a-9226-063f4b20ef5a@app.fastmail.com/">Chuck Lever</a></p>
+</blockquote>
+<h3>Suspect Commits Identified</h3>
+<p>Chuck Lever narrowed the likely source of the regression to the session slot rework that landed in the v6.13/v6.14 timeframe, specifically highlighting four commits:</p>
+<blockquote>
+<p>"the major changes landed in the v6.13/v6.14 timeframe: 0b6e14242630 ('nfsd: use an xarray to store v4.1 session slots'), 60aa6564317d ('nfsd: allocate new session-based DRC slots on demand'), fc8738c68d0b ('nfsd: add support for freeing unused session-DRC slots'), 35e34642b599 ('nfsd: add shrinker to reduce number of slots allocated per session')" <a href="https://lore.kernel.org/linux-nfs/89582fe2-2ee0-452a-9226-063f4b20ef5a@app.fastmail.com/">Chuck Lever</a></p>
+</blockquote>
+<p>He identified the slot freeing and shrinker commits as the most likely candidates:</p>
+<blockquote>
+<p>"If bisection becomes necessary, I would start with the slot freeing and shrinker commits (fc8738c68d0b and 35e34642b599) as the most likely candidates given they add the most complexity to slot lifecycle management." <a href="https://lore.kernel.org/linux-nfs/89582fe2-2ee0-452a-9226-063f4b20ef5a@app.fastmail.com/">Chuck Lever</a></p>
+</blockquote>
+<h3>Potential Fix Candidate</h3>
+<p>In a follow-up message, Chuck Lever pointed to an unmerged fix in his <code>nfsd-testing</code> branch that might be directly relevant:</p>
+<blockquote>
+<p>"This fix: cbfd91d22776 ('nfsd: never defer requests during idmap lookup') has the possibility of being highly relevant." <a href="https://lore.kernel.org/linux-nfs/dcba5f89-7603-4abb-821f-f5322e964c40@app.fastmail.com/">Chuck Lever</a></p>
+</blockquote>
+<p>This commit addresses request deferral during ID mapping lookups, which could interact with the session slot lifecycle management in ways that trigger the refcount underflow.</p>
+<h3>Resolution Path Forward</h3>
+<p>Daire Byrne confirmed he had applied the refined ftrace debugging suggestions and planned to test the potential fix:</p>
+<blockquote>
+<p>"I've applied (all) your recent ftrace debug suggestions so let's see if I can capture anything useful first and then I will try again with those patches to see if it makes any odds." <a href="https://lore.kernel.org/linux-nfs/CAPt2mGNXuktDMYeh4dhs9Em6Jjb8k5pcRGaYEjmFgSszUz9wjQ@mail.gmail.com/">Daire Byrne</a></p>
+</blockquote>
+<h2>Technical Significance</h2>
+<p>This bug represents a critical reliability issue for NFS server deployments, particularly those using re-export configurations at high throughput. The <code>refcount_t</code> underflow in <code>nfsd4_sequence_done</code> indicates a reference counting imbalance in the NFSv4.1+ session slot management code — likely introduced by the architectural changes to use xarray-based slot storage and on-demand allocation with shrinker support (v6.13/v6.14).</p>
+<p>The investigation highlights several important aspects of kernel debugging at production scale:</p>
+<ol>
+<li><strong>Tracepoint noise management</strong>: At 50 Gbps, even per-operation tracepoints can overwhelm buffers, losing the critical pre-crash context.</li>
+<li><strong>Targeted kprobes</strong>: Direct instrumentation of <code>refcount_warn_saturate</code> provides a more surgical approach to capturing underflow events.</li>
+<li><strong>Suspect commit narrowing</strong>: By identifying the session slot rework as the likely regression window, the bisect effort can be focused on a manageable set of commits rather than the full v6.4-to-v6.18 span.</li>
+</ol>
+<h2>Status</h2>
+<p><strong>Open — under investigation.</strong> No root cause has been identified or fix merged. Daire Byrne is collecting improved trace data using Chuck Lever's refined debugging methodology and plans to test the candidate fix (<code>cbfd91d22776</code>) from the <code>nfsd-testing</code> branch. The thread remains active with follow-up messages expected in subsequent weeks.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/CAPt2mGO_gSfO4He7XeeENKuWD_+rbxa_z+hRJxNgQ8eC0XzZWw@mail.gmail.com/">2026-01-08 Daire Byrne <a href="mailto:daire@dneg.com">daire@dneg.com</a> — Re: refcount_t underflow (nfsd4_sequence_done?) with v6.18 re-export</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/89582fe2-2ee0-452a-9226-063f4b20ef5a@app.fastmail.com/">2026-01-08 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: refcount_t underflow (nfsd4_sequence_done?) with v6.18 re-export</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/dcba5f89-7603-4abb-821f-f5322e964c40@app.fastmail.com/">2026-01-08 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: refcount_t underflow (nfsd4_sequence_done?) with v6.18 re-export</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAPt2mGNXuktDMYeh4dhs9Em6Jjb8k5pcRGaYEjmFgSszUz9wjQ@mail.gmail.com/">2026-01-08 Daire Byrne <a href="mailto:daire@dneg.com">daire@dneg.com</a> — Re: refcount_t underflow (nfsd4_sequence_done?) with v6.18 re-export</a></li>
+</ul>
+  </main>
+</body>
+</html>

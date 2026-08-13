@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>lockd API Boundary Cleanup v3: Race Fix and Header Refactoring Submitted</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-29</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>lockd API Boundary Cleanup v3: Race Fix and Header Refactoring Submitted</h1>
+<h2>Summary</h2>
+<h1>lockd API Boundary Cleanup: v3 Series (14 patches) Submitted</h1>
+<p><strong>Type:</strong> Refactoring / Bug fix (race condition fix in NFS client shutdown path, plus input validation hardening)</p>
+<h2>Overview</h2>
+<p>Chuck Lever submitted version 3 of his series to clarify the lockd module's API boundaries (<a href="https://lore.kernel.org/linux-nfs/20260126195535.154697-1-cel@kernel.org/">PATCH v3 00/14</a> through <a href="https://lore.kernel.org/linux-nfs/20260126195535.154697-15-cel@kernel.org/">PATCH v3 14/14</a>). This is a significant reduction from the previous 42-patch v2 submission, as Chuck separated the API cleanup work (patches 01–14 in v3) from the NLMv4 XDR modernization using xdrgen (which will be posted separately).</p>
+<p>As Chuck explained in the cover letter:</p>
+<blockquote>
+<p>"The patches in this series refactor the lockd code base to clearly separate its public API from internal implementation and NLM protocol details."</p>
+</blockquote>
+<p>He further noted that these changes are prerequisites for future XDR work:</p>
+<blockquote>
+<p>"These changes enable subsequent work to modernize the NLMv4 XDR layer using xdrgen without risk of breaking external consumers."</p>
+</blockquote>
+<h2>Context from Prior Week</h2>
+<p>Last week, Chuck posted a 42-patch v2 series (<a href="https://lore.kernel.org/linux-nfs/20260123185259.1215767-1-cel@kernel.org/">prior summary</a>) that received review from Jeff Layton, who identified a pre-existing race condition in the NFS client's sysfs shutdown path and provided a Reviewed-by tag for the series. The kernel test robot also reported build failures on alpha and hexagon architectures caused by hidden header dependencies in <code>fs/nfs/nfs3proc.c</code> (<a href="https://lore.kernel.org/linux-nfs/20260123185259.1215767-11-cel@kernel.org/">prior summary</a>).</p>
+<p>The v3 series addresses all feedback from v2, incorporating the race condition fix and build failure resolution directly into the patches.</p>
+<h2>Key Technical Changes (v3 vs. v2)</h2>
+<p>Chuck documented the changes between versions in the cover letter:</p>
+<blockquote>
+<p>"Changes since v2:</p>
+<ul>
+<li>Serialize client-side NLM shutdown to avoid UAF and NPD</li>
+<li>Address a build failure due to header reorganization</li>
+<li>Rename internal status code nlm_drop_reply"</li>
+</ul>
+</blockquote>
+<blockquote>
+<p>"Changes since v1:</p>
+<ul>
+<li>Refine the pre-requisite header adjustments</li>
+<li>Reduce stack consumption by moving large structures to wrappers</li>
+<li>Additional extensive clean up"</li>
+</ul>
+</blockquote>
+<h2>Critical NFS Client Bug Fix: Race Condition in Sysfs Shutdown</h2>
+<p>The most important change for NFS client developers is <strong><a href="https://lore.kernel.org/linux-nfs/20260126195535.154697-7-cel@kernel.org/">PATCH v3 06/14</a></strong>, which fixes a use-after-free and null pointer dereference race condition in the NFS client's sysfs "shutdown" file path:</p>
+<blockquote>
+<p>"A race condition exists in shutdown_store() when writing to the sysfs 'shutdown' file concurrently with nlm_shutdown_hosts_net(). Without synchronization, the following sequence can occur:</p>
+<ol>
+<li>shutdown_store() reads server-&gt;nlm_host (non-NULL)</li>
+<li>nlm_shutdown_hosts_net() acquires nlm_host_mutex, calls rpc_shutdown_client(), sets h_rpcclnt to NULL, and potentially frees the host via nlm_gc_hosts()</li>
+<li>shutdown_store() dereferences the now-stale or freed host"</li>
+</ol>
+</blockquote>
+<p>The fix introduces a new public API helper <code>nlmclnt_shutdown_rpc_clnt()</code> that acquires <code>nlm_host_mutex</code> before accessing <code>h_rpcclnt</code>, synchronizing with <code>nlm_shutdown_hosts_net()</code>. This was originally identified by Jeff Layton during review of v2:</p>
+<blockquote>
+<p>"I don't see any locking here. Soon after this thing goes NULL, the nlm_clnt can be freed. ISTM that this ought to take a reference to nlm_clnt and put it afterward." <a href="https://lore.kernel.org/linux-nfs/53120eface645028e6a33cfb3cbf1a66ccbe2ca6.camel@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<p>Chuck confirmed the issue during v2 review:</p>
+<blockquote>
+<p>"I asked Claude specifically to look for races, and he agrees there is a pre-existing synchronization issue in here. Certainly could be addressed via a pre-requisite patch to 05/42." <a href="https://lore.kernel.org/linux-nfs/8131fa88-2f62-4724-97d1-25615b2de7d3@app.fastmail.com/">Chuck Lever</a></p>
+</blockquote>
+<p>The fix also improves API layering: NFS client code no longer needs to include the internal lockd header to access <code>nlm_host</code> fields. The new helper resides in <code>bind.h</code> alongside other public lockd interfaces.</p>
+<h2>Input Validation Hardening: Lock Range Clamping</h2>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260126195535.154697-14-cel@kernel.org/">PATCH v3 13/14</a></strong> adds input validation to prevent malformed lock requests from violating kernel invariants:</p>
+<blockquote>
+<p>"While relocating the function, add input validation: clamp the starting offset to OFFSET_MAX before use. Without this, a malformed lock request with off &gt; OFFSET_MAX results in fl_start &gt; fl_end, violating file_lock invariants and potentially causing incorrect lock conflict detection."</p>
+</blockquote>
+<p>This is a defensive hardening measure that prevents potential issues from malicious or corrupted NLMv4 lock requests on both client and server sides.</p>
+<h2>Build Fix: NFS Client Header Dependency</h2>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260126195535.154697-12-cel@kernel.org/">PATCH v3 11/14</a></strong> addresses the build failure reported by the kernel test robot on alpha and hexagon architectures. The patch adds an explicit <code>#include</code> of <code>filelock.h</code> in <code>fs/nfs/nfs3proc.c</code> for <code>struct file_lock</code> and <code>FL_CLOSE</code>, which were previously pulled in transitively through <code>include/linux/lockd/xdr.h</code>:</p>
+<blockquote>
+<p>"Additionally, nfs3proc.c needs an explicit include of filelock.h for struct file_lock and FL_CLOSE, which xdr.h previously provided."</p>
+</blockquote>
+<p>This corrects a layering violation where NFS client code depended on internal lockd headers.</p>
+<h2>API Boundary Enforcement (Patches 01–14)</h2>
+<p>The series systematically reduces the public API surface of lockd:</p>
+<ul>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260126195535.154697-2-cel@kernel.org/">PATCH v3 01/14</a></strong>: Simplifies <code>cast_status()</code> by removing dead NLMv4 code from the NLMv1/v3 handler.</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260126195535.154697-3-cel@kernel.org/">PATCH v3 02/14</a></strong>: Relocates and renames <code>nlm_drop_reply</code> to <code>nlm__int__drop_reply</code>, making its internal-only nature explicit (per Jeff Layton's naming suggestion from v2 review).</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260126195535.154697-4-cel@kernel.org/">PATCH v3 03/14</a></strong>: Introduces <code>nlm__int__deadlock</code> as an internal status code, establishing a translation boundary between generic lockd code and version-specific wire protocol handlers.</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260126195535.154697-5-cel@kernel.org/">PATCH v3 04/14</a></strong>: Changes <code>nlm_fopen()</code> to return standard <code>errno</code> values instead of on-the-wire NLM status codes, removing NFSD's dependency on NLM wire protocol definitions.</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260126195535.154697-6-cel@kernel.org/">PATCH v3 05/14</a></strong>: Relocates <code>nlmsvc_unlock</code> API declarations to <code>bind.h</code>, grouping them with other external API functions.</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260126195535.154697-8-cel@kernel.org/">PATCH v3 07–12/14</a></strong>: Moves internal headers (<code>xdr4.h</code>, <code>share.h</code>, <code>lockd.h</code>, <code>debug.h</code>, <code>xdr.h</code>, <code>nlm.h</code>) from <code>include/linux/lockd/</code> to <code>fs/lockd/</code>, reducing the public API to just <code>bind.h</code>.</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260126195535.154697-15-cel@kernel.org/">PATCH v3 14/14</a></strong>: Relocates <code>svc_version</code> definitions to the XDR layer, preventing internal implementation details from leaking into public RPC server interfaces.</li>
+</ul>
+<h2>Discussion Status</h2>
+<p>As of this week's window close, no replies have been posted to the v3 series. The series carries Jeff Layton's Reviewed-by tags from the v2 review cycle on several patches (notably patches 01, 03, 04, and 06), suggesting that the core technical content has already received positive review, with v3 incorporating the requested changes.</p>
+<h2>Summary for NFS Client Development</h2>
+<p>The most directly relevant changes for NFS client developers are:</p>
+<ol>
+<li>
+<p><strong>Race condition fix</strong> (<a href="https://lore.kernel.org/linux-nfs/20260126195535.154697-7-cel@kernel.org/">PATCH v3 06/14</a>): A pre-existing use-after-free/null pointer dereference in the sysfs "shutdown" path is fixed by introducing <code>nlmclnt_shutdown_rpc_clnt()</code>, which properly serializes access to <code>h_rpcclnt</code> via <code>nlm_host_mutex</code>.</p>
+</li>
+<li>
+<p><strong>Layering correction</strong> (<a href="https://lore.kernel.org/linux-nfs/20260126195535.154697-12-cel@kernel.org/">PATCH v3 11/14</a>): <code>fs/nfs/nfs3proc.c</code> now explicitly includes <code>filelock.h</code> rather than relying on transitive inclusion through lockd headers, fixing build failures on alpha and hexagon architectures.</p>
+</li>
+<li>
+<p><strong>Input validation hardening</strong> (<a href="https://lore.kernel.org/linux-nfs/20260126195535.154697-14-cel@kernel.org/">PATCH v3 13/14</a>): Malformed NLMv4 lock requests with offsets exceeding <code>OFFSET_MAX</code> are now clamped, preventing violations of <code>file_lock</code> invariants that could cause incorrect lock conflict detection.</p>
+</li>
+<li>
+<p><strong>API surface reduction</strong>: Going forward, NFS client code should only depend on <code>include/linux/lockd/bind.h</code> for lockd interactions. All other lockd headers have been moved to <code>fs/lockd/</code> as internal implementation details.</p>
+</li>
+</ol>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260126195535.154697-1-cel@kernel.org/">2026-01-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 00/14] Clarify module API boundaries</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260126195535.154697-2-cel@kernel.org/">2026-01-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 01/14] lockd: Simplify cast_status() in svcproc.c</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260126195535.154697-4-cel@kernel.org/">2026-01-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 03/14] lockd: Introduce nlm__int__deadlock</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260126195535.154697-3-cel@kernel.org/">2026-01-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 02/14] lockd: Relocate and rename nlm_drop_reply</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260126195535.154697-5-cel@kernel.org/">2026-01-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 04/14] lockd: Have nlm_fopen() return errno values</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260126195535.154697-6-cel@kernel.org/">2026-01-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 05/14] lockd: Relocate nlmsvc_unlock API declarations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260126195535.154697-7-cel@kernel.org/">2026-01-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 06/14] NFS: Use nlmclnt_shutdown_rpc_clnt() to safely shut down NLM</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260126195535.154697-9-cel@kernel.org/">2026-01-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 08/14] lockd: Move share.h from include/linux/lockd/ to fs/lockd/</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260126195535.154697-8-cel@kernel.org/">2026-01-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 07/14] lockd: Move xdr4.h from include/linux/lockd/ to fs/lockd/</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260126195535.154697-10-cel@kernel.org/">2026-01-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 09/14] lockd: Relocate include/linux/lockd/lockd.h</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260126195535.154697-11-cel@kernel.org/">2026-01-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 10/14] lockd: Remove lockd/debug.h</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260126195535.154697-12-cel@kernel.org/">2026-01-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 11/14] lockd: Move xdr.h from include/linux/lockd/ to fs/lockd/</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260126195535.154697-14-cel@kernel.org/">2026-01-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 13/14] lockd: Move nlm4svc_set_file_lock_range()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260126195535.154697-13-cel@kernel.org/">2026-01-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 12/14] lockd: Make linux/lockd/nlm.h an internal header</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260126195535.154697-15-cel@kernel.org/">2026-01-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 14/14] lockd: Relocate svc_version definitions to XDR layer</a></li>
+</ul>
+  </main>
+</body>
+</html>

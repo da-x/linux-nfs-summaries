@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS: Require Filesystems to Opt-In for nfsd Export Support via EXPORT_OP_STABLE_HANDLES</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-15</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS: Require Filesystems to Opt-In for nfsd Export Support via EXPORT_OP_STABLE_HANDLES</h1>
+<h2>Summary</h2>
+<h2>Overview</h2>
+<p>Jeff Layton submitted a 29-patch series, <strong>[PATCH 00/29] fs: require filesystems to explicitly opt-in to nfsd export support</strong> [id://20260115-exportfs-nfsd-v1-0-8e80160e3c0c@kernel.org], introducing a new mechanism to prevent unsuitable filesystems from being exported via NFS. This is a <strong>bug fix / hardening change</strong> targeting the NFS server (nfsd) subsystem, with broad implications across many kernel filesystems.</p>
+<h2>Problem Statement</h2>
+<p>Layton explained the core issue in his cover letter:</p>
+<blockquote>
+<p>"In recent years, a number of filesystems that can't present stable filehandles have grown struct export_operations. They've mostly done this for local use-cases (enabling open_by_handle_at() and the like). Unfortunately, having export_operations is generally sufficient to make a filesystem be considered exportable via nfsd, but that requires that the server present stable filehandles."</p>
+</blockquote>
+<p>Filesystems such as kernfs, pidfs, and nsfs have acquired <code>struct export_operations</code> for local utilities (e.g., <code>open_by_handle_at()</code>), yet their filehandles are not stable across reboots — a fundamental requirement for NFS exports. Without an explicit opt-in mechanism, nfsd would incorrectly consider these filesystems exportable.</p>
+<h2>Proposed Solution</h2>
+<p>The patch series introduces a new flag, <strong><code>EXPORT_OP_STABLE_HANDLES</code></strong>, in <code>include/linux/exportfs.h</code>. The approach unfolds in three stages:</p>
+<ol>
+<li><strong>Patch 01/29</strong>: Adds the new <code>EXPORT_OP_STABLE_HANDLES</code> flag to the export operations structure [id://20260115-exportfs-nfsd-v1-1-8e80160e3c0c@kernel.org].</li>
+<li><strong>Patches 02–28/29</strong>: Adds the flag to every filesystem that genuinely supports stable filehandles — including tmpfs, ext4, ext2, erofs, efs, xfs, ceph, btrfs, befs, ufs, udf, affs, squashfs, smb/client, ovl (overlayfs), orangefs, ocfs2, ntfs3, nilfs2, nfs, jfs, jffs2, isofs, gfs2, fuse, fat, and f2fs.</li>
+<li><strong>Patch 29/29</strong>: Adds a check in <code>__fh_verify()</code> within <code>fs/nfsd/nfsfh.c</code> that returns <code>nfserr_stale</code> if the flag is not set [id://20260115-exportfs-nfsd-v1-29-8e80160e3c0c@kernel.org].</li>
+</ol>
+<h2>Key Technical Discussion: "Stable" vs. "Persistent" Handles</h2>
+<p>The most substantial debate in the thread centered on <strong>nomenclature</strong>. Amir Goldstein immediately questioned the choice of <code>STABLE_HANDLES</code> over <code>PERSISTENT_HANDLES</code>:</p>
+<blockquote>
+<p>"Where does the term 'stable file handles' come from? and what does it mean? Why not 'persistent handles', which is described in NFS and SMB specs?" [id://CAOQ4uxjOJMwv_hRVTn3tJHDLMQHbeaCGsdLupiZYcwm7M2rm3g@mail.gmail.com]</p>
+</blockquote>
+<p>Chuck Lever defended the term "stable" on two grounds. First, he argued that "persistent" implies storage on persistent media, which is not true of tmpfs:</p>
+<blockquote>
+<p>"PERSISTENT generally implies that the file handle is saved on persistent storage. This is not true of tmpfs. The use of 'stable' means that the file handle is stable for the life of the file. This /is/ true of tmpfs." [id://d486fdb8-686c-4426-9fac-49b7dbc28765@app.fastmail.com]</p>
+</blockquote>
+<p>Second, and more significantly, Lever raised a forward-looking concern about terminology collision with NFSv4:</p>
+<blockquote>
+<p>"Another reason not to adopt the same terminology as NFS is that someone might come along and implement NFSv4's VOLATILE file handles in Linux, and then say 'OK, /now/ can we export cgroupfs?' And then Linux will be stuck with overloaded terminology and we'll still want to say 'NO, NFS doesn't support cgroupfs'." [id://4d9967cc-a454-46cf-909b-b8ab2d18358d@kernel.org]</p>
+</blockquote>
+<p>Amir Goldstein pushed back initially, noting that "persistent" can also mean "continuing to exist or occur over a prolonged period," which works for tmpfs. However, he conceded after Chuck's argument about NFSv4 VOLATILE handles:</p>
+<blockquote>
+<p>"Good argument. I'm fine with stable as well :)" [id://CAOQ4uxhtorpd6FVsaGO=NdRD72MxeDyabip84ctQYSNufobS8w@mail.gmail.com]</p>
+</blockquote>
+<p>Dave Chinner added a pedantic but important clarification about inode lifetimes versus file lifetimes, noting that XFS physically reuses inodes across multiple files:</p>
+<blockquote>
+<p>"Hence I think that file handle stability/persistence needs to be defined in terms of -file lifetimes-, not the lifetimes of the filesystem objects implement the file's persistent data store." [id://aWlXfBImnC_jhTw4@dread.disaster.area]</p>
+</blockquote>
+<p>Chuck Lever acknowledged this point: "Fair enough, 'inode' is the wrong term to use here" [id://06dcc4b6-7457-4094-a1c6-586ce518020f@app.fastmail.com].</p>
+<p>Jeff Layton noted that the name was Chuck's suggestion and expressed flexibility: "I don't much care about the flag name, so if everyone likes PERSISTENT better I'll roll with that" [id://9c99197dde2eafa55a1b55dce2f0d4d02c77340a.camel@kernel.org].</p>
+<h2>Filesystem-Specific Feedback</h2>
+<p>Several filesystem maintainers raised concerns about specific patches:</p>
+<ul>
+<li>
+<p><strong>Overlayfs (ovl)</strong>: Amir Goldstein flagged that overlayfs has a variant of <code>export_ops</code> used when <code>nfs_export=off</code>, where "encoded file handles can change after copyup+reboot" [id://CAOQ4uxhnxipJcjznEoa_D2R91NDZRgT_TTouGA4PGJO-7R9spw@mail.gmail.com]. Jeff acknowledged: "Also, on the ovl patch: will fix..." [id://9c99197dde2eafa55a1b55dce2f0d4d02c77340a.camel@kernel.org].</p>
+</li>
+<li>
+<p><strong>FUSE</strong>: Amir Goldstein noted that FUSE export operations are used when the server declares <code>FUSE_NO_EXPORT_SUPPORT</code>, meaning they should not opt in for NFS export: "The sad thing w.r.t FUSE is that in most likelihood server does not provide persistent handles also when it does not declare FUSE_NO_EXPORT_SUPPORT but we are stuck with that" [id://CAOQ4uxh4VaVL9PD7-_Op9Xs-z5Qrx8g6x2x5FccujQX-Cw9RqQ@mail.gmail.com]. Jeff responded: "Thanks, I removed that flag in the patch in my tree" [id://0d838a5cf271f98ce7158998dd6b1d0a86ea7eb7.camel@kernel.org].</p>
+</li>
+<li>
+<p><strong>SMB/client</strong>: Amir noted it was "Kind of odd to have this here after the comment out of NFS export" and suggested placing the flag inside the commented-out block [id://CAOQ4uxiTE+8r+F-e91cg9wZY-fjZfSHHOeLk3RWb+2JQQZvbvA@mail.gmail.com].</p>
+</li>
+<li>
+<p><strong>Ceph</strong>: Viacheslav Dubeyko provided a review: "Looks good. Reviewed-by: Viacheslav Dubeyko" [id://dd46aee3d0523cb88e3fe5e5c0e20df08b848a59.camel@ibm.com].</p>
+</li>
+<li>
+<p><strong>JFS</strong>: Dave Kleikamp acknowledged the patch: "Acked-by: Dave Kleikamp" [id://3e190d32-fa91-4d5f-a0ce-225bfff7a410@oracle.com].</p>
+</li>
+</ul>
+<h2>Additional Technical Concern</h2>
+<p>Amir Goldstein raised a question about Patch 29/29, questioning whether the check should be in <code>check_export()</code> rather than <code>__fh_verify()</code>:</p>
+<blockquote>
+<p>"IDGI. Don't you want to deny the export of those fs in check_export()? By the same logic that check_export() checks for can_decode_fh() not for can_encode_fh()." [id://CAOQ4uxg304=s1Uoeayy3rm1e154Nf7ScOgseJHThw4uQjKwk0A@mail.gmail.com]</p>
+</blockquote>
+<p>This point was left unresolved at the end of the week's discussion.</p>
+<h2>Conclusion</h2>
+<p>The series received broad conceptual support but generated a lively debate over terminology and several filesystem-specific corrections. The key outcomes:</p>
+<ol>
+<li><strong>Naming settled</strong>: <code>EXPORT_OP_STABLE_HANDLES</code> retained over <code>PERSISTENT_HANDLES</code>, with Amir Goldstein conceding after Chuck Lever's argument about avoiding confusion with NFSv4 VOLATILE handles.</li>
+<li><strong>FUSE corrected</strong>: Jeff Layton removed the flag from FUSE in his tree based on Amir's feedback.</li>
+<li><strong>Overlayfs flagged</strong>: The ovl patch requires a fix for the <code>nfs_export=off</code> code path.</li>
+<li><strong>Check location questioned</strong>: Amir raised an open question about whether the guard belongs in <code>check_export()</code> rather than <code>__fh_verify()</code>.</li>
+</ol>
+<p>The series represents an important hardening of the NFS server stack, ensuring that only filesystems with genuinely stable filehandles can be exported via nfsd — preventing subtle data corruption scenarios where unstable handles would silently produce stale-filehandle errors for NFS clients.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115-exportfs-nfsd-v1-0-8e80160e3c0c@kernel.org/">2026-01-15 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 00/29] fs: require filesystems to explicitly opt-in to nfsd export support</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115-exportfs-nfsd-v1-1-8e80160e3c0c@kernel.org/">2026-01-15 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 01/29] exportfs: add new EXPORT_OP_STABLE_HANDLES flag</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115-exportfs-nfsd-v1-2-8e80160e3c0c@kernel.org/">2026-01-15 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 02/29] tmpfs: add EXPORT_OP_STABLE_HANDLES flag to export operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115-exportfs-nfsd-v1-3-8e80160e3c0c@kernel.org/">2026-01-15 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 03/29] ext4: add EXPORT_OP_STABLE_HANDLES flag to export operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115-exportfs-nfsd-v1-4-8e80160e3c0c@kernel.org/">2026-01-15 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 04/29] ext2: add EXPORT_OP_STABLE_HANDLES flag to export operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115-exportfs-nfsd-v1-5-8e80160e3c0c@kernel.org/">2026-01-15 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 05/29] erofs: add EXPORT_OP_STABLE_HANDLES flag to export operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115-exportfs-nfsd-v1-6-8e80160e3c0c@kernel.org/">2026-01-15 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 06/29] efs: add EXPORT_OP_STABLE_HANDLES flag to export operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115-exportfs-nfsd-v1-7-8e80160e3c0c@kernel.org/">2026-01-15 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 07/29] xfs: add EXPORT_OP_STABLE_HANDLES flag to export operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115-exportfs-nfsd-v1-8-8e80160e3c0c@kernel.org/">2026-01-15 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 08/29] ceph: add EXPORT_OP_STABLE_HANDLES flag to export operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115-exportfs-nfsd-v1-9-8e80160e3c0c@kernel.org/">2026-01-15 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 09/29] btrfs: add EXPORT_OP_STABLE_HANDLES flag to export operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115-exportfs-nfsd-v1-10-8e80160e3c0c@kernel.org/">2026-01-15 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 10/29] befs: add EXPORT_OP_STABLE_HANDLES flag to export operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115-exportfs-nfsd-v1-11-8e80160e3c0c@kernel.org/">2026-01-15 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 11/29] ufs: add EXPORT_OP_STABLE_HANDLES flag to export operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115-exportfs-nfsd-v1-12-8e80160e3c0c@kernel.org/">2026-01-15 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 12/29] udf: add EXPORT_OP_STABLE_HANDLES flag to export operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115-exportfs-nfsd-v1-13-8e80160e3c0c@kernel.org/">2026-01-15 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 13/29] affs: add EXPORT_OP_STABLE_HANDLES flag to export operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115-exportfs-nfsd-v1-14-8e80160e3c0c@kernel.org/">2026-01-15 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 14/29] squashfs: add EXPORT_OP_STABLE_HANDLES flag to export operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115-exportfs-nfsd-v1-15-8e80160e3c0c@kernel.org/">2026-01-15 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 15/29] smb/client: add EXPORT_OP_STABLE_HANDLES flag to export operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115-exportfs-nfsd-v1-16-8e80160e3c0c@kernel.org/">2026-01-15 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 16/29] ovl: add EXPORT_OP_STABLE_HANDLES flag to export operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115-exportfs-nfsd-v1-17-8e80160e3c0c@kernel.org/">2026-01-15 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 17/29] orangefs: add EXPORT_OP_STABLE_HANDLES flag to export operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115-exportfs-nfsd-v1-18-8e80160e3c0c@kernel.org/">2026-01-15 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 18/29] ocfs2: add EXPORT_OP_STABLE_HANDLES flag to export operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115-exportfs-nfsd-v1-19-8e80160e3c0c@kernel.org/">2026-01-15 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 19/29] ntfs3: add EXPORT_OP_STABLE_HANDLES flag to export operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115-exportfs-nfsd-v1-20-8e80160e3c0c@kernel.org/">2026-01-15 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 20/29] nilfs2: add EXPORT_OP_STABLE_HANDLES flag to export operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115-exportfs-nfsd-v1-21-8e80160e3c0c@kernel.org/">2026-01-15 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 21/29] nfs: add EXPORT_OP_STABLE_HANDLES flag to export operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115-exportfs-nfsd-v1-22-8e80160e3c0c@kernel.org/">2026-01-15 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 22/29] jfs: add EXPORT_OP_STABLE_HANDLES flag to export operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115-exportfs-nfsd-v1-23-8e80160e3c0c@kernel.org/">2026-01-15 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 23/29] jffs2: add EXPORT_OP_STABLE_HANDLES flag to export operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115-exportfs-nfsd-v1-24-8e80160e3c0c@kernel.org/">2026-01-15 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 24/29] isofs: add EXPORT_OP_STABLE_HANDLES flag to export operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115-exportfs-nfsd-v1-25-8e80160e3c0c@kernel.org/">2026-01-15 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 25/29] gfs2: add EXPORT_OP_STABLE_HANDLES flag to export operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115-exportfs-nfsd-v1-26-8e80160e3c0c@kernel.org/">2026-01-15 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 26/29] fuse: add EXPORT_OP_STABLE_HANDLES flag to export operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115-exportfs-nfsd-v1-27-8e80160e3c0c@kernel.org/">2026-01-15 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 27/29] fat: add EXPORT_OP_STABLE_HANDLES flag to export operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115-exportfs-nfsd-v1-28-8e80160e3c0c@kernel.org/">2026-01-15 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 28/29] f2fs: add EXPORT_OP_STABLE_HANDLES flag to export operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115-exportfs-nfsd-v1-29-8e80160e3c0c@kernel.org/">2026-01-15 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 29/29] nfsd: only allow filesystems that set EXPORT_OP_STABLE_HANDLES</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxjOJMwv_hRVTn3tJHDLMQHbeaCGsdLupiZYcwm7M2rm3g@mail.gmail.com/">2026-01-15 Amir Goldstein <a href="mailto:amir73il@gmail.com">amir73il@gmail.com</a> — Re: [PATCH 00/29] fs: require filesystems to explicitly opt-in to nfsd export support</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxhnxipJcjznEoa_D2R91NDZRgT_TTouGA4PGJO-7R9spw@mail.gmail.com/">2026-01-15 Amir Goldstein <a href="mailto:amir73il@gmail.com">amir73il@gmail.com</a> — Re: [PATCH 16/29] ovl: add EXPORT_OP_STABLE_HANDLES flag to export operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/9c99197dde2eafa55a1b55dce2f0d4d02c77340a.camel@kernel.org/">2026-01-15 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 00/29] fs: require filesystems to explicitly opt-in to nfsd export support</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/d486fdb8-686c-4426-9fac-49b7dbc28765@app.fastmail.com/">2026-01-15 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 00/29] fs: require filesystems to explicitly opt-in to nfsd export support</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxh4VaVL9PD7-_Op9Xs-z5Qrx8g6x2x5FccujQX-Cw9RqQ@mail.gmail.com/">2026-01-15 Amir Goldstein <a href="mailto:amir73il@gmail.com">amir73il@gmail.com</a> — Re: [PATCH 26/29] fuse: add EXPORT_OP_STABLE_HANDLES flag to export operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxhnoTC6KBmRVx2xhvTXYg1hRkCJWrq2eoBQGHKC3sv3Hw@mail.gmail.com/">2026-01-15 Amir Goldstein <a href="mailto:amir73il@gmail.com">amir73il@gmail.com</a> — Re: [PATCH 00/29] fs: require filesystems to explicitly opt-in to nfsd export support</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/dd46aee3d0523cb88e3fe5e5c0e20df08b848a59.camel@ibm.com/">2026-01-15 Viacheslav Dubeyko <a href="mailto:Slava.Dubeyko@ibm.com">Slava.Dubeyko@ibm.com</a> — Re:  [PATCH 08/29] ceph: add EXPORT_OP_STABLE_HANDLES flag to export operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxg304=s1Uoeayy3rm1e154Nf7ScOgseJHThw4uQjKwk0A@mail.gmail.com/">2026-01-15 Amir Goldstein <a href="mailto:amir73il@gmail.com">amir73il@gmail.com</a> — Re: [PATCH 29/29] nfsd: only allow filesystems that set EXPORT_OP_STABLE_HANDLES</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxiTE+8r+F-e91cg9wZY-fjZfSHHOeLk3RWb+2JQQZvbvA@mail.gmail.com/">2026-01-15 Amir Goldstein <a href="mailto:amir73il@gmail.com">amir73il@gmail.com</a> — Re: [PATCH 15/29] smb/client: add EXPORT_OP_STABLE_HANDLES flag to export operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxhnSPoqwws7XW4JU=jjgZJoFgCjcWwbfPaprDCZq=wnKQ@mail.gmail.com/">2026-01-15 Amir Goldstein <a href="mailto:amir73il@gmail.com">amir73il@gmail.com</a> — Re: [PATCH 00/29] fs: require filesystems to explicitly opt-in to nfsd export support</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/4d9967cc-a454-46cf-909b-b8ab2d18358d@kernel.org/">2026-01-15 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 00/29] fs: require filesystems to explicitly opt-in to nfsd export support</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/0d838a5cf271f98ce7158998dd6b1d0a86ea7eb7.camel@kernel.org/">2026-01-15 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 26/29] fuse: add EXPORT_OP_STABLE_HANDLES flag to export operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxhtorpd6FVsaGO=NdRD72MxeDyabip84ctQYSNufobS8w@mail.gmail.com/">2026-01-15 Amir Goldstein <a href="mailto:amir73il@gmail.com">amir73il@gmail.com</a> — Re: [PATCH 00/29] fs: require filesystems to explicitly opt-in to nfsd export support</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aWlXfBImnC_jhTw4@dread.disaster.area/">2026-01-15 Dave Chinner <a href="mailto:david@fromorbit.com">david@fromorbit.com</a> — Re: [PATCH 00/29] fs: require filesystems to explicitly opt-in to nfsd export support</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/06dcc4b6-7457-4094-a1c6-586ce518020f@app.fastmail.com/">2026-01-15 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 00/29] fs: require filesystems to explicitly opt-in to nfsd export support</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/3e190d32-fa91-4d5f-a0ce-225bfff7a410@oracle.com/">2026-01-15 Dave Kleikamp <a href="mailto:dave.kleikamp@oracle.com">dave.kleikamp@oracle.com</a> — Re: [PATCH 22/29] jfs: add EXPORT_OP_STABLE_HANDLES flag to export operations</a></li>
+</ul>
+  </main>
+</body>
+</html>

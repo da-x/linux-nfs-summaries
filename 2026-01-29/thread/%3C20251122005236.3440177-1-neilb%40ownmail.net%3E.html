@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD Foreign File Handle Handling in COPY: Series Stalled, Chuck Offers to Take Over</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-29</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD Foreign File Handle Handling in COPY: Series Stalled, Chuck Offers to Take Over</h1>
+<h2>Summary</h2>
+<h1>NFSD Foreign File Handle Handling in COPY: Patch Series Stalled, Chuck Offers to Take Over</h1>
+<h2>Classification</h2>
+<p><strong>Type:</strong> NFS server (NFSD) cleanup / protocol compliance improvement — specifically an enhancement to how the NFSv4.2 inter-server COPY operation handles foreign file handles during PUTFH. Not a regression fix, security patch, or new feature, but rather a correctness and robustness improvement for cross-implementation NFS interoperability.</p>
+<h2>Overview</h2>
+<p>This thread concerns NeilBrown's 14-patch series (<a href="https://lore.kernel.org/linux-nfs/20251122005236.3440177-1-neilb@ownmail.net/">PATCH v7 00/14</a>) titled <em>"nfsd: assorted cleanups involving v4 special stateids,"</em> originally posted in November 2025. The discussion this week focuses specifically on <strong>patch 04/14</strong> — <em>"allow unrecognisable filehandle for foreign servers in COPY"</em> — which addresses how NFSD handles file handles from foreign NFS servers during inter-server COPY operations (an NFSv4.2 feature).</p>
+<p>After a technical debate spanning November 2025, Chuck Lever followed up on January 23, 2026, to inquire about the status of the series and offered to complete it himself.</p>
+<h2>Background: The Foreign File Handle Problem in COPY</h2>
+<p>The NFSv4.2 inter-server COPY operation allows a client to request that data be copied directly between two NFS servers without traversing the client. When the source file handle belongs to a foreign server (i.e., one not running the same NFSD implementation), the receiving server may not be able to verify or interpret that file handle using its own internal mechanisms.</p>
+<p>RFC 7862 (NFSv4.2) acknowledges this scenario in section 15.2.3, noting that a foreign file handle might result in <code>NFS4ERR_STALE</code> when presented via PUTFH, and provides guidance on ignoring this error when the PUTFH precedes a COPY operation. However, as NeilBrown observed, the RFC does not explicitly address <code>NFS4ERR_BADHANDLE</code>, which can also occur when the foreign server uses a different NFS implementation with incompatible file handle formats.</p>
+<p>NeilBrown's patch extends NFSD's existing logic — which already delays <code>STALE</code> errors in this context — to also delay <code>BADHANDLE</code> errors when PUTFH precedes a COPY operation. This allows the server to forward the foreign file handle to the destination server rather than rejecting the COMPOUND prematurely.</p>
+<h2>Evolution of the Discussion</h2>
+<h3>Initial Review (November 22, 2025)</h3>
+<p>Chuck Lever provided early feedback on patch 04/14 <a href="https://lore.kernel.org/linux-nfs/aSIoEqzuT6seYiq0@morisot.1015granger.net/">in his first review</a>, noting:</p>
+<blockquote>
+<p>"These are plausible claims. But IMO, they need firmer rationale."</p>
+</blockquote>
+<p>He suggested consulting the IETF NFS Working Group and potentially filing an RFC errata or documenting the observation in an implementation experience document he was co-authoring with Olga Kornievskaia. He also raised the possibility of <code>NFS4ERR_MOVED</code> as another error that might warrant similar treatment.</p>
+<h3>Deeper Analysis (November 23, 2025)</h3>
+<p>In a follow-up <a href="https://lore.kernel.org/linux-nfs/aSM5oSoiw_6wDU_K@morisot.1015granger.net/">message</a>, Chuck clarified his position:</p>
+<blockquote>
+<p>"I agree that PUTFH handling NFS4ERR_BADHANDLE is a concern when there is a subsequent COPY operation in the COMPOUND."</p>
+</blockquote>
+<p>He articulated the spirit of RFC 7862 more precisely:</p>
+<blockquote>
+<p>"The spirit of RFC 7862 is that PUTFH mustn't fail if a client presents a foreign file handle via a PUTFH that precedes a COPY operation. The lack of BCP14 language specific to other status codes shouldn't stop NFSD from handling other status codes as it needs to."</p>
+</blockquote>
+<p>Chuck raised several important architectural questions:</p>
+<ul>
+<li>Should PUTFH check for <em>specific</em> status codes from <code>fh_verify()</code> before looking ahead in the COMPOUND, or should it look ahead on <em>any</em> failure?</li>
+<li>Is this patch a fix requiring backport to LTS kernels?</li>
+<li>He noted that NFSD's PUTFH implementation unconditionally invokes <code>fh_verify</code>, which is an artifact causing this complexity.</li>
+</ul>
+<p>He also mused:</p>
+<blockquote>
+<p>"It seems like NFSv4.2 could have added a PUT_FOREIGN_FH operation to avoid all this nonsense."</p>
+</blockquote>
+<p>And highlighted a performance benefit:</p>
+<blockquote>
+<p>"Now that our MAX_OPS_PER_COMPOUND has increased and might increase again, moving the COPY look ahead checking out of nfsd4_proc_compound is a huge bonus for handling large COMPOUNDs."</p>
+</blockquote>
+<h3>NeilBrown's Response (November 27, 2025)</h3>
+<p>NeilBrown <a href="https://lore.kernel.org/linux-nfs/176420492316.634289.7890732620603254090@noble.neil.brown.name/">replied</a> with RFC 8881 analysis, noting that the error code description for <code>NFS4ERR_BADHANDLE</code> states:</p>
+<blockquote>
+<p>"Illegal NFS filehandle for the current server. The current filehandle failed internal consistency checks. Once accepted as valid (by PUTFH), no subsequent status change can cause the filehandle to generate this error."</p>
+</blockquote>
+<p>He concluded:</p>
+<blockquote>
+<p>"So I think we are in agreement that the RFC isn't crystal clear but doesn't put any barriers in the way of us making this change."</p>
+</blockquote>
+<p>On the question of which errors should trigger look-ahead, NeilBrown noted that <code>fh_verify()</code> can also generate <code>nfserr_nofilehandle</code>, <code>nfserr_jukebox</code>, and <code>nfserr_perm</code>, with <code>nfserr_perm</code> potentially warranting similar treatment to <code>nfserr_stale</code>.</p>
+<p>Regarding backporting:</p>
+<blockquote>
+<p>"It doesn't fix a regression, a security hole, and data corruption, a kernel panic. So I don't think it needs to be backported."</p>
+</blockquote>
+<p>He explained the failure mode:</p>
+<blockquote>
+<p>"I think the failure mode is that the client would fallback to handling the copy like it would for v4.1."</p>
+</blockquote>
+<h3>Status Check (January 23, 2026 — This Week)</h3>
+<p>After a two-month gap in the discussion, Chuck Lever <a href="https://lore.kernel.org/linux-nfs/315da21d-4a29-4bf5-b99c-dec70c645456@kernel.org/">followed up</a>:</p>
+<blockquote>
+<p>"I continue to be interested in improving NFSD's handling of foreign file handles (and it might be complicated by the addition of file handle signing). Do you have plans to revise this series, or would you like me to take it across the finish line?"</p>
+</blockquote>
+<p>This message is the sole activity in this thread during the current week.</p>
+<h2>Key Technical Arguments</h2>
+<ol>
+<li>
+<p><strong>RFC Compliance vs. Implementation Reality</strong>: While RFC 7862 explicitly addresses <code>NFS4ERR_STALE</code> for foreign file handles in COPY, it omits <code>NFS4ERR_BADHANDLE</code>. Both NeilBrown and Chuck Lever agreed that the RFC's spirit supports handling both errors similarly, even if the letter of the RFC is incomplete.</p>
+</li>
+<li>
+<p><strong>PUTFH Architecture</strong>: The root cause of the complexity lies in NFSD's PUTFH implementation unconditionally invoking <code>fh_verify()</code>. The debate centered on whether PUTFH should look ahead for COPY on specific error codes or on any <code>fh_verify()</code> failure.</p>
+</li>
+<li>
+<p><strong>Backport Considerations</strong>: NeilBrown determined this is not a critical fix requiring LTS backport, as the failure mode results in graceful fallback to client-mediated copy (NFSv4.1 behavior).</p>
+</li>
+<li>
+<p><strong>Future Complications</strong>: Chuck Lever noted that upcoming file handle signing features may further complicate foreign file handle handling, adding urgency to resolving these issues.</p>
+</li>
+</ol>
+<h2>Final Conclusions</h2>
+<ul>
+<li><strong>No resolution reached this week.</strong> The thread ended with Chuck Lever's offer to take over the series if NeilBrown does not plan to revise it.</li>
+<li><strong>The patch remains unmerged.</strong> As of this week, NeilBrown has not responded to Chuck's follow-up.</li>
+<li><strong>Technical consensus exists on the approach</strong>, but questions remain about scope (which error codes to handle) and whether additional RFC errata or WG consultation is warranted.</li>
+</ul>
+<h2>Relevance to NFS Client Development</h2>
+<p>While this thread primarily concerns NFSD (server-side) implementation, it has implications for NFS client developers:</p>
+<ol>
+<li><strong>Interoperability</strong>: Improved handling of foreign file handles in COPY means NFS clients can rely on inter-server copy working more reliably across heterogeneous server implementations.</li>
+<li><strong>Fallback behavior</strong>: Without this fix, clients fall back to NFSv4.1-style client-mediated copy when encountering <code>BADHANDLE</code> errors — a functional but less efficient path.</li>
+<li><strong>File handle signing</strong>: Chuck Lever's mention of upcoming file handle signing suggests future protocol changes that may affect both client and server implementations.</li>
+</ol>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/315da21d-4a29-4bf5-b99c-dec70c645456@kernel.org/">2026-01-23 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v6 04/14] nfsd: allow unrecognisable filehandle for foreign servers in COPY</a></li>
+</ul>
+  </main>
+</body>
+</html>

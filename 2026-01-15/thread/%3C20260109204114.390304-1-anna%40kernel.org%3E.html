@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS Client: Fix Synchronous Directory Delegation Return Under Lock</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-15</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS Client: Fix Synchronous Directory Delegation Return Under Lock</h1>
+<h2>Summary</h2>
+<h1>NFS Client: Fix for Directory Delegation Return Under Lock</h1>
+<h2>Overview</h2>
+<p>This week, Anna Schumaker submitted a <strong>bug fix</strong> patch addressing a locking correctness issue in the NFS client's directory delegation handling. The single-message thread introduces a targeted correction to how directory delegations are returned when the <code>nodirdeleg</code> module option is used to disable them.</p>
+<h2>Classification</h2>
+<p>This is a <strong>bug fix</strong> for the NFS client, correcting a potential deadlock scenario introduced by a prior commit that added a module option to disable directory delegations.</p>
+<h2>The Bug: Synchronous Delegation Return Under Lock</h2>
+<p>The patch <a href="https://lore.kernel.org/linux-nfs/20260109204114.390304-1-anna@kernel.org/">submitted on January 9</a> addresses a subtle concurrency issue in the NFS client's delegation management code. Anna Schumaker explained the problem:</p>
+<blockquote>
+<p>"The function nfs_inode_evict_delegation() immediately and synchronously returns a delegation when called. This means we can't call it from nfs4_have_delegation(), since that function could be called under a lock."</p>
+</blockquote>
+<p>The root cause traces back to commit <code>b6d2a520f463</code> ("NFS: Add a module option to disable directory delegations"), which introduced the <code>nodirdeleg</code> module parameter. When this option is set, the NFS client should refuse directory delegations. The implementation in <code>nfs4_have_delegation()</code> — a function that checks whether a delegation can be held for a given inode — was calling <code>nfs_inode_evict_delegation()</code> directly to immediately return any existing directory delegation.</p>
+<p>The problem: <code>nfs4_have_delegation()</code> can be invoked while holding locks (e.g., the inode's state lock). Calling <code>nfs_inode_evict_delegation()</code> synchronously under a lock risks deadlock, as the eviction path may attempt to acquire the same or related locks during the delegation recall process.</p>
+<h2>The Fix: Asynchronous Delegation Return via State Manager</h2>
+<p>The fix is minimal — a one-line change in <code>fs/nfs/delegation.c</code> — but architecturally significant. Instead of immediately evicting the delegation, the code now marks the delegation for return and lets the NFS state manager handle the actual recall asynchronously:</p>
+<blockquote>
+<p>"Instead we should mark the delegation for return and let the state manager handle it for us."
+— <a href="https://lore.kernel.org/linux-nfs/20260109204114.390304-1-anna@kernel.org/">Anna Schumaker</a></p>
+</blockquote>
+<p>This approach follows the established NFS client pattern of deferring potentially blocking operations to the state manager thread, which runs outside of user-context lock domains and can safely perform delegation recall RPCs without risking deadlocks.</p>
+<h2>Context: Broader Lease and Delegation Work This Week</h2>
+<p>This fix arrives in the context of significant VFS-level work on lease semantics this week. As documented in related summaries, Jeff Layton's 24-patch series to make VFS lease support an explicit opt-in feature was applied to <code>vfs-7.0.leases</code>, and a separate six-patch series fixing directory lease denial semantics was applied to <code>vfs.fixes</code>. Both series directly impact NFS client delegation behavior:</p>
+<ol>
+<li>The <strong>directory lease denial fix</strong> (applied to <code>vfs.fixes</code>) ensures that <code>simple_nosetlease()</code> is properly set in NFS directory <code>file_operations</code>, preventing incorrect lease grants on directories — a prerequisite for correct directory delegation handling.</li>
+<li>The <strong>lease opt-in series</strong> (applied to <code>vfs-7.0.leases</code>) prevents future regressions where new filesystems inadvertently support leases without proper implementation, which could break NFS delegation correctness.</li>
+</ol>
+<p>Schumaker's patch complements this work by fixing a locking bug in the NFS client's own handling of directory delegations when they are explicitly disabled via module option.</p>
+<h2>Impact on NFS Client Development</h2>
+<p>This fix has several implications for NFS client development:</p>
+<ol>
+<li><strong>Locking correctness</strong>: The <code>nodirdeleg</code> module option can now be safely used without risk of deadlock during delegation checks. This is particularly important in environments where directory delegations cause issues (e.g., certain server implementations or workloads).</li>
+<li><strong>State manager pattern reinforcement</strong>: The fix reinforces the established pattern of deferring delegation eviction to the state manager, a design principle that NFS client developers should follow when modifying delegation-related code paths.</li>
+<li><strong>Directory delegation reliability</strong>: Combined with the VFS-level lease fixes applied this week, directory delegation handling in the NFS client is now more robust and correct across all code paths.</li>
+</ol>
+<h2>Final Conclusions</h2>
+<p>This is a <strong>single-patch bug fix</strong> with no further discussion this week. The patch:</p>
+<ul>
+<li>Fixes a potential deadlock when <code>nfs_inode_evict_delegation()</code> was called synchronously from under a lock in <code>nfs4_have_delegation()</code>.</li>
+<li>Uses the established state manager pattern for asynchronous delegation return.</li>
+<li>Addresses a regression introduced by commit <code>b6d2a520f463</code> ("NFS: Add a module option to disable directory delegations").</li>
+</ul>
+<p>The patch is signed off by Anna Schumaker and includes a proper <code>Fixes:</code> tag, indicating it is intended for the stable kernel backport process. No reviews or objections were recorded in this thread during the current week.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260109204114.390304-1-anna@kernel.org/">2026-01-09 Anna Schumaker <a href="mailto:anna@kernel.org">anna@kernel.org</a> — [PATCH] NFS: Don't immediately return directory delegations when disabled</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260109204114.390304-1-anna@kernel.org/">2026-01-09 Anna Schumaker <a href="mailto:anna@kernel.org">anna@kernel.org</a> — [PATCH] NFS: Don't immediately return directory delegations when disabled</a></li>
+</ul>
+  </main>
+</body>
+</html>

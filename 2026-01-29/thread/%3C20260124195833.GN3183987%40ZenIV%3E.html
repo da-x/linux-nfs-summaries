@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RFC: Eliminating NFS Dummy Root Dentries — Viro Proposes Cleanup of 13-Year-Old Workaround</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-29</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>RFC: Eliminating NFS Dummy Root Dentries — Viro Proposes Cleanup of 13-Year-Old Workaround</h1>
+<h2>Summary</h2>
+<h1>Eliminating NFS Dummy Root Dentries: An RFC Proposal by Al Viro</h1>
+<p><strong>Type:</strong> Cleanup / Bug fix (removal of a historical workaround in the NFS client's superblock root dentry handling)</p>
+<h2>Overview</h2>
+<p>On January 24, VFS maintainer <strong>Al Viro</strong> posted an <a href="https://lore.kernel.org/linux-nfs/20260124195833.GN3183987@ZenIV/">RFC patch</a> proposing to eliminate a long-standing workaround in the NFS client related to "dummy root dentries." This is a <strong>cleanup and simplification effort</strong> targeting internal VFS/NFS client code — not a protocol change or new feature.</p>
+<p>The patch addresses what Viro calls <em>"weirdness around NFS dummy root dentries"</em> — a historical hack where the NFS client manually created an alias for the root directory and removed it from the inode's alias list, violating standard dcache assumptions.</p>
+<h2>Key Technical Arguments</h2>
+<h3>The Historical Problem</h3>
+<p>For over a decade (since 2013), the NFS client maintained a special "dummy" root dentry that was manually detached from its inode's alias list. This was originally necessary because <code>dcache_shrink_for_umount()</code> would be confused if the filesystem's <code>-&gt;s_root</code> dentry were spliced onto a secondary tree during cross-mount scenarios.</p>
+<p>Viro explains:</p>
+<blockquote>
+<p>"These days (starting from 2013, actually) dcache_shrink_for_umount() is not bothered by having -&gt;s_root spliced onto one of the secondary trees, so the reason for having a weird alias for root directory (manually removed from the alias list of directory inode, which violates all kinds of assumptions) no longer applies."</p>
+</blockquote>
+<h3>The Proposed Fix</h3>
+<p>The patch proposes two simplifications:</p>
+<ol>
+<li>
+<p><strong>Use the real dentry as <code>-&gt;s_root</code></strong>: Instead of creating a special dummy dentry, simply use the dentry that is about to be returned as the superblock's root, if it hasn't been set already.</p>
+</li>
+<li>
+<p><strong>Remove manual security instantiation</strong>: The patch also eliminates redundant calls to <code>security_d_instantiate()</code>, since <code>d_obtain_root()</code> already handles this:</p>
+</li>
+</ol>
+<blockquote>
+<p>"And don't bother with manual security_d_instantiate(), while we are at it - d_obtain_root() has already done that."</p>
+</blockquote>
+<h3>Trade-off Noted</h3>
+<p>Viro transparently documents a behavioral change in the patch description. If the root of an earlier mount gets spliced onto a larger subtree from a subsequent mount, the chain of ancestor dentries will remain pinned in dcache for as long as any of the mounts exist. He illustrates with a concrete example:</p>
+<blockquote>
+<p>"if root of the first mount does get spliced onto the bigger subtree of subsequent mount, it will keep the resulting chain of ancestors pinned in dcache for as long as any of mounts exist. That won't affect the 'is the filesystem busy' logics, though; just that after</p>
+<pre><code>mount foo:/bar/baz/barf /path1
+mount foo:/bar/ /path2
+ls /path2/baz/barf
+umount /path1
+</code></pre>
+<p>we'll get the dentries of /path2/baz and /path2/baz/barf stay in dcache (unhashed if invalidated, etc.) until /path2 is also unmounted, rather than having only the dummy root pinned."</p>
+</blockquote>
+<p>Viro concludes his rationale with:</p>
+<blockquote>
+<p>"AFAICS, it works and unless there are other reasons why need it, it would be nice to get rid of that wart."</p>
+</blockquote>
+<h2>Discussion Status</h2>
+<p>As of the end of this week's window (January 30), <strong>no replies have been posted</strong> to this RFC. The thread contains only Viro's initial proposal. Given the RFC designation, the community is expected to review and provide feedback in the coming days.</p>
+<h2>Significance for NFS Client Development</h2>
+<p>This patch targets a foundational aspect of how the NFS client manages its superblock root dentry — a core data structure in the VFS layer. Key implications:</p>
+<ol>
+<li>
+<p><strong>Code simplification</strong>: Removing the dummy root dentry hack eliminates code that <em>"violates all kinds of assumptions"</em> about dcache behavior, making the NFS client's dentry handling more consistent with standard VFS patterns.</p>
+</li>
+<li>
+<p><strong>No functional regression expected</strong>: The trade-off in dcache pinning behavior is described as cosmetic — it does not affect filesystem busy-checking logic or unmount semantics.</p>
+</li>
+<li>
+<p><strong>Historical cleanup</strong>: This workaround has been unnecessary since 2013, making its removal a long-overdue simplification.</p>
+</li>
+<li>
+<p><strong>Interaction with concurrent work</strong>: This week also saw significant NFS client development activity in the <a href="https://lore.kernel.org/linux-nfs/20260128151935.1646063-1-cel@kernel.org/">lockd API boundary clarification series</a>, which fixed a race condition in the sysfs shutdown path and refactored lockd's public API. Viro's dentry cleanup is complementary to these efforts, further reducing NFS client code complexity.</p>
+</li>
+</ol>
+<h2>Final Conclusions</h2>
+<ul>
+<li><strong>Status</strong>: RFC posted; awaiting community review and feedback.</li>
+<li><strong>Nature</strong>: Cleanup of a 13-year-old workaround in NFS client dentry management.</li>
+<li><strong>Risk</strong>: Low — the behavioral change (slightly more dcache pinning) is explicitly documented and does not affect core mount/unmount semantics.</li>
+<li><strong>Next steps</strong>: Community review during the v7.0 merge window period, with potential integration into the mainline kernel if no objections are raised.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260124195833.GN3183987@ZenIV/">2026-01-24 Al Viro <a href="mailto:viro@zeniv.linux.org.uk">viro@zeniv.linux.org.uk</a> — [RFC][PATCH] get rid of weirdness around NFS dummy root dentries</a></li>
+</ul>
+  </main>
+</body>
+</html>

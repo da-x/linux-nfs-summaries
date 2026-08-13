@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VFS: Properly Deny Directory Leases on NFS, Ceph, and Other Filesystems</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-08</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>VFS: Properly Deny Directory Leases on NFS, Ceph, and Other Filesystems</h1>
+<h2>Summary</h2>
+<h1>VFS: Properly Deny Directory Leases on Filesystems with Special Lease Handling</h1>
+<h2>Overview</h2>
+<p>Jeff Layton submitted a six-patch series this week targeting the NFS client and several other network/distributed filesystems to address a correctness issue in how directory leases and delegations are handled. The series is classified as a <strong>bug fix</strong>, correcting improper lease denial mechanisms introduced by a prior VFS refactoring.</p>
+<h2>Background and Motivation</h2>
+<p>The root cause traces back to commit <code>e6d28ebc17eb</code> ("filelock: push the S_ISREG check down to -&gt;setlease handlers"), which moved the regular-file-only check for leases from the generic VFS layer into individual filesystem <code>-&gt;setlease()</code> handlers. With the advent of directory delegations in NFSv4.2, this change exposed a subtle bug: several filesystems were checking <code>S_ISREG()</code> inside their file-level <code>-&gt;setlease()</code> handlers, but that handler is never invoked for directories. As a result, lease requests on directories were not being properly denied on these filesystems.</p>
+<blockquote>
+<p>"Checking for S_ISREG() in nfs4_setlease() is incorrect, since that op is never called for directories. The right way to deny lease requests on directories is to set the -&gt;setlease() operation to simple_nosetlease() in the directory file_operations."
+— <a href="https://lore.kernel.org/linux-nfs/20260107-setlease-6-19-v1-1-85f034abcc57@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<p>The practical impact, as noted by Layton, is primarily in test infrastructure:</p>
+<blockquote>
+<p>"There should be no noticeable change in behavior, other than fixing the support detection in xfstests, allowing lease/delegation tests to be properly skipped on these filesystems."
+— <a href="https://lore.kernel.org/linux-nfs/20260107-setlease-6-19-v1-0-85f034abcc57@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<h2>Patch Series Breakdown</h2>
+<p>The six patches target the following filesystems, each adding <code>simple_nosetlease()</code> to directory <code>file_operations</code> and, where applicable, removing incorrect <code>S_ISREG()</code> checks from file-level handlers:</p>
+<ol>
+<li><strong>NFS</strong> (<a href="https://lore.kernel.org/linux-nfs/20260107-setlease-6-19-v1-1-85f034abcc57@kernel.org/">PATCH 1/6</a>): Adds <code>simple_nosetlease()</code> to NFS directory operations and removes the now-redundant <code>S_ISREG()</code> check from <code>nfs4_setlease()</code>.</li>
+<li><strong>SMB/client</strong> (<a href="https://lore.kernel.org/linux-nfs/20260107-setlease-6-19-v1-2-85f034abcc57@kernel.org/">PATCH 2/6</a>): Similar fix for CIFS/SMB client.</li>
+<li><strong>9p</strong> (<a href="https://lore.kernel.org/linux-nfs/20260107-setlease-6-19-v1-3-85f034abcc57@kernel.org/">PATCH 3/6</a>: Adds directory lease denial.</li>
+<li><strong>GFS2</strong> (<a href="https://lore.kernel.org/linux-nfs/20260107-setlease-6-19-v1-4-85f034abcc57@kernel.org/">PATCH 4/6</a>: Adds directory lease denial, with a noted exception for the "nolock" case where denial is unnecessary.</li>
+<li><strong>Ceph</strong> (<a href="https://lore.kernel.org/linux-nfs/20260107-setlease-6-19-v1-5-85f034abcc57@kernel.org/">PATCH 5/6</a>: Adds directory lease denial.</li>
+<li><strong>VBoxSF</strong> (<a href="https://lore.kernel.org/linux-nfs/20260107-setlease-6-19-v1-6-85f034abcc57@kernel.org/">PATCH 6/6</a>: Adds directory lease denial.</li>
+</ol>
+<h2>Discussion and Review</h2>
+<h3>Christoph Hellwig's Feedback</h3>
+<p>Christoph Hellwig, who originally reported the issue, provided a <strong>Tested-by</strong> tag for the NFS patch:</p>
+<blockquote>
+<p>"This fixes generic/786 on NFSv4.2 for me, so: Tested-by: Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a>"
+— <a href="https://lore.kernel.org/linux-nfs/aV93y-xeWk16s48r@infradead.org/">Christoph Hellwig</a></p>
+</blockquote>
+<p>Hellwig also weighed in on Layton's long-term vision for lease handling. Layton proposed that leases/delegations should become an opt-in feature, denied by default when <code>-&gt;setlease()</code> is not set:</p>
+<blockquote>
+<p>"Long term, I think it would be best to change leases/delegations to be an opt-in thing, such that leases are always denied by default if the method isn't set."
+— <a href="https://lore.kernel.org/linux-nfs/20260107-setlease-6-19-v1-0-85f034abcc57@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<p>Hellwig agreed in principle:</p>
+<blockquote>
+<p>"Agreed."
+— <a href="https://lore.kernel.org/linux-nfs/aV58kmCAicqTpFhK@infradead.org/">Christoph Hellwig</a></p>
+</blockquote>
+<p>However, he cautioned against wiring up <code>simple_nosetlease()</code> everywhere indiscriminately:</p>
+<blockquote>
+<p>"Initially you can just wire them up everywhere. But I guess that would be overkill."
+— <a href="https://lore.kernel.org/linux-nfs/aV58kmCAicqTpFhK@infradead.org/">Christoph Hellwig</a></p>
+</blockquote>
+<p>Layton elaborated on the scope of such a change, noting there are "literally thousands of file_operations structures," many in driver code with no legitimate need for lease support. He proposed a pragmatic approach:</p>
+<blockquote>
+<p>"I think what we probably want to do is wire them up in most filesystems under fs/. Basically, in anything that might reasonably be exportable via NFS or SMB, and have the rest deny them."
+— <a href="https://lore.kernel.org/linux-nfs/77f5f47510472760ded83b343efb6be9a2afe2b7.camel@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<h3>Ceph Review</h3>
+<p>Viacheslav Dubeyko provided a <strong>Reviewed-by</strong> tag for the Ceph patch:</p>
+<blockquote>
+<p>"Looks good. Reviewed-by: Viacheslav Dubeyko <a href="mailto:Slava.Dubeyko@ibm.com">Slava.Dubeyko@ibm.com</a>"
+— <a href="https://lore.kernel.org/linux-nfs/591f69efdf89ba02c36b042faa3486eca0cec76d.camel@redhat.com/">Viacheslav Dubeyko</a></p>
+</blockquote>
+<h2>Key Technical Arguments</h2>
+<ul>
+<li><strong>Correctness over convenience</strong>: The series prioritizes correct VFS semantics — directory lease denial must happen at the directory <code>file_operations</code> level, not inside file-level handlers that are never invoked for directories.</li>
+<li><strong>Test infrastructure impact</strong>: The immediate benefit is enabling xfstests to properly detect and skip unsupported lease/delegation scenarios on these filesystems.</li>
+<li><strong>Long-term VFS design</strong>: The discussion surfaced a broader architectural question about whether leases should be opt-in (denied by default) rather than opt-out, with consensus that this is desirable but requires careful auditing across thousands of <code>file_operations</code> structures.</li>
+</ul>
+<h2>Final Conclusions</h2>
+<p>The patch series received positive review feedback, including a Tested-by from Christoph Hellwig confirming the fix resolves xfstest <code>generic/786</code> on NFSv4.2, and a Reviewed-by from Viacheslav Dubeyko for the Ceph component. Layton suggested merging all six patches together via Christian Brauner's tree (vfs), targeting kernel v6.19. The immediate bug fix is straightforward and well-supported; the longer-term discussion about making leases opt-in by default remains an open architectural consideration for future work.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107-setlease-6-19-v1-0-85f034abcc57@kernel.org/">2026-01-07 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 0/6] vfs: properly deny directory leases on filesystems with special lease handling</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107-setlease-6-19-v1-1-85f034abcc57@kernel.org/">2026-01-07 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 1/6] nfs: properly disallow delegation requests on directories</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107-setlease-6-19-v1-2-85f034abcc57@kernel.org/">2026-01-07 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 2/6] smb/client: properly disallow delegations on directories</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107-setlease-6-19-v1-3-85f034abcc57@kernel.org/">2026-01-07 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 3/6] 9p: don't allow delegations to be set on directories</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107-setlease-6-19-v1-4-85f034abcc57@kernel.org/">2026-01-07 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 4/6] gfs2: don't allow delegations to be set on directories</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107-setlease-6-19-v1-5-85f034abcc57@kernel.org/">2026-01-07 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 5/6] ceph: don't allow delegations to be set on directories</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107-setlease-6-19-v1-6-85f034abcc57@kernel.org/">2026-01-07 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 6/6] vboxsf: don't allow delegations to be set on directories</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aV58kmCAicqTpFhK@infradead.org/">2026-01-07 Christoph Hellwig <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [PATCH 0/6] vfs: properly deny directory leases on filesystems with special lease handling</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/77f5f47510472760ded83b343efb6be9a2afe2b7.camel@kernel.org/">2026-01-07 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 0/6] vfs: properly deny directory leases on filesystems with special lease handling</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/591f69efdf89ba02c36b042faa3486eca0cec76d.camel@redhat.com/">2026-01-07 Viacheslav Dubeyko <a href="mailto:vdubeyko@redhat.com">vdubeyko@redhat.com</a> — Re: [EXTERNAL] [PATCH 5/6] ceph: don't allow delegations to be set on directories</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aV93y-xeWk16s48r@infradead.org/">2026-01-08 Christoph Hellwig <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [PATCH 1/6] nfs: properly disallow delegation requests on directories</a></li>
+</ul>
+  </main>
+</body>
+</html>

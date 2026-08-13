@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>pNFS: Fix Missing Wake-Up on NFS_LAYOUT_DRAIN Race Condition</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-29</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>pNFS: Fix Missing Wake-Up on NFS_LAYOUT_DRAIN Race Condition</h1>
+<h2>Summary</h2>
+<h1>pNFS: Fix a Missing Wake-Up While Waiting on NFS_LAYOUT_DRAIN</h1>
+<h2>Overview</h2>
+<p>This week, Olga Kornievskaia (Red Hat) submitted a <strong>bug fix</strong> for a subtle race condition in the parallel NFS (pNFS) client code that could cause tasks to hang indefinitely. The patch addresses a missing wake-up scenario when waiting on the <code>NFS_LAYOUT_DRAIN</code> bit flag in layout state management.</p>
+<h2>Classification</h2>
+<ul>
+<li><strong>Type:</strong> Bug fix</li>
+<li><strong>Component:</strong> NFS client — pNFS layout handling (<code>fs/nfs/pnfs.c</code>)</li>
+<li><strong>Fixes commit:</strong> <code>880265c77ac4</code> ("pNFS: Avoid a live lock condition in pnfs_update_layout()")</li>
+</ul>
+<h2>The Problem</h2>
+<p>Kornievskaia describes a race window across multiple CPUs that can lead to tasks sleeping forever:</p>
+<blockquote>
+<p>"It is possible to have a task get stuck on waiting on the NFS_LAYOUT_DRAIN in the following scenario"</p>
+</blockquote>
+<p>The sequence unfolds as follows:</p>
+<ol>
+<li><strong>CPU A:</strong> A waiter tests <code>NFS_LAYOUT_DRAIN</code> (set) and <code>plh_outstanding</code> (non-zero).</li>
+<li><strong>CPU B:</strong> <code>atomic_dec_and_test()</code> clears the bit and issues a wake-up.</li>
+<li><strong>CPU C:</strong> Sets <code>NFS_LAYOUT_DRAIN</code> again.</li>
+<li><strong>CPU A:</strong> Calls <code>wait_on_bit()</code> and sleeps forever, since it missed the wake-up from step 2 and will not receive one for the re-set in step 3.</li>
+</ol>
+<p>Kornievskaia provides a concrete scenario to illustrate this: two outstanding pNFS write I/O operations receive an <code>ESTALE</code> error, both calling <code>pnfs_destroy_layout()</code> and setting the <code>NFS_LAYOUT_DRAIN</code> bit. However, the first one has not yet called <code>pnfs_put_layout_hdr()</code>, which would prevent the second ESTALE write from attempting to call <code>pnfs_destroy_layout()</code>. A new write arriving in this window finds <code>NFS_LAYOUT_DRAIN</code> set and <code>phl_outstanding &gt; 0</code>, so it enters <code>wait_on_bit()</code>. When a LAYOUTGET completes (clearing the bit and waking waiters), the second ESTALE write then sets <code>NFS_LAYOUT_DRAIN</code> again. The waiting write wakes up, re-checks the condition, finds the bit set once more, and goes back to sleep — this time with no future wake-up coming.</p>
+<h2>The Fix</h2>
+<p>The root cause is that when <code>NFS_LAYOUT_INVALID_STID</code> was already set, the code should skip the work of <code>pnfs_mark_layout_stateid_invalid()</code>, thereby ensuring <code>NFS_LAYOUT_DRAIN</code> is not set more than once for an invalid layout. As Kornievskaia explains:</p>
+<blockquote>
+<p>"The problem revolves around the fact that if NFS_LAYOUT_INVALID_STID was already set, it should not do the work of pnfs_mark_layout_stateid_invalid(), thus NFS_LAYOUT_DRAIN will not be set more than once for an invalid layout."</p>
+</blockquote>
+<p>The fix is a minimal one-line change in <code>fs/nfs/pnfs.c</code> (2 insertions, 1 deletion), adding a guard to prevent redundant re-setting of the <code>NFS_LAYOUT_DRAIN</code> flag. The patch was suggested by Trond Myklebust.</p>
+<h2>Significance for NFS Client Development</h2>
+<p>This fix addresses a critical reliability issue in the pNFS client: tasks can hang indefinitely under specific concurrent I/O failure conditions. While the race window is narrow, it involves realistic scenarios (ESTALE errors on parallel writes) that could occur in production environments using pNFS storage backends. The fix ensures proper synchronization semantics when draining layouts with invalid state IDs, preventing permanent task stalls.</p>
+<h2>Status</h2>
+<p>The patch was submitted as a single-message thread on January 26. No replies or reviews were recorded within this week's window. Further discussion and review are expected in subsequent weeks.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260126191539.4280-1-okorniev@redhat.com/">2026-01-26 Olga Kornievskaia <a href="mailto:okorniev@redhat.com">okorniev@redhat.com</a> — [PATCH 1/1] pNFS: fix a missing wake up while waiting on NFS_LAYOUT_DRAIN</a></li>
+</ul>
+  </main>
+</body>
+</html>

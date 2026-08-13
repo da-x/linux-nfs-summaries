@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD: POSIX Draft ACL Support for SETATTR and File Creation (v2 patches 10–12/12)</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-08</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD: POSIX Draft ACL Support for SETATTR and File Creation (v2 patches 10–12/12)</h1>
+<h2>Summary</h2>
+<h1>NFSD: POSIX Draft ACL Support for SETATTR, File Creation, and SUPPATTR Advertising (v2)</h1>
+<h2>Overview</h2>
+<p>This week, Chuck Lever posted three patches from the <strong>[PATCH v2 00/12] Add NFSv4.2 POSIX ACL support</strong> series (<a href="https://lore.kernel.org/linux-nfs/20260104161019.3404489-1-cel@kernel.org/">cover letter</a>), implementing the server-side of the IETF draft extension <em>"POSIX Draft ACL support for Network File System Version 4, Minor Version 2"</em> (<a href="https://datatracker.ietf.org/doc/draft-ietf-nfsv4-posix-acls/">draft-ietf-nfsv4-posix-acls</a>). This is classified as a <strong>new feature</strong> — not a bug fix or protocol change — extending the NFS server (NFSD) to support POSIX draft ACLs directly over NFSv4.2, bypassing the lossy NFSv4-to-POSIX mapping algorithm.</p>
+<p>The three patches in this thread (<a href="https://lore.kernel.org/linux-nfs/20260104161049.3404551-1-cel@kernel.org/">10/12</a>, <a href="https://lore.kernel.org/linux-nfs/20260104161049.3404551-2-cel@kernel.org/">11/12</a>, and <a href="https://lore.kernel.org/linux-nfs/20260104161049.3404551-3-cel@kernel.org/">12/12</a>) complete the NFSD implementation by wiring POSIX ACL support into file creation, attribute modification (SETATTR), and capability advertising (SUPPATTR bitmasks).</p>
+<h2>Context: The Larger v2 Series</h2>
+<p>The v2 series comprises 12 patches authored by Chuck Lever and Rick Macklem. As explained in the cover letter <a href="https://lore.kernel.org/linux-nfs/20260104161019.3404489-1-cel@kernel.org/">by Chuck Lever</a>:</p>
+<blockquote>
+<p>"The extension adds four new attributes to the protocol."</p>
+</blockquote>
+<p>The implementation enables POSIX draft ACLs to be manipulated directly by <code>getfacl(1)</code> and <code>setfacl(1)</code> over NFSv4.2, analogous to the NFS_ACL sideband protocol used with NFSv2/v3. Key design decisions include:</p>
+<ul>
+<li>The feature is gated behind <code>CONFIG_NFSD_V4_POSIX_ACLS</code>, marking it as experimental.</li>
+<li>POSIX ACL support applies at the file system level (not per-file), assuming all objects on a given file system use POSIX draft ACLs when the feature is enabled.</li>
+<li>Mutual exclusion between NFSv4 ACLs and POSIX ACLs is enforced — setting both simultaneously returns <code>nfserr_inval</code>.</li>
+</ul>
+<p>Changes since v1 included folding fixes into earlier patches, ensuring bisectability, adding the Kconfig option, deferring SUPPATTR bit advertisement to the final patch, using xdrgen for XDR code generation, and refactoring SETATTR/CREATE integration.</p>
+<h2>Patch Breakdown</h2>
+<h3>Patch 10/12: Add support for POSIX draft ACLs for file creation</h3>
+<p>Authored by Rick Macklem, this patch extends <code>nfsd4_create()</code> and <code>nfsd4_create_file()</code> to handle POSIX ACLs during file creation via OPEN(CREATE) and CREATE operations <a href="https://lore.kernel.org/linux-nfs/20260104161049.3404551-1-cel@kernel.org/">as described in the commit message</a>:</p>
+<blockquote>
+<p>"NFSv4.2 clients can specify POSIX draft ACLs when creating file objects via OPEN(CREATE) and CREATE operations. The previous patch added POSIX ACL support to the NFSv4 SETATTR operation for modifying existing objects, but file creation follows different code paths that also require POSIX ACL handling."</p>
+</blockquote>
+<p>Key technical details:</p>
+<ul>
+<li>Ownership of decoded ACL pointers (<code>op_dpacl</code>, <code>op_pacl</code>, <code>cr_dpacl</code>, <code>cr_pacl</code>) transfers to the <code>nfsd_attrs</code> structure immediately, with original fields cleared to NULL. This ensures <code>nfsd_attrs_free()</code> releases the ACLs upon completion and prevents double-free on error paths.</li>
+<li>Mutual exclusion between NFSv4 ACLs and POSIX ACLs is enforced: setting both simultaneously returns <code>nfserr_inval</code>.</li>
+<li>Errors during ACL application clear the corresponding bits in the result bitmask (<code>fattr-&gt;bmval</code>), signaling partial completion to the client.</li>
+</ul>
+<h3>Patch 11/12: Add POSIX draft ACL support to the NFSv4 SETATTR operation</h3>
+<p>Also authored by Rick Macklem, this patch connects the <code>na_pacl</code> and <code>na_dpacl</code> fields in <code>nfsd_attrs</code> to the decoded ACL pointers from the NFSv4 SETATTR decoder <a href="https://lore.kernel.org/linux-nfs/20260104161049.3404551-2-cel@kernel.org/">as explained</a>:</p>
+<blockquote>
+<p>"The POSIX ACL extension to NFSv4 enables clients to set access and default ACLs via FATTR4_POSIX_ACCESS_ACL and FATTR4_POSIX_DEFAULT_ACL attributes. Integration of these attributes into SETATTR processing requires wiring them through the nfsd_attrs structure and ensuring proper cleanup on all code paths."</p>
+</blockquote>
+<p>Notable implementation details:</p>
+<ul>
+<li>Ownership of ACL references transfers to <code>attrs</code> immediately after initialization, with decoder pointers cleared to NULL. This ensures <code>nfsd_attrs_free()</code> releases the ACLs on normal completion.</li>
+<li>New error paths call <code>posix_acl_release()</code> directly when cleanup occurs before <code>nfsd_attrs_free()</code> runs.</li>
+<li>Early returns in <code>nfsd4_setattr()</code> are converted to <code>goto</code> statements branching to proper cleanup handlers — paths before <code>fh_want_write()</code> branch to <code>out_err</code> for ACL release only; paths after use the existing <code>out</code> label for full cleanup.</li>
+<li>Mutual exclusion between NFSv4 ACLs (<code>sa_acl</code>) and POSIX ACLs is enforced, returning <code>nfserr_inval</code> when both types are set simultaneously.</li>
+</ul>
+<h3>Patch 12/12: Add POSIX ACL file attributes to SUPPATTR bitmasks</h3>
+<p>Authored by Chuck Lever, this final patch advertises POSIX ACL support to NFS clients <a href="https://lore.kernel.org/linux-nfs/20260104161049.3404551-3-cel@kernel.org/">as noted</a>:</p>
+<blockquote>
+<p>"Now that infrastructure for NFSv4 POSIX draft ACL has been added to NFSD, it should be safe to advertise support to NFS clients."</p>
+</blockquote>
+<p>The patch adds the new POSIX ACL attributes to <code>NFSD_SUPPATTR_EXCLCREAT_WORD2</code>, which includes NFSv4.2-only attributes. Version filtering via <code>nfsd_suppattrs[]</code> ensures that pre-4.2 clients never see unsupported attributes.</p>
+<h2>Review and Feedback</h2>
+<p>Jeff Layton provided a positive review of the entire v2 series <a href="https://lore.kernel.org/linux-nfs/d577c7dcac1753ee8d0fc30b30b41275eeb02948.camel@kernel.org/">on January 6th</a>:</p>
+<blockquote>
+<p>"This all looks pretty reasonable. Nice work!"</p>
+<p>Reviewed-by: Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a></p>
+</blockquote>
+<h2>Significance for NFS Client and Server Development</h2>
+<p>While this series targets the NFS <strong>server</strong> (NFSD), it has direct implications for NFS clients:</p>
+<ol>
+<li>
+<p><strong>Lossless ACL transport</strong>: Clients can now set and retrieve POSIX draft ACLs without the lossy conversion inherent in the traditional NFSv4-to-POSIX mapping algorithm. This is critical for enterprise environments relying on fine-grained access controls with named principals.</p>
+</li>
+<li>
+<p><strong>Tool compatibility</strong>: The mechanism enables <code>getfacl(1)</code> and <code>setfacl(1)</code> to operate directly over NFSv4.2 mounts, providing a familiar POSIX ACL management interface without requiring special client-side tooling.</p>
+</li>
+<li>
+<p><strong>Complementary to recent bug fixes</strong>: Earlier this week, a separate backport effort addressed the bug where NFSv4 file creation neglected to set ACLs entirely (<a href="https://lore.kernel.org/linux-nfs/20260103193854.2954342-1-cel@kernel.org/">see related summary</a>). This new feature series builds upon that corrected foundation, extending ACL support to the POSIX draft model.</p>
+</li>
+<li>
+<p><strong>Experimental gating</strong>: The <code>CONFIG_NFSD_V4_POSIX_ACLS</code> option allows administrators to opt in cautiously, providing a safe path for production evaluation.</p>
+</li>
+</ol>
+<h2>Conclusion</h2>
+<p>This thread represents the final three patches of a 12-patch v2 series implementing NFSv4.2 POSIX draft ACL support in the Linux NFS server. The patches complete the implementation by handling POSIX ACLs during file creation (patch 10/12), integrating them into SETATTR processing (patch 11/12), and advertising support to clients via SUPPATTR bitmasks (patch 12/12). With Jeff Layton's positive review, the series is well-positioned for eventual upstream integration. The feature provides a significant enhancement for NFS deployments requiring POSIX-compliant ACL management over network mounts.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260104161049.3404551-2-cel@kernel.org/">2026-01-04 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 11/12] NFSD: Add POSIX draft ACL support to the NFSv4 SETATTR operation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260104161049.3404551-1-cel@kernel.org/">2026-01-04 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 10/12] NFSD: Add support for POSIX draft ACLs for file creation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260104161049.3404551-3-cel@kernel.org/">2026-01-04 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 12/12] NFSD: Add POSIX ACL file attributes to SUPPATTR bitmasks</a></li>
+</ul>
+  </main>
+</body>
+</html>

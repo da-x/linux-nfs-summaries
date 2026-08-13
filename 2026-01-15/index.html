@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS re-export deadlocks fixed for 6.19; VFS lease opt-in and stable-handle export enforcement land; case folding, POSIX ACLs, and encrypted filehandles advance</title>
+  <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../index.html">Summaries</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS re-export deadlocks fixed for 6.19; VFS lease opt-in and stable-handle export enforcement land; case folding, POSIX ACLs, and encrypted filehandles advance</h1>
+<p><em>Week ending 2026-01-15</em></p>
+<h1>NFS Mailing List — Week of 2026-01-15</h1>
+<h2>Critical Bugs &amp; Fixes</h2>
+<h3>NFS Client Bugfixes Pulled for Linux 6.19</h3>
+<p>Trond Myklebust submitted and Linus merged a second batch of NFS client fixes for the 6.19 release cycle (<a href="thread/%253C57c6f8f6464f7ba0c0455875d4c53a0f9bf01a2c.camel%2540kernel.org%253E.html">GIT PULL</a>). The pull includes <strong>12 patches</strong> covering:</p>
+<ul>
+<li><strong>Deadlock fixes</strong>: A second <code>nfs_release_folio()</code> deadlock and a pNFS delegation-return deadlock during open.</li>
+<li><strong>Size read race conditions</strong>: Races in truncate, fallocate, and copy-offload operations that could corrupt data — directly addressing the regression reported by NVIDIA (see below).</li>
+<li><strong>Directory delegation hardening</strong>: Five patches from Anna Schumaker fixing verifier checks, premature slot freeing, and incorrect state-recovery assumptions for delegated directories.</li>
+<li><strong>pNFS memory leaks</strong>: Fixes in FlexFiles device ID allocation and Block Layout SCSI parsing error paths.</li>
+<li><strong>LocalIO fixes</strong>: Proper I/O shutdown on fatal errors and handling of page offsets exceeding <code>PAGE_SIZE</code>.</li>
+</ul>
+<h3>fscache/NFS Re-export Server Lockup — Fix Identified</h3>
+<p>The ongoing investigation into production server deadlocks in NFS/fscache re-export deployments reached a breakthrough (<a href="thread/%253CCADFF-zeNJUPLaVcogSBt%253Ds4%252Bo2Lty45-DueSYKJmCgZw6hraEg%2540mail.gmail.com%253E.html">thread</a>). Mike Snitzer identified Trond Myklebust's commit <code>cce0be6eb497</code> (fixing the <code>nfs_release_folio()</code> synchronous-wait deadlock) as the likely cure. The fix converts <code>nfs_release_folio()</code> to use asynchronous writeback kicks, breaking a circular dependency between memory compaction and NFS I/O. Mike Owen plans to test against 6.19-rc5; Red Hat and Ubuntu backporting efforts are underway.</p>
+<h3>refcount_t Underflow on v6.18 Re-export — Debugging Stalls</h3>
+<p>Daire Byrne's investigation into <code>refcount_t</code> underflows in <code>nfsd4_sequence_done</code> on high-throughput re-export servers hit a wall this week (<a href="thread/%253CCAPt2mGPafo29KgjW9Rb17OhBDLnB-3fZn18zFQEhYk7Eitf6BA%2540mail.gmail.com%253E.html">thread</a>). Despite refined ftrace configuration, the crash produced an empty trace buffer and the <code>refcount_warn_saturate</code> kprobe failed to register (the function is compiled <code>notrace</code>). The candidate fix (<code>cbfd91d22776</code>, "nfsd: never defer requests during idmap lookup") remains untested.</p>
+<h3>NFS EOF Page Pollution Fix — Race Condition Patch Proposed</h3>
+<p>NVIDIA reported ext4 checksum corruption in nested VMs caused by the NFS client's eof page pollution protection commit (<a href="thread/%253C447f41f0-f3ab-462a-8b59-e27bb2dfcbc0%2540nvidia.com%253E.html">thread</a>). Trond Myklebust identified a race condition where file size was read <em>before</em> locking the inode in NFSv4.2 <code>fallocate</code> and copy-offload operations, causing <code>nfs_truncate_last_folio()</code> to overwrite valid data. A targeted patch was submitted for NVIDIA's testing team.</p>
+<h3>New Client Hang Report — fscache Re-export Topology</h3>
+<p>Mike Owen opened a new bug report (<a href="thread/%253CCADFF-zepeLopnvw6UoBGLgxmOHMY4z_Z1OFa2Q1SBZLvni--Vw%2540mail.gmail.com%253E.html">thread</a>) describing silent NFS client hangs in a multi-tier fscache re-export deployment. Clients lose their NFS socket with no logging, revivable only by forced unmount. No responses this week.</p>
+<hr />
+<h2>Major Trends &amp; Architecture</h2>
+<h3>VFS Lease Opt-In and Stable-Handle Export Enforcement</h3>
+<p>Two landmark series landed this week that reshape how filesystems interact with NFS infrastructure:</p>
+<ol>
+<li>
+<p><strong>VFS lease opt-in</strong> (<a href="thread/%253C8af369636c32b868f83669c49aea708ca3b894ac.camel%2540kernel.org%253E.html">discussion</a>): Christian Brauner's 24-patch series requiring filesystems to explicitly opt-in to lease support was applied to <code>vfs-7.0.leases</code>. This prevents future regressions where new filesystems inadvertently support leases without proper implementation, which would break NFS delegation correctness.</p>
+</li>
+<li>
+<p><strong>Stable-handle export enforcement</strong> (<a href="thread/%253C20260115-exportfs-nfsd-v1-0-8e80160e3c0c%2540kernel.org%253E.html">thread</a>): Jeff Layton posted a 29-patch series introducing <code>EXPORT_OP_STABLE_HANDLES</code>, requiring filesystems to declare that their file handles are stable for NFS export. This prevents kernfs-based filesystems (cgroupfs, pidfs, nsfs) — which have <code>export_operations</code> for <code>open_by_handle_at()</code> but non-persistent handles — from being incorrectly exported via nfsd. The series sparked a lively debate on terminology ("stable" vs. "persistent"), with Chuck Lever arguing that "stable" avoids confusion with NFSv4's VOLATILE handle concept. FUSE and overlayfs edge cases were flagged for correction.</p>
+</li>
+</ol>
+<h3>NFSD/SunRPC Layering Cleanup</h3>
+<p>Jeff Layton's two-patch series (<a href="thread/%253C20260113-rq_private-v1-0-88ed308364e6%2540kernel.org%253E.html">thread</a>) added a generic <code>rq_private</code> pointer to <code>svc_rqst</code>, allowing NFSD to attach per-thread state without polluting the SunRPC layer. The NFSv4-specific <code>rq_lease_breaker</code> and <code>rq_cachetype</code> fields were migrated into a new <code>struct nfsd_thread_local_info</code>. Applied to <code>nfsd-testing</code> after debate over stack vs. heap allocation.</p>
+<hr />
+<h2>New Features &amp; Protocol Extensions</h2>
+<h3>Case Folding Behavior Exposure (v4)</h3>
+<p>Chuck Lever posted v4 of his 16-patch series (<a href="thread/%253C20260114142900.3945054-1-cel%2540kernel.org%253E.html">thread</a>) adding <code>case_insensitive</code> and <code>case_nonpreserving</code> fields to <code>struct file_kattr</code>, implemented across 12 filesystems (FAT, exFAT, NTFS3, HFS/HFS+, ext4, XFS, CIFS, NFS client, f2fs, vboxsf, ISO9660). NFSD patches replace hard-coded case-sensitivity assumptions with dynamic filesystem queries, enabling accurate reporting to Windows/macOS NFS clients. v4 fixed UAPI exposure and flag naming from v3; the remaining open item is struct layout (dedicated field vs. packing into <code>fa_xflags</code>).</p>
+<h3>NFSv4.2 POSIX ACL Server Support (v3)</h3>
+<p>Chuck Lever and Rick Macklem submitted v3 of a 13-patch series (<a href="thread/%253C20260109162143.4186112-1-cel%2540kernel.org%253E.html">thread</a>) implementing server-side NFSv4.2 POSIX ACL support per the IETF draft. The extension introduces four new file attributes (<code>FATTR4_ACL_TRUEFORM</code>, <code>FATTR4_ACL_TRUEFORM_SCOPE</code>, <code>FATTR4_POSIX_ACCESS_ACL</code>, <code>FATTR4_POSIX_DEFAULT_ACL</code>) enabling lossless POSIX ACL manipulation over NFSv4.2, gated behind <code>CONFIG_NFSD_V4_POSIX_ACLS</code>. No replies this week.</p>
+<h3>kNFSD Encrypted Filehandles — Threat Model Debate</h3>
+<p>Benjamin Coddington (Hammerspace) resumed his encrypted filehandle series (<a href="thread/%253C510E10A4-11BE-412D-93AF-C4CC969954E7%2540hammerspace.com%253E.html">thread</a>). Chuck Lever pushed back on the threat model and cryptographic approach, arguing that signing (siphash) rather than full AES encryption may suffice to prevent file handle fabrication. Coddington committed to a v2 using siphash with concrete attack-scenario examples. The discussion also exposed layering concerns in <code>svc_rqst</code>, addressed separately by Layton's <code>rq_private</code> series.</p>
+<h3>NFS Client Delegation LRU</h3>
+<p>Christoph Hellwig's 24-patch series adding an LRU-based eviction policy for NFS client delegations received explicit endorsement from Sagi Grimberg (<a href="thread/%253C20260107072720.1744129-1-hch%2540lst.de%253E.html">thread</a>). A debate emerged on whether delegation recall should be client-driven or server-driven, with Trond Myklebust cautioning that excessive delegation retention harms workloads like <code>rm -rf</code>. A latent bug was identified: the NFS client ignores the "keep" parameter in <code>RECALL_ANY</code> operations.</p>
+<h3>NFSD Asynchronous Write Throttling (RFC)</h3>
+<p>Chuck Lever's RFC to throttle UNSTABLE WRITEs under memory pressure (<a href="thread/%253C20260109215613.25250-1-cel%2540kernel.org%253E.html">thread</a>) drew skepticism from Neil Brown, who questioned whether <code>balance_dirty_pages_ratelimited_flags()</code> works correctly across NFSD's multi-threaded architecture. The underlying problem — server memory exhaustion under heavy UNSTABLE WRITE traffic observed by Hammerspace — is acknowledged as real. No consensus reached.</p>
+<h3>bio_vec-Based RDMA API for svcrdma</h3>
+<p>Chuck Lever posted a 4-patch series (<a href="thread/%253C20260114143948.3946615-1-cel%2540kernel.org%253E.html">thread</a>) adding <code>bio_vec</code>-based RDMA read/write APIs, eliminating scatterlist conversions in svcrdma and reducing the context structure from ~4KB to ~100 bytes. Christoph Hellwig raised concerns about API duplication, IOVA mapping correctness, and dynamic allocation trade-offs.</p>
+<hr />
+<h2>NFS Client Focus</h2>
+<h3>Directory Delegation Fix</h3>
+<p>Anna Schumaker submitted a one-line fix (<a href="thread/%253C20260109204114.390304-1-anna%2540kernel.org%253E.html">thread</a>) preventing deadlock when the <code>nodirdeleg</code> module option triggers synchronous delegation return under lock. The patch defers eviction to the state manager and was included in the 6.19 bugfix pull.</p>
+<h3>NFS Client Case Sensitivity Reporting</h3>
+<p>The case folding series includes an NFS client patch implementing <code>fileattr_get</code> to propagate case-sensitivity information received from servers during mount, enabling accurate re-export via NFSD.</p>
+<hr />
+<h2>Ongoing Debates</h2>
+<table><thead><tr><th>Topic</th><th>Status</th></tr></thead><tbody>
+<tr><td><strong>Stable vs. persistent handles</strong> — naming for the export opt-in flag</td><td>"Stable" retained; series under review</td></tr>
+<tr><td><strong>Signing vs. encryption</strong> for file handle protection</td><td>v2 to use siphash; threat model still being refined</td></tr>
+<tr><td><strong>Client vs. server delegation recall responsibility</strong></td><td>No consensus; data-driven approach advocated</td></tr>
+<tr><td><strong>NFSD write throttling architecture</strong></td><td>RFC stage; Neil Brown's multi-threading concerns unresolved</td></tr>
+<tr><td><strong>bio_vec API design for RDMA</strong></td><td>Hellwig's consolidation and IOVA concerns pending</td></tr>
+</tbody></table>
+<h2>Discussions this week</h2>
+<ul>
+<li><a href="thread/%253C20260107-setlease-6-19-v1-0-85f034abcc57%2540kernel.org%253E.html">Re: [PATCH 0/6] vfs: properly deny directory leases on filesystems with special lease handling</a></li>
+<li><a href="thread/%253C20260108-setlease-6-20-v1-0-ea4dec9b67fa%2540kernel.org%253E.html">Re: [PATCH 13/24] nilfs2: add setlease file operation</a></li>
+<li><a href="thread/%253C8af369636c32b868f83669c49aea708ca3b894ac.camel%2540kernel.org%253E.html">Re: [PATCH 00/24] vfs: require filesystems to explicitly opt-in to lease support</a></li>
+<li><a href="thread/%253CCAOQ4uxgD%252BSgbbg9K2U0SF9TyUOBb%253D%253DZ6auShUWc4FfPaDCQ%253Drg%2540mail.gmail.com%253E.html">Re: [PATCH 00/24] vfs: require filesystems to explicitly opt-in to lease support</a></li>
+<li><a href="thread/%253Ccb5d2da6-2090-4639-ad96-138342bba56d%2540oracle.com%253E.html">Re: [PATCH 00/24] vfs: require filesystems to explicitly opt-in to lease support</a></li>
+<li><a href="thread/%253Cce700ee20834631eceededc8cd15fc5d00fee28e.camel%2540kernel.org%253E.html">Re: [PATCH 00/24] vfs: require filesystems to explicitly opt-in to lease support</a></li>
+<li><a href="thread/%253Cec78bf021fa1f6243798945943541ba171e337e7.camel%2540kernel.org%253E.html">Re: [PATCH 00/24] vfs: require filesystems to explicitly opt-in to lease support</a></li>
+<li><a href="thread/%253C20260115-exportfs-nfsd-v1-0-8e80160e3c0c%2540kernel.org%253E.html">[PATCH 00/29] fs: require filesystems to explicitly opt-in to nfsd export support</a></li>
+<li><a href="thread/%253C20260112174629.3729358-1-cel%2540kernel.org%253E.html">[PATCH v3 00/16] Exposing case folding behavior</a></li>
+<li><a href="thread/%253C20260114142900.3945054-1-cel%2540kernel.org%253E.html">[PATCH v4 00/16] Exposing case folding behavior</a></li>
+<li><a href="thread/%253C20251223003756.409543-1-hch%2540lst.de%253E.html">Re: re-enable IOCB_NOWAIT writes to files v4</a></li>
+<li><a href="thread/%253C20260108141934.2052404-1-hch%2540lst.de%253E.html">Re: re-enable IOCB_NOWAIT writes to files v6</a></li>
+<li><a href="thread/%253C510E10A4-11BE-412D-93AF-C4CC969954E7%2540hammerspace.com%253E.html">Re: [PATCH v1 0/7] kNFSD Encrypted Filehandles</a></li>
+<li><a href="thread/%253C1e92e144-d436-44dd-956f-3125403dfdc8%2540kernel.org%253E.html">Re: [PATCH v1 0/7] kNFSD Encrypted Filehandles</a></li>
+<li><a href="thread/%253C20260109162143.4186112-1-cel%2540kernel.org%253E.html">[PATCH v3 00/13] Add NFSv4.2 POSIX ACL support</a></li>
+<li><a href="thread/%253C20260102232934.1560-6-rick.macklem%2540gmail.com%253E.html">Re: [PATCH v1 5/7] Make nfs4_server_supports_acls() global</a></li>
+<li><a href="thread/%253C20260114010141.1297-1-rick.macklem%2540gmail.com%253E.html">[PATCH v2 7/8] Set SB_POSIXACL if the server supports the extension</a></li>
+<li><a href="thread/%253CCADFF-zepeLopnvw6UoBGLgxmOHMY4z_Z1OFa2Q1SBZLvni--Vw%2540mail.gmail.com%253E.html">NFS client hangs from NFS/fscache re-export servers</a></li>
+<li><a href="thread/%253CCADFF-zeNJUPLaVcogSBt%253Ds4%252Bo2Lty45-DueSYKJmCgZw6hraEg%2540mail.gmail.com%253E.html">Re: fscache/NFS re-export server lockup</a></li>
+<li><a href="thread/%253CCAPt2mGPafo29KgjW9Rb17OhBDLnB-3fZn18zFQEhYk7Eitf6BA%2540mail.gmail.com%253E.html">Re: refcount_t underflow (nfsd4_sequence_done?) with v6.18 re-export</a></li>
+<li><a href="thread/%253C20260108004016.3907158-1-cel%2540kernel.org%253E.html">Re: [PATCH v2 4/6] fs: invoke group_pin_kill() during mount teardown</a></li>
+<li><a href="thread/%253C20260109215613.25250-1-cel%2540kernel.org%253E.html">[RFC PATCH v2] NFSD: Add asynchronous write throttling support for UNSTABLE WRITEs</a></li>
+<li><a href="thread/%253C20260107072720.1744129-1-hch%2540lst.de%253E.html">Re: add a LRU for delegations</a></li>
+<li><a href="thread/%253C20260109204114.390304-1-anna%2540kernel.org%253E.html">[PATCH] NFS: Don't immediately return directory delegations when disabled</a></li>
+<li><a href="thread/%253C20260112-tonyk-fs_uuid-v1-0-acc1889de772%2540igalia.com%253E.html">[PATCH 0/4] exportfs: Some kernel-doc fixes</a></li>
+<li><a href="thread/%253C20260114-tonyk-get_disk_uuid-v1-0-e6a319e25d57%2540igalia.com%253E.html">[PATCH 1/3] exportfs: Rename get_uuid() to get_disk_uuid()</a></li>
+<li><a href="thread/%253C20260113-rq_private-v1-0-88ed308364e6%2540kernel.org%253E.html">[PATCH 0/2] nfsd/sunrpc: fix up some layering violations</a></li>
+<li><a href="thread/%253C20260114143948.3946615-1-cel%2540kernel.org%253E.html">[PATCH v1 0/4] Add a bio_vec based API to core/rw.c</a></li>
+<li><a href="thread/%253C20260112-minthreads-v1-1-30c5f4113720%2540kernel.org%253E.html">[PATCH] nfsdctl: add support for min-threads parameter</a></li>
+<li><a href="thread/%253C20260112185813.34595-1-wanjay%2540amazon.com%253E.html">[PATCH 6.12] NFSD: net ref data still needs to be freed even if net hasn't startup</a></li>
+<li><a href="thread/%253C2025122941-civic-revered-b250%2540gregkh%253E.html">Re: [PATCH 6.6.y v2 1/4] nfsd: convert to new timestamp accessors</a></li>
+<li><a href="thread/%253C20251008-master-v1-0-c879be4973c8%2540kernel.org%253E.html">Re: [PATCH 0/2] nfsd/nfsdctl: default to starting with v4.0 servers disabled</a></li>
+<li><a href="thread/%253C176454037897.634289.3566631742434963788%2540noble.neil.brown.name%253E.html">Re: [PATCH] fuse: fix conversion of fuse_reverse_inval_entry() to start_removing()</a></li>
+<li><a href="thread/%253C176814099134.689475.12160936392296863650%2540eldamar.lan%253E.html">[nfs-utils] "blkmapd open pipe file /run/rpc_pipefs/nfs/blocklayout failed" and handling of nfs-blkmap.service service</a></li>
+<li><a href="thread/%253CaWc5dO3fP4J67x0H%2540infradead.org%253E.html">[nfs-utils PATCH] Rename CONFIG_NFSV41 to CONFIG_BLKMAPD and disable by default</a></li>
+<li><a href="thread/%253COSZPR01MB7772EEED7AED473150DF6758888CA%2540OSZPR01MB7772.jpnprd01.prod.outlook.com%253E.html">[PATCH] nfs-utils: fix typos in comments, man pages, and a message</a></li>
+<li><a href="thread/%253C57c6f8f6464f7ba0c0455875d4c53a0f9bf01a2c.camel%2540kernel.org%253E.html">[GIT PULL] Please pull NFS client bugfixes for Linux 6.19</a></li>
+<li><a href="thread/%253C447f41f0-f3ab-462a-8b59-e27bb2dfcbc0%2540nvidia.com%253E.html">Re: Possible regression after NFS eof page pollution fix (ext4 checksum errors)</a></li>
+<li><a href="thread/%253C20260112015047.2184003-1-liujian56%2540huawei.com%253E.html">Re: [LTP] [PATCH v2] rpc: create valid fd to pass libtirpc validation</a></li>
+<li><a href="thread/%253Ctencent_5BEC627E1710B43F5D8245FA%2540qq.com%253E.html">Questions regarding the usage of SCSI layout for NFSD PNFS</a></li>
+<li><a href="thread/%253CCALXu0Uci_qXuuKcmNhwOwoCei5%253DAAHVW-sBLJi7wJHDYfAKYwQ%2540mail.gmail.com%253E.html">Mount option to reject mount if given NFS share is not case-insenstive?</a></li>
+<li><a href="thread/%253CCAKAoaQmC-rUcPaA%252BcyG7ssqk4EbKKgtOeQrG6kx%253DewmqaGtspw%2540mail.gmail.com%253E.html">Fwd: [Ms-nfs41-client-devel] [Announcement] NFSv4.2/NFSv4.1 filesystem client Windows driver binaries for Windows 10/11+WindowsServer 2019/2022/2025 for testing, 2026-01-12 ...</a></li>
+</ul>
+  </main>
+</body>
+</html>

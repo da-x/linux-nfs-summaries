@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd: Fix cred refcount leak in netlink handlers</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-29</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd: Fix cred refcount leak in netlink handlers</h1>
+<h2>Summary</h2>
+<h1>NFS Server Credential Reference Count Leak Fix</h1>
+<h2>Overview</h2>
+<p>This week, Kuniyuki Iwashima submitted a two-patch series addressing credential reference count leaks in the NFS server (nfsd) netlink control interface. This is a <strong>bug fix</strong> targeting memory leaks of <code>struct cred</code> objects discovered by syzbot's fuzzing infrastructure. The patches were quickly reviewed and applied to the nfsd-testing tree by maintainer Chuck Lever.</p>
+<h2>Background</h2>
+<p>The Linux NFS server uses the kernel's credential management subsystem to track security contexts for operations. Functions like <code>get_current_cred()</code> increment a reference count on the current task's credentials, while <code>current_cred()</code> simply returns a pointer without bumping the refcount. Misusing these functions — specifically calling <code>get_current_cred()</code> when no corresponding <code>put_cred()</code> exists — leads to memory leaks of credential structures.</p>
+<h2>The Bug</h2>
+<h3>Patch 1: nfsd_nl_threads_set_doit()</h3>
+<p>In <a href="https://lore.kernel.org/linux-nfs/20260124041902.548904-2-kuniyu@google.com/">PATCH 1/2</a>, Iwashima explains the root cause:</p>
+<blockquote>
+<p>"nfsd_nl_threads_set_doit() passes get_current_cred() to nfsd_svc(), but put_cred() is not called after that."</p>
+</blockquote>
+<p>The credential obtained via <code>get_current_cred()</code> flows down to <code>_svc_xprt_create()</code>, which calls <code>get_cred()</code> on it for its own internal use. However, the original reference from <code>get_current_cred()</code> is never released — it is "just leaked," as Iwashima puts it.</p>
+<p>Iwashima contrasts this with another caller of <code>nfsd_svc()</code>:</p>
+<blockquote>
+<p>"nfsd_svc() is also called from write_threads(), but it does not bump file-&gt;f_cred there."</p>
+</blockquote>
+<p>Since <code>nfsd_nl_threads_set_doit()</code> runs in process context via <code>sendmsg()</code> and <code>current-&gt;cred</code> does not disappear, the fix is straightforward: use <code>current_cred()</code> instead of <code>get_current_cred()</code>.</p>
+<p>The bug was originally introduced by commit 924f4fb003ba ("NFSD: convert write_threads to netlink command") and was reported by syzbot with a detailed memory leak backtrace showing allocation in <code>prepare_creds</code> → <code>copy_creds</code> → <code>copy_process</code> → <code>kernel_clone</code>.</p>
+<h3>Patch 2: nfsd_nl_listener_set_doit()</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260124041902.548904-3-kuniyu@google.com/">PATCH 2/2</a> addresses a similar issue in the listener netlink command handler:</p>
+<blockquote>
+<p>"nfsd_nl_listener_set_doit() uses get_current_cred() without put_cred()."</p>
+</blockquote>
+<p>Iwashima notes that other callers of <code>svc_xprt_create_from_sa()</code> do not require an extra reference count, and since this function also runs in process context via <code>sendmsg()</code>, the same fix applies: replace <code>get_current_cred()</code> with <code>current_cred()</code>.</p>
+<p>This bug traces back to commit 16a471177496 ("NFSD: add listener-{set,get} netlink command").</p>
+<h2>Review and Acceptance</h2>
+<p>The patches were well-received. Jeff Layton provided a prompt review on January 24th, commenting:</p>
+<blockquote>
+<p>"Nice catch."</p>
+</blockquote>
+<p>He added his Reviewed-by tag for the series.</p>
+<p>Chuck Lever applied both patches to the nfsd-testing tree on January 25th:</p>
+<blockquote>
+<p>"Applied to nfsd-testing, thanks!"</p>
+</blockquote>
+<p>The commits were recorded as:</p>
+<ul>
+<li><code>c14b0c3b5966a1e2cf6a7f219c4f4b3fafeb89d0</code> for patch 1/2</li>
+<li><code>687b9b69fcda9de606e998fd2edccb8a14406e19</code> for patch 2/2</li>
+</ul>
+<h2>Significance</h2>
+<p>While these are small one-line changes (two insertions, two deletions in <code>fs/nfsd/nfsctl.c</code>), they address genuine memory leaks that can accumulate over time in production NFS server deployments. Each invocation of the affected netlink commands — used to adjust NFS thread counts and listener configurations — would leak a credential structure. Over repeated administrative operations or automated management cycles, this could lead to significant memory consumption.</p>
+<p>The fix demonstrates the value of kernel fuzzing tools like syzbot in uncovering subtle resource management bugs that might otherwise go unnoticed in code paths exercised infrequently.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260124041902.548904-1-kuniyu@google.com/">2026-01-24 Kuniyuki Iwashima <a href="mailto:kuniyu@google.com">kuniyu@google.com</a> — [PATCH v1 0/2] nfsd: Fix cred refcount leak.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260124041902.548904-2-kuniyu@google.com/">2026-01-24 Kuniyuki Iwashima <a href="mailto:kuniyu@google.com">kuniyu@google.com</a> — [PATCH v1 1/2] nfsd: Fix cred ref leak in nfsd_nl_threads_set_doit().</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260124041902.548904-3-kuniyu@google.com/">2026-01-24 Kuniyuki Iwashima <a href="mailto:kuniyu@google.com">kuniyu@google.com</a> — [PATCH v1 2/2] nfsd: Fix cred ref leak in nfsd_nl_listener_set_doit().</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/5aea2cd26cf9d0d8c55ca2f95cf06b3224020f61.camel@kernel.org/">2026-01-24 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v1 0/2] nfsd: Fix cred refcount leak.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/176931125800.30355.7451399373487878151.b4-ty@oracle.com/">2026-01-25 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v1 0/2] nfsd: Fix cred refcount leak.</a></li>
+</ul>
+  </main>
+</body>
+</html>

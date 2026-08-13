@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>bio_vec-Based RDMA Read/Write API for svcrdma</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-15</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>bio_vec-Based RDMA Read/Write API for svcrdma</h1>
+<h2>Summary</h2>
+<h2>bio_vec-Based RDMA Read/Write API for svcrdma</h2>
+<p><strong>Classification:</strong> New feature / API addition (with performance optimization)</p>
+<h3>Overview</h3>
+<p>Chuck Lever introduced a four-patch series <a href="https://lore.kernel.org/linux-nfs/20260114143948.3946615-1-cel@kernel.org/">on Wednesday, January 14</a> to add a <code>bio_vec</code>-based API for RDMA read and write operations in the RDMA core subsystem (<code>drivers/infiniband/core/rw.c</code>). The series targets the NFS server-side RDMA transport (svcrdma), eliminating unnecessary scatterlist conversions for callers that already maintain data in <code>bio_vec</code> format.</p>
+<h3>Patch Series Breakdown</h3>
+<p><strong>Patch 1/4</strong> — <a href="https://lore.kernel.org/linux-nfs/20260114143948.3946615-2-cel@kernel.org/">RDMA/core: add bio_vec based RDMA read/write API</a>: Introduces <code>rdma_rw_ctx_init_bvec()</code> and <code>rdma_rw_ctx_destroy_bvec()</code> to accept <code>bio_vec</code> arrays directly, using <code>dma_map_phys()</code> for hardware RDMA devices and virtual addressing for software RDMA devices (rxe, siw). Memory registration support was deferred; callers requiring MR-based transfers received <code>-EOPNOTSUPP</code>.</p>
+<p><strong>Patch 2/4</strong> — <a href="https://lore.kernel.org/linux-nfs/20260114143948.3946615-3-cel@kernel.org/">RDMA/core: use IOVA-based DMA mapping for bvec RDMA operations</a>: Replaces per-page IOTLB synchronization with the two-step IOVA API (<code>dma_iova_try_alloc</code>/<code>dma_iova_link</code>/<code>dma_iova_sync</code>), reducing IOTLB flushes from O(n) to O(1).</p>
+<p><strong>Patch 3/4</strong> — <a href="https://lore.kernel.org/linux-nfs/20260114143948.3946615-4-cel@kernel.org/">RDMA/core: add MR support for bvec-based RDMA operations</a>: Adds <code>rdma_rw_init_mr_wrs_bvec()</code> to handle memory registration for bvec arrays by constructing a synthetic scatterlist from the bvec DMA addresses, reusing existing <code>ib_map_mr_sg()</code> infrastructure.</p>
+<p><strong>Patch 4/4</strong> — <a href="https://lore.kernel.org/linux-nfs/20260114143948.3946615-5-cel@kernel.org/">svcrdma: use bvec-based RDMA read/write API</a>: Converts svcrdma to the new API, replacing its scatterlist conversion code and significantly reducing the <code>svc_rdma_rw_ctxt</code> structure size from ~4KB (with an embedded scatterlist array of <code>RPCSVC_MAXPAGES</code> entries) down to approximately 100 bytes.</p>
+<h3>Review Feedback</h3>
+<h4>Leon Romanovsky — Positive Initial Assessment</h4>
+<p>RDMA subsystem maintainer Leon Romanovsky provided an encouraging but preliminary review:</p>
+<blockquote>
+<p>"Amazing, thanks a lot."</p>
+</blockquote>
+<blockquote>
+<p>"I haven't done a deep-dive review yet, but from what I've seen so far it looks solid and well put together."</p>
+</blockquote>
+<p>He also noted a minor issue in patch 4/4 — a stray <code>Signed-off-by: cel@kernel.org</code> line that appeared to be an error.</p>
+<h4>Christoph Hellwig — Substantive Technical Concerns</h4>
+<p>Christoph Hellwig raised several important points across multiple messages:</p>
+<p><strong>On the cover letter (pre-allocated vs. dynamic allocation):</strong></p>
+<blockquote>
+<p>"But isn't that comparison a little unfair when a preallocated/embedded data structure is replaced with a dynamic allocation?"</p>
+</blockquote>
+<p>Hellwig questioned whether the structure size reduction claim was entirely fair, since the old approach used an embedded scatterlist while the new one uses dynamic allocation.</p>
+<p><strong>On patch 1/4 (API design and code duplication):</strong></p>
+<blockquote>
+<p>"Hmm, if we need to split/adjust bvecs, it might be better to pass a bvec_iter and let the iter handle the iteration?"</p>
+</blockquote>
+<p>He suggested using <code>bvec_iter</code> for more robust iteration handling. He also flagged significant code duplication:</p>
+<blockquote>
+<p>"Much of this seems to duplicate rdma_rw_init_map_wrs. I wonder if having a low-level helper that gets either a scatterlist or bvec array (or bvec_iter) and just has different inner loops for them would make more sense? If not we'll just need to migrate everyone off the scatterlist version ASAP :)"</p>
+</blockquote>
+<p><strong>On patch 2/4 (IOVA mapping logic):</strong></p>
+<p>Hellwig identified what he believed was a correctness issue with the IOVA mapping approach:</p>
+<blockquote>
+<p>"This creates a single contiguous IOVA for all the passed in bvecs, even if they had non-contiguous host physical addresses."</p>
+</blockquote>
+<blockquote>
+<p>"... which means that here you just need a single WR and SGE to register all of them. No need to split the IOVA space up again."</p>
+</blockquote>
+<p>He also suggested passing the total transfer length from the caller rather than computing it in the helper.</p>
+<p><strong>On patch 3/4 (MR API):</strong></p>
+<blockquote>
+<p>"I wish we'd just have a bvec based MR API, and could use that. But I don't want to hold this work back, because of that."</p>
+</blockquote>
+<p>Hellwig expressed a preference for a native bvec-based MR API but did not block the series on this point.</p>
+<p><strong>On patch 4/4 (svcrdma specifics):</strong></p>
+<p>Hellwig asked two clarifying questions:</p>
+<blockquote>
+<p>"Can you explain why this switches to the dynamic allocation? To me that seems like a separate trade-off to bvec vs scatterlist."</p>
+</blockquote>
+<blockquote>
+<p>"For both the old and new version, can you explain they have to start on a page boundary? Because that's not how scatterlists or bvecs work in general."</p>
+</blockquote>
+<h3>Chuck Lever's Responses</h3>
+<p>Chuck Lever addressed Hellwig's questions in two follow-up messages:</p>
+<p><strong>On dynamic allocation:</strong> He explained that the current svcrdma implementation uses a "default size" scatterlist with chaining for larger requests. With bvecs, there is no chaining concept — the exact-size array must be allocated dynamically, otherwise every context would need to carry a maximum-sized <code>bio_vec</code> array. He noted:</p>
+<blockquote>
+<p>"Now, I suppose that later on we will be able to adopt the use of the rqstp-&gt;rq_bvec, when the full NFSD stack supports biovecs, and this allocation could be replaced, at least in some cases."</p>
+</blockquote>
+<p><strong>On page alignment:</strong> Lever clarified that the constraint stems from how <code>xdr_buf</code> represents pages — as an array of <code>struct page *</code> pointers with a single <code>page_offset</code> field applying only to the first entry. Subsequent entries have no per-entry offsets:</p>
+<blockquote>
+<p>"Therefore the payload buffer starts at an offset of zero or greater in the first page in that array, but after that, the buffer continues across the boundaries of each page from offset 4095 on page N to byte 0 of page N+1, for all N."</p>
+</blockquote>
+<p>He acknowledged the comment was misleading and noted:</p>
+<blockquote>
+<p>"We can certainly clarify that as part of this bvec conversion series. And (much) later on, when the head, tail, and pages fields in 'struct xdr_buf' are replaced with a single bio_vec array, this issue goes away completely."</p>
+</blockquote>
+<h3>Status and Outlook</h3>
+<p>The thread concluded with substantive review feedback but no final resolution or revised patches within this week's window. Key open items include:</p>
+<ol>
+<li><strong>API consolidation</strong>: Hellwig's suggestion to unify the scatterlist and bvec code paths into a single low-level helper with different inner loops.</li>
+<li><strong>IOVA mapping correctness</strong>: Whether the contiguous IOVA approach in patch 2/4 is correct or needs adjustment.</li>
+<li><strong>Minor fixes</strong>: The stray <code>Signed-off-by</code> line and comment clarifications.</li>
+</ol>
+<p>This series represents an important step toward modernizing the NFS server-side RDMA transport, reducing memory footprint, and improving IOTLB synchronization efficiency — all while paving the way for eventual full <code>bio_vec</code> adoption across the NFSD stack.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260114143948.3946615-1-cel@kernel.org/">2026-01-14 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v1 0/4] Add a bio_vec based API to core/rw.c</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260114143948.3946615-2-cel@kernel.org/">2026-01-14 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v1 1/4] RDMA/core: add bio_vec based RDMA read/write API</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260114143948.3946615-3-cel@kernel.org/">2026-01-14 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v1 2/4] RDMA/core: use IOVA-based DMA mapping for bvec RDMA operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260114143948.3946615-4-cel@kernel.org/">2026-01-14 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v1 3/4] RDMA/core: add MR support for bvec-based RDMA operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260114143948.3946615-5-cel@kernel.org/">2026-01-14 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v1 4/4] svcrdma: use bvec-based RDMA read/write API</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115095000.GA14359@unreal/">2026-01-15 Leon Romanovsky <a href="mailto:leon@kernel.org">leon@kernel.org</a> — Re: [PATCH v1 0/4] Add a bio_vec based API to core/rw.c</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115095100.GB14359@unreal/">2026-01-15 Leon Romanovsky <a href="mailto:leon@kernel.org">leon@kernel.org</a> — Re: [PATCH v1 4/4] svcrdma: use bvec-based RDMA read/write API</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115154635.GA14083@lst.de/">2026-01-15 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: [PATCH v1 0/4] Add a bio_vec based API to core/rw.c</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115155334.GB14083@lst.de/">2026-01-15 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: [PATCH v1 1/4] RDMA/core: add bio_vec based RDMA read/write API</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115155802.GC14083@lst.de/">2026-01-15 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: [PATCH v1 2/4] RDMA/core: use IOVA-based DMA mapping for bvec RDMA operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115155856.GD14083@lst.de/">2026-01-15 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: [PATCH v1 3/4] RDMA/core: add MR support for bvec-based RDMA operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260115162929.GC17257@lst.de/">2026-01-15 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: [PATCH v1 4/4] svcrdma: use bvec-based RDMA read/write API</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/e85b5f0f-dbe1-4b4a-8e1c-56ecfe5853ea@app.fastmail.com/">2026-01-15 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v1 4/4] svcrdma: use bvec-based RDMA read/write API</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/bdcf6391-5d92-4bec-b351-f8fe75b1ea43@app.fastmail.com/">2026-01-15 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v1 4/4] svcrdma: use bvec-based RDMA read/write API</a></li>
+</ul>
+  </main>
+</body>
+</html>

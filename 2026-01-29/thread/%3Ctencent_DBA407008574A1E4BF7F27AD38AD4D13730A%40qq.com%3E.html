@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>sunrpc/xs_read_stream: Dead-loop fix for xs_read_discard NACKed by Trond Myklebust</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-29</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>sunrpc/xs_read_stream: Dead-loop fix for xs_read_discard NACKed by Trond Myklebust</h1>
+<h2>Summary</h2>
+<h1>sunrpc/xs_read_stream: Fix Dead Loop When xs_read_discard — NACKed</h1>
+<h2>Classification: Bug Fix (Rejected)</h2>
+<p>This week saw a bug-fix patch submission targeting the SunRPC transport layer in the NFS client, specifically addressing a potential infinite loop in <code>xs_read_stream()</code> when the discard path (<code>xs_read_discard</code>) is taken. The patch was promptly rejected by NFS maintainer Trond Myklebust with a clear technical explanation of why the proposed fix would introduce worse problems.</p>
+<hr />
+<h2>The Proposed Fix</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/tencent_DBA407008574A1E4BF7F27AD38AD4D13730A@qq.com/">jack.zhou</a> submitted a patch titled <strong>"[PATCH] sunrpc/xs_read_stream: fix dead loop when xs_read_discard"</strong> on January 26, describing a scenario where the NFS client using TCP mode could enter an infinite loop during RPC reply processing.</p>
+<p>The author outlined the normal operation flow:</p>
+<ol>
+<li><code>xs_read_stream()</code> runs within a for-loop in <code>xs_stream_data_receive()</code>, exiting only when its return value is <code>&lt; 0</code>.</li>
+<li>When <code>transport-&gt;recv.len == 0</code>, <code>xs_read_stream_header()</code> is called, which determines whether to execute <code>RPC_CALL</code> or <code>RPC_REPLY</code> and sets <code>transport-&gt;recv.len</code>.</li>
+<li>In the <code>RPC_REPLY</code> path, the return value comes from <code>tcp_recvmsg()</code>, indicating copied skb data size (<code>&gt; 0</code>).</li>
+<li>On normal completion, <code>transport-&gt;recv.offset</code> and <code>transport-&gt;recv.len</code> are reset to 0, and the positive <code>read</code> value is returned — allowing the loop to continue (not exit).</li>
+</ol>
+<p>The <strong>abnormal scenario</strong> described by the author:</p>
+<ol>
+<li>Due to a corrupted skb, <code>transport-&gt;recv.calldir</code> parses an incorrect value, triggering <code>MSG_TRUNC</code> and setting <code>transport-&gt;recv.len</code>.</li>
+<li>The condition <code>if (transport-&gt;recv.offset &lt; transport-&gt;recv.len)</code> is entered.</li>
+<li><code>xs_read_discard()</code> returns <code>&gt; 0</code>, so the upstream for-loop does not exit.</li>
+<li>On re-entry to <code>xs_read_stream()</code>, since <code>transport-&gt;recv.len != 0</code>, <code>xs_read_stream_header()</code> is <strong>not</strong> called — meaning <code>transport-&gt;recv.calldir</code> can never be correctly reset.</li>
+<li>All subsequent RPC replies are forced into the <code>xs_read_discard</code> path indefinitely, creating an infinite loop because <code>transport-&gt;recv.len</code> is never reset to 0.</li>
+</ol>
+<p>The proposed fix was to reset <code>transport-&gt;recv.len</code> to 0 after reaching <code>xs_read_discard</code>, mirroring the normal return path. The author noted: <em>"The modification has been tested and passed in version 5.10.160."</em></p>
+<hr />
+<h2>Maintainer Rejection</h2>
+<p>Trond Myklebust <a href="https://lore.kernel.org/linux-nfs/19540d70aaa8d92a65625f1a4530824d92f6ba44.camel@kernel.org/">responded on the same day</a> with a firm <strong>NACK</strong>, explaining why the fix was fundamentally flawed:</p>
+<blockquote>
+<p>"If we're in the xs_read_discard() case, then that's because we're out of receive buffer space, and so we've given up reading the remainder of the message into that receive buffer. However we still have to read to the end of that message before we get to the next message in the TCP stream."</p>
+</blockquote>
+<p>Myklebust emphasized that the discard path is intentionally designed to drain the remainder of a malformed or oversized message from the TCP stream — even if it cannot be fully buffered. Resetting <code>transport-&gt;recv.len</code> prematurely would break this protocol discipline:</p>
+<blockquote>
+<p>"With this change, then as soon as there is no more buffered data to read from the socket and it returns EAGAIN, you will reset the message parameters. The result is that the next call to xs_read_stream() will just leave us reading random data from the middle of the message as if it were a new message header."</p>
+</blockquote>
+<p>In other words, the proposed fix would cause the NFS client to misinterpret partial TCP stream data as new RPC message headers, leading to complete protocol desynchronization — arguably a far more severe bug than the original infinite loop.</p>
+<p>Myklebust also noted that the existing code already handles connection breakage gracefully: <em>"The only thing that can prevent that is if someone breaks the connection, and in that case the client already takes care of resetting the message state as part of reconnecting."</em></p>
+<hr />
+<h2>Final Status</h2>
+<p><strong>Rejected.</strong> The patch was NACKed by Trond Myklebust. No further discussion occurred this week. The underlying concern about infinite loops in <code>xs_read_discard</code> remains unaddressed, but the maintainer's analysis suggests that any fix must preserve the invariant that the full message is consumed from the TCP stream before state is reset — a constraint the original patch violated.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/tencent_DBA407008574A1E4BF7F27AD38AD4D13730A@qq.com/">2026-01-26 "jack.zhou" <a href="mailto:jack.wemmick@foxmail.com">jack.wemmick@foxmail.com</a> — [PATCH] sunrpc/xs_read_stream: fix dead loop when xs_read_discard</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/19540d70aaa8d92a65625f1a4530824d92f6ba44.camel@kernel.org/">2026-01-26 Trond Myklebust <a href="mailto:trondmy@kernel.org">trondmy@kernel.org</a> — Re: [PATCH] sunrpc/xs_read_stream: fix dead loop when xs_read_discard</a></li>
+</ul>
+  </main>
+</body>
+</html>

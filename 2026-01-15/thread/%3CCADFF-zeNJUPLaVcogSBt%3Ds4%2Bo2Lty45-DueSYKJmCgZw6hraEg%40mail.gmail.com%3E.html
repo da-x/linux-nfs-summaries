@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>fscache/NFS Re-export Server Lockup: nfs_release_folio Deadlock Fix Identified</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-15</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>fscache/NFS Re-export Server Lockup: nfs_release_folio Deadlock Fix Identified</h1>
+<h2>Summary</h2>
+<h1>fscache/NFS Re-export Server Lockup: Deadlock Fix Identified, Testing Pending</h1>
+<p><strong>Classification:</strong> Bug fix (NFS client deadlock in <code>nfs_release_folio()</code> during NFS re-export with fscache/cachefiles).</p>
+<h2>Background (Prior Week)</h2>
+<p>This thread originated on December 19, 2025, when Mike Owen reported persistent server lockups on Ubuntu 24.04-based NFS re-export servers using fscache to cache data from Isilon and NetApp filers over NFSv3, while serving clients over NFSv4. The symptoms included complete system deadlocks with hung tasks in <code>kcompactd</code>, <code>kjournald2</code>, and <code>nfsd</code> threads, followed by cache corruption (terabytes of cached data lost after reboot).</p>
+<h2>This Week's Activity</h2>
+<h3>Initial Follow-up and Context Expansion</h3>
+<p>On January 9, Mike Owen responded to earlier diagnostic suggestions from Daire Byrne <a href="https://lore.kernel.org/linux-nfs/CADFF-zcFgycZ7c0KC_5eUafjvba_ZxhzED0a7yDR4oip4_KxbA@mail.gmail.com/">here</a>, confirming that the machine was dedicated solely to KNFSD caching duties and that the issue occurred even at low cache utilization (~10–20% of NVMe capacity). Owen noted:</p>
+<blockquote>
+<p>"We did try running 6.17.0 but made no difference."</p>
+</blockquote>
+<p>He also referenced a related thread with Chuck Lever regarding <code>"refcount_t underflow (nfsd4_sequence_done?) with v6.18 re-export"</code> and suggested commits to investigate, including <code>cbfd91d22776</code> ("nfsd: never defer requests during idmap lookup"), speculating that "there is a cascading issue here and we are in need of some NFS patches."</p>
+<h3>Deadlock Fix Identified by Mike Snitzer</h3>
+<p>On January 10, Mike Snitzer provided the critical breakthrough <a href="https://lore.kernel.org/linux-nfs/aWIgdDImfFg6fgxn@kernel.org/">here</a>. He identified a specific commit from Trond Myklebust that should address the deadlock:</p>
+<blockquote>
+<p>"This commit from Trond, which he'll be sending to Linus soon as part of his 6.19-rc NFS client fixes pull request, should fix the NFS re-export induced nfs_release_folio deadlock reflected in your below stack trace."</p>
+</blockquote>
+<p>Snitzer pointed to commit <code>cce0be6eb4971456b703aaeafd571650d314bcca</code>, which fixes a deadlock in <code>nfs_release_folio()</code> — the same function visible in Owen's stack traces during memory compaction (<code>folio_wait_private_2</code> → <code>nfs_release_folio</code>). Snitzer confirmed the fix had resolved his own LOCALIO-based re-export deadlock situation and noted:</p>
+<blockquote>
+<p>"I'm doing my part to advocate that Red Hat (Olga cc'd) take this fix into RHEL 10.2 (and backport as needed)."</p>
+</blockquote>
+<h3>Testing Plan Confirmed</h3>
+<p>On January 12, Mike Owen acknowledged the promising lead <a href="https://lore.kernel.org/linux-nfs/CADFF-zf1qypwRDYkCPH9MFVLoPgsJxsNXZ7-qEbiMLo-L3Ldsg@mail.gmail.com/">here</a>:</p>
+<blockquote>
+<p>"Whilst we wait for the necessary NFS client fixes PR, I'll look to add the patch to 6.19-rc5 and report back if this fixes the issue we are seeing."</p>
+</blockquote>
+<p>He also committed to advocating internally for Canonical/Ubuntu to absorb the fix.</p>
+<h3>Continued Investigation — Distinct Deadlock Path?</h3>
+<p>On January 15, Mike Owen posted an extensive analysis of his deadlock scenario <a href="https://lore.kernel.org/linux-nfs/c6dc98cc-df27-4a37-9b15-c4543e199ad0@gmail.com/">here</a>, detailing the environment and tracing a complex dependency chain involving fscache cookie state machine timeouts, NFS readahead, cachefiles I/O on ext4, and memory compaction.</p>
+<p>Mike Snitzer responded later that day <a href="https://lore.kernel.org/linux-nfs/aWlh7XAoR0NENXNo@kernel.org/">here</a>, noting an important distinction between the two deadlock scenarios:</p>
+<blockquote>
+<p>"OK, my deadlock was blocked in wait_on_commit whereas you've consistently shown folio_wait_private_2 in your stack traces (I originally missed that detail). So I'm not aware of what is different in your setup.. devil is in the details, but maybe its your use of fscache?"</p>
+</blockquote>
+<p>Snitzer suggested that David Howells (fscache maintainer) may need to weigh in from an fscache-specific perspective, and praised Owen's detailed analysis while noting it would be most useful for informing the fscache subsystem maintainers.</p>
+<h2>Key Technical Arguments</h2>
+<ol>
+<li>
+<p><strong>Root Cause Hypothesis</strong>: The deadlock involves <code>nfs_release_folio()</code> performing synchronous operations during memory reclaim/compaction in an NFS re-export scenario with fscache, creating a circular dependency where page migration cannot complete because the NFS client is blocked waiting on I/O that itself depends on memory allocation.</p>
+</li>
+<li>
+<p><strong>Proposed Fix</strong>: Trond Myklebust's commit <code>cce0be6eb497</code> transforms <code>nfs_release_folio()</code> to avoid synchronous waits, instead using asynchronous writeback/commit kicks via a new <code>nfs_wb_folio_reclaim()</code> helper — the same approach that resolved Wang Zhaolong's slot table draining deadlock and Snitzer's LOCALIO re-export deadlock.</p>
+</li>
+<li>
+<p><strong>Open Question</strong>: Whether Owen's fscache-specific stack trace (blocked in <code>folio_wait_private_2</code> rather than <code>wait_on_commit</code>) represents a distinct variant of the same bug or a separate fscache-related issue requiring additional investigation by David Howells.</p>
+</li>
+</ol>
+<h2>Final Conclusions</h2>
+<ul>
+<li>The discussion has converged on a specific upstream fix (<code>cce0be6eb497</code>) from Trond Myklebust that addresses the <code>nfs_release_folio()</code> deadlock in NFS re-export scenarios.</li>
+<li>Mike Owen plans to test the patch against kernel 6.19-rc5 and report results.</li>
+<li>Distribution backporting efforts are underway for both RHEL (advocated by Snitzer) and Ubuntu/Canonical (advocated by Owen).</li>
+<li>The interaction between fscache and the NFS client's folio release path remains an area requiring further scrutiny, with David Howells potentially needed to provide additional insight.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/CADFF-zcFgycZ7c0KC_5eUafjvba_ZxhzED0a7yDR4oip4_KxbA@mail.gmail.com/">2026-01-09 Mike Owen <a href="mailto:mjnowen@gmail.com">mjnowen@gmail.com</a> — Re: fscache/NFS re-export server lockup</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aWIgdDImfFg6fgxn@kernel.org/">2026-01-10 Mike Snitzer <a href="mailto:snitzer@kernel.org">snitzer@kernel.org</a> — Re: fscache/NFS re-export server lockup</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CADFF-zf1qypwRDYkCPH9MFVLoPgsJxsNXZ7-qEbiMLo-L3Ldsg@mail.gmail.com/">2026-01-12 Mike Owen <a href="mailto:mjnowen@gmail.com">mjnowen@gmail.com</a> — Re: fscache/NFS re-export server lockup</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/c6dc98cc-df27-4a37-9b15-c4543e199ad0@gmail.com/">2026-01-15 Mike Owen <a href="mailto:mjnowen@gmail.com">mjnowen@gmail.com</a> — Re: fscache/NFS re-export server lockup</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aWlh7XAoR0NENXNo@kernel.org/">2026-01-15 Mike Snitzer <a href="mailto:snitzer@kernel.org">snitzer@kernel.org</a> — Re: fscache/NFS re-export server lockup</a></li>
+</ul>
+  </main>
+</body>
+</html>

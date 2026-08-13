@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>syzbot Reports NFS Server Task Hang in expkey_flush — nfsd_mutex Contention</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-22</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>syzbot Reports NFS Server Task Hang in expkey_flush — nfsd_mutex Contention</h1>
+<h2>Summary</h2>
+<h1>syzbot Reports NFS Server Task Hang in <code>expkey_flush</code> — Lock Contention on <code>nfsd_mutex</code></h1>
+<p><strong>Type:</strong> Bug report (kernel fuzzer finding)</p>
+<h2>Overview</h2>
+<p>On January 20th, Google's syzkaller fuzzing bot reported a task hang in the NFS server (NFSD) subsystem <a href="https://lore.kernel.org/linux-nfs/696fe2d5.050a0220.706b.0002.GAE@google.com/">syzbot</a>. The report was filed against the upstream kernel tree at commit <code>983d014aafb1</code> and tagged with <code>[nfs?]</code>, indicating syzbot's heuristic subsystem classification for NFS-related code. No human responses or patches were posted within this week's window.</p>
+<h2>Technical Analysis of the Hang</h2>
+<p>The report documents a severe concurrency issue involving multiple tasks blocked in uninterruptible sleep (state <code>D</code>) for over 143 seconds, all contending on the global <code>nfsd_mutex</code>. The call traces reveal three distinct code paths converging on this single lock:</p>
+<h3>Path 1: Export Key Cache Flush (<code>expkey_flush</code>)</h3>
+<p>One task hung while attempting to acquire <code>nfsd_mutex</code> inside <code>expkey_flush()</code>:</p>
+<pre><code>__mutex_lock+0xc69/0x1ca0 kernel/locking/mutex.c:776
+expkey_flush+0x20/0x90 fs/nfsd/export.c:250
+write_flush.constprop.0+0x2af/0x3d0 net/sunrpc/cache.c:1550
+</code></pre>
+<p>This path was triggered by a write to the <code>/proc/fs/nfsd/exports</code> flush interface, which is used to force the NFS export cache to write out pending entries. The task held <code>sb_writers#3</code> (superblock writer lock) and then attempted to acquire <code>nfsd_mutex</code>.</p>
+<h3>Path 2: NFS Server Thread Shutdown (<code>nfsd_shutdown_threads</code>)</h3>
+<p>Multiple tasks were blocked in <code>nfsd_shutdown_threads()</code> during filesystem unmount operations:</p>
+<pre><code>__mutex_lock+0xc69/0x1ca0 kernel/locking/mutex.c:776
+nfsd_shutdown_threads+0x5b/0xf0 fs/nfsd/nfssvc.c:575
+nfsd_umount+0x3b/0x60 fs/nfsd/nfsctl.c:1353
+deactivate_locked_super+0xc1/0x1a0 fs/super.c:474
+</code></pre>
+<p>These tasks held the superblock's <code>s_umount_key</code> (exclusive unmount lock) and then attempted to acquire <code>nfsd_mutex</code>. The lock listing shows numerous syz-executor threads in this state, each holding both <code>s_umount_key#53</code> and waiting on <code>nfsd_mutex</code>.</p>
+<h3>Path 3: Netlink Thread Configuration (<code>nfsd_nl_threads_set_doit</code>)</h3>
+<p>Additional tasks were blocked while attempting to configure NFS server thread counts via netlink:</p>
+<pre><code>__mutex_lock+0xc69/0x1ca0 kernel/locking/mutex.c:776
+nfsd_nl_threads_set_doit+0x687/0xbc0 fs/nfsd/nfsctl.c:1596
+genl_family_rcv_msg_doit+0x209/0x2f0 net/netlink/genetlink.c:1115
+</code></pre>
+<p>These tasks held the <code>cb_lock</code> (callback lock from netlink reception) and then attempted to acquire <code>nfsd_mutex</code>.</p>
+<h3>Path 4: Superblock Lock Contention (<code>down_write</code>)</h3>
+<p>One task was blocked acquiring a write-side superblock lock:</p>
+<pre><code>rwsem_down_write_slowpath+0x521/0x1310 kernel/locking/rwsem.c:1185
+down_write+0x1d6/0x200 kernel/locking/rwsem.c:1591
+super_lock+0x17d/0x3f0 fs/super.c:121
+grab_super+0xab/0x420 fs/super.c:531
+sget_fc+0x612/0xc20 fs/super.c:801
+</code></pre>
+<p>This task was attempting to mount a new NFS filesystem while the superblock lock was held by one of the unmount operations.</p>
+<h2>Lock Ordering and Deadlock Characteristics</h2>
+<p>The "locks held in the system" section reveals a complex web of interlocking dependencies. The critical observation is that <code>nfsd_mutex</code> serves as a global serialization point for multiple NFSD administrative operations — export cache flushing, thread shutdown during unmount, and netlink-based thread configuration — while each caller arrives holding different outer locks (<code>sb_writers</code>, <code>s_umount_key</code>, <code>cb_lock</code>).</p>
+<p>The NMI backtrace confirms the system entered a soft lockup state (tainted <code>[L]=SOFTLOCKUP</code>), with CPU 0 idle in <code>pv_native_safe_halt</code> and CPU 1 running the hung-task watchdog.</p>
+<h2>Context: Recent NFSD Locking Changes</h2>
+<p>This report arrives amid significant recent activity in NFSD locking infrastructure. As noted in <a href="2026-01-08/thread/%3C20260108004016.3907158-1-cel%40kernel.org%3E.html">prior summaries</a>, Chuck Lever's "Automatic NFSv4 state revocation on filesystem unmount" series (v2) explicitly addressed lock ordering around <code>nfsd_mutex</code>, with a change noted as:</p>
+<blockquote>
+<p>"Hold <code>nfsd_mutex</code> while closing <code>nfsd_files</code>"</p>
+</blockquote>
+<p>This prior work demonstrates that the NFSD maintainers are actively aware of and addressing locking complexities in this subsystem. The syzbot finding may represent either a pre-existing issue or a regression introduced by recent changes to the export cache flush path, thread shutdown sequence, or netlink control interface.</p>
+<h2>Significance for NFS Server Development</h2>
+<p>This bug report highlights several important concerns:</p>
+<ol>
+<li>
+<p><strong>Global mutex contention</strong>: The <code>nfsd_mutex</code> serves as a bottleneck for concurrent administrative operations on the NFS server. When multiple threads attempt to perform mount/unmount, thread configuration, and cache flush operations simultaneously — as syzkaller's fuzzing naturally induces — the system can enter a prolonged hung state.</p>
+</li>
+<li>
+<p><strong>Interaction with filesystem lifecycle</strong>: The hang occurs during filesystem unmount (<code>nfsd_umount</code>), which is precisely the scenario that Chuck Lever's state revocation series aims to improve. The interplay between VFS superblock locks and NFSD's internal mutex needs careful attention.</p>
+</li>
+<li>
+<p><strong>Netlink control plane safety</strong>: The <code>nfsd_nl_threads_set_doit()</code> path shows that netlink-based NFS server management can also participate in lock contention, expanding the surface area for concurrency bugs beyond traditional procfs interfaces.</p>
+</li>
+<li>
+<p><strong>No reproducer available</strong>: As syzbot noted:</p>
+</li>
+</ol>
+<blockquote>
+<p>"Unfortunately, I don't have any reproducer for this issue yet."</p>
+</blockquote>
+<p>This means developers will need to rely on the call traces and lock state dump provided in the report to diagnose the root cause.</p>
+<h2>Status</h2>
+<p>The report remains open with no human response or patch within this week's window. The syzbot dashboard link is available at: https://syzkaller.appspot.com/bug?extid=b6a0f8e7fb5f9c959ddd</p>
+<p>Contributors are reminded that if they fix the issue, they should add the tag:</p>
+<blockquote>
+<p>"Reported-by: syzbot+b6a0f8e7fb5f9c959ddd@syzkaller.appspotmail.com"</p>
+</blockquote>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/696fe2d5.050a0220.706b.0002.GAE@google.com/">2026-01-20 syzbot <a href="mailto:syzbot+b6a0f8e7fb5f9c959ddd@syzkaller.appspotmail.com">syzbot+b6a0f8e7fb5f9c959ddd@syzkaller.appspotmail.com</a> — [syzbot] [nfs?] INFO: task hung in expkey_flush</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/696fe2d5.050a0220.706b.0002.GAE@google.com/">2026-01-20 syzbot <a href="mailto:syzbot+b6a0f8e7fb5f9c959ddd@syzkaller.appspotmail.com">syzbot+b6a0f8e7fb5f9c959ddd@syzkaller.appspotmail.com</a> — [syzbot] [nfs?] INFO: task hung in expkey_flush</a></li>
+</ul>
+  </main>
+</body>
+</html>

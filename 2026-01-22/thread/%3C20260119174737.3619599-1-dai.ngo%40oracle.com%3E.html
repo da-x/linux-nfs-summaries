@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD: Enforce Recall Timeout for Layout Conflict — Review and Data Integrity Concerns</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-22</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD: Enforce Recall Timeout for Layout Conflict — Review and Data Integrity Concerns</h1>
+<h2>Summary</h2>
+<h1>NFSD: Enforce Recall Timeout for Layout Conflict</h1>
+<h2>Overview</h2>
+<p>Dai Ngo submitted a single-patch proposal <a href="https://lore.kernel.org/linux-nfs/20260119174737.3619599-1-dai.ngo@oracle.com/">NFSD: Enforce recall timeout for layout conflict</a> to address a critical reliability concern in the NFSv4 server's block layout (pNFS) implementation. This is fundamentally a <strong>bug fix / robustness improvement</strong> for the NFSD lease management code, with significant implications for NFS client data integrity when layout conflicts occur.</p>
+<h2>The Problem</h2>
+<p>When a layout conflict triggers a recall on the server, nfsd threads can become indefinitely blocked in <code>__break_lease</code> waiting for the client to release its layout. This creates two problems:</p>
+<ol>
+<li><strong>Server starvation</strong>: Excessive nfsd threads tied up in lease-breaking operations prevent the server from servicing incoming requests efficiently.</li>
+<li><strong>Data integrity risk</strong>: If a recall times out and the lease is removed before the rogue client is fenced, competing access could corrupt data or metadata on the backing store.</li>
+</ol>
+<p>As Dai Ngo explained in the patch description:</p>
+<blockquote>
+<p>"When a layout conflict triggers a recall, enforcing a timeout is necessary to prevent excessive nfsd threads from being tied up in __break_lease and ensure the server can continue servicing incoming requests efficiently."</p>
+</blockquote>
+<h2>Patch Design</h2>
+<p>The patch introduces two new callbacks in <code>lease_manager_operations</code>:</p>
+<ol>
+<li>
+<p><strong><code>lm_breaker_timedout</code></strong>: Invoked when a lease recall times out, allowing the lease manager to take action — specifically, issuing a fence operation if the layout type supports it, preventing the client from accessing the block device.</p>
+</li>
+<li>
+<p><strong><code>lm_need_to_retry</code></strong>: Invoked when a lease conflict is detected, allowing the lease manager to signal <code>__break_lease</code> to return an error, prompting retry of the conflicting operation and avoiding excessive nfsd threads being blocked.</p>
+</li>
+</ol>
+<p>The patch also adds a new boolean flag <code>flc_in_conflict</code> in <code>struct file_lock_context</code> to track ongoing layout break operations.</p>
+<h2>Review Feedback</h2>
+<h3>Build Warnings</h3>
+<p>The kernel test robot reported documentation warnings: <a href="https://lore.kernel.org/linux-nfs/202601200621.KNAnUu7y-lkp@intel.com/">build warnings from lkp</a>, including mismatched kdoc prototypes and undocumented parameters. Dai Ngo acknowledged these for fixes in v2.</p>
+<h3>Christoph Hellwig's Assessment</h3>
+<p>Christoph provided a cautious initial review:</p>
+<blockquote>
+<p>"This looks reasonable to me, but I don't really feel confident enough about the locks.c code that you should consider this a review."</p>
+</blockquote>
+<p>He also raised an important side question about XFS layout-breaking logic, and Dai Ngo asked whether <code>xfs_break_leased_layouts</code> should break out of its retry loop on errors other than <code>-EWOULDBLOCK</code>. Christoph agreed:</p>
+<blockquote>
+<p>"So yeah, I think we should break out of the loop on error."</p>
+</blockquote>
+<h3>Chuck Lever's Technical Concerns</h3>
+<p>Chuck Lever raised several significant issues <a href="https://lore.kernel.org/linux-nfs/627f9faa-74b0-4028-9e52-0c1021e3500f@app.fastmail.com/">in his review</a>:</p>
+<ol>
+<li>
+<p><strong>Error code semantics</strong>: The use of <code>-ERESTARTSYS</code> was questioned:</p>
+<blockquote>
+<p>"-ERESTARTSYS is for syscall restart after signal delivery, which doesn't match up well with the semantics here. A better choice might be -EAGAIN or -EBUSY?"</p>
+</blockquote>
+<p>Dai Ngo responded that <code>-EAGAIN</code> (equivalent to <code>-EWOULDBLOCK</code>) would not break out of the XFS retry loop, and <code>-EBUSY</code> maps to <code>NFS4ERR_IO</code>, making <code>-ERESTARTSYS</code> the only viable option given current code structure.</p>
+</li>
+<li>
+<p><strong>Race condition on <code>flc_in_conflict</code></strong>: Chuck noted that unconditionally clearing this flag could be problematic if another racing thread had set it. Dai Ngo argued no race exists since all operations are under <code>flc_lock</code>.</p>
+</li>
+<li>
+<p><strong>LAYOUTRETURN vs. timeout race</strong>: The most critical concern — the stateid reference might become invalid between a voluntary LAYOUTRETURN and the timeout handler:</p>
+<blockquote>
+<p>"LAYOUTRETURN races with this timeout. Something needs to guarantee that @ls will remain valid for both racing threads, so this stateid probably needs an extra reference count bump somewhere."</p>
+</blockquote>
+</li>
+<li>
+<p><strong>API design</strong>: Chuck suggested passing common C types rather than internal VFS structures through the new callbacks.</p>
+</li>
+</ol>
+<h3>Jeff Layton's Critical Data Integrity Concern</h3>
+<p>Jeff Layton identified what may be the most serious flaw in the initial approach <a href="https://lore.kernel.org/linux-nfs/f02d32dc80e1a51f4a91c5e3ce2a5fe10680e4ea.camel@kernel.org/">in his review</a>:</p>
+<blockquote>
+<p>"When the lease times out, you go ahead and remove it but then mark it with FL_BREAKER_TIMEDOUT. Then later, you call -&gt;lm_breaker_timedout if that's set. That means that when this happens, there is a window of time where there is no lease, but the rogue client isn't yet fenced. That sounds like a problem as you could allow competing access."</p>
+</blockquote>
+<p>He recommended reversing the order — fence first, then remove the lease:</p>
+<blockquote>
+<p>"I think you'll have to do this in reverse order: fence the client and then remove the lease."</p>
+</blockquote>
+<p>Dai Ngo initially pushed back, arguing that since the conflicting thread hasn't accessed file data yet, there was no immediate problem. But Jeff pressed the point with a compelling scenario <a href="https://lore.kernel.org/linux-nfs/f2203e755aca4da45b099b18aac03b0a9d299343.camel@kernel.org/">in his follow-up</a>:</p>
+<blockquote>
+<p>"Isn't the whole point of write layout leases to grant exclusive access to an external client? At the point where you lose the lease, any competing access can then proceed. Maybe a local file writer starts writing to the file at that point. But...what if the client is still writing stuff to the backing store? Won't that corrupt data (and maybe metadata)?"</p>
+</blockquote>
+<h2>Evolution Toward Resolution</h2>
+<p>The discussion evolved through several iterations:</p>
+<ol>
+<li>
+<p><strong>Flag placement debate</strong>: Dai Ngo suggested moving <code>flc_in_conflict</code> into <code>nfsd_file</code>, but Jeff noted there can be multiple <code>nfsd_file</code> objects per inode. Dai then proposed using <code>nfs4_file</code> instead, which is per-filehandle:</p>
+<blockquote>
+<p>"Can we move the in_conflict flag in to nfs4_file? I think there is exactly one nfs4_file for every unique inode in use by NFSv4 clients."</p>
+</blockquote>
+<p>Jeff agreed this could work <a href="https://lore.kernel.org/linux-nfs/45cd7c99978f0f3df8599e86d224c31cc1ca198e.camel@kernel.org/">in his final response</a>:</p>
+<blockquote>
+<p>"Yeah, that might work since it is a per-fh object, and you shouldn't need to deal with this except on files open via nfs4 anyway."</p>
+</blockquote>
+</li>
+<li>
+<p><strong>Alternative approach</strong>: Jeff suggested an even cleaner solution — performing fencing before lease removal and using existing lease flags (<code>FL_UNLOCK_PENDING</code> or <code>FL_DOWNGRADE_PENDING</code>) instead of a custom flag:</p>
+<blockquote>
+<p>"it would still be better to just do the fencing before you remove the lease. That just seems less hacky... If you did that, then I think you could look for the presence of a lease on the list with FL_UNLOCK_PENDING or FL_DOWNGRADE_PENDING set, instead of the flc_in_conflict file flag."</p>
+</blockquote>
+</li>
+</ol>
+<h2>Status and Next Steps</h2>
+<p>The patch remains under active review with no final resolution this week. Key items for v2:</p>
+<ul>
+<li>Fix kdoc header mismatches (noted by both kernel test robot and reviewers)</li>
+<li>Address the fence-before-lease-removal ordering concern raised by Jeff Layton</li>
+<li>Resolve the LAYOUTRETURN race condition identified by Chuck Lever</li>
+<li>Consider moving conflict tracking to <code>nfs4_file</code> instead of VFS structures</li>
+<li>Improve error handling in XFS layout-breaking loops (side issue confirmed by Christoph)</li>
+</ul>
+<p>This discussion highlights the complexity of ensuring data integrity in pNFS block layouts, where the server must balance responsive recall enforcement against the risk of allowing concurrent access that could corrupt storage. The reviewers' insistence on fencing before lease removal underscores the importance of maintaining exclusive access guarantees throughout the entire conflict resolution lifecycle.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260119174737.3619599-1-dai.ngo@oracle.com/">2026-01-19 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — [PATCH 1/1] NFSD: Enforce recall timeout for layout conflict</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/202601200621.KNAnUu7y-lkp@intel.com/">2026-01-19 kernel test robot <a href="mailto:lkp@intel.com">lkp@intel.com</a> — Re: [PATCH 1/1] NFSD: Enforce recall timeout for layout conflict</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260120072638.GA6380@lst.de/">2026-01-20 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: [PATCH 1/1] NFSD: Enforce recall timeout for layout conflict</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/627f9faa-74b0-4028-9e52-0c1021e3500f@app.fastmail.com/">2026-01-20 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 1/1] NFSD: Enforce recall timeout for layout conflict</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/0b0112f8-793c-42af-a2a7-ee662496a9e4@oracle.com/">2026-01-20 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — Re: [PATCH 1/1] NFSD: Enforce recall timeout for layout conflict</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/1652de99-7bb6-4121-a5f4-2454ddec7d41@oracle.com/">2026-01-20 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — Re: [PATCH 1/1] NFSD: Enforce recall timeout for layout conflict</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/f02d32dc80e1a51f4a91c5e3ce2a5fe10680e4ea.camel@kernel.org/">2026-01-20 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 1/1] NFSD: Enforce recall timeout for layout conflict</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/0f7c99a3-0768-40e7-8a0e-2b1ceadd5694@oracle.com/">2026-01-20 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — Re: [PATCH 1/1] NFSD: Enforce recall timeout for layout conflict</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/a1dc8306-6422-45c8-a5b0-8d10a4d89279@oracle.com/">2026-01-20 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — Re: [PATCH 1/1] NFSD: Enforce recall timeout for layout conflict</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/f2203e755aca4da45b099b18aac03b0a9d299343.camel@kernel.org/">2026-01-20 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 1/1] NFSD: Enforce recall timeout for layout conflict</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/59921524-57d4-4880-9374-b9b420104266@oracle.com/">2026-01-20 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — Re: [PATCH 1/1] NFSD: Enforce recall timeout for layout conflict</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/06f45f752d868d267947035dd578dca615d4b68e.camel@kernel.org/">2026-01-20 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 1/1] NFSD: Enforce recall timeout for layout conflict</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/0b8ccb71-4727-47b0-84c7-0d4a4abbe390@oracle.com/">2026-01-20 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — Re: [PATCH 1/1] NFSD: Enforce recall timeout for layout conflict</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260121083807.GA15669@lst.de/">2026-01-21 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: [PATCH 1/1] NFSD: Enforce recall timeout for layout conflict</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/45cd7c99978f0f3df8599e86d224c31cc1ca198e.camel@kernel.org/">2026-01-21 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 1/1] NFSD: Enforce recall timeout for layout conflict</a></li>
+</ul>
+  </main>
+</body>
+</html>

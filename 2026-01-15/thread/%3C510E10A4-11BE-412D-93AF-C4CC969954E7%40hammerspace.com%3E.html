@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>kNFSD Encrypted Filehandles: Threat Model Debate and Path to v2</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-15</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>kNFSD Encrypted Filehandles: Threat Model Debate and Path to v2</h1>
+<h2>Summary</h2>
+<h2>kNFSD Encrypted Filehandles: Threat Model and Design Direction</h2>
+<p><strong>Classification:</strong> New feature proposal (security hardening of NFS file handles).</p>
+<h3>Overview</h3>
+<p>Benjamin Coddington (Hammerspace) resumed work on his RFC series to add encrypted file handle support to the Linux NFS server (kNFSD). The week's discussion, concentrated on January 13, revolved around fundamental architectural concerns, the threat model justifying the feature, and the choice of cryptographic primitive. The conversation involved Chuck Lever (NFS maintainer) and Jeff Layton.</p>
+<h3>Architectural Concern: Per-Thread Buffers and Layering</h3>
+<p>Coddington's v1 implementation required dynamically allocated buffers per kNFSD thread for hashing file handles using the synchronous crypto API. He proposed attaching a callback to <code>svc_rqst</code> (the SunRPC request structure) so that NFSD could free these buffers when an RPC service thread exits:</p>
+<blockquote>
+<p>"I need small, dynamically allocated buffers for hashing the filehandles, and it makes the most sense to have them per-thread as that's the scope of contention. I want to allocate them once when(if) they are needed, and free them when the thread exits." <a href="https://lore.kernel.org/linux-nfs/ECE1341F-BA8A-4DC7-BC9D-BDD6F10F6013@hammerspace.com/">Ben Coddington</a></p>
+</blockquote>
+<p>Chuck Lever pushed back strongly on adding NFSD-specific hooks to the SunRPC layer, calling it a "layering violation":</p>
+<blockquote>
+<p>"I'd rather avoid hanging anything NFSD-related off of svc_rqst, which is really an RPC layer object. I know we still have some NFSD-specific fields in there, but those are really technical debt." <a href="https://lore.kernel.org/linux-nfs/dc3d8ff3-f68f-4200-a546-605f0f2e3611@kernel.org/">Chuck Lever</a></p>
+</blockquote>
+<p>Jeff Layton offered a compromise: adding a generic <code>void *rq_private</code> pointer to <code>svc_rqst</code>, allowing higher-level services like NFSD to attach their own per-thread structures without hardcoding NFSD-specific fields into SunRPC. He noted this could also clean up an existing layering violation by moving the NFS-specific <code>rq_lease_breaker</code> pointer out of <code>svc_rqst</code>:</p>
+<blockquote>
+<p>"I think we need something like this in svc_rqst: void *rq_private; nfsd could hang some sort of struct nfsd_thread_info off of it, other services can just leave it as NULL." <a href="https://lore.kernel.org/linux-nfs/b793648723bc956aa77c34a5a80ff7f0c962b4ce.camel@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<h3>Threat Model: What Is Being Protected?</h3>
+<p>A significant portion of the thread was devoted to clarifying <em>why</em> file handle protection is needed. Chuck Lever pressed Coddington to articulate a concrete threat model, noting that other reviewers (Neil Brown and Eric Biggers) had also requested clarification:</p>
+<blockquote>
+<p>"We need to understand your threat model before deciding whether completely obscuring the file handles is more secure than making a cryptographic hash part of the on-the-wire handle." <a href="https://lore.kernel.org/linux-nfs/bf09e1e1-d397-405b-aef8-38c44e6c2840@kernel.org/">Chuck Lever</a></p>
+</blockquote>
+<blockquote>
+<p>"No, what I'm saying is you haven't described your threat model in enough detail to justify the proposed design of encrypting file handles." <a href="https://lore.kernel.org/linux-nfs/1c5569bd-fcac-4b55-8e84-3fbc096cdff3@kernel.org/">Chuck Lever</a></p>
+</blockquote>
+<p>Coddington's core argument: NFS file handles allow clients to access files directly without traversing the directory tree. If file handles are predictable (as they are for some filesystems), a malicious or compromised client could guess file handles and bypass directory-level permission checks. This is particularly relevant in pNFS Flexfiles deployments where Hammerspace Data Servers (DSes) use <code>root_squash</code> exports, and one client may act as a broker handing out file handles to other clients:</p>
+<blockquote>
+<p>"As you know, a client that has a filehandle can access a file without needing to walk the directory tree to the file's location. That walk might have permissions set on parent directories above the file that restrict the walk to the file from that user." <a href="https://lore.kernel.org/linux-nfs/86B6E978-C67B-4C78-9E5F-6F171FD62F3E@hammerspace.com/">Ben Coddington</a></p>
+</blockquote>
+<p>Chuck Lever challenged whether this is truly unique to NFS or specific to Hammerspace's deployment model:</p>
+<blockquote>
+<p>"And I think that means that every NFS server implementation out there has the same exposure. And wouldn't open_by_filehandle() have the same exposure?" <a href="https://lore.kernel.org/linux-nfs/e711e1cb-eb8a-4723-a9af-39ce7d9658dd@app.fastmail.com/">Chuck Lever</a></p>
+</blockquote>
+<p>Coddington acknowledged that <code>open_by_handle()</code> has similar exposure on local systems but argued that NFS is "a bit more exposed" and that solving it in kNFSD could later be generalized to all <code>exportfs</code> users.</p>
+<h3>Signing vs. Encryption: The Cryptographic Debate</h3>
+<p>Chuck Lever questioned whether full encryption (AES) was necessary, suggesting that a cryptographic hash/MAC would suffice to prevent fabrication of file handles:</p>
+<blockquote>
+<p>"What you really want to do is prevent a remote client (maliciously or accidentally) from fabricating a file handle that can be used to access areas of the exported file system that have explicitly not been shared. A hash that cannot be fabricated without the server's secret key would accomplish that, ISTM." <a href="https://lore.kernel.org/linux-nfs/bf09e1e1-d397-405b-aef8-38c44e6c2840@kernel.org/">Chuck Lever</a></p>
+</blockquote>
+<p>Coddington argued for encryption over signing on three grounds:</p>
+<ol>
+<li>A MAC appends to the file handle (adding 8 bytes), while AES-CBC may sometimes produce smaller handles depending on padding.</li>
+<li>With a MAC, having more known file handles could theoretically make it easier to guess the secret key; with full encryption, the plaintext is never exposed to the client.</li>
+<li>Non-obscured file handles can leak filesystem-internal information that the NFS server does not control and may not wish to reveal.</li>
+</ol>
+<p>Chuck Lever pushed back on each point, noting that transport-level security (krb5p or TLS) should already protect in-transit data, and questioned whether per-user isolation on a shared client could truly be solved by file handle encryption alone:</p>
+<blockquote>
+<p>"Each RPC message protected by krb5p is wrapped by a specific user's Kerberos credentials, so generally speaking another user cannot decrypt that message." <a href="https://lore.kernel.org/linux-nfs/e711e1cb-eb8a-4723-a9af-39ce7d9658dd@app.fastmail.com/">Chuck Lever</a></p>
+</blockquote>
+<p>Coddington countered that transport encryption does not prevent local users on the same client from using <code>open_by_handle()</code> to guess file handles:</p>
+<blockquote>
+<p>"It doesn't matter, because the users on the client can just use open_by_handle() on NFS and guess filehandles." <a href="https://lore.kernel.org/linux-nfs/C79886E5-3064-4202-9813-0D79091F78DF@hammerspace.com/">Ben Coddington</a></p>
+</blockquote>
+<h3>Key Rotation and Cryptographic Considerations</h3>
+<p>Chuck Lever raised important cryptographic concerns about the design:</p>
+<ul>
+<li>File handles are public and persist for the lifetime of a file, meaning the signing/encryption key cannot be rotated.</li>
+<li>Billions of file handles may be encrypted or signed by the same key.</li>
+<li>The file handle plaintext is predictable.</li>
+</ul>
+<blockquote>
+<p>"Filehandles are public and live as long as a file on a filesystem instance. This means (I think) that the signing/encryption key cannot be rotated." <a href="https://lore.kernel.org/linux-nfs/e711e1cb-eb8a-4723-a9af-39ce7d9658dd@app.fastmail.com/">Chuck Lever</a></p>
+</blockquote>
+<p>Coddington acknowledged these concerns but noted that multi-key support could theoretically be added later, allowing a "drain and fill" migration strategy between keys.</p>
+<h3>Conclusions and Path Forward</h3>
+<p>The discussion concluded with agreement to restart the review process with a revised v2 submission:</p>
+<ol>
+<li><strong>Simpler cryptographic primitive for v2:</strong> Chuck Lever recommended starting with siphash rather than AES encryption:</li>
+</ol>
+<blockquote>
+<p>"If you want to prototype something quickly, please use siphash for v2. We need to understand if signing is enough, if encryption is actually required, or if even that isn't sufficient." <a href="https://lore.kernel.org/linux-nfs/e711e1cb-eb8a-4723-a9af-39ce7d9658dd@app.fastmail.com/">Chuck Lever</a></p>
+</blockquote>
+<p>Coddington agreed: "Ok, will do - thanks for your time and engagement on this so far." <a href="https://lore.kernel.org/linux-nfs/C79886E5-3064-4202-9813-0D79091F78DF@hammerspace.com/">Ben Coddington</a></p>
+<ol start="2">
+<li><strong>Broader audience:</strong> Chuck Lever requested that v2 broaden the CC list to include <code>linux-crypto</code>:</li>
+</ol>
+<blockquote>
+<p>"Let's reset and start over with a v2, and broaden the Cc's." <a href="https://lore.kernel.org/linux-nfs/e711e1cb-eb8a-4723-a9af-39ce7d9658dd@app.fastmail.com/">Chuck Lever</a></p>
+</blockquote>
+<ol start="3">
+<li><strong>Concrete examples required:</strong> The maintainer requested specific, concrete attack scenarios tied to particular Linux filesystem implementations:</li>
+</ol>
+<blockquote>
+<p>"Can you provide some specific examples when you repost? For instance, give a particular file system implementation and explain exactly how a plaintext filehandle generated by the filesystem can be used to game the server into accessing a file?" <a href="https://lore.kernel.org/linux-nfs/e711e1cb-eb8a-4723-a9af-39ce7d9658dd@app.fastmail.com/">Chuck Lever</a></p>
+</blockquote>
+<p>Coddington committed to providing these examples in v2.</p>
+<h3>Significance for NFS Client Development</h3>
+<p>While this thread focuses on the NFS server (kNFSD), the implications extend to NFS clients. Encrypted or signed file handles would change the semantics of file handle caching and validation on the client side. The discussion also touches on <code>open_by_handle()</code> interactions, which are relevant to any NFS client implementation that supports direct file handle access. The debate over whether transport-level security (krb5p/TLS) is sufficient versus needing application-layer file handle protection has broad relevance for NFS security architecture decisions affecting both clients and servers.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/7F8B576A-465B-4DCE-95F9-9F877513DF2A@hammerspace.com/">2026-01-13 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — Re: [PATCH v1 0/7] kNFSD Encrypted Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/b793648723bc956aa77c34a5a80ff7f0c962b4ce.camel@kernel.org/">2026-01-13 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v1 0/7] kNFSD Encrypted Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/1e92e144-d436-44dd-956f-3125403dfdc8@kernel.org/">2026-01-13 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v1 0/7] kNFSD Encrypted Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ECE1341F-BA8A-4DC7-BC9D-BDD6F10F6013@hammerspace.com/">2026-01-13 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — Re: [PATCH v1 0/7] kNFSD Encrypted Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/dc3d8ff3-f68f-4200-a546-605f0f2e3611@kernel.org/">2026-01-13 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v1 0/7] kNFSD Encrypted Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/A3F6E0BB-523F-4B99-B583-D6D80E9D7BFB@hammerspace.com/">2026-01-13 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — Re: [PATCH v1 0/7] kNFSD Encrypted Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/bf09e1e1-d397-405b-aef8-38c44e6c2840@kernel.org/">2026-01-13 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v1 0/7] kNFSD Encrypted Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/BCFA2167-C883-40C8-A718-10B481533943@hammerspace.com/">2026-01-13 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — Re: [PATCH v1 0/7] kNFSD Encrypted Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/1c5569bd-fcac-4b55-8e84-3fbc096cdff3@kernel.org/">2026-01-13 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v1 0/7] kNFSD Encrypted Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/86B6E978-C67B-4C78-9E5F-6F171FD62F3E@hammerspace.com/">2026-01-13 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — Re: [PATCH v1 0/7] kNFSD Encrypted Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/e711e1cb-eb8a-4723-a9af-39ce7d9658dd@app.fastmail.com/">2026-01-13 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v1 0/7] kNFSD Encrypted Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/C79886E5-3064-4202-9813-0D79091F78DF@hammerspace.com/">2026-01-13 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — Re: [PATCH v1 0/7] kNFSD Encrypted Filehandles</a></li>
+</ul>
+  </main>
+</body>
+</html>

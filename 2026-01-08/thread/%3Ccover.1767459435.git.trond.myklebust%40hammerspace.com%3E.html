@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS/localio: Fixing Data Corruption and Short Write Handling</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-08</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS/localio: Fixing Data Corruption and Short Write Handling</h1>
+<h2>Summary</h2>
+<h2>NFS/localio: Fixing Data Corruption and Short Write Handling</h2>
+<p>Trond Myklebust submitted a four-patch series titled <strong>"Fix misc localio issues"</strong> to address critical bugs in the NFS LOCALIO (local I/O) subsystem. LOCALIO allows an NFS client to bypass network RPC when the server is on the same host, directly accessing the underlying filesystem. The series was motivated by two primary concerns:</p>
+<blockquote>
+<p>"Data corruption when localio hits a transient error."
+"Short write handling can trigger spurious ENOSPC errors"</p>
+</blockquote>
+<p><a href="https://lore.kernel.org/linux-nfs/cover.1767459435.git.trond.myklebust@hammerspace.com/">As outlined in the cover letter</a>, the patches target <code>fs/nfs/localio.c</code> with 66 insertions and 40 deletions. Mike Snitzer, a key reviewer and contributor to LOCALIO development, provided thorough reviews and reviewed-by tags for all four patches.</p>
+<h3>Patch 1: Stop Further I/O Upon Hitting an Error</h3>
+<p>The first patch addresses a bug where the localio code would continue issuing I/O after encountering an error from the underlying filesystem. <a href="https://lore.kernel.org/linux-nfs/d0d1748668398cd6adfb079fed60409b29167ff2.1767459435.git.trond.myklebust@hammerspace.com/">Trond explained</a>:</p>
+<blockquote>
+<p>"If the call into the filesystem results in an I/O error, then the next chunk of data won't be contiguous with the end of the last successful chunk. So break out of the I/O loop and report the results."</p>
+</blockquote>
+<p>This patch fixes a regression introduced by commit <code>6a218b9c3183</code>. Mike Snitzer noted that the patch needed rebasing against Linus's master due to a more recent fix for an out-of-order <code>__put_cred</code> regression. He provided a rebased version with his reviewed-by tag <a href="https://lore.kernel.org/linux-nfs/aVvyl52wfhyeNGvp@kernel.org/">in his reply</a>, praising the cleanup:</p>
+<blockquote>
+<p>"Thanks, definitely cleaner to not have the awkward force_done flag, sorry for that nastiness."</p>
+</blockquote>
+<p>Trond confirmed he had already caught the rebase issue in his testing branch <a href="https://lore.kernel.org/linux-nfs/09331fd9a94cb5bb8ffa7ae4bcfc3f8f5af06def.camel@kernel.org/">in response</a>.</p>
+<h3>Patch 2: Deal with Page Bases Larger Than PAGE_SIZE</h3>
+<p>The second patch fixes an issue where the page base could grow larger than <code>PAGE_SIZE</code> during request resends. <a href="https://lore.kernel.org/linux-nfs/f7d976f25972708d6b79b48d411e6b3273354c00.1767459435.git.trond.myklebust@hammerspace.com/">Trond noted</a>:</p>
+<blockquote>
+<p>"When resending requests, etc, the page base can quickly grow larger than the page size."</p>
+</blockquote>
+<p>Mike Snitzer reviewed this patch and reflected on the origin of the bug:</p>
+<blockquote>
+<p>"This was bound to happen given the 'No functional change.' in the header for commit 091bdcfcece0 -- wasn't purely a refactor, ugh. Should the implications of not having this fix be made clearer in this patch header?"</p>
+</blockquote>
+<p>He added his reviewed-by tag <a href="https://lore.kernel.org/linux-nfs/aVv3hHmeRmChS6NR@kernel.org/">in his reply</a>.</p>
+<h3>Patch 3: Handle Short Writes by Retrying</h3>
+<p>The third and most complex patch addresses short write handling. Previously, the localio code would truncate I/O on a short write and set an error, risking data loss since the partially written data might not be persisted. <a href="https://lore.kernel.org/linux-nfs/aad94ed780fd5ea5deee8967261e5cfeb17b4c04.1767459435.git.trond.myklebust@hammerspace.com/">Trond explained</a>:</p>
+<blockquote>
+<p>"To fix this, change localio so that the upper layers can direct the behaviour to persist any unstable data by rewriting it, and then continuing writing until an ENOSPC is hit."</p>
+</blockquote>
+<p>Mike Snitzer raised two concerns in his review <a href="https://lore.kernel.org/linux-nfs/aVv9NqgOeEWJDfnk@kernel.org/">here</a>: whether a code comment should be added to <code>nfs_local_pgio_release()</code> explaining the subtle dependency on <code>rpc_call_done</code> conditionally setting <code>task-&gt;tk_action</code>, and whether a <code>default</code> case in a switch statement warranted a <code>BUG_ON()</code>. Trond responded <a href="https://lore.kernel.org/linux-nfs/2a48660a6da0f53e5d36c4c34050c0f920a8b586.camel@kernel.org/">in his reply</a>:</p>
+<blockquote>
+<p>"That's how restarts work in the RPC code: after the rpc_call_done callback is done, rpc_exit_task() will check for whether or not the task-&gt;tk_action got reset, and if so, it will prepare a new RPC call."</p>
+</blockquote>
+<p>Regarding the <code>BUG_ON()</code> question, he added:</p>
+<blockquote>
+<p>"I considered a BUG_ON(), but it shouldn't really matter. All this does now is cancel the restart."</p>
+</blockquote>
+<p>Mike Snitzer accepted this reasoning and provided his reviewed-by tag <a href="https://lore.kernel.org/linux-nfs/aVwDU3WuZfzIovt2@kernel.org/">in his final reply</a>.</p>
+<h3>Patch 4: Cleanup nfs_local_pgio_done() Parameters</h3>
+<p>The final patch removes a redundant <code>force</code> parameter from <code>nfs_local_pgio_done()</code>, a straightforward cleanup. Mike Snitzer provided his reviewed-by tag <a href="https://lore.kernel.org/linux-nfs/aVvz2mPW2qN1e0rA@kernel.org/">in his reply</a>.</p>
+<h3>Follow-Up: Additional LOCALIO Improvements</h3>
+<p>On January 7, Mike Snitzer posted a follow-up series titled <strong>"NFS/localio: various improvements"</strong> <a href="https://lore.kernel.org/linux-nfs/20260107160858.6847-1-snitzer@kernel.org/">here</a>, rebased on Trond's patchset. He revealed that his patches were developed while chasing a severe deadlock under heavy LOCALIO load on systems with limited memory (16GB). The deadlock involved <code>khugepaged</code> and <code>nfsd</code> tasks stuck in <code>wait_on_commit</code>, ultimately resolved by a separate <code>nfs_release_folio()</code> deadlock fix from Trond. Snitzer noted:</p>
+<blockquote>
+<p>"Anyway, I think this LOCALIO series is worthwhile on its own and ready for wider review and hopeful inclusion."</p>
+</blockquote>
+<h3>Conclusion</h3>
+<p>This thread represents a focused bug-fix effort to harden the NFS LOCALIO subsystem against data corruption and spurious errors. All four of Trond's patches received reviewed-by tags from Mike Snitzer after constructive discussion around rebase requirements, code clarity, and edge-case handling. The follow-up series from Snitzer further demonstrates ongoing investment in LOCALIO stability under stress conditions.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/cover.1767459435.git.trond.myklebust@hammerspace.com/">2026-01-03 Trond Myklebust <a href="mailto:trondmy@kernel.org">trondmy@kernel.org</a> — [PATCH 0/4] Fix misc localio issues</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/f7d976f25972708d6b79b48d411e6b3273354c00.1767459435.git.trond.myklebust@hammerspace.com/">2026-01-03 Trond Myklebust <a href="mailto:trondmy@kernel.org">trondmy@kernel.org</a> — [PATCH 2/4] NFS/localio: Deal with page bases that are &gt; PAGE_SIZE</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/d0d1748668398cd6adfb079fed60409b29167ff2.1767459435.git.trond.myklebust@hammerspace.com/">2026-01-03 Trond Myklebust <a href="mailto:trondmy@kernel.org">trondmy@kernel.org</a> — [PATCH 1/4] NFS/localio: Stop further I/O upon hitting an error</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/bf5a9581839ebeebbd3bd004a174fea9afa19dcb.1767459435.git.trond.myklebust@hammerspace.com/">2026-01-03 Trond Myklebust <a href="mailto:trondmy@kernel.org">trondmy@kernel.org</a> — [PATCH 4/4] NFS/localio: Cleanup the nfs_local_pgio_done() parameters</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aad94ed780fd5ea5deee8967261e5cfeb17b4c04.1767459435.git.trond.myklebust@hammerspace.com/">2026-01-03 Trond Myklebust <a href="mailto:trondmy@kernel.org">trondmy@kernel.org</a> — [PATCH 3/4] NFS/localio: Handle short writes by retrying</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aVvyl52wfhyeNGvp@kernel.org/">2026-01-05 Mike Snitzer <a href="mailto:snitzer@kernel.org">snitzer@kernel.org</a> — Re: [PATCH 1/4] NFS/localio: Stop further I/O upon hitting an error</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aVvz2mPW2qN1e0rA@kernel.org/">2026-01-05 Mike Snitzer <a href="mailto:snitzer@kernel.org">snitzer@kernel.org</a> — Re: [PATCH 4/4] NFS/localio: Cleanup the nfs_local_pgio_done() parameters</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/09331fd9a94cb5bb8ffa7ae4bcfc3f8f5af06def.camel@kernel.org/">2026-01-05 Trond Myklebust <a href="mailto:trondmy@kernel.org">trondmy@kernel.org</a> — Re: [PATCH 1/4] NFS/localio: Stop further I/O upon hitting an error</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aVv3hHmeRmChS6NR@kernel.org/">2026-01-05 Mike Snitzer <a href="mailto:snitzer@kernel.org">snitzer@kernel.org</a> — Re: [PATCH 2/4] NFS/localio: Deal with page bases that are &gt; PAGE_SIZE</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aVv9NqgOeEWJDfnk@kernel.org/">2026-01-05 Mike Snitzer <a href="mailto:snitzer@kernel.org">snitzer@kernel.org</a> — Re: [PATCH 3/4] NFS/localio: Handle short writes by retrying</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/2a48660a6da0f53e5d36c4c34050c0f920a8b586.camel@kernel.org/">2026-01-05 Trond Myklebust <a href="mailto:trondmy@kernel.org">trondmy@kernel.org</a> — Re: [PATCH 3/4] NFS/localio: Handle short writes by retrying</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aVwDU3WuZfzIovt2@kernel.org/">2026-01-05 Mike Snitzer <a href="mailto:snitzer@kernel.org">snitzer@kernel.org</a> — Re: [PATCH 3/4] NFS/localio: Handle short writes by retrying</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107160858.6847-1-snitzer@kernel.org/">2026-01-07 Mike Snitzer <a href="mailto:snitzer@kernel.org">snitzer@kernel.org</a> — [PATCH 0/4] NFS/localio: various improvements</a></li>
+</ul>
+  </main>
+</body>
+</html>

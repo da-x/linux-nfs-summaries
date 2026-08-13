@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Build Warnings on parisc and s390 Expose Missing file_lock Forward Declaration in lockd Public API</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-29</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Build Warnings on parisc and s390 Expose Missing file_lock Forward Declaration in lockd Public API</h1>
+<h2>Summary</h2>
+<h1>Build Warnings on parisc and s390 Expose Missing <code>struct file_lock</code> Forward Declaration in lockd Public API</h1>
+<h2>Summary</h2>
+<p><strong>Type:</strong> Bug fix (build warning caused by API refactoring exposing a missing forward declaration)</p>
+<p>This thread captures two automated build warning reports from the kernel test robot against <a href="https://lore.kernel.org/linux-nfs/20260126195535.154697-12-cel@kernel.org/">PATCH v3 11/14</a> of Chuck Lever's series to clarify lockd module API boundaries. The patch moves <code>xdr.h</code> from the public include path (<code>include/linux/lockd/</code>) to an internal location (<code>fs/lockd/</code>), which inadvertently exposed a missing forward declaration for <code>struct file_lock</code> in the public lockd API header <code>bind.h</code>.</p>
+<h2>Context from Prior Weeks</h2>
+<p>Chuck Lever's v3 series (14 patches) was submitted this week as a refined version of his earlier 42-patch v2 submission. The series aims to separate lockd's public API from internal implementation details, reducing the public API surface to just <code>include/linux/lockd/bind.h</code>. As detailed in <a href="https://lore.kernel.org/linux-nfs/20260126195535.154697-1-cel@kernel.org/">the cover letter summary</a>, Chuck noted:</p>
+<blockquote>
+<p>"The patches in this series refactor the lockd code base to clearly separate its public API from internal implementation and NLM protocol details."</p>
+</blockquote>
+<p>Patch 11/14 specifically moves <code>xdr.h</code> internally, adding a forward declaration for <code>struct nfs_fh</code> (previously pulled in transitively through <code>xdr.h</code>) and an explicit <code>#include</code> of <code>filelock.h</code> in <code>fs/nfs/nfs3proc.c</code>. A similar issue was reported during v2 review on alpha and hexagon architectures (<a href="https://lore.kernel.org/linux-nfs/20260123185259.1215767-11-cel@kernel.org/">prior summary</a>), where the same header relocation caused build <em>errors</em> in <code>nfs3proc.c</code>. The v3 patch addressed that specific case, but as these new reports show, additional hidden dependencies remain.</p>
+<h2>Key Technical Arguments</h2>
+<h3>Build Warnings on parisc and s390 Architectures</h3>
+<p>The kernel test robot reported warnings on two distinct architectures and compilers:</p>
+<p><strong>parisc (GCC 15.2.0):</strong></p>
+<blockquote>
+<p>"include/linux/lockd/bind.h:76:69: warning: 'struct file_lock' declared inside parameter list will not be visible outside of this definition or declaration" <a href="https://lore.kernel.org/linux-nfs/202601271122.bOzo5v5D-lkp@intel.com/">kernel test robot</a></p>
+</blockquote>
+<p><strong>s390 (Clang 22.0.0git):</strong></p>
+<blockquote>
+<p>"include/linux/lockd/bind.h:76:64: warning: declaration of 'struct file_lock' will not be visible outside of this function [-Wvisibility]" <a href="https://lore.kernel.org/linux-nfs/202601271247.TFeb5MO5-lkp@intel.com/">kernel test robot</a></p>
+</blockquote>
+<p>Both warnings point to the same declaration in <code>include/linux/lockd/bind.h</code> at line 76:</p>
+<pre><code class="language-c">extern int nlmclnt_proc(struct nlm_host *host, int cmd, struct file_lock *fl, void *data);
+</code></pre>
+<h3>Root Cause Analysis</h3>
+<p>The warning arises because <code>bind.h</code> — the sole remaining public lockd API header — declares <code>nlmclnt_proc()</code> with a parameter of type <code>struct file_lock *</code>, but does not include any header that provides a forward declaration or full definition of <code>struct file_lock</code>. Previously, this was masked by transitive inclusion through <code>include/linux/lockd/xdr.h</code>, which pulled in the necessary definitions. With <code>xdr.h</code> moved to <code>fs/lockd/</code>, those implicit includes are no longer available.</p>
+<p>This is a <strong>different issue</strong> from the v2 build <em>errors</em> on alpha/hexagon (which affected <code>nfs3proc.c</code>). The v3 patch fixed <code>nfs3proc.c</code> by adding an explicit <code>#include "filelock.h"</code>. However, the warning here originates in <code>fs/nfsd/lockd.c</code>, which includes <code>bind.h</code> but does not itself include <code>filelock.h</code> — and now that <code>xdr.h</code> is no longer in the public path, the forward declaration for <code>struct file_lock</code> is missing from the transitive include chain.</p>
+<h3>Significance for NFS Client and Server Development</h3>
+<p>This warning highlights another layering issue exposed by the API cleanup:</p>
+<ol>
+<li>
+<p><strong>The NFSD side</strong> (<code>fs/nfsd/lockd.c</code>) depends on <code>bind.h</code> but was implicitly getting <code>struct file_lock</code> through transitive includes from <code>xdr.h</code>. Now it needs either a forward declaration added to <code>bind.h</code> or an explicit include in the consuming code.</p>
+</li>
+<li>
+<p><strong>The public API contract</strong> of <code>bind.h</code> should be self-contained. If <code>nlmclnt_proc()</code> is declared as a public function accepting <code>struct file_lock *</code>, then <code>bind.h</code> must either provide a forward declaration of <code>struct file_lock</code> or include the appropriate header. This is the same principle that motivated adding the <code>struct nfs_fh</code> forward declaration in this patch.</p>
+</li>
+</ol>
+<h2>Evolution of the Discussion</h2>
+<p>This thread contains only automated reports from the kernel test robot, with no human responses during this week's window. The two messages are near-identical in content, differing only in architecture (parisc vs. s390) and compiler (GCC vs. Clang). Both serve as actionable bug reports that Chuck Lever will need to address before the series can be merged.</p>
+<h2>Final Conclusions</h2>
+<p>The build warnings reported here indicate that:</p>
+<ol>
+<li>
+<p><strong>Patch 11/14 needs a small fix</strong> to add a forward declaration of <code>struct file_lock</code> in <code>include/linux/lockd/bind.h</code>, similar to how <code>struct nfs_fh</code> was already handled. This would make the public API header self-contained and eliminate the warning on all architectures.</p>
+</li>
+<li>
+<p><strong>This is consistent with the series' goals</strong>: The warnings are precisely the kind of hidden dependency that Chuck Lever's refactoring aims to surface and resolve. By making implicit includes explicit, the codebase becomes more maintainable and less fragile to header reorganization.</p>
+</li>
+<li>
+<p><strong>The fix should be straightforward</strong>: Adding <code>struct file_lock;</code> as a forward declaration in <code>bind.h</code> (or including <code>linux/fs.h</code> or <code>linux/filelock.h</code>) would resolve the issue across all architectures.</p>
+</li>
+</ol>
+<p>These automated reports demonstrate the effectiveness of cross-architecture CI testing in uncovering hidden header dependencies that may not manifest on more commonly tested configurations like x86_64.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/202601271122.bOzo5v5D-lkp@intel.com/">2026-01-27 kernel test robot <a href="mailto:lkp@intel.com">lkp@intel.com</a> — Re: [PATCH v3 11/14] lockd: Move xdr.h from include/linux/lockd/ to fs/lockd/ (parisc/GCC warning)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/202601271247.TFeb5MO5-lkp@intel.com/">2026-01-27 kernel test robot <a href="mailto:lkp@intel.com">lkp@intel.com</a> — Re: [PATCH v3 11/14] lockd: Move xdr.h from include/linux/lockd/ to fs/lockd/ (s390/Clang warning)</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/202601271122.bOzo5v5D-lkp@intel.com/">2026-01-27 kernel test robot <a href="mailto:lkp@intel.com">lkp@intel.com</a> — Re: [PATCH v3 11/14] lockd: Move xdr.h from include/linux/lockd/ to fs/lockd/</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/202601271247.TFeb5MO5-lkp@intel.com/">2026-01-27 kernel test robot <a href="mailto:lkp@intel.com">lkp@intel.com</a> — Re: [PATCH v3 11/14] lockd: Move xdr.h from include/linux/lockd/ to fs/lockd/</a></li>
+</ul>
+  </main>
+</body>
+</html>

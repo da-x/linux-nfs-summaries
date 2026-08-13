@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS Container Mounts and FS_USERNS_DELEGATABLE: Resolving User Namespace Restrictions</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-29</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS Container Mounts and FS_USERNS_DELEGATABLE: Resolving User Namespace Restrictions</h1>
+<h2>Summary</h2>
+<h1>NFS Mounting in Containers Blocked by User Namespace Restrictions — FS_USERNS_DELEGATABLE Proposed as Solution</h1>
+<h2>Classification</h2>
+<p><strong>Type:</strong> Kernel filesystem subsystem policy change with direct impact on NFS client behavior in containers (bug fix / security hardening discussion).</p>
+<hr />
+<h2>Overview</h2>
+<p>A long-standing thread dating back to July 2024, originally initiated by Seth Forshee (DigitalOcean) regarding a patch titled "[PATCH] fs: don't allow non-init s_user_ns for filesystems without FS_USERNS_MOUNT," saw renewed activity this week. The core issue is a security hardening proposal that would restrict which filesystems can be mounted with a non-initial user namespace (<code>s_user_ns</code>). For NFS, this has significant implications for container-based deployments where privileged daemons in the init namespace assist unprivileged containers in performing mounts.</p>
+<p>This week's discussion, occurring on January 29, 2026, centers on how to reconcile the security goal of restricting arbitrary filesystem mounts in user namespaces with the practical needs of NFS container workflows that rely on a trusted daemon model.</p>
+<hr />
+<h2>Background (Brief)</h2>
+<p>The original patch by Seth Forshee addressed an observation by Christian Brauner: it was possible for a privileged user to mount most filesystems with a non-initial user namespace in <code>sb-&gt;s_user_ns</code>, even for filesystems that do not set the <code>FS_USERNS_MOUNT</code> flag. The proposed fix would prevent this, tightening the security boundary around which filesystems can be mounted inside unprivileged user namespaces.</p>
+<hr />
+<h2>This Week's Discussion</h2>
+<h3>Jeff Layton: NFS Container Mount Workflow Broken by Proposed Restriction</h3>
+<p>Jeff Layton <a href="https://lore.kernel.org/linux-nfs/b02d93c9cd1ccda04127031155ec9b4c29ee69d5.camel@kernel.org/">raised a critical concern</a> that the proposed restriction would break NFS mounting in containers for his organization:</p>
+<blockquote>
+<p>"this patch breaks NFS mounting in containers for us, as the prohibited activity is exactly the process we use to do them."</p>
+</blockquote>
+<p>He described their container NFS mount architecture in detail:</p>
+<blockquote>
+<p>"We basically have a task in the container do an fsopen() and then pass the fd to a daemon in the init namespace via unix socket. The daemon vets the NFS mount parameters (ensuring that the mount options are sane, and that we trust the server), and then does the mount inside the container."</p>
+</blockquote>
+<p>This is a well-known pattern — sometimes called the "mountfsd model" — where an unprivileged process initiates a mount operation via <code>fsopen()</code>, but the actual mount completion is performed by a trusted privileged daemon. This allows fine-grained policy enforcement: the daemon can validate server identity, mount options, and other security-sensitive parameters before allowing the mount to proceed.</p>
+<p>Layton then articulated the core tension for NFS specifically:</p>
+<blockquote>
+<p>"We don't want to set FS_USERNS_MOUNT on NFS, because that would give the container carte blanche to mount anything it likes, even a malicious server."</p>
+</blockquote>
+<p>The concern is clear: setting <code>FS_USERNS_MOUNT</code> on NFS would allow any unprivileged user in a container to mount arbitrary NFS shares without any oversight. This could expose containers to malicious NFS servers or misconfigured mounts. However, the proposed patch would block the daemon-assisted workflow entirely, since it prohibits non-init <code>s_user_ns</code> for filesystems lacking <code>FS_USERNS_MOUNT</code>.</p>
+<p>Layton proposed splitting the flag into two distinct concepts:</p>
+<blockquote>
+<p>"Do we need to split that flag into two? Maybe FS_USERNS_SAFE and FS_USERNS_MOUNT?"</p>
+</blockquote>
+<p>This would distinguish between filesystems that are safe to mount in user namespaces (from a kernel security perspective) and those that can be freely mounted by unprivileged users without daemon assistance.</p>
+<h3>Christian Brauner: FS_USERNS_DELEGATABLE as the Solution</h3>
+<p>Christian Brauner <a href="https://lore.kernel.org/linux-nfs/20260129-zielgebiet-zutiefst-d9d9cb902f1b@brauner/">responded directly</a> to Layton's concern, identifying the workflow and offering a concrete solution:</p>
+<blockquote>
+<p>"The mountfsd model - kinda."</p>
+</blockquote>
+<p>He then proposed using an existing mechanism rather than introducing new flags:</p>
+<blockquote>
+<p>"I think you can simply add FS_USERNS_DELEGATABLE and raise it for nfs."</p>
+</blockquote>
+<p>The <code>FS_USERNS_DELEGATABLE</code> flag is part of the modern open/fsmount API infrastructure. It indicates that a filesystem supports delegation — i.e., a file descriptor from <code>fsopen()</code> can be passed across namespace boundaries (e.g., via Unix socket) to a privileged process that then completes the mount on behalf of the unprivileged caller. This precisely matches the workflow Layton described.</p>
+<hr />
+<h2>Key Technical Arguments</h2>
+<ol>
+<li>
+<p><strong>Security vs. Practicality</strong>: The original patch aims to close a security gap where filesystems without <code>FS_USERNS_MOUNT</code> can still be mounted with non-init user namespaces. However, this breaks legitimate use cases for NFS in containers that rely on the daemon-assisted mount model.</p>
+</li>
+<li>
+<p><strong>NFS Cannot Use FS_USERNS_MOUNT</strong>: Unlike some other filesystems, NFS cannot simply set <code>FS_USERNS_MOUNT</code> because doing so would allow unprivileged users to mount arbitrary remote servers without any policy enforcement — a significant security risk.</p>
+</li>
+<li>
+<p><strong>FS_USERNS_DELEGATABLE as the Middle Ground</strong>: Brauner's suggestion of using <code>FS_USERNS_DELEGATABLE</code> provides a mechanism for NFS to support container mounts via the delegation model (trusted daemon completes the mount) while still preventing unprivileged users from independently mounting arbitrary NFS shares.</p>
+</li>
+</ol>
+<hr />
+<h2>Evolution of the Discussion</h2>
+<p>The thread has been ongoing since July 2024, with this week's exchange representing a pivotal moment where:</p>
+<ul>
+<li>The practical impact on NFS container deployments was clearly articulated by Layton.</li>
+<li>A concrete resolution path was proposed by Brauner using existing kernel infrastructure (<code>FS_USERNS_DELEGATABLE</code>).</li>
+</ul>
+<hr />
+<h2>Final Conclusions</h2>
+<p>The discussion concluded with Brauner's recommendation to use <code>FS_USERNS_DELEGATABLE</code> for NFS, which would:</p>
+<ol>
+<li>Allow the daemon-assisted mount workflow (fsopen + Unix socket delegation) to continue functioning in containers.</li>
+<li>Prevent unprivileged users from independently mounting arbitrary NFS shares.</li>
+<li>Maintain the security hardening goals of the original patch without breaking legitimate container use cases.</li>
+</ol>
+<p>No further messages were posted this week, but this exchange sets up a clear path forward for NFS client development: adding <code>FS_USERNS_DELEGATABLE</code> to the NFS filesystem type would enable continued support for secure, policy-enforced NFS mounts in containers while respecting the kernel's user namespace security boundaries.</p>
+<hr />
+<h2>Significance for NFS Client Development</h2>
+<p>This discussion is directly relevant to NFS client developers working on container support:</p>
+<ol>
+<li>
+<p><strong>Container mount workflows</strong>: Organizations using the daemon-assisted <code>fsopen()</code> pattern for NFS mounts in containers need to ensure their setup is compatible with the evolving user namespace restrictions. The <code>FS_USERNS_DELEGATABLE</code> flag will be the mechanism that enables this workflow going forward.</p>
+</li>
+<li>
+<p><strong>Flag semantics</strong>: Understanding the distinction between <code>FS_USERNS_MOUNT</code> (unrestricted unprivileged mounting) and <code>FS_USERNS_DELEGATABLE</code> (delegation via trusted daemon) is essential for designing secure NFS container architectures.</p>
+</li>
+<li>
+<p><strong>Upstream changes</strong>: NFS client maintainers should track whether and when <code>FS_USERNS_DELEGATABLE</code> is added to the NFS filesystem type, as this will be required for container mount support under the tightened security model.</p>
+</li>
+</ol>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/b02d93c9cd1ccda04127031155ec9b4c29ee69d5.camel@kernel.org/">2026-01-29 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH] fs: don't allow non-init s_user_ns for filesystems without FS_USERNS_MOUNT</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260129-zielgebiet-zutiefst-d9d9cb902f1b@brauner/">2026-01-29 Christian Brauner <a href="mailto:brauner@kernel.org">brauner@kernel.org</a> — Re: [PATCH] fs: don't allow non-init s_user_ns for filesystems without FS_USERNS_MOUNT</a></li>
+</ul>
+  </main>
+</body>
+</html>

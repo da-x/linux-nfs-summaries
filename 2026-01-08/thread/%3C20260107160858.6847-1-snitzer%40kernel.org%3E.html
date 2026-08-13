@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS/localio: Deadlock Prevention and Code Cleanup Improvements</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-08</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS/localio: Deadlock Prevention and Code Cleanup Improvements</h1>
+<h2>Summary</h2>
+<h2>NFS/localio: Various Improvements to Prevent Deadlocks and Clean Up Code</h2>
+<p><strong>Type:</strong> Bug fixes and code cleanup for NFS LOCALIO support.</p>
+<p>Mike Snitzer submitted a four-patch series on January 7th, rebased on Trond Myklebust's recent NFS patchset, addressing several issues in the NFS LOCALIO subsystem — an optimization that avoids network I/O when the NFS client and server reside on the same system. The patches focus heavily on preventing deadlocks related to direct memory reclaim recursion and cleaning up now-unnecessary error handling paths.</p>
+<blockquote>
+<p>"This series has been rebased on Trond's recent patchset... but the first 2 patches were developed while chasing a particularly nasty deadlock that was reproducible when putting LOCALIO under heavy load on systems with smaller amounts of memory (16G)." — <a href="https://lore.kernel.org/linux-nfs/20260107160858.6847-1-snitzer@kernel.org/">Mike Snitzer</a></p>
+</blockquote>
+<h3>Patch 1: Prevent Direct Reclaim Recursion via GFP_NOFS</h3>
+<p>The most critical patch addresses a direct reclaim deadlock scenario where LOCALIO operations could recurse back into NFS through <code>nfs_writepages</code>. Snitzer documented the problematic stack traces observed under heavy load on memory-constrained systems (16 GB), showing tasks such as <code>khugepaged</code> and <code>nfsd</code> stuck in commit waits:</p>
+<blockquote>
+<p>"LOCALIO is an NFS loopback mount optimization that avoids using the network for READ, WRITE and COMMIT if the NFS client and server are determined to be on the same system. But because LOCALIO is still fundamentally 'just NFS loopback mount' it is susceptible to recursion deadlock via direct reclaim, e.g.: NFS LOCALIO down to XFS and then back into NFS via nfs_writepages." — <a href="https://lore.kernel.org/linux-nfs/20260107160858.6847-2-snitzer@kernel.org/">Mike Snitzer</a></p>
+</blockquote>
+<p>The fix ensures all page cache allocations in LOCALIO are performed from <code>GFP_NOFS</code> context, preventing filesystem recursion during memory reclaim. This approach was inspired by a similar XFS fix (commit ad22c7a043c2), with credit given to Ben Coddington for the suggestion.</p>
+<h3>Patch 2: Use GFP_NOIO and Non-Memreclaim Workqueue in nfs_local_commit</h3>
+<p>The second patch corrects the workqueue used for LOCALIO's SYNC operations. Snitzer notes that <code>nfslocaliod_workqueue</code> is already a non-memreclaim workqueue, but it was not being used consistently for SYNC work:</p>
+<blockquote>
+<p>"nfslocaliod_workqueue is a non-memreclaim workqueue (it isn't initialized with WQ_MEM_RECLAIM)... Use nfslocaliod_workqueue for LOCALIO's SYNC work." — <a href="https://lore.kernel.org/linux-nfs/20260107160858.6847-3-snitzer@kernel.org/">Mike Snitzer</a></p>
+</blockquote>
+<p>The patch also sets <code>PF_LOCAL_THROTTLE | PF_MEMALLOC_NOIO</code> flags in <code>nfs_local_fsync_work</code>, further hardening the code against reclaim-related deadlocks.</p>
+<h3>Patch 3: Remove Dead -EAGAIN Handling in nfs_local_doio()</h3>
+<p>This cleanup patch removes obsolete <code>-EAGAIN</code> handling code from <code>nfs_local_doio()</code>. The error path, which would call <code>nfs_localio_disable_client()</code>, was introduced in an earlier commit but has since become unreachable due to a subsequent refactoring of iocb initialization:</p>
+<blockquote>
+<p>"Handling -EAGAIN in nfs_local_doio() was introduced with commit 0978e5b85fc08... but commit e43e9a3a3d66 since eliminated the possibility for this -EAGAIN early return. So remove nfs_local_doio()'s -EAGAIN handling that calls nfs_localio_disable_client() -- while it should never happen from nfs_do_local_{read,write} this particular -EAGAIN handling is now 'dead' and so it has become a liability." — <a href="https://lore.kernel.org/linux-nfs/20260107160858.6847-4-snitzer@kernel.org/">Mike Snitzer</a></p>
+</blockquote>
+<h3>Patch 4: Simplify Return Types to void</h3>
+<p>The final patch is a minor cleanup, converting <code>nfs_local_do_read</code> and <code>nfs_local_do_write</code> to return <code>void</code> since they only ever return <code>0</code>. This simplifies the code without changing behavior.</p>
+<h3>Context: Related Deadlock Fix</h3>
+<p>Snitzer notes that the deadlock he was chasing was also addressed by a separate fix from Trond Myklebust (commit cce0be6eb497) for <code>nfs_release_folio()</code>, which resolved tasks getting stuck in commit waits during page migration and memory compaction. However, Snitzer's series remains valuable as standalone improvements to LOCALIO's robustness.</p>
+<blockquote>
+<p>"Ultimately that deadlock happens to also be fixed by Trond's recent commit... Anyway, I think this LOCALIO series is worthwhile on its own and ready for wider review and hopeful inclusion." — <a href="https://lore.kernel.org/linux-nfs/20260107160858.6847-1-snitzer@kernel.org/">Mike Snitzer</a></p>
+</blockquote>
+<h3>Summary</h3>
+<p>This patch series represents important bug fixes for NFS LOCALIO client development, addressing:</p>
+<ul>
+<li><strong>Direct reclaim recursion deadlocks</strong> via <code>GFP_NOFS</code> allocation context (Patch 1)</li>
+<li><strong>Workqueue and memory allocation flag corrections</strong> for SYNC operations (Patch 2)</li>
+<li><strong>Removal of dead error-handling code</strong> that could become a liability (Patch 3)</li>
+<li><strong>Minor code cleanup</strong> simplifying return types (Patch 4)</li>
+</ul>
+<p>The patches were reported based on real-world testing by John Cagle and verified by Allen Lu at Hammerspace. As of the end of this week, no replies or reviews had been posted to the thread.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107160858.6847-2-snitzer@kernel.org/">2026-01-07 Mike Snitzer <a href="mailto:snitzer@kernel.org">snitzer@kernel.org</a> — [PATCH 1/4] NFS/localio: prevent direct reclaim recursion into NFS via nfs_writepages</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107160858.6847-3-snitzer@kernel.org/">2026-01-07 Mike Snitzer <a href="mailto:snitzer@kernel.org">snitzer@kernel.org</a> — [PATCH 2/4] NFS/localio: use GFP_NOIO and non-memreclaim workqueue in nfs_local_commit</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107160858.6847-4-snitzer@kernel.org/">2026-01-07 Mike Snitzer <a href="mailto:snitzer@kernel.org">snitzer@kernel.org</a> — [PATCH 3/4] NFS/localio: remove -EAGAIN handling in nfs_local_doio()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107160858.6847-5-snitzer@kernel.org/">2026-01-07 Mike Snitzer <a href="mailto:snitzer@kernel.org">snitzer@kernel.org</a> — [PATCH 4/4] NFS/localio: switch nfs_local_do_read and nfs_local_do_write to return void</a></li>
+</ul>
+  </main>
+</body>
+</html>

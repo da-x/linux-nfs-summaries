@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>bio_vec RDMA API v3 Review: Iterator Conventions, MR Refactoring Debate, and v4 Committed</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-29</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>bio_vec RDMA API v3 Review: Iterator Conventions, MR Refactoring Debate, and v4 Committed</h1>
+<h2>Summary</h2>
+<h1>bio_vec RDMA API v3: Review Week — Code Style, MR Refactoring, and a v4 in Progress</h1>
+<p><strong>Type:</strong> New feature / API addition with an important bug fix (continued from prior week)</p>
+<h2>Prior Week Recap</h2>
+<p>Last week, Chuck Lever posted version 3 of his five-patch series to add a <code>bio_vec</code>-based RDMA read/write API to <code>drivers/infiniband/core/rw.c</code>, converting the NFS server-side RDMA transport (svcrdma) away from scatterlists. The v3 series incorporated Christoph Hellwig's feedback on iterator design, IOVA coalescing, and MR support, and notably introduced a new patch fixing a Send Queue sizing bug that caused exhaustion under heavy NFS WRITE workloads with memory registration enabled. See <a href="2026-01-22/thread/%3C20260122220401.1143331-1-cel%40kernel.org%3E.html">last week's summary</a> for full details.</p>
+<h2>This Week's Activity: Detailed Review and Path to v4</h2>
+<p>This week, the v3 series received thorough review from Christoph Hellwig, Zhu Yanjun, and Jason Gunthorpe. The discussion focused on code style nitpicks, API design conventions around <code>bvec_iter</code>, structural concerns about memory registration (MR) code duplication, and broader architectural vision for scatterlist elimination in the kernel.</p>
+<h3>Performance Testing Inquiry</h3>
+<p>Zhu Yanjun opened the review by asking for performance data:</p>
+<blockquote>
+<p>"Do you happen to have any performance or functional test results you could share for this series, in particular: Hardware RDMA devices (e.g., latency, bandwidth, or CPU utilization changes), and/or Software RDMA devices such as rxe or siw?" [id://c02ab348-5243-4e97-b916-6bd59ffe769a@linux.dev]</p>
+</blockquote>
+<p>Lever responded that functional tests on CX-5 InfiniBand showed no regression, but quantitative performance data was limited:</p>
+<blockquote>
+<p>"Performance tests are difficult to evaluate because I don't have a multi-client set-up here to drive a heavy workload, plus filesystems bottleneck long before the network transport does. The changes are designed to improve scalability (eg lower CPU utilization for the same workload and less interaction between host and RNIC) more than improve raw throughput." [id://d67a30a0-5ff1-4e31-a168-81f8b7bee97f@kernel.org]</p>
+</blockquote>
+<p>He noted "perhaps a bit of improvement for tail latencies" and emphasized the broader architectural goal:</p>
+<blockquote>
+<p>"The main purpose of the series, however, is part of an effort to enable kernel-wide replacement of the use of scatter-gather lists, which are technical debt. Socket APIs already support struct bio_vec." [id://d67a30a0-5ff1-4e31-a168-81f8b7bee97f@kernel.org]</p>
+</blockquote>
+<p>Zhu Yanjun acknowledged the response:</p>
+<blockquote>
+<p>"Thanks a lot. Based on the code changes, this patch series should improve performance. Unfortunately, due to various limitations, we are unable to provide performance test results." [id://6e3b0ade-6b45-4597-b065-9148c2c5e0ef@linux.dev]</p>
+</blockquote>
+<h3>Patch 1/5: Code Style Nits (Reviewed-by Retained)</h3>
+<p>Christoph Hellwig reviewed patch 1/5 with several code style observations but did not withdraw his prior <strong>Reviewed-by</strong> tag. He flagged overly long lines and questioned the open-coding of <code>mp_bvec_iter_bvec</code>:</p>
+<blockquote>
+<p>"Why is this open coding mp_bvec_iter_bvec?" [id://20260123062643.GA25786@lst.de]</p>
+</blockquote>
+<p>He also suggested using <code>bvec_virt()</code> instead of manual pointer arithmetic:</p>
+<blockquote>
+<p>"Overly long line here, which could be fixed by just using bvec_virt()." [id://20260123062643.GA25786@lst.de]</p>
+</blockquote>
+<p>These are cosmetic issues expected to be addressed in v4.</p>
+<h3>Patch 2/5: <code>bvec_iter</code> Conventions Debate</h3>
+<p>Hellwig questioned why the code used a local copy of the iterator (<code>link_iter</code>) rather than consuming the original:</p>
+<blockquote>
+<p>"Why is this using a local link_iter? We're not using iter later." [id://20260123062844.GB25786@lst.de]</p>
+</blockquote>
+<p>Lever explained his defensive programming rationale:</p>
+<blockquote>
+<p>"I think we don't want to leak a partially-updated iter if the API call returns an error." [id://d70b5896-2de8-4417-a149-0fd1c55f4d2d@app.fastmail.com]</p>
+</blockquote>
+<p>Hellwig pushed back, citing established block layer conventions:</p>
+<blockquote>
+<p>"That's how all the block layer bvec_iter-based API work. The functions consume the iter. If a caller needs to save it for some reason, it stashes away a copy." [id://20260126061433.GA1638@lst.de]</p>
+</blockquote>
+<p>This exchange highlights an ongoing effort to align the new RDMA API with established kernel <code>bvec_iter</code> conventions — a detail that matters for API consistency and future maintainability.</p>
+<h3>Patch 3/5: MR Code Duplication — The Substantive Debate</h3>
+<p>The most substantive technical discussion centered on patch 3/5, which adds Memory Registration (MR) support for bvec-based RDMA operations. Hellwig raised three concerns:</p>
+<ol>
+<li>
+<p><strong>Confusing naming</strong> between <code>rdma_rw_io_requires_mr</code> (protocol-driven, iWARP) and <code>rdma_rw_io_needs_mr</code> (threshold-driven):</p>
+<blockquote>
+<p>"I find the naming really confusing here. I guess requires is that the protocol (iWarp) doesn't work with it, needs means we need it for the number of entries." [id://20260123063622.GA26025@lst.de]</p>
+</blockquote>
+</li>
+<li>
+<p><strong>Structural design</strong> of the <code>reg</code> field in the context structure:</p>
+<blockquote>
+<p>"Jumping ahead here - why can't the sgtable be stored in -&gt;reg without renaming? Is there case where need it, but the rest of reg?" [id://20260123063622.GA26025@lst.de]</p>
+</blockquote>
+</li>
+<li>
+<p><strong>Code duplication</strong> with the existing <code>rdma_rw_init_mr_wrs</code>:</p>
+<blockquote>
+<p>"I guess you looked into that, but never replied, but this still looks like it duplicates most of rdma_rw_init_mr_wrs. Is there something that prevents reusing that directly or with minor refactoring?" [id://20260123063622.GA26025@lst.de]</p>
+</blockquote>
+</li>
+</ol>
+<p>Lever responded that both fields are needed simultaneously in the bvec path and preferred reverting to a non-union structure:</p>
+<blockquote>
+<p>"I think the answer is yes, with bvec, both fields are needed at the same time. My preference is to go back to the early form of the structure without a union, since there are API consumers who access the reg field directly." [id://9a8a0671-29a2-4220-8d38-361a6718b7ea@app.fastmail.com]</p>
+</blockquote>
+<p>Hellwig clarified his position:</p>
+<blockquote>
+<p>"What I don't understand is why it can't be added to struct rdma_rw_reg_ctx. Are there any uses of the new fields that don't have that allocated? If yes, just adding the new fields outside the union seems to cause the least churn for now, although I'd still want to clean it up later eventually." [id://20260126061631.GB1638@lst.de]</p>
+</blockquote>
+<p>On the code duplication concern, Hellwig was firm:</p>
+<blockquote>
+<p>"I was hoping we could just reuse the code instead of duplicating it. [...] not reusing the existing scatterlist code to then work on it feels wrong." [id://20260126061752.GC1638@lst.de]</p>
+</blockquote>
+<p>Lever committed to addressing this in v4:</p>
+<blockquote>
+<p>"I added a helper that refactors out the common logic. But I did that a few days ago and all of the context has dribbled out of my brain. I'll post a v4 soon, and we can continue from there." [id://38f7282c-31a6-4edf-8d5c-0d08b401f1f5@app.fastmail.com]</p>
+</blockquote>
+<h3>Patch 4/5: SQ Sizing Bug Fix — Clean Reviewed-by</h3>
+<p>The Send Queue sizing bug fix patch received an unqualified <strong>Reviewed-by</strong> from Hellwig:</p>
+<blockquote>
+<p>"Looks good: Reviewed-by: Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a>" [id://20260123063652.GB26025@lst.de]</p>
+</blockquote>
+<p>This is the most straightforward acceptance in the thread, reflecting consensus on the importance of this fix for NFS server stability under heavy WRITE workloads with memory registration.</p>
+<h3>Broader Vision: Scatterlist Elimination</h3>
+<p>Jason Gunthorpe weighed in on the overarching architectural motivation:</p>
+<blockquote>
+<p>"I haven't imagined tree wide, but I am envisioning a world where a modern server runs all its primary IO paths without using scatterlist." [id://20260126171319.GO1134360@nvidia.com]</p>
+</blockquote>
+<p>This endorsement from the RDMA subsystem maintainer reinforces that this series is not merely an optimization for svcrdma but part of a kernel-wide initiative to eliminate scatterlist technical debt.</p>
+<h2>Evolution and Conclusions</h2>
+<p>The discussion evolved from initial questions about performance data (Jan 23) through detailed code review (Jan 23–24) to structural debates about MR code organization (Jan 26), culminating in Lever's commitment to a v4 release. Key outcomes:</p>
+<ol>
+<li><strong>Patch 1/5</strong>: Cosmetic fixes needed (line length, use of <code>bvec_virt()</code> and <code>mp_bvec_iter_bvec</code>). Reviewed-by retained.</li>
+<li><strong>Patch 2/5</strong>: Iterator consumption convention should follow block layer patterns — consume the iter directly rather than using a local copy.</li>
+<li><strong>Patch 3/5</strong>: Requires refactoring to eliminate code duplication with <code>rdma_rw_init_mr_wrs</code> and resolve structural concerns about the <code>reg</code> field. This is the primary blocker for v4.</li>
+<li><strong>Patch 4/5</strong>: Clean Reviewed-by — ready to land pending series acceptance.</li>
+<li><strong>Patch 5/5</strong> (svcrdma conversion): No specific review this week; implicitly depends on patches 1–4 being finalized.</li>
+</ol>
+<h2>Significance for NFS Client and Server Development</h2>
+<p>While this series primarily targets the NFS <em>server</em> side (svcrdma), it has implications for NFS client development as well:</p>
+<ul>
+<li><strong>Correctness fix</strong>: The SQ sizing bug fix (patch 4/5) prevents Send Queue exhaustion on NFS servers under heavy WRITE workloads with memory registration — a scenario increasingly relevant as iWARP adoption grows.</li>
+<li><strong>Scalability improvements</strong>: By eliminating scatterlist conversions, the server-side RDMA path reduces CPU overhead and IOTLB synchronization costs, benefiting large compound NFS operations.</li>
+<li><strong>API direction</strong>: The kernel-wide push toward <code>bio_vec</code> over scatterlists may eventually influence NFS client RDMA code paths (pnfs/blocklayout) as those subsystems evolve.</li>
+</ul>
+<h2>Status</h2>
+<p>Chuck Lever has committed to posting v4 soon, incorporating Hellwig's feedback on iterator conventions and MR code refactoring. The series is expected to proceed through the RDMA subsystem tree once review concerns are resolved.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/c02ab348-5243-4e97-b916-6bd59ffe769a@linux.dev/">2026-01-23 Zhu Yanjun <a href="mailto:yanjun.zhu@linux.dev">yanjun.zhu@linux.dev</a> — Re: [PATCH v3 0/5] Add a bio_vec based API to core/rw.c</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260123062643.GA25786@lst.de/">2026-01-23 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: [PATCH v3 1/5] RDMA/core: add bio_vec based RDMA read/write API</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260123062844.GB25786@lst.de/">2026-01-23 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: [PATCH v3 2/5] RDMA/core: use IOVA-based DMA mapping for bvec RDMA operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260123063622.GA26025@lst.de/">2026-01-23 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: [PATCH v3 3/5] RDMA/core: add MR support for bvec-based RDMA operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260123063652.GB26025@lst.de/">2026-01-23 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: [PATCH v3 4/5] RDMA/core: add rdma_rw_max_sge() helper for SQ sizing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/d67a30a0-5ff1-4e31-a168-81f8b7bee97f@kernel.org/">2026-01-23 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v3 0/5] Add a bio_vec based API to core/rw.c</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/d70b5896-2de8-4417-a149-0fd1c55f4d2d@app.fastmail.com/">2026-01-23 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v3 2/5] RDMA/core: use IOVA-based DMA mapping for bvec RDMA operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/d868e180-b6ed-4b3b-afc6-7f08083615c1@app.fastmail.com/">2026-01-23 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v3 3/5] RDMA/core: add MR support for bvec-based RDMA operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/9a8a0671-29a2-4220-8d38-361a6718b7ea@app.fastmail.com/">2026-01-23 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v3 3/5] RDMA/core: add MR support for bvec-based RDMA operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/6e3b0ade-6b45-4597-b065-9148c2c5e0ef@linux.dev/">2026-01-24 Zhu Yanjun <a href="mailto:yanjun.zhu@linux.dev">yanjun.zhu@linux.dev</a> — Re: [PATCH v3 0/5] Add a bio_vec based API to core/rw.c</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260126061433.GA1638@lst.de/">2026-01-26 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: [PATCH v3 2/5] RDMA/core: use IOVA-based DMA mapping for bvec RDMA operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260126061631.GB1638@lst.de/">2026-01-26 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: [PATCH v3 3/5] RDMA/core: add MR support for bvec-based RDMA operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260126061752.GC1638@lst.de/">2026-01-26 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: [PATCH v3 3/5] RDMA/core: add MR support for bvec-based RDMA operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/38f7282c-31a6-4edf-8d5c-0d08b401f1f5@app.fastmail.com/">2026-01-26 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v3 3/5] RDMA/core: add MR support for bvec-based RDMA operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260126171319.GO1134360@nvidia.com/">2026-01-26 Jason Gunthorpe <a href="mailto:jgg@nvidia.com">jgg@nvidia.com</a> — Re: [PATCH v3 0/5] Add a bio_vec based API to core/rw.c</a></li>
+</ul>
+  </main>
+</body>
+</html>

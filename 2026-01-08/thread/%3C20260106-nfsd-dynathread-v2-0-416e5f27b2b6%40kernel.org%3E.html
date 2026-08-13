@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD/SUNRPC: Dynamically-Sized Thread Pool for nfsd (v2 Applied)</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-08</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD/SUNRPC: Dynamically-Sized Thread Pool for nfsd (v2 Applied)</h1>
+<h2>Summary</h2>
+<h1>NFSD/SUNRPC: Dynamically-Sized Thread Pool for nfsd (v2 Applied)</h1>
+<h2>Summary</h2>
+<p>This week, Jeff Layton posted <strong>version 2</strong> of an eight-patch series introducing dynamic thread pool sizing to the NFS server (NFSD) and the underlying SUNRPC service infrastructure. This is classified as a <strong>new feature</strong>, not a bug fix or protocol change. The series was positively reviewed by NFSD maintainer Chuck Lever and subsequently applied to the <code>nfsd-testing</code> tree on January 8th.</p>
+<h2>Background</h2>
+<p>Prior to this work, nfsd operated with a statically-configured number of threads per pool — set at startup via the traditional <code>threads</code> parameter. This meant that servers either had to over-provision threads (wasting resources during idle periods) or under-provision them (limiting throughput during peak loads). The dynamic thread pool feature allows nfsd to automatically scale its thread count up and down based on actual workload demand.</p>
+<h2>Patch Series Breakdown</h2>
+<p>The eight-patch series, posted on January 6th, is structured as follows:</p>
+<h3>Preparatory SUNRPC Refactoring (Patches 1-3)</h3>
+<p><strong>Patch 1/8</strong> — <em>sunrpc: split svc_set_num_threads() into two functions</em> <a href="https://lore.kernel.org/linux-nfs/20260106-nfsd-dynathread-v2-1-416e5f27b2b6@kernel.org/">Jeff Layton</a></p>
+<p>The existing <code>svc_set_num_threads()</code> handled two divergent codepaths: setting threads for a single pool (when given a pool pointer) and distributing threads evenly across all pools (when given NULL). This patch splits these into separate helpers — the new <code>svc_set_pool_threads()</code> for per-pool control and a streamlined <code>svc_set_num_threads()</code> for global distribution.</p>
+<p><strong>Patch 2/8</strong> — <em>sunrpc: remove special handling of NULL pool from svc_start/stop_kthreads()</em> <a href="https://lore.kernel.org/linux-nfs/20260106-nfsd-dynathread-v2-2-416e5f27b2b6@kernel.org/">Jeff Layton</a></p>
+<p>Further cleanup removing legacy NULL-pool special-casing in thread start/stop functions, simplifying the codebase for dynamic threading.</p>
+<p><strong>Patch 3/8</strong> — <em>sunrpc: track the max number of requested threads in a pool</em> <a href="https://lore.kernel.org/linux-nfs/20260106-nfsd-dynathread-v2-3-416e5f27b2b6@kernel.org/">Jeff Layton</a></p>
+<p>Adds tracking of the maximum requested thread count per pool, establishing the upper bound for dynamic scaling.</p>
+<h3>Core Dynamic Threading Infrastructure (Patches 4-6)</h3>
+<p><strong>Patch 4/8</strong> — <em>sunrpc: introduce the concept of a minimum number of threads per pool</em> <a href="https://lore.kernel.org/linux-nfs/20260106-nfsd-dynathread-v2-4-416e5f27b2b6@kernel.org/">Jeff Layton</a></p>
+<p>This patch introduces the <code>sp_nrthrmin</code> field to track a minimum thread count per pool. The key behavioral change: when <code>min_threads</code> is non-zero and less than the max, the server starts at the minimum and scales up as needed. As Layton explains in the cover letter [Jeff Layton](https://lore.kernel.org/linux-nfs/20260106-nfsd-dynathread-v2-0-416e5f27b2b6@kernel.org&gt;:</p>
+<blockquote>
+<p>"When the minimum is set to a non-zero value, the traditional 'threads' setting is interpreted as a maximum number of threads instead of a static count. The server will start the minimum number of threads, and then ramp up the thread count as needed. When the server is idle, it will gradually ramp down the thread count."</p>
+</blockquote>
+<p><strong>Patch 5/8</strong> — <em>sunrpc: split new thread creation into a separate function</em> <a href="id://%3C20260106-nfsd-dynathread-v2-5-416e5f27b2b6@kernel.org/">Jeff Layton</a></p>
+<p>Refactors thread creation logic into its own function, enabling the dynamic scaling code to spawn new threads on demand.</p>
+<p><strong>Patch 6/8</strong> — <em>sunrpc: allow svc_recv() to return -ETIMEDOUT and -EBUSY</em> <a href="https://lore.kernel.org/linux-nfs/20260106-nfsd-dynathread-v2-6-416e5f27b2b6@kernel.org/">Jeff Layton</a></p>
+<p>A critical change for the feedback mechanism. <code>svc_recv()</code> now accepts a timeout parameter and can return:</p>
+<ul>
+<li><strong>-ETIMEDOUT</strong>: When a thread waits the full timeout period with no work, signaling that the service is idle and threads could be retired.</li>
+<li><strong>-EBUSY</strong>: When a thread wakes up, finds pending work but no available threads, signaling that more threads are needed.</li>
+</ul>
+<p>As described in the patch:</p>
+<blockquote>
+<p>"If it wakes up, finds that there is more work and that no threads are available, then attempt to set SP_TASK_STARTING. If wasn't already set, have the task return -EBUSY to cue to the caller that the service could use more threads."</p>
+</blockquote>
+<h3>NFSD Integration (Patches 7-8)</h3>
+<p><strong>Patch 7/8</strong> — <em>nfsd: adjust number of running nfsd threads based on activity</em> <a href="https://lore.kernel.org/linux-nfs/20260106-nfsd-dynathread-v2-7-416e5f27b2b6@kernel.org/">Jeff Layton</a></p>
+<p>The core dynamic scaling logic in the nfsd thread function. On <code>-ETIMEDOUT</code>, a thread marks itself as <code>RQ_VICTIM</code> for exit (if above minimum). On <code>-EBUSY</code>, it attempts to spawn a new thread (if below maximum), serialized via the <code>SP_TASK_STARTING</code> flag and <code>mutex_trylock()</code>.</p>
+<p>Notably, NeilBrown contributed co-authorship with an important design note:</p>
+<blockquote>
+<p>"I think we want memory pressure to be able to push a thread into returning -ETIMEDOUT. That can come later."</p>
+</blockquote>
+<p><strong>Patch 8/8</strong> — <em>nfsd: add controls to set the minimum number of threads per pool</em> <a href="https://lore.kernel.org/linux-nfs/20260106-nfsd-dynathread-v2-8-416e5f27b2b6@kernel.org/">Jeff Layton</a></p>
+<p>Adds user-facing controls via both nfsdfs and netlink interfaces, allowing administrators to configure <code>min_threads</code> per pool from userland.</p>
+<h2>Key v2 Changes</h2>
+<p>Layton highlighted several improvements over v1 in the cover letter [Jeff Layton](https://lore.kernel.org/linux-nfs/20260106-nfsd-dynathread-v2-0-416e5f27b2b6@kernel.org&gt;:</p>
+<blockquote>
+<p>"Changes in v2:</p>
+<ul>
+<li>svc_recv(/) now takes a timeout parameter. This should mean that non-dynamic RPC services are unaffected by these changes.</li>
+<li>if min_threads is larger than the max, then clamp it to the max</li>
+<li>simplify SP_TASK_STARTING usage. Have same task set and clear it.</li>
+<li>rework thread starting logic (EBUSY handling)</li>
+<li>reorder arguments to svc_set_num_threads() and svc_set_pool_threads()</li>
+<li>break up larger patches"</li>
+</ul>
+</blockquote>
+<p>The timeout parameter for <code>svc_recv()</code> is particularly significant — it ensures backward compatibility with non-dynamic RPC services (like lockd and NFS callbacks) that continue to use the traditional blocking wait behavior.</p>
+<h2>Discussion and Outcome</h2>
+<p>Chuck Lever provided a swift and positive review:</p>
+<blockquote>
+<p>"I'm comfortable with this series. Let me know when you are ready for me to apply it." <a href="https://lore.kernel.org/linux-nfs/5081c9a2-2a2a-469d-9df8-eef6be2d05ac@app.fastmail.com/">Chuck Lever</a></p>
+</blockquote>
+<p>Layton responded that he wanted to get the series into testing quickly:</p>
+<blockquote>
+<p>"I think it'd be great to put this in nfsd-testing soon so we can start playing with it. I'll plan to post the nfs-utils patches for this in the near future too (they need a bit more work)." <a href="https://lore.kernel.org/linux-nfs/9409276a27b852abb276616ff38638d7abf8de82.camel@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<p>Chuck Lever applied all eight patches to <code>nfsd-testing</code> on January 8th:</p>
+<blockquote>
+<p>"Applied to nfsd-testing, thanks!" <a href="https://lore.kernel.org/linux-nfs/176783211844.3906223.2883879157306428101.b4-ty@oracle.com/">Chuck Lever</a></p>
+</blockquote>
+<h2>Significance for NFS Development</h2>
+<p>This feature represents a meaningful step forward in NFSD resource management:</p>
+<ol>
+<li>
+<p><strong>Resource efficiency</strong>: Servers can now start with a minimal thread footprint and scale up only when demand warrants it, reducing CPU overhead during idle periods.</p>
+</li>
+<li>
+<p><strong>Backward compatibility</strong>: The design is carefully backward-compatible. When <code>min_threads</code> is zero (the default), behavior is unchanged — the server runs the full static thread count as before. This allows safe deployment across mixed kernel environments.</p>
+</li>
+<li>
+<p><strong>Graceful degradation</strong>: As Layton noted [Jeff Layton](https://lore.kernel.org/linux-nfs/20260106-nfsd-dynathread-v2-0-416e5f27b2b6@kernel.org&gt;:</p>
+</li>
+</ol>
+<blockquote>
+<p>"This control scheme should allow us to sanely switch between kernels that do and do not support dynamic threading. In the case where dynamic threading is not supported, the user will just get the static maximum number of threads, just like they do today."</p>
+</blockquote>
+<ol start="4">
+<li><strong>Userland tooling pending</strong>: Layton indicated that complementary nfs-utils patches are forthcoming, which will enable administrators to configure the new <code>min_threads</code> controls from userspace.</li>
+</ol>
+<h2>Conclusion</h2>
+<p>The dynamic thread pool feature for NFSD has been successfully merged into the <code>nfsd-testing</code> tree following a clean v2 review cycle. The implementation is architecturally sound — introducing minimum/maximum thread bounds in SUNRPC, using timeout-based feedback via <code>-ETIMEDOUT</code> and <code>-EBUSY</code> return codes, and maintaining full backward compatibility with existing NFS server configurations. Future work includes benchmarking performance impact (noted as pending by Layton/) and potential integration of memory pressure signals into the scaling decision logic (suggested by NeilBrown).</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260106-nfsd-dynathread-v2-0-416e5f27b2b6@kernel.org/">2026-01-06 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v2 0/8] nfsd, sunrpc: allow for a dynamically-sized threadpool</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260106-nfsd-dynathread-v2-1-416e5f27b2b6@kernel.org/">2026-01-06 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v2 1/8] sunrpc: split svc_set_num_threads() into two functions</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260106-nfsd-dynathread-v2-2-416e5f27b2b6@kernel.org/">2026-01-06 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v2 2/8] sunrpc: remove special handling of NULL pool from svc_start/stop_kthreads()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260106-nfsd-dynathread-v2-3-416e5f27b2b6@kernel.org/">2026-01-06 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v2 3/8] sunrpc: track the max number of requested threads in a pool</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260106-nfsd-dynathread-v2-4-416e5f27b2b6@kernel.org/">2026-01-06 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v2 4/8] sunrpc: introduce the concept of a minimum number of threads per pool</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260106-nfsd-dynathread-v2-5-416e5f27b2b6@kernel.org/">2026-01-06 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v2 5/8] sunrpc: split new thread creation into a separate function</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260106-nfsd-dynathread-v2-6-416e5f27b2b6@kernel.org/">2026-01-06 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v2 6/8] sunrpc: allow svc_recv() to return -ETIMEDOUT and -EBUSY</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260106-nfsd-dynathread-v2-7-416e5f27b2b6@kernel.org/">2026-01-06 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v2 7/8] nfsd: adjust number of running nfsd threads based on activity</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260106-nfsd-dynathread-v2-8-416e5f27b2b6@kernel.org/">2026-01-06 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v2 8/8] nfsd: add controls to set the minimum number of threads per pool</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/5081c9a2-2a2a-469d-9df8-eef6be2d05ac@app.fastmail.com/">2026-01-06 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v2 0/8] nfsd, sunrpc: allow for a dynamically-sized threadpool</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/9409276a27b852abb276616ff38638d7abf8de82.camel@kernel.org/">2026-01-06 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v2 0/8] nfsd, sunrpc: allow for a dynamically-sized threadpool</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/176783211844.3906223.2883879157306428101.b4-ty@oracle.com/">2026-01-08 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v2 0/8] nfsd, sunrpc: allow for a dynamically-sized threadpool</a></li>
+</ul>
+  </main>
+</body>
+</html>

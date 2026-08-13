@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>bio_vec RDMA API: Scatterlist Removal Roadmap, iWARP MR, and P2P Deferral</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-22</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>bio_vec RDMA API: Scatterlist Removal Roadmap, iWARP MR, and P2P Deferral</h1>
+<h2>Summary</h2>
+<h1>bio_vec-Based RDMA Read/Write API for svcrdma — Week of Jan 16–22</h1>
+<h2>Classification</h2>
+<p><strong>New feature / API addition</strong> with performance optimization, targeting the NFS server-side RDMA transport (svcrdma) and the broader RDMA core subsystem.</p>
+<h2>Prior Week Recap</h2>
+<p>Last week, Chuck Lever introduced a four-patch series to add <code>bio_vec</code>-based RDMA read/write APIs in <code>drivers/infiniband/core/rw.c</code>, eliminating unnecessary scatterlist conversions for callers that already maintain data in <code>bio_vec</code> format. Christoph Hellwig raised substantive concerns about API design (code duplication with the scatterlist path), IOVA mapping correctness, and page alignment constraints. Leon Romanovsky provided encouraging initial feedback. Lever responded to questions about dynamic allocation and <code>xdr_buf</code> page alignment semantics.</p>
+<h2>This Week's Discussion</h2>
+<p>The conversation this week focused on three main themes: <strong>(1)</strong> whether to eventually eliminate scatterlist support from the RDMA core rw.c code, <strong>(2)</strong> iWARP memory registration requirements and the path toward a native bvec-based MR API, and <strong>(3)</strong> peer-to-peer (P2P) RDMA support for the new bvec API.</p>
+<h3>1. Eliminating Scatterlist Support — A Shared Vision</h3>
+<p>The most significant development this week was a strong alignment between the RDMA subsystem maintainers on the long-term direction: removing scatterlist-based APIs from <code>rw.c</code> entirely in favor of <code>bio_vec</code>.</p>
+<p>Christoph Hellwig had suggested last week that if the bvec and scatterlist code paths weren't unified, "we'll just need to migrate everyone off the scatterlist version ASAP." Leon Romanovsky confirmed this was the intended direction:</p>
+<blockquote>
+<p>"I had short offline discussion with Jason about this series and both of us would be more than happy to get rid of 'scatterlist version'." <a href="https://lore.kernel.org/linux-nfs/20260116113310.GF14359@unreal/">Leon Romanovsky</a></p>
+</blockquote>
+<p>Hellwig then highlighted the scope of the migration effort, noting that <code>nvmet_rdma_rw_ctx_init</code> is used by <strong>isert, srpt, nvmet, ksmbd, and the sunrpc server side</strong>:</p>
+<blockquote>
+<p>"I don't think any of them should be super complicated to work, but it will need a fair amount of testing resources." <a href="https://lore.kernel.org/linux-nfs/20260116145206.GB16842@lst.de/">Christoph Hellwig</a></p>
+</blockquote>
+<p>Chuck Lever advocated for keeping the current series narrowly scoped — introducing the new API with one consumer (svcrdma), and letting other conversions be done incrementally by domain experts:</p>
+<blockquote>
+<p>"My preference is to keep the scope of this series narrow -- introduce the new API, and add one consumer for it. The other conversions can then each be done by domain experts as they have time." <a href="https://lore.kernel.org/linux-nfs/19c34c0c-5391-477b-892c-00ab124e543b@app.fastmail.com/">Chuck Lever</a></p>
+</blockquote>
+<p>He added:</p>
+<blockquote>
+<p>"I have no strong feeling for or against eventually removing SGL support entirely from rw.c." <a href="https://lore.kernel.org/linux-nfs/19c34c0c-5391-477b-892c-00ab124e543b@app.fastmail.com/">Chuck Lever</a></p>
+</blockquote>
+<p>Leon acknowledged this pragmatic approach:</p>
+<blockquote>
+<p>"Of course, I'm only outlining the direction in which the RDMA subsystem is expected to evolve." <a href="https://lore.kernel.org/linux-nfs/20260116211413.GH14359@unreal/">Leon Romanovsky</a></p>
+</blockquote>
+<h3>2. iWARP Memory Registration and the bvec MR API</h3>
+<p>On patch 3/4 (MR support for bvec-based operations), Leon asked why iWARP needed a special case:</p>
+<blockquote>
+<p>"Do you know why we need a special case here? Is there a reason we cannot avoid using scatterlists for iWARP as well, now or in the future?" <a href="https://lore.kernel.org/linux-nfs/20260116114236.GG14359@unreal/">Leon Romanovsky</a></p>
+</blockquote>
+<p>Hellwig explained that iWARP must use Memory Regions (MRs) for RDMA READ destinations, and the core RW code can optionally use MRs for other purposes too. A native bvec-based <code>ib_map_mr_sg</code> would be needed to fully eliminate scatterlists:</p>
+<blockquote>
+<p>"iWarp must use MRs for the destination of RDMA READ operations, but the core RW code can also optionally use it for other things. So to support that natively here we'd need a bvec-based version of ib_map_mr_sg." <a href="https://lore.kernel.org/linux-nfs/20260116145027.GA16842@lst.de/">Christoph Hellwig</a></p>
+</blockquote>
+<p>He acknowledged the current scatterlist emulation approach as an acceptable interim solution:</p>
+<blockquote>
+<p>"Which would be really nice to have for the storage host drivers anyway, but until then the scatterlist emulation here can do. And implementing it might take a while, as ib_map_mr_sg is a very thin wrapper around a call into the low-level driver." <a href="https://lore.kernel.org/linux-nfs/20260116145027.GA16842@lst.de/">Christoph Hellwig</a></p>
+</blockquote>
+<p>Leon confirmed this was on his roadmap:</p>
+<blockquote>
+<p>"It is in my roadmap, but as you said, it will take time :(" <a href="https://lore.kernel.org/linux-nfs/20260116211631.GI14359@unreal/">Leon Romanovsky</a></p>
+</blockquote>
+<h3>3. Page Alignment Constraints Resolved</h3>
+<p>Hellwig's earlier concern about page alignment was clarified. He confirmed that both classic RDMA memory registrations and IOVA-based DMA mapping require subsequent entries to be at least page-aligned:</p>
+<blockquote>
+<p>"Yeah. I also realized both the classic RDMA memory registrations, and the IOVA based DMA mapping requires the subsequent entries to be at least page aligned." <a href="https://lore.kernel.org/linux-nfs/20260116093836.GA23431@lst.de/">Christoph Hellwig</a></p>
+</blockquote>
+<p>He noted a Mellanox-specific MR type that doesn't require this, but acknowledged it wouldn't help iWARP and that IOVA coalescing remains valuable.</p>
+<h3>4. Peer-to-Peer (P2P) RDMA Support — Deferred</h3>
+<p>Leon suggested extending the bvec API to support P2P scenarios:</p>
+<blockquote>
+<p>"It would also be worthwhile to support P2P scenarios in this flow." <a href="https://lore.kernel.org/linux-nfs/20260116212425.GJ14359@unreal/">Leon Romanovsky</a></p>
+</blockquote>
+<p>Lever offered to add the code but noted a testing gap:</p>
+<blockquote>
+<p>"I can add some code to this series to do that, but I don't believe I have facilities to test it." <a href="https://lore.kernel.org/linux-nfs/bad1a0d2-6408-4d0b-a421-f1e35265ac28@app.fastmail.com/">Chuck Lever</a></p>
+</blockquote>
+<p>Hellwig firmly pushed back against merging untested code:</p>
+<blockquote>
+<p>"Please don't add untested code. If Leon wants the P2P support and volunteers to test it, sure. But let's not merge it without being tested." <a href="https://lore.kernel.org/linux-nfs/20260119065212.GA1423@lst.de/">Christoph Hellwig</a></p>
+</blockquote>
+<p>He also questioned whether P2P would naturally fit into NFS:</p>
+<blockquote>
+<p>"And at least for NFS I don't really see how P2P would easily fit in anyway." <a href="https://lore.kernel.org/linux-nfs/20260119065212.GA1423@lst.de/">Christoph Hellwig</a></p>
+</blockquote>
+<p>Leon countered that the new API would also benefit NVMe, where P2P could be more useful:</p>
+<blockquote>
+<p>"Chuck is proposing a new IB/core API that will also be used by NVMe too. Wouldn't p2p be useful in the general case" <a href="https://lore.kernel.org/linux-nfs/20260119102857.GI13201@unreal/">Leon Romanovsky</a></p>
+</blockquote>
+<p>Hellwig acknowledged P2P could theoretically work with NFS now that direct I/O support exists, but would require substantial effort:</p>
+<blockquote>
+<p>"Well, P2P into a CMB might work in nfsd in theory now that there is direct I/O support, but it'll require a lot of work." <a href="https://lore.kernel.org/linux-nfs/20260119120311.GA23572@lst.de/">Christoph Hellwig</a></p>
+</blockquote>
+<p>He suggested the nvmet conversion series would be the right place to add and test P2P support:</p>
+<blockquote>
+<p>"So if you want to help to convert nvmet, the series to do that would be the right place to add P2P support, as with that we can actually test it." <a href="https://lore.kernel.org/linux-nfs/20260119120311.GA23572@lst.de/">Christoph Hellwig</a></p>
+</blockquote>
+<p>Lever agreed and confirmed he already had a patch but would defer it:</p>
+<blockquote>
+<p>"I can understand that P2P is not in the narrow scope of the existing series. I have a patch now, but I'll postpone it until later." <a href="https://lore.kernel.org/linux-nfs/b8001e1b-9cca-46fd-80fe-b8243fb74ae2@app.fastmail.com/">Chuck Lever</a></p>
+</blockquote>
+<h3>5. LSF/MM Roadmap Discussion</h3>
+<p>Leon proposed discussing the broader P2P and scatterlist removal roadmap in person at LSF/MM:</p>
+<blockquote>
+<p>"If both of you plan to attend LSF/MM this year, and I receive an invitation as well, we can discuss the future p2p roadmap in person and how we want to move forward." <a href="https://lore.kernel.org/linux-nfs/20260119183420.GP13201@unreal/">Leon Romanovsky</a></p>
+</blockquote>
+<p>He noted that most items from their previous year's discussion have been completed or are on track, with the remaining major item being:</p>
+<blockquote>
+<p>"The remaining big item which is left is removing SG from RDMA." <a href="https://lore.kernel.org/linux-nfs/20260119183420.GP13201@unreal/">Leon Romanovsky</a></p>
+</blockquote>
+<h2>Key Technical Conclusions</h2>
+<ol>
+<li>
+<p><strong>Consensus on scatterlist removal</strong>: All three participants agree that scatterlist-based APIs in <code>rw.c</code> should eventually be eliminated in favor of <code>bio_vec</code>. The current series is a stepping stone toward that goal.</p>
+</li>
+<li>
+<p><strong>Incremental migration strategy</strong>: Lever will keep this series narrowly scoped (svcrdma only), with other consumers (isert, srpt, nvmet, ksmbd) to be converted separately by their domain experts.</p>
+</li>
+<li>
+<p><strong>iWARP MR support via scatterlist emulation</strong>: The current approach of constructing a synthetic scatterlist from bvec DMA addresses for <code>ib_map_mr_sg()</code> is accepted as an interim solution until a native bvec-based MR API can be developed — work that Leon has on his roadmap.</p>
+</li>
+<li>
+<p><strong>P2P support deferred</strong>: P2P RDMA support for the bvec API is acknowledged as valuable (especially for NVMe) but will not be included in this series due to testing constraints. It may be added during the nvmet conversion effort, where test infrastructure exists.</p>
+</li>
+<li>
+<p><strong>Page alignment confirmed</strong>: The requirement that subsequent <code>bio_vec</code> entries be page-aligned is confirmed as a constraint of both classic MR registration and IOVA-based DMA mapping, consistent with how <code>xdr_buf</code> represents pages in NFSD.</p>
+</li>
+<li>
+<p><strong>LSF/MM follow-up planned</strong>: The broader roadmap for P2P support and scatterlist removal will be discussed at LSF/MM if participants attend.</p>
+</li>
+</ol>
+<h2>Status</h2>
+<p>The thread concluded with strong alignment on direction but no revised patches this week. The series remains under review, with open items including Hellwig's earlier suggestions about API consolidation (unifying bvec and scatterlist inner loops) and potential <code>bvec_iter</code> usage. The P2P feature has been explicitly deferred to a future effort tied to the nvmet conversion.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260116093836.GA23431@lst.de/">2026-01-16 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: [PATCH v1 4/4] svcrdma: use bvec-based RDMA read/write API</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260116113310.GF14359@unreal/">2026-01-16 Leon Romanovsky <a href="mailto:leon@kernel.org">leon@kernel.org</a> — Re: [PATCH v1 1/4] RDMA/core: add bio_vec based RDMA read/write API</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260116114236.GG14359@unreal/">2026-01-16 Leon Romanovsky <a href="mailto:leon@kernel.org">leon@kernel.org</a> — Re: [PATCH v1 3/4] RDMA/core: add MR support for bvec-based RDMA operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260116145027.GA16842@lst.de/">2026-01-16 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: [PATCH v1 3/4] RDMA/core: add MR support for bvec-based RDMA operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260116145206.GB16842@lst.de/">2026-01-16 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: [PATCH v1 1/4] RDMA/core: add bio_vec based RDMA read/write API</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/19c34c0c-5391-477b-892c-00ab124e543b@app.fastmail.com/">2026-01-16 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v1 1/4] RDMA/core: add bio_vec based RDMA read/write API</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260116211413.GH14359@unreal/">2026-01-16 Leon Romanovsky <a href="mailto:leon@kernel.org">leon@kernel.org</a> — Re: [PATCH v1 1/4] RDMA/core: add bio_vec based RDMA read/write API</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260116211631.GI14359@unreal/">2026-01-16 Leon Romanovsky <a href="mailto:leon@kernel.org">leon@kernel.org</a> — Re: [PATCH v1 3/4] RDMA/core: add MR support for bvec-based RDMA operations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260116212425.GJ14359@unreal/">2026-01-16 Leon Romanovsky <a href="mailto:leon@kernel.org">leon@kernel.org</a> — Re: [PATCH v1 1/4] RDMA/core: add bio_vec based RDMA read/write API</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/bad1a0d2-6408-4d0b-a421-f1e35265ac28@app.fastmail.com/">2026-01-16 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v1 1/4] RDMA/core: add bio_vec based RDMA read/write API</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260117162056.GK14359@unreal/">2026-01-17 Leon Romanovsky <a href="mailto:leon@kernel.org">leon@kernel.org</a> — Re: [PATCH v1 1/4] RDMA/core: add bio_vec based RDMA read/write API</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260119065212.GA1423@lst.de/">2026-01-19 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: [PATCH v1 1/4] RDMA/core: add bio_vec based RDMA read/write API</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260119102857.GI13201@unreal/">2026-01-19 Leon Romanovsky <a href="mailto:leon@kernel.org">leon@kernel.org</a> — Re: [PATCH v1 1/4] RDMA/core: add bio_vec based RDMA read/write API</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260119120311.GA23572@lst.de/">2026-01-19 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: [PATCH v1 1/4] RDMA/core: add bio_vec based RDMA read/write API</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/b8001e1b-9cca-46fd-80fe-b8243fb74ae2@app.fastmail.com/">2026-01-19 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v1 1/4] RDMA/core: add bio_vec based RDMA read/write API</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260119183420.GP13201@unreal/">2026-01-19 Leon Romanovsky <a href="mailto:leon@kernel.org">leon@kernel.org</a> — Re: [PATCH v1 1/4] RDMA/core: add bio_vec based RDMA read/write API</a></li>
+</ul>
+  </main>
+</body>
+</html>

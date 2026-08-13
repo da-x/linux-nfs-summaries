@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Re-enable IOCB_NOWAIT Writes to Files v5: Non-Blocking Timestamp Updates</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-08</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Re-enable IOCB_NOWAIT Writes to Files v5: Non-Blocking Timestamp Updates</h1>
+<h2>Summary</h2>
+<h1>Re-enable IOCB_NOWAIT Writes to Files (v5)</h1>
+<p>Christoph Hellwig posted version 5 of his series to <a href="https://lore.kernel.org/linux-nfs/20260106075008.1610195-1-hch@lst.de/">re-enable <code>IOCB_NOWAIT</code> writes to files</a>, addressing a performance regression introduced by commit 66fa3cedf16a ("fs: Add async write file modification handling."). The series consists of 11 patches that refactor the VFS timestamp update infrastructure and add non-blocking lazytime support, with XFS as the first filesystem implementation.</p>
+<h2>Background: The IOCB_NOWAIT Problem</h2>
+<p>The cover letter explains the core issue:</p>
+<blockquote>
+<p>"commit 66fa3cedf16a ("fs: Add async write file modification handling.") effectively disabled IOCB_NOWAIT writes as timestamp updates currently always require blocking, and the modern timestamp resolution means we always update timestamps. This leads to a lot of context switches from applications using io_uring to submit file writes, making it often worse than using the legacy aio code that is not using IOCB_NOWAIT."</p>
+</blockquote>
+<p>The series aims to allow non-blocking timestamp updates for lazytime when the filesystem supports it, thereby restoring the performance benefits of <code>IOCB_NOWAIT</code> for io_uring-based workloads.</p>
+<h2>Series Structure</h2>
+<p>The 11-patch series progresses through several stages:</p>
+<ol>
+<li><strong>Patches 01–03</strong>: Preparatory VFS cleanup — removing <code>inode_update_time</code>, allowing error returns from <code>generic_update_time</code>, and splitting NFS's <code>nfs_update_timestamps</code>.</li>
+<li><strong>Patch 04</strong>: FAT-specific flag cleanup for <code>fat_truncate_time</code>.</li>
+<li><strong>Patches 05–07</strong>: Core refactoring of <code>-&gt;update_time</code> handling, factoring out a <code>sync_lazytime</code> helper, and adding a new <code>-&gt;sync_lazytime</code> filesystem method.</li>
+<li><strong>Patch 08</strong>: The key feature — adding support for non-blocking timestamp updates by passing <code>IOCB_NOWAIT</code> to <code>-&gt;update_time</code>.</li>
+<li><strong>Patches 09–11</strong>: Further refactoring of <code>file_update_time_flags</code>, and XFS-specific implementations of <code>-&gt;sync_lazytime</code> and non-blocking timestamp updates.</li>
+</ol>
+<h2>NFS Client Development: Splitting <code>nfs_update_timestamps</code></h2>
+<p>The most NFS-relevant change is <a href="https://lore.kernel.org/linux-nfs/20260106075008.1610195-4-hch@lst.de/">Patch 03/11</a>, which splits <code>nfs_update_timestamps</code> into separate paths for atime updates versus ctime/mtime updates:</p>
+<blockquote>
+<p>"The VFS paths update either the atime or ctime and mtime but never mix between atime and the others. Split nfs_update_timestamps to match this to prepare for cleaning up the VFS interfaces."</p>
+</blockquote>
+<p>This patch was reviewed positively by both Jan Kara and Jeff Layton:</p>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/wct2d2jrwausxgwusbnepzuegelkcl3s2veaixgrzehl6qcjyp@affaed5rinqo/">Jan Kara</a>: "Looks good. Feel free to add: Reviewed-by: Jan Kara"</li>
+<li><a href="https://lore.kernel.org/linux-nfs/58783a0861b6fe67ef93684e61363bc245d7053a.camel@kernel.org/">Jeff Layton</a>: "Reviewed-by: Jeff Layton"</li>
+</ul>
+<p>The NFS client's <code>nfs_update_timestamps</code> is also updated in <a href="https://lore.kernel.org/linux-nfs/20260106075008.1610195-6-hch@lst.de/">Patch 05/11</a> to use the new enum-based update type interface instead of the legacy <code>S_*</code> flags, aligning it with the broader VFS refactoring.</p>
+<h2>Key Technical Discussions and Bug Fixes</h2>
+<h3>Timestamp Sampling Order Bug (Patch 05/11)</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/jlw4ghr5vx32ss576akxes25oodlcx42zak7vjaaktlgn3m3d7@cbpcvx66y7za/">Jan Kara</a> identified a critical bug in the refactored <code>inode_update_cmtime()</code> function:</p>
+<blockquote>
+<p>"This needs to be below sampling of ctime. Otherwise inode dirtying will be broken..."</p>
+</blockquote>
+<p>The issue was that <code>inode_set_ctime_current()</code> must be called <em>after</em> sampling the current ctime value, not before. <a href="https://lore.kernel.org/linux-nfs/20260107073552.GB17448@lst.de/">Christoph acknowledged and fixed this</a>: "Fixed."</p>
+<p><a href="https://lore.kernel.org/linux-nfs/b208c2a6e1a3ab44e3c820af106b5be99279d986.camel@kernel.org/">Jeff Layton</a> corroborated: "I think Jan is correct though that you need to sample those in reverse order."</p>
+<h3>FAT Bisectability Concern (Patch 04/11)</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/87cy3nrpdu.fsf@mail.parknet.co.jp/">OGAWA Hirofumi</a> flagged a bisectability issue:</p>
+<blockquote>
+<p>"This breaks fat_update_time() by calling fat_truncate_time() with old S_* flags (later patch looks like fixing though). Please add the commit comment about it, or fix it in this patch."</p>
+</blockquote>
+<p>OGAWA later retracted his concern after noticing the new values reuse the same numeric values as <code>S_*</code>, granting an <a href="https://lore.kernel.org/linux-nfs/878qeask1x.fsf@mail.parknet.co.jp/">Acked-by</a>. However, Christoph took additional precautions:</p>
+<blockquote>
+<p>"Still not a good idea to not create a bisection hazard. I've added a local fat_flags variable and a translation for this patch, even if that will go away in the next patch to be 100% sane." <a href="https://lore.kernel.org/linux-nfs/20260107074346.GA18258@lst.de/">Christoph Hellwig</a></p>
+</blockquote>
+<h3>Documentation Nit (Patch 05/11)</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/b208c2a6e1a3ab44e3c820af106b5be99279d986.camel@kernel.org/">Jeff Layton</a> noted a documentation inconsistency: "nit: these are int return in the code, but are documented as void return here. Can you fix that up while you're in here?"</p>
+<h2>Non-Blocking Timestamp Updates (Patch 08/11)</h2>
+<p>The centerpiece of the series is <a href="https://lore.kernel.org/linux-nfs/20260106075008.1610195-9-hch@lst.de/">Patch 08/11</a>, which enables non-blocking timestamp updates:</p>
+<blockquote>
+<p>"Currently file_update_time_flags unconditionally returns -EAGAIN if any timestamp needs to be updated and IOCB_NOWAIT is passed. This makes non-blocking direct writes impossible on file systems with granular enough timestamps."</p>
+</blockquote>
+<p>Both <a href="https://lore.kernel.org/linux-nfs/jdntrcr644ukmht5wq2xbbh6vmolawdahxahm22vuaihtvpa43@ixt3uehbbdiq/">Jan Kara</a> and <a href="https://lore.kernel.org/linux-nfs/66a15379507f08da9d563416a86d1ad495466ec8.camel@kernel.org/">Jeff Layton</a> provided positive reviews, with Jan noting: "Much nicer now! Thanks for the refactoring."</p>
+<h2>XFS Implementation (Patches 10–11/11)</h2>
+<p>The series concludes with <a href="https://lore.kernel.org/linux-nfs/20260106075008.1610195-11-hch@lst.de/">XFS-specific patches</a> that implement <code>-&gt;sync_lazytime</code> and enable non-blocking timestamp updates. The final patch carries a <code>Fixes:</code> tag pointing to the original regression:</p>
+<blockquote>
+<p>"The lazytime path using the generic helpers can never block in XFS because there is no -&gt;dirty_inode method that could block."</p>
+</blockquote>
+<h2>Changes Since Prior Versions</h2>
+<p>The cover letter summarizes the evolution across versions:</p>
+<ul>
+<li><strong>v5</strong>: Replaced <code>S_*</code> flags with an enum to fix a bug and reduce fragility.</li>
+<li><strong>v4</strong>: Fixed <code>was_dirty_time</code> handling, refactored <code>inode_update_timestamps</code>, allowed non-blocking updates for FAT.</li>
+<li><strong>v3</strong>: Dropped merged patches, adjusted for inode state accessors, fixed XFS blocking behavior and race conditions.</li>
+</ul>
+<h2>Conclusion</h2>
+<p>This is a <strong>feature-enabling series with significant bug-fix implications</strong>. It restores <code>IOCB_NOWAIT</code> write performance for io_uring applications by introducing non-blocking lazytime timestamp updates. The NFS client receives targeted refactoring to align its <code>nfs_update_timestamps</code> with the new VFS interface, though NFS itself does not yet implement non-blocking timestamp updates in this series — that remains future work. All patches received positive reviews from key filesystem maintainers (Jan Kara, Jeff Layton), and Christoph addressed identified bugs promptly.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260106075008.1610195-1-hch@lst.de/">2026-01-06 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — re-enable IOCB_NOWAIT writes to files v5</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260106075008.1610195-2-hch@lst.de/">2026-01-06 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 01/11] fs: remove inode_update_time</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260106075008.1610195-3-hch@lst.de/">2026-01-06 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 02/11] fs: allow error returns from generic_update_time</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260106075008.1610195-4-hch@lst.de/">2026-01-06 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 03/11] nfs: split nfs_update_timestamps</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260106075008.1610195-5-hch@lst.de/">2026-01-06 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 04/11] fat: cleanup the flags for fat_truncate_time</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260106075008.1610195-6-hch@lst.de/">2026-01-06 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 05/11] fs: refactor -&gt;update_time handling</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260106075008.1610195-7-hch@lst.de/">2026-01-06 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 06/11] fs: factor out a sync_lazytime helper</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260106075008.1610195-8-hch@lst.de/">2026-01-06 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 07/11] fs: add a -&gt;sync_lazytime method</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260106075008.1610195-9-hch@lst.de/">2026-01-06 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 08/11] fs: add support for non-blocking timestamp updates</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260106075008.1610195-10-hch@lst.de/">2026-01-06 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 09/11] fs: refactor file_update_time_flags</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260106075008.1610195-11-hch@lst.de/">2026-01-06 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 10/11] xfs: implement -&gt;sync_lazytime</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260106075008.1610195-12-hch@lst.de/">2026-01-06 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 11/11] xfs: enable non-blocking timestamp updates</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/87cy3nrpdu.fsf@mail.parknet.co.jp/">2026-01-06 OGAWA Hirofumi <a href="mailto:hirofumi@mail.parknet.co.jp">hirofumi@mail.parknet.co.jp</a> — Re: [PATCH 04/11] fat: cleanup the flags for fat_truncate_time</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/wct2d2jrwausxgwusbnepzuegelkcl3s2veaixgrzehl6qcjyp@affaed5rinqo/">2026-01-06 Jan Kara <a href="mailto:jack@suse.cz">jack@suse.cz</a> — Re: [PATCH 03/11] nfs: split nfs_update_timestamps</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/58783a0861b6fe67ef93684e61363bc245d7053a.camel@kernel.org/">2026-01-06 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 03/11] nfs: split nfs_update_timestamps</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/jlw4ghr5vx32ss576akxes25oodlcx42zak7vjaaktlgn3m3d7@cbpcvx66y7za/">2026-01-06 Jan Kara <a href="mailto:jack@suse.cz">jack@suse.cz</a> — Re: [PATCH 05/11] fs: refactor -&gt;update_time handling</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/t3klyln4eejq7olm3bseuje2lao6jh3a26kpzkdqrnak5l2sdh@ehrk2o6mmxfw/">2026-01-06 Jan Kara <a href="mailto:jack@suse.cz">jack@suse.cz</a> — Re: [PATCH 09/11] fs: refactor file_update_time_flags</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/jdntrcr644ukmht5wq2xbbh6vmolawdahxahm22vuaihtvpa43@ixt3uehbbdiq/">2026-01-06 Jan Kara <a href="mailto:jack@suse.cz">jack@suse.cz</a> — Re: [PATCH 08/11] fs: add support for non-blocking timestamp updates</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/b208c2a6e1a3ab44e3c820af106b5be99279d986.camel@kernel.org/">2026-01-06 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 05/11] fs: refactor -&gt;update_time handling</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/66a15379507f08da9d563416a86d1ad495466ec8.camel@kernel.org/">2026-01-06 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 08/11] fs: add support for non-blocking timestamp updates</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/e33dbefe18eab49f394afb1989303aab57930adb.camel@kernel.org/">2026-01-06 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 09/11] fs: refactor file_update_time_flags</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/878qeask1x.fsf@mail.parknet.co.jp/">2026-01-06 OGAWA Hirofumi <a href="mailto:hirofumi@mail.parknet.co.jp">hirofumi@mail.parknet.co.jp</a> — Re: [PATCH 04/11] fat: cleanup the flags for fat_truncate_time</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107073552.GB17448@lst.de/">2026-01-07 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: [PATCH 05/11] fs: refactor -&gt;update_time handling</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107073639.GC17448@lst.de/">2026-01-07 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: [PATCH 05/11] fs: refactor -&gt;update_time handling</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107074346.GA18258@lst.de/">2026-01-07 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: [PATCH 04/11] fat: cleanup the flags for fat_truncate_time</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD: Asynchronous Write Throttling for UNSTABLE WRITEs (RFC v2 Discussion)</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-15</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD: Asynchronous Write Throttling for UNSTABLE WRITEs (RFC v2 Discussion)</h1>
+<h2>Summary</h2>
+<h1>NFSD: Asynchronous Write Throttling for UNSTABLE WRITEs (RFC PATCH v2)</h1>
+<p><strong>Classification:</strong> New feature / protocol-level flow control mechanism<br />
+<strong>Status:</strong> RFC discussion; no consensus reached this week.</p>
+<h2>Overview</h2>
+<p>Chuck Lever proposed an RFC patch series aimed at improving NFSD's resilience under memory pressure by introducing asynchronous write throttling specifically for UNSTABLE WRITE operations. The proposal seeks to prevent server-side memory exhaustion caused by high rates of uncommitted write payloads, a problem that has been observed in production environments including Hammerspace deployments.</p>
+<h2>Key Technical Arguments</h2>
+<h3>Chuck Lever's Proposal</h3>
+<p>Chuck Lever introduced the patch on January 9th, explaining the core problem:</p>
+<blockquote>
+<p>"When memory pressure occurs during buffered writes, the traditional approach is for balance_dirty_pages() to put the writing thread to sleep until dirty pages are flushed. For NFSD, this means server threads block waiting for I/O, reducing overall server throughput."</p>
+</blockquote>
+<p>The proposed solution uses the <code>BDP_ASYNC</code> flag with <code>balance_dirty_pages_ratelimited_flags()</code> to check memory pressure before performing a buffered write. If the call returns <code>-EAGAIN</code> (indicating memory exhaustion), NFSD returns <code>NFS4ERR_DELAY</code> (or <code>NFSERR_JUKEBOX</code> for NFSv3) to the client, prompting the client to wait and retry rather than tying up server memory with cached uncommitted write payloads.</p>
+<p>Key changes from RFC v1:</p>
+<ul>
+<li>Removal of an experimental debugfs setting</li>
+<li>Throttling enforcement restricted specifically to UNSTABLE WRITEs only</li>
+</ul>
+<h3>NeilBrown's Critique</h3>
+<p>NeilBrown raised several concerns about the approach on January 10th, questioning whether the mechanism would work reliably:</p>
+<blockquote>
+<p>"I doubt that this will do what you want - at least not reliably."</p>
+</blockquote>
+<p>His primary objection centered on how <code>balance_dirty_pages_ratelimited_flags()</code> operates:</p>
+<blockquote>
+<p>"balance_dirty_pages_ratelimited_flags() assumes it will be called repeatedly by the same task and it lets that task write for a while, then blocks it, then lets it write some more. The way you have integrated it into nfsd could result in the write load bouncing around among different threads and behaving inconsistently."</p>
+</blockquote>
+<p>NeilBrown also noted that the delay imposed (100ms to 15 seconds) may be too long compared to what would be desirable, suggesting:</p>
+<blockquote>
+<p>"What we really want, I think, is to be able to push back on the client by limiting the number of bytes in unacknowledged writes, but I don't think NFS has any mechanism for that."</p>
+</blockquote>
+<p>He speculated about a deeper integration with writeback code and suggested that allowing the thread pool to grow might make this a non-problem.</p>
+<h3>Chuck Lever's Rebuttal</h3>
+<p>Chuck Lever responded on January 10th, clarifying his intent:</p>
+<blockquote>
+<p>"Set aside my threading comments for a moment. What I'm trying to prevent is UNSTABLE WRITEs tying up server /memory/. When under memory pressure, NFSD needs to delay UNSTABLE WRITEs until there is adequate memory to cache the WRITE payloads, without having to evict something more critical that could cause the server significant heartburn or livelock."</p>
+</blockquote>
+<p>He dismissed the thread pool growth suggestion:</p>
+<blockquote>
+<p>"I think allowing the thread pool to grow could make the memory problem worse."</p>
+</blockquote>
+<p>Chuck Lever also proposed an alternative idea involving cgroup-based memory constraints for svc threads.</p>
+<h3>The Underlying Problem: Server Memory Exhaustion</h3>
+<p>In a follow-up exchange, NeilBrown pressed for concrete symptoms:</p>
+<blockquote>
+<p>"What exactly is 'the memory problem'? Do you have specific symptoms you are trying to address? Have you had NFS server run out of memory and grind to a halt?"</p>
+</blockquote>
+<p>Chuck Lever pointed to prior work by Mike on direct I/O over the past nine months:</p>
+<blockquote>
+<p>"Review the past 9 months of Mike's work on direct I/O, published on this mailing list. Hammerspace has measured this misbehavior and experienced server melt-down. Their solution is to avoid using the page cache entirely."</p>
+</blockquote>
+<p>He characterized the issue as an effective denial-of-service vector:</p>
+<blockquote>
+<p>"But even so there still seems to be an effective denial-of-service vector by overloading NFSD with UNSTABLE WRITE traffic faster than it can push it to persistence."</p>
+</blockquote>
+<h3>Evolution of the Discussion</h3>
+<p>The conversation evolved toward broader architectural considerations. NeilBrown asked whether Chuck Lever was seeking an alternative to existing mechanisms like drop-behind and direct I/O:</p>
+<blockquote>
+<p>"Are you trying to find another way to address the same problem?"</p>
+</blockquote>
+<p>Chuck Lever confirmed this on January 12th, emphasizing the need for LTS kernel compatibility:</p>
+<blockquote>
+<p>"Yes. I don't think we can backport direct I/O, for example, to LTS kernels. I expect it will be important to have an alternative to the new I/O caching modes for this reason alone."</p>
+</blockquote>
+<p>He also dismissed drop-behind as insufficient:</p>
+<blockquote>
+<p>"Drop-behind is too inefficient to be used here. This is why direct I/O is also an option. Direct I/O is measurably superior to drop-behind."</p>
+</blockquote>
+<h2>Final Conclusions</h2>
+<p>No definitive conclusion was reached this week. The discussion highlighted several key points:</p>
+<ol>
+<li>
+<p><strong>The problem is real:</strong> Server memory exhaustion under heavy UNSTABLE WRITE traffic has been observed in production (notably by Hammerspace), leading to server "melt-down" scenarios.</p>
+</li>
+<li>
+<p><strong>The proposed solution has architectural concerns:</strong> NeilBrown raised valid questions about the interaction between NFSD's multi-threaded architecture and the per-task assumptions of <code>balance_dirty_pages_ratelimited_flags()</code>.</p>
+</li>
+<li>
+<p><strong>Testing is needed:</strong> Both participants acknowledged that empirical testing under realistic load conditions would be essential to validate or refute the approach. As Chuck Lever noted, "Perhaps we need better observability first."</p>
+</li>
+<li>
+<p><strong>Broader context:</strong> This discussion sits within a larger effort to improve NFSD's I/O handling, including direct I/O support and alternative caching modes. The challenge is finding solutions that can be backported to LTS kernels where newer features like direct I/O may not be available.</p>
+</li>
+</ol>
+<p>The thread remains open with no clear path forward identified this week. Further exploration of cgroup-based memory constraints, improved observability, and deeper integration with the writeback subsystem were suggested as potential directions.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260109215613.25250-1-cel@kernel.org/">2026-01-09 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [RFC PATCH v2] NFSD: Add asynchronous write throttling support for UNSTABLE WRITEs</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/176802301025.16766.5819430775313248993@noble.neil.brown.name/">2026-01-10 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [RFC PATCH v2] NFSD: Add asynchronous write throttling support for UNSTABLE WRITEs</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/63566a53-ed5a-4c0b-920d-22219c750354@app.fastmail.com/">2026-01-10 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [RFC PATCH v2] NFSD: Add asynchronous write throttling support for UNSTABLE WRITEs</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/eaac3112-eafc-4bc5-974f-752edf868788@app.fastmail.com/">2026-01-10 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [RFC PATCH v2] NFSD: Add asynchronous write throttling support for UNSTABLE WRITEs</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ffebecde-a979-475b-a838-6b17df4d33b7@kernel.org/">2026-01-12 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [RFC PATCH v2] NFSD: Add asynchronous write throttling support for UNSTABLE WRITEs</a></li>
+</ul>
+  </main>
+</body>
+</html>

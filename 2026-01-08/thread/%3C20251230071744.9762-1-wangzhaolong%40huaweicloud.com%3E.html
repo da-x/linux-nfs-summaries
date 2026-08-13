@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSv4.1: Fixing slot table draining + memory reclaim deadlock in state manager creation</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-08</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSv4.1: Fixing slot table draining + memory reclaim deadlock in state manager creation</h1>
+<h2>Summary</h2>
+<h2>NFSv4.1 Deadlock: Slot Table Draining vs. Memory Reclaim</h2>
+<h3>Background (Prior Weeks)</h3>
+<p>This thread addresses a critical <strong>bug fix</strong> targeting a deadlock in the NFSv4.1 client that can render a system permanently stuck during server outages combined with memory pressure. The discussion began late last week when Wang Zhaolong reported the issue as an RFC patch <a href="https://lore.kernel.org/linux-nfs/20251230071744.9762-1-wangzhaolong@huaweicloud.com/">on December 30</a>, followed by a comprehensive response and proposed fix from NFS maintainer Trond Myklebust <a href="https://lore.kernel.org/linux-nfs/de47c214bf6c85735db8e74d630e05b4e9bbf767.camel@kernel.org/">on December 31</a>.</p>
+<h3>The Deadlock Scenario</h3>
+<p>Wang Zhaolong described a production-like scenario involving three participants in a circular wait:</p>
+<ul>
+<li><strong>P1 (sunrpc worker)</strong>: On receiving an error like <code>NFS4ERR_BADSESSION</code>, the session slot table is set to draining (<code>NFS4_SLOT_TBL_DRAINING</code>) and recovery triggers creation of a state manager thread via <code>kthread_run()</code>, which waits for kthreadd.</li>
+<li><strong>P2 (kthreadd)</strong>: While creating the new thread, memory allocation triggers direct reclaim. During reclaim, <code>nfs_release_folio()</code> is invoked, which calls <code>nfs_commit_inode(inode, FLUSH_SYNC)</code> — a synchronous commit that waits for RPC completion.</li>
+<li><strong>P3 (sunrpc worker 2)</strong>: Non-privileged RPC tasks are blocked on the slot table wait queue because the table is in draining state.</li>
+</ul>
+<p>The result: kthreadd blocks waiting for commits to complete, but commits cannot progress because the slot table is draining and non-privileged requests are blocked. The system remains stuck even after the server or network is restored.</p>
+<p>Wang noted this issue likely became possible after commit <code>c907e72f58ed</code> ("NFSv4.1: freeze the session table upon receiving NFS4ERR_BADSESSION"), which sets draining before the recovery thread runs. He also referenced <a href="https://access.redhat.com/solutions/7016754">SUSE Bugzilla #1211527</a> as a potentially related prior report.</p>
+<h3>Trond's Proposed Fix Direction</h3>
+<p>Trond Myklebust proposed a fundamentally different approach rather than Wang's initial patch. His core insight was that <code>nfs_release_folio()</code> should not perform synchronous waits at all:</p>
+<blockquote>
+<p>"I think we need to treat nfs_release_folio() as being different from nfs_wb_folio() altogether. There are too many different ways in which waiting on I/O can cause deadlocks, including waiting on the writeback to complete."</p>
+</blockquote>
+<p>He suggested treating the call as a <strong>hint</strong> to kick off either writeback or an asynchronous commit — but never waiting for completion:</p>
+<blockquote>
+<p>"My suggestion is therefore that we just make this simple, and see it as a hint that we should kick off either writeback or a commit, but not that we should be waiting for it to complete."</p>
+</blockquote>
+<p>Trond provided a full patch titled <strong>"NFS: Fix a deadlock involving nfs_release_folio()"</strong> that introduces a new function <code>nfs_wb_folio_reclaim()</code>. This function asynchronously kicks off writeback or an async commit without blocking, breaking the circular dependency. The patch targets the root cause traced to commit <code>96780ca55e3c</code> ("NFS: fix up nfs_release_folio() to try to release the page").</p>
+<h3>Current Week Activity (January 2–8)</h3>
+<p>Wang Zhaolong replied <a href="https://lore.kernel.org/linux-nfs/fcfbf7c0-f65f-4bf8-a702-4dafc9c094c9@huaweicloud.com/">on January 6</a>, expressing agreement with Trond's approach:</p>
+<blockquote>
+<p>"I agree with the overall direction. Avoiding any synchronous waits from -&gt;release_folio() makes a lot of sense."</p>
+</blockquote>
+<p>Wang also identified a minor code issue in Trond's proposed patch — an uninitialized variable <code>ret</code> in the <code>nfs_wb_folio_reclaim()</code> function:</p>
+<blockquote>
+<p>"One small thing: in nfs_wb_folio_reclaim(), the else nfs_commit_inode(inode, 0); branch seems to return an uninitialized ret (unless I missed something)."</p>
+</blockquote>
+<p>He suggested either initializing <code>ret = 0</code> or returning the value from <code>nfs_commit_inode()</code> for tracing purposes. Wang offered to test the fix once formally posted:</p>
+<blockquote>
+<p>"Happy to test this with my reproducer once you post it."</p>
+</blockquote>
+<h3>Summary and Status</h3>
+<ul>
+<li><strong>Type</strong>: Bug fix — a critical deadlock in NFSv4.1 client state recovery under memory pressure.</li>
+<li><strong>Root cause</strong>: <code>nfs_release_folio()</code> performing synchronous commit waits during memory reclaim, which can block kthreadd from creating the state manager thread needed to unblock slot table draining.</li>
+<li><strong>Proposed resolution</strong>: Replace synchronous waits in <code>nfs_release_folio()</code> with asynchronous writeback/commit kicks via a new <code>nfs_wb_folio_reclaim()</code> helper.</li>
+<li><strong>Status</strong>: Trond's patch has been reviewed and conceptually approved by Wang, pending a minor fix for an uninitialized return value. The patch has not yet been formally posted to the mailing list as of this week's end; Wang is prepared to test it once available.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/fcfbf7c0-f65f-4bf8-a702-4dafc9c094c9@huaweicloud.com/">2026-01-06 Wang Zhaolong <a href="mailto:wangzhaolong@huaweicloud.com">wangzhaolong@huaweicloud.com</a> — Re: [PATCH] [RFC] NFSv4.1: slot table draining + memory reclaim can deadlock state manager creation</a></li>
+</ul>
+  </main>
+</body>
+</html>

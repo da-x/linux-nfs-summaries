@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>kNFSD Signed Filehandles v2: API Design Debate and Technical Refinements</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-22</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>kNFSD Signed Filehandles v2: API Design Debate and Technical Refinements</h1>
+<h2>Summary</h2>
+<h1>kNFSD Signed Filehandles: v2 Patch Series Sparks Heated Debate on API Design</h1>
+<h2>Overview</h2>
+<p><strong>Discussion type:</strong> New feature (NFS server security enhancement)</p>
+<p>Benjamin Coddington <a href="https://lore.kernel.org/linux-nfs/cover.1769026777.git.bcodding@hammerspace.com/">submitted a revised 3-patch series</a> this week, refining his proposal to add Message Authentication Code (MAC) signing to NFS filehandles in the kernel NFS server (kNFSD). The goal remains unchanged from <a href="https://lore.kernel.org/linux-nfs/cover.1768573690.git.bcodding@hammerspace.com/">the v1 series last week</a>: prevent filehandle guessing attacks, where an attacker fabricates valid filehandles to access files they shouldn't reach through normal directory permission checks.</p>
+<p>The v2 series is reduced from 4 patches to 3, incorporating several changes:</p>
+<ul>
+<li>Dropped the export flags <code>BIT()</code> macro conversion (per Chuck Lever's UAPI concerns)</li>
+<li>Moved MAC signing into <code>__fh_update()</code> rather than XDR encoding code (addressing layering concerns)</li>
+<li>Made fh_key setting an optional attribute on the netlink "threads" verb (per Jeff Layton's suggestion)</li>
+<li>Fixed format string and uninitialized variable warnings caught by the kernel test robot</li>
+</ul>
+<p>The series comprises:</p>
+<ol>
+<li><strong>Patch 1/3</strong>: Add a key for signing filehandles via netlink and nfsctl filesystem</li>
+<li><strong>Patch 2/3</strong>: Add <code>sign_fh</code> export option</li>
+<li><strong>Patch 3/3</strong>: Implement actual signing and verification using siphash</li>
+</ol>
+<h2>Key Technical Arguments This Week</h2>
+<h3>The Enduring Debate: procfs vs. Netlink API</h3>
+<p>The most contentious discussion this week centered on whether the fh_key setting interface should exist in both procfs (<code>/proc/fs/nfsd/fh_key</code>) and netlink (via <code>nfsdctl</code>). Coddington included both interfaces, arguing that distributions use different startup mechanisms:</p>
+<blockquote>
+<p>"Some distros use one or the other. Some try to use both! Until you guys deprecate one of the interfaces I think we're stuck expanding them both."</p>
+</blockquote>
+<p>Chuck Lever pushed back strongly against adding new procfs APIs:</p>
+<blockquote>
+<p>"We have said we don't want to continue adding new APIs to procfs. It's not just NFSD that prefers this, it's a long term project across the kernel. If you have a clear technical reason that a new procfs API is needed, let's hear it."</p>
+</blockquote>
+<p>Lever emphasized that netlink provides better guarantees about startup ordering — preventing the server from starting without setting the key first:</p>
+<blockquote>
+<p>"Sounds like it will cause spurious stale file handles, which will kill applications on NFS mounts."</p>
+</blockquote>
+<p>Jeff Layton sided with Lever, calling the procfs interface "categorically inferior due to its piecemeal nature":</p>
+<blockquote>
+<p>"The old /proc interface is really for the case where you have old nfs-utils and/or an old kernel. In order to use this, you need both new nfs-utils and new kernel. If you have those, then both should support the netlink interface."</p>
+</blockquote>
+<p>Coddington countered with a practical concern about RHEL's systemd startup, which falls back to <code>rpc.nfsd</code> on <code>nfsdctl</code> failure:</p>
+<blockquote>
+<p>"The systemd startup for the nfs-server in RHEL falls back to rpc.nfsd on nfsdctl failure. Without the additional interface you can have systems that start the nfs-server via rpc.nfsd without setting the key - exactly the situation you're so adamant should never happen."</p>
+</blockquote>
+<p>He also noted his own product (Hammerspace) would need the procfs interface since their tooling hasn't been converted to <code>nfsdctl</code> yet.</p>
+<p>The exchange escalated in tone, with Chuck Lever writing:</p>
+<blockquote>
+<p>"Is it? There's no point in asking that question other than as the kind of jab a kid makes when trying to catch a parent in a contradiction."</p>
+</blockquote>
+<p>Coddington responded:</p>
+<blockquote>
+<p>"Wow, yes. It's personal, and unprofessional. It has nothing to do with the merits of the argument at hand."</p>
+</blockquote>
+<p>Ultimately, Coddington conceded:</p>
+<blockquote>
+<p>"I understand. I'll remove the procfs interface here on the next posting."</p>
+</blockquote>
+<h3>Key Rotation Mechanism</h3>
+<p>Chuck Lever pressed for documentation or a mechanism for rotating the signing key when compromised. The initial design allowed setting the key only once per module load, with no reset capability. Jeff Layton proposed a more flexible approach:</p>
+<blockquote>
+<p>"Personally, I think just disallowing key changes while the nfs server is running should be sufficient. If someone wants to shut down the threads and then change the key on the next startup, then I don't see why that shouldn't be allowed."</p>
+</blockquote>
+<p>Coddington agreed and asked Chuck for approval. Chuck concurred:</p>
+<blockquote>
+<p>"I hadn't thought of the 'nfsd.ko is built in' case. Oops. Yes, I think it's fine to keep the fh_key value locked only while the server is running, much like most of the other NFSD settings."</p>
+</blockquote>
+<h3>Endianness Bug Caught by Eric Biggers</h3>
+<p>Eric Biggers identified a subtle but important bug in the key handling code:</p>
+<blockquote>
+<p>"Note that siphash_key_t consists of a pair of native-endian u64's. If you copy a byte array into it, the result will differ on little endian vs. big endian CPUs. You may want to do le64_to_cpus() on each u64, like what fscrypt_derive_siphash_key() does."</p>
+</blockquote>
+<p>Coddington acknowledged: "Great catch - thanks Eric." This is a significant correctness issue that would cause signed filehandles to behave differently across CPU architectures.</p>
+<h3>Behavior When sign_fh Export Option Changes</h3>
+<p>Jeff Layton raised an important edge case regarding export option transitions:</p>
+<blockquote>
+<p>"Support we start with sign_fh enabled, and client gets a signed filehandle. The server then reboots and the export options change such that sign_fh is disabled. What happens when the client tries to present that fh to the server?"</p>
+</blockquote>
+<p>Coddington explained that the current code would return <code>-ESTALE</code> because the unsigned path would bypass MAC verification but still fail to resolve the oversized filehandle. He considered whether to trim the MAC without verification:</p>
+<blockquote>
+<p>"Would it be a good idea to allow the server to see that the filehandle has FH_AT_MAC set, and just trim off the MAC without verifying it?"</p>
+</blockquote>
+<p>Jeff Layton concluded: "No, I think -ESTALE is fine in this situation. We just need to understand what happens if it does, and make sure that it's documented."</p>
+<p>Chuck Lever agreed and added:</p>
+<blockquote>
+<p>"The documentation for 'changing from signed to unsigned and back' goes along with what happens when the fh_key needs to change, I would think."</p>
+</blockquote>
+<p>He also suggested comprehensive testing:</p>
+<blockquote>
+<p>"IMHO we also want to craft some pynfs tests to ensure that these cases work as we expect, and to ensure that we capture all of the cases that need to be checked (including the cases involving transitioning from sign_fh to not sign_fh and vice versa)."</p>
+</blockquote>
+<h3>nfsdctl Usability Concerns</h3>
+<p>In a side discussion, Coddington shared frustrations with <code>nfsdctl</code>'s error reporting:</p>
+<blockquote>
+<p>"When it reports a failure its not easy to figure out what's going wrong... I had to turn on the function tracer in the kernel to find that the error was coming from somewhere in nfs4_state_start()."</p>
+</blockquote>
+<p>Jeff Layton acknowledged these rough edges and suggested improvements:</p>
+<blockquote>
+<p>"In principle, we could have the kernel pass an error string back in the netlink upcall that nfsdctl could display. The problem is that nfs startup is spread over a bunch of functions, so passing that string back from the deep call stack would take some refactoring."</p>
+</blockquote>
+<h3>NeilBrown's Request for Quantified Threat Assessment</h3>
+<p>NeilBrown <a href="https://lore.kernel.org/linux-nfs/176903611574.16766.10534751557103722262@noble.neil.brown.name//">requested</a> more concrete evidence in the cover letter:</p>
+<blockquote>
+<p>"Simple testing confirms that the correct generation number can be found within XXX minutes using open_by_handle_at() and it is estimated that adding network delay with genuine NFS calls would only increase this to YYY minutes (ZZZ hours)."</p>
+</blockquote>
+<p>This follows up on his v1 feedback asking for quantified threat modeling rather than qualitative assertions.</p>
+<h2>Evolution of the Discussion</h2>
+<p>The thread progressed through several phases:</p>
+<ol>
+<li><strong>Patch submission</strong> (Jan 21): Coddington posted v2, incorporating most v1 review feedback</li>
+<li><strong>API design debate</strong> (Jan 21-22): Intense back-and-forth between Coddington and Chuck Lever over procfs vs. netlink, escalating in tone before de-escalating</li>
+<li><strong>Technical corrections</strong> (Jan 22): Eric Biggers identified the endianness bug; Jeff Layton raised the export option transition question</li>
+<li><strong>Resolution</strong> (Jan 22): Coddington agreed to remove procfs interface; key rotation approach was settled on "locked while server running" model; documentation commitments made for edge cases</li>
+</ol>
+<h2>Final Conclusions and Next Steps</h2>
+<p>The discussion concluded with several clear action items for v3:</p>
+<ol>
+<li><strong>Remove the procfs fh_key interface</strong>, keeping only netlink (Coddington's commitment)</li>
+<li><strong>Fix the endianness bug</strong> in key handling per Eric Biggers' suggestion</li>
+<li><strong>Allow key changes when server is stopped</strong> (not just once per module load), with documentation of the procedure</li>
+<li><strong>Document the behavior</strong> when <code>sign_fh</code> export option transitions between enabled/disabled, including <code>-ESTALE</code> responses for mismatched filehandles</li>
+<li><strong>Add pynfs tests</strong> for corner cases involving sign_fh transitions and key changes (Chuck Lever's suggestion)</li>
+<li><strong>Quantify the threat model</strong> in the cover letter with concrete timing measurements (NeilBrown's request)</li>
+</ol>
+<p>The series remains under active development with no formal acceptance or rejection. The broader architectural debate about signed filehandles versus alternative approaches (such as NeilBrown's proposal for 64-bit generation numbers using per-filesystem UUIDs, discussed in v1) continues to inform the design direction but was not revisited in detail this week.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/cover.1769026777.git.bcodding@hammerspace.com/">2026-01-21 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — [PATCH v2 0/3] kNFSD Signed Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/6d7bfccbaf082194ea257749041c19c2c2385cce.1769026777.git.bcodding@hammerspace.com/">2026-01-21 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — [PATCH v2 1/3] NFSD: Add a key for signing filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/7202a379d564fc1be6d2bfbf4da85c40418d9b07.1769026777.git.bcodding@hammerspace.com/">2026-01-21 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — [PATCH v2 2/3] NFSD/export: Add sign_fh export option</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/0aaa9ca4fd3edc7e0d25433ad472cb873560bf7d.1769026777.git.bcodding@hammerspace.com/">2026-01-21 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — [PATCH v2 3/3] NFSD: Sign filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/e299b7c6-9d37-4ffe-8d45-a95d92e33406@app.fastmail.com/">2026-01-21 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v2 1/3] NFSD: Add a key for signing filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/0D5F8EA8-D77E-4F56-9EA6-8D6FC2F2CD37@hammerspace.com/">2026-01-21 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — Re: [PATCH v2 1/3] NFSD: Add a key for signing filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/9c5e9e07-b370-4c71-9dd6-8b6a3efe32c7@kernel.org/">2026-01-21 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v2 1/3] NFSD: Add a key for signing filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/176903611574.16766.10534751557103722262@noble.neil.brown.name/">2026-01-21 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v2 0/3] kNFSD Signed Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/5EBC1684-ECA5-497A-8892-9317B44186EC@hammerspace.com/">2026-01-21 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — Re: [PATCH v2 1/3] NFSD: Add a key for signing filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/29aabe1c-3062-4dff-887d-805d7835912e@kernel.org/">2026-01-21 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v2 1/3] NFSD: Add a key for signing filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260122005112.GA946159@google.com/">2026-01-22 Eric Biggers <a href="mailto:ebiggers@kernel.org">ebiggers@kernel.org</a> — Re: [PATCH v2 1/3] NFSD: Add a key for signing filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/9A2DB68D-4336-4564-A3C1-71D507C0C5F7@hammerspace.com/">2026-01-22 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — Re: [PATCH v2 1/3] NFSD: Add a key for signing filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/DC80A9CE-C98B-4D03-889F-90F477065FB1@hammerspace.com/">2026-01-22 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — Re: [PATCH v2 1/3] NFSD: Add a key for signing filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/d43cd682b0c51b187ba124f0c3c11ccc9d8698c8.camel@kernel.org/">2026-01-22 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v2 1/3] NFSD: Add a key for signing filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/b4b88c29299dde052a8864e7104a40eb616a26ad.camel@kernel.org/">2026-01-22 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v2 1/3] NFSD: Add a key for signing filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/989656C1-F190-4F58-AB82-974F63551C26@hammerspace.com/">2026-01-22 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — Re: [PATCH v2 1/3] NFSD: Add a key for signing filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/bf6b833c5cf45da96df4349ab318a597e5189c83.camel@kernel.org/">2026-01-22 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v2 1/3] NFSD: Add a key for signing filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/3080c6d6-4734-41e9-81a6-8ad9fc8a1061@app.fastmail.com/">2026-01-22 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v2 1/3] NFSD: Add a key for signing filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/e91bdc9e-16b0-4e9c-a1a0-aedd30e1c135@app.fastmail.com/">2026-01-22 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v2 1/3] NFSD: Add a key for signing filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/C0C90433-6319-4CB5-9485-A9CA87E09AFC@hammerspace.com/">2026-01-22 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — Re: [PATCH v2 1/3] NFSD: Add a key for signing filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/801018d9115ea8abb214eaa74d5000c6f7f758a4.camel@kernel.org/">2026-01-22 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v2 2/3] NFSD/export: Add sign_fh export option</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/0597653E-1984-4D2B-9A47-9BAE3A8E7A8B@hammerspace.com/">2026-01-22 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — Re: [PATCH v2 2/3] NFSD/export: Add sign_fh export option</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/29da00c72005812ca83954e8f2af91248b5bffe4.camel@kernel.org/">2026-01-22 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v2 2/3] NFSD/export: Add sign_fh export option</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/B364CDCB-39A6-4C51-A562-CC52CE22C059@hammerspace.com/">2026-01-22 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — Re: [PATCH v2 2/3] NFSD/export: Add sign_fh export option</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/d0439773f714f079f3dfd478a738612986f9e71e.camel@kernel.org/">2026-01-22 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v2 2/3] NFSD/export: Add sign_fh export option</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/6D390E12-0EF1-4830-A67F-9C8614E924B7@hammerspace.com/">2026-01-22 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — Re: [PATCH v2 1/3] NFSD: Add a key for signing filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/7bfa1642-d0b1-41aa-9709-86bb51669464@app.fastmail.com/">2026-01-22 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v2 2/3] NFSD/export: Add sign_fh export option</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/df581ada-007b-4729-8ac0-19be90dcbfd7@app.fastmail.com/">2026-01-22 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v2 1/3] NFSD: Add a key for signing filehandles</a></li>
+</ul>
+  </main>
+</body>
+</html>

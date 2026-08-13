@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>kNFSD Encrypted Filehandles: MAC vs. Encryption Debate for NFS Security</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-15</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>kNFSD Encrypted Filehandles: MAC vs. Encryption Debate for NFS Security</h1>
+<h2>Summary</h2>
+<h1>kNFSD Encrypted Filehandles: Cryptographic Debate on MAC vs. Encryption for NFS Security</h1>
+<p><strong>Type:</strong> New feature — security hardening of NFSv4 filehandle handling in kNFSD (the kernel NFS server)</p>
+<h2>Background</h2>
+<p>Benjamin Coddington (Hammerspace) has been developing a patch series to encrypt NFSv4 filehandles in kNFSD, motivated by concerns that plaintext filehandles expose filesystem internals and can be guessed or sniffed to subvert access controls. The original RFC/v1 was posted on December 27th (<a href="https://lore.kernel.org/linux-nfs/510E10A4-11BE-412D-93AF-C4CC969954E7@hammerspace.com/">cover letter</a>), and the discussion continued into this week with significant cryptographic review from Eric Biggers and architectural input from key NFS maintainers.</p>
+<h2>This Week's Discussion: Cryptographic Critique of AES-CBC</h2>
+<h3>Eric Biggers' Security Analysis</h3>
+<p>On January 14th, cryptography expert Eric Biggers delivered a pointed critique of the proposed use of AES-CBC for filehandle encryption [id://20260114004205.GC2178@quark]:</p>
+<blockquote>
+<p>"AES-CBC is an unauthenticated encryption algorithm that protects a message's confidentiality. It isn't a hash function, it isn't a MAC, and it doesn't protect a message's authenticity. AES-CBC will successfully decrypt any ciphertext, even one tampered with by an attacker, into some plaintext. You may be confusing AES-CBC with AES-CBC-MAC."</p>
+</blockquote>
+<p>Biggers argued that the actual security goal — ensuring only filehandles issued to a given client are accepted by the server — is better served by a Message Authentication Code (MAC) rather than unauthenticated encryption:</p>
+<blockquote>
+<p>"To me it seems like you want to ensure that for a given client, only file handles that it was sent by the server will be accepted by the server (provided that it can't snoop on handles sent to other clients). An unauthenticated encryption mode like AES-CBC doesn't solve that problem. I think a MAC is sufficient to solve that problem."</p>
+</blockquote>
+<p>He recommended kernel-native MAC algorithms with clean APIs — HMAC-SHA256, HMAC-SHA512, BLAKE2s, or SipHash-2-4 — noting these avoid the dynamic memory allocation and scatterlist overhead of crypto subsystem calls. On FIPS 140-3 compliance:</p>
+<blockquote>
+<p>"In the case where the kernel is certified as a FIPS 140-3 module, I don't know whether this feature would actually be considered a security function for FIPS purposes or not."</p>
+</blockquote>
+<h3>Benjamin Coddington's Response</h3>
+<p>Coddington acknowledged Biggers' critique [id://834DBCBA-1CD8-4BA9-81E8-09E621B3F176@hammerspace.com]:</p>
+<blockquote>
+<p>"I'm not confusing them, and you're absolutely correct — if an encrypted filehandle were tampered with we'd be relying on the decoded filehandle being garbage — the routines to decode the fsid and fileid would return errors, because a filehandle's data is meaningful and well-structured."</p>
+</blockquote>
+<p>He distinguished this from what a MAC provides:</p>
+<blockquote>
+<p>"That's a big difference from what using a MAC would provide — immediate knowledge the filehandle had been modified."</p>
+</blockquote>
+<p>Coddington closed with appreciation: "Thanks Eric, much appreciate your advice here."</p>
+<h3>Jeff Layton: MACs Enable Client-Bound Filehandles</h3>
+<p>Jeff Layton endorsed the MAC approach and proposed an enhancement: salting the MAC with the NFSv4 client ID to create per-client filehandles [id://a092bf21127a679a32ac9f9c476e7d070667c36b.camel@kernel.org]:</p>
+<blockquote>
+<p>"If you append a MAC though and check it on the server, you could give out filehandles that are limited-use. For instance, with v4, you could salt the hash with the long-form clientid and ensure that that filehandle is only usable by that client. Anyone else gets back NFS4ERR_STALE."</p>
+</blockquote>
+<p>He noted the combination with TLS would provide strong protection:</p>
+<blockquote>
+<p>"Couple that with TLS and you'd have a pretty decent guard against sniffing and filehandle guessing attacks."</p>
+</blockquote>
+<h3>Chuck Lever: The Sniffing vs. Guessing Distinction</h3>
+<p>Chuck Lever pushed back on conflating two different attack vectors [id://c8ad96c5-1da1-4aeb-8999-2a8b63021a23@kernel.org]:</p>
+<blockquote>
+<p>"A sniffing attack is easier than guessing a file handle or constructing one. Neither encrypting a filehandle nor signing it protects against sniffing attacks. But using full in-transit encryption does, and we have that implemented already."</p>
+</blockquote>
+<p>He emphasized that with TLS protecting the wire, plaintext filehandles are less predictable:</p>
+<blockquote>
+<p>"With full in-transit encryption, the plaintext is much much less predictable as well."</p>
+</blockquote>
+<h3>Trond Myklebust: Defining the Orthogonal Problem Space</h3>
+<p>Trond Myklebust clarified the distinction between sniffing and spoofing protection [id://a78cf4e4274f8b4e69a3c7bf3aa778ce7cc25f72.camel@kernel.org]:</p>
+<blockquote>
+<p>"Protection against sniffing and protection against spoofing are two completely orthogonal problems. Please don't muddle the already murky waters in this thread by confusing the two."</p>
+</blockquote>
+<p>When Lever argued they were not orthogonal in this context, Myklebust articulated the core security requirement driving this work [id://d982f950ef0291076801b23cfd53ae8da1b31c00.camel@kernel.org]:</p>
+<blockquote>
+<p>"The orthogonal problem that we're looking to solve is when a trusted client is shared by multiple users who are trusted to access different data sets. If they can set up a TLS connection (or if there is no need to set up TLS because network access is trusted through other methods), then the users can currently just iterate through sets of valid filehandles in order to brute force access to data sets that they are not supposed to see."</p>
+</blockquote>
+<p>He further explained why existing mechanisms fall short:</p>
+<blockquote>
+<p>"We cannot use krb5 as a solution here because the flexfiles protocol does not currently support that, and because pNFS authorisation at the data server is not based on user authentication, but on proof that the user holds a valid layout. If the filehandle is unguessable in that situation, then that does suffice as proof that the user holds a layout."</p>
+</blockquote>
+<h2>Key Technical Arguments Summary</h2>
+<table><thead><tr><th>Argument</th><th>Proponent</th><th>Position</th></tr></thead><tbody>
+<tr><td>AES-CBC is insufficient for authenticity</td><td>Eric Biggers</td><td>Unauthenticated encryption doesn't prevent tampering; recommend MAC instead</td></tr>
+<tr><td>Filehandle structure provides implicit integrity</td><td>Benjamin Coddington</td><td>Tampered ciphertext decodes to garbage that fails fsid/fileid validation</td></tr>
+<tr><td>Client-bound filehandles via MAC salting</td><td>Jeff Layton</td><td>Salt with clientid to restrict filehandle reuse across clients</td></tr>
+<tr><td>Sniffing ≠ guessing; TLS handles sniffing</td><td>Chuck Lever</td><td>Wire encryption already protects against sniffing; signing doesn't add that protection</td></tr>
+<tr><td>Multi-user shared-client scenario</td><td>Trond Myklebust</td><td>Need unguessable filehandles when multiple users share a trusted client connection, especially for pNFS/flexfiles layouts</td></tr>
+</tbody></table>
+<h2>Final Conclusions</h2>
+<p>The discussion converged on several important points:</p>
+<ol>
+<li><strong>AES-CBC is not well-suited</strong> for this use case — it provides confidentiality without authenticity guarantees.</li>
+<li><strong>A MAC-based approach</strong> (e.g., HMAC-SHA256) is preferred by multiple reviewers for its ability to detect tampering and its simpler kernel API.</li>
+<li><strong>Client-bound filehandles</strong> via salting the MAC with the NFSv4 client ID could provide stronger isolation between users sharing a client connection.</li>
+<li><strong>The core threat model</strong> is not wire sniffing (already addressed by TLS) but rather <strong>filehandle guessing/brute-forcing</strong> within a trusted network context, particularly relevant to pNFS flexfiles where layout holders need proof of authorization without krb5 support.</li>
+</ol>
+<p>The thread did not reach a final resolution on the patch series itself — Coddington acknowledged Biggers' feedback and indicated he would refine the approach in a future version. The cryptographic direction has shifted from encryption toward authentication (MAC), with client-binding as a potential enhancement.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260114004205.GC2178@quark/">2026-01-14 Eric Biggers <a href="mailto:ebiggers@kernel.org">ebiggers@kernel.org</a> — Re: [PATCH v1 0/7] kNFSD Encrypted Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/834DBCBA-1CD8-4BA9-81E8-09E621B3F176@hammerspace.com/">2026-01-14 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — Re: [PATCH v1 0/7] kNFSD Encrypted Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/a092bf21127a679a32ac9f9c476e7d070667c36b.camel@kernel.org/">2026-01-14 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v1 0/7] kNFSD Encrypted Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/c8ad96c5-1da1-4aeb-8999-2a8b63021a23@kernel.org/">2026-01-14 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v1 0/7] kNFSD Encrypted Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/a78cf4e4274f8b4e69a3c7bf3aa778ce7cc25f72.camel@kernel.org/">2026-01-14 Trond Myklebust <a href="mailto:trondmy@kernel.org">trondmy@kernel.org</a> — Re: [PATCH v1 0/7] kNFSD Encrypted Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/becabe80-b2e3-4210-bda1-77721f56113b@app.fastmail.com/">2026-01-14 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v1 0/7] kNFSD Encrypted Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/d982f950ef0291076801b23cfd53ae8da1b31c00.camel@kernel.org/">2026-01-14 Trond Myklebust <a href="mailto:trondmy@kernel.org">trondmy@kernel.org</a> — Re: [PATCH v1 0/7] kNFSD Encrypted Filehandles</a></li>
+</ul>
+  </main>
+</body>
+</html>

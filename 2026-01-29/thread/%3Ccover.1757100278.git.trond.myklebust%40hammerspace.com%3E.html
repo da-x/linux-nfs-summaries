@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS EOF Page Pollution Fix: Design Rationale and MM Subsystem Abstraction Discussion</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-29</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS EOF Page Pollution Fix: Design Rationale and MM Subsystem Abstraction Discussion</h1>
+<h2>Summary</h2>
+<h1>NFS Client "EOF Page Pollution" Protection: Design Rationale Discussed</h1>
+<h2>Classification</h2>
+<p>This thread concerns <strong>a bug fix</strong> in the NFS client — specifically, a discussion about the design rationale behind Trond Myklebust's patch series to protect against "eof page pollution," originally submitted in September 2025. The conversation this week represents a retrospective review by MM developer Lorenzo Stoakes seeking to understand why the NFS implementation diverges from the generic <code>pagecache_isize_extend()</code> helper.</p>
+<h2>Background (Prior Weeks)</h2>
+<p>The original eof page pollution fix (commit <code>b1817b18ff20</code>, titled "NFS: Protect against 'eof page pollution'") was designed to address xfstest <code>generic/363</code> and prevent data corruption when users <code>mmap()</code> beyond the end of a file and write into the folio straddling the EOF boundary. In January 2026, NVIDIA engineers reported that this fix caused intermittent ext4 checksum errors during boot of nested VMs using qcow2 disk images on NFSv4.2 shares. A multi-week investigation revealed a separate race condition in NFSv4.2 <code>fallocate</code> and copy offload operations where file size was read before locking the inode. That regression was resolved by a targeted patch, and the original eof page pollution safeguard remains intact.</p>
+<h2>This Week's Discussion</h2>
+<p>On January 24, MM developer Lorenzo Stoakes from Oracle dug up the old patch series to understand its design choices, particularly why the NFS-specific <code>nfs_truncate_last_folio()</code> function diverges from the generic <code>pagecache_isize_extend()</code> helper:</p>
+<blockquote>
+<p>"So this seems to be a slightly adjusted version of pagecache_isize_extend(), what was it about that that didn't work for you?"</p>
+</blockquote>
+<p>Stoakes identified three key differences between the NFS implementation and the generic helper:</p>
+<ol>
+<li>Block size alignment (which he believed was still needed)</li>
+<li>Using <code>folio_test_uptodate()</code> instead of <code>folio_test_dirty()</code></li>
+<li>The addition of a trace line</li>
+</ol>
+<p>His primary concern centered on the uptodate-vs-dirty distinction:</p>
+<blockquote>
+<p>"Really I'm confused as to why you are using folio_test_uptodate() here rather than folio_test_dirty() as in pagecache_isize_extend()? Wouldn't writeback have already handled this if the folio is up to date, or if the folio was never dirty in the first place? Shouldn't we only need to do this if the folio is dirty?"</p>
+</blockquote>
+<h2>Trond Myklebust's Response: Five Key Points</h2>
+<p>NFS client maintainer Trond Myklebust responded on January 24 with a detailed five-point explanation clarifying why the NFS-specific approach was necessary:</p>
+<ol>
+<li><strong>NFS is not a block protocol</strong>:</li>
+</ol>
+<blockquote>
+<p>"NFS is not a block protocol. Reads and writes are byte aligned."</p>
+</blockquote>
+<ol start="2">
+<li><strong>Block size alignment is irrelevant for NFS</strong>:</li>
+</ol>
+<blockquote>
+<p>"The test for bsize &gt;= PAGE_SIZE is nonsense for a byte aligned filesystem."</p>
+</blockquote>
+<ol start="3">
+<li><strong>Race protection via <code>folio_mkclean()</code></strong>:</li>
+</ol>
+<blockquote>
+<p>"NFS does care about using folio_mkclean() to fix races between an application that is writing to the folio, and any zeroing of the data that may result from the file truncation."</p>
+</blockquote>
+<ol start="4">
+<li><strong>Dirty state is not the concern</strong>:</li>
+</ol>
+<blockquote>
+<p>"The existing folio dirty state isn't of interest here, since NFS won't extend existing writes to cover the part of the folio that lies after the old eof."</p>
+</blockquote>
+<ol start="5">
+<li><strong>Uptodate state is what matters for reads</strong>:</li>
+</ol>
+<blockquote>
+<p>"The folio uptodate state is of interest, since any future pagecache read needs to see zeroed bytes starting at the old eof and extending either to the offset at the end of the folio, or to the new eof (whichever of the two is smaller)."</p>
+</blockquote>
+<h2>Lorenzo Stoakes' Follow-Up: Toward Better Abstraction</h2>
+<p>On January 26, Lorenzo acknowledged the explanation and outlined his motivation for asking — he was working on abstracting away <code>folio_mkclean()</code> as an implementation detail that shouldn't be exported from the MM subsystem. He noted that NFS and ext4 are the only current users of this pattern:</p>
+<blockquote>
+<p>"Motivation is that generally it seems to me folio_mkclean() itself is an implementation detail we shouldn't be exporting, but I'm considering how we might abstract this while retaining functionality in existing file systems (nfs and ext4 are the only current users)."</p>
+</blockquote>
+<p>He proposed two potential paths forward:</p>
+<ul>
+<li>An abstraction providing an alternative to <code>pagecache_isize_extend()</code> that accounts for NFS's use case, possibly by breaking it into parts</li>
+<li>A simpler abstraction around the <code>folio_mkclean()</code> / <code>folio_mark_dirty()</code> dance</li>
+</ul>
+<blockquote>
+<p>"The latter I was trying to avoid as it doesn't do all that much to un-export the implementation detail but of course ensuring in-tree filesystems work as they do now is a requirement for any such change."</p>
+</blockquote>
+<p>He concluded with a commitment to keep the NFS maintainer informed:</p>
+<blockquote>
+<p>"Obviously I will cc- you on anything that touches NFS in this regard!"</p>
+</blockquote>
+<h2>Conclusions</h2>
+<p>This thread represents a productive cross-subsystem discussion between MM and NFS client development. The key takeaways are:</p>
+<ul>
+<li><strong>The NFS eof page pollution fix is correct as designed</strong>: Trond's five-point explanation clarifies that the divergence from <code>pagecache_isize_extend()</code> is intentional and necessary due to NFS being a byte-aligned protocol rather than block-aligned, and because the concern is about read correctness (uptodate state) rather than writeback (dirty state).</li>
+<li><strong>Future MM subsystem cleanup may affect NFS</strong>: Lorenzo Stoakes is exploring ways to abstract <code>folio_mkclean()</code> away from filesystem code. The NFS implementation's specific needs will need to be accommodated in any such refactoring, and Trond has been added to the CC list for related work.</li>
+<li><strong>The original bug fix remains intact</strong>: Following last week's resolution of the ext4 checksum regression (which was a separate race condition), the eof page pollution protection continues to serve its purpose of preventing data corruption when applications mmap beyond EOF.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/4a0a8181-b0b5-4f2f-84e1-3c935273b7df@lucifer.local/">2026-01-24 Lorenzo Stoakes <a href="mailto:lorenzo.stoakes@oracle.com">lorenzo.stoakes@oracle.com</a> — Re: [PATCH 1/5] NFS: Protect against 'eof page pollution'</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/7c86e2c3ec73650696579a3e03be937a8b4205a1.camel@kernel.org/">2026-01-24 Trond Myklebust <a href="mailto:trondmy@kernel.org">trondmy@kernel.org</a> — Re: [PATCH 1/5] NFS: Protect against 'eof page pollution'</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/8b0b3a40-008a-435f-aa01-75668c22be62@lucifer.local/">2026-01-26 Lorenzo Stoakes <a href="mailto:lorenzo.stoakes@oracle.com">lorenzo.stoakes@oracle.com</a> — Re: [PATCH 1/5] NFS: Protect against 'eof page pollution'</a></li>
+</ul>
+  </main>
+</body>
+</html>

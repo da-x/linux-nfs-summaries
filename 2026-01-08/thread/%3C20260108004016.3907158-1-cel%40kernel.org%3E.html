@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Automatic NFSv4 State Revocation on Filesystem Unmount (v2)</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-08</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Automatic NFSv4 State Revocation on Filesystem Unmount (v2)</h1>
+<h2>Summary</h2>
+<h1>Automatic NFSv4 State Revocation on Filesystem Unmount (v2)</h1>
+<h2>Overview</h2>
+<p>This week, Chuck Lever submitted <strong>version 2</strong> of a six-patch series that introduces automatic NFSv4 state revocation when an underlying filesystem is unmounted. This is classified as a <strong>new feature</strong> for the NFS server (NFSD), addressing a long-standing operational pain point: when clients hold NFSv4 opens, locks, or delegations on an exported filesystem, unmounting fails with <code>EBUSY</code>, requiring administrators to manually invoke <code>/proc/fs/nfsd/unlock_fs</code>.</p>
+<p>The series leverages the kernel's existing <code>fs_pin</code> infrastructure — previously used only by BSD process accounting — to detect mount teardown events and trigger cleanup. This is a significant architectural change that touches both VFS core code and NFSD internals, with implications for containerized NFS servers, orchestration systems, and unattended maintenance scripts.</p>
+<p>As Chuck Lever explained in the cover letter:</p>
+<blockquote>
+<p>"Manual intervention breaks automation workflows. Containerized NFS servers, orchestration systems, and unattended maintenance scripts cannot reliably unmount exported filesystems without implementing custom logic to detect the failure and invoke unlock_fs." <a href="https://lore.kernel.org/linux-nfs/20260108004016.3907158-1-cel@kernel.org/">Chuck Lever</a></p>
+</blockquote>
+<h2>Patch Series Breakdown (v2)</h2>
+<h3>Patch 1/6: Cancel async COPY operations on admin revocation</h3>
+<p>This patch extends the existing <code>unlock_fs</code> mechanism to also cancel ongoing asynchronous NFSv4 COPY operations, which hold copy stateids representing NFSv4 state. Each cancelled copy triggers a <code>CB_OFFLOAD</code> callback carrying <code>NFS4ERR_ADMIN_REVOKED</code> to notify the client. The static <code>drop_client()</code> function is renamed to <code>nfsd4_put_client()</code> and exported for use by both the new cancellation path and the CB_OFFLOAD release callback.</p>
+<blockquote>
+<p>"Async COPY operations hold copy stateids that represent NFSv4 state. Thus, when the NFS server administrator revokes all NFSv4 state for a filesystem via the unlock_fs interface, ongoing async COPY operations referencing that filesystem must also be canceled." <a href="https://lore.kernel.org/linux-nfs/20260108004016.3907158-2-cel@kernel.org/">Chuck Lever</a></p>
+</blockquote>
+<h3>Patch 2/6: Export <code>pin_insert</code> and <code>pin_remove</code> for modular filesystems</h3>
+<p>The existing <code>fs_pin</code> infrastructure provides unmount callbacks, but <code>pin_insert()</code> and <code>pin_remove()</code> lacked <code>EXPORT_SYMBOL_GPL()</code>, restricting the facility to built-in subsystems. This patch exports both symbols to permit modular filesystems like NFSD to register <code>fs_pin</code> callbacks:</p>
+<blockquote>
+<p>"NFSD requires this to revoke NFSv4 delegations, layouts, and open state when the underlying filesystem is unmounted, preventing use-after-free conditions in the state tracking layer." <a href="https://lore.kernel.org/linux-nfs/20260108004016.3907158-3-cel@kernel.org/">Chuck Lever</a></p>
+</blockquote>
+<h3>Patch 3/6: Add <code>pin_insert_sb()</code> for superblock-only pins</h3>
+<p>A critical deadlock concern drove this addition. The standard <code>mnt_pin_kill()</code> callback runs during <code>cleanup_mnt()</code> with namespace locks held, but NFSD's state revocation path acquires these same locks for mount table lookups — creating an AB-BA deadlock risk. The new <code>pin_insert_sb()</code> registers pins on the superblock's <code>s_pins</code> list only, avoiding the problematic locking context:</p>
+<blockquote>
+<p>"NFSD maintains NFSv4 client state associated with the superblocks of exported filesystems. Revoking this state during unmount requires lock ordering that conflicts with mnt_pin_kill() context." <a href="https://lore.kernel.org/linux-nfs/20260108004016.3907158-4-cel@kernel.org/">Chuck Lever</a></p>
+</blockquote>
+<h3>Patch 4/6: Invoke <code>group_pin_kill()</code> during mount teardown</h3>
+<p>Previously, <code>group_pin_kill()</code> was called only during remount read-only. This patch adds a call in <code>cleanup_mnt()</code> so that pins registered via <code>pin_insert_sb()</code> receive callbacks during mount teardown as well. An important side effect is noted:</p>
+<blockquote>
+<p>"Because group_pin_kill() operates on the superblock's s_pins list, unmounting any mount of a filesystem—including bind mounts—triggers callbacks for all pins registered on that superblock. For NFSD, this means unmounting an exported bind mount revokes NFSv4 state for the entire filesystem, even if other mounts remain." <a href="https://lore.kernel.org/linux-nfs/20260108004016.3907158-5-cel@kernel.org/">Chuck Lever</a></p>
+</blockquote>
+<h3>Patch 5/6: Revoke NFSv4 state on filesystem unmount</h3>
+<p>The core patch of the series. An xarray in <code>nfsd_net</code> tracks per-superblock pins. When any NFS state is created, a pin is registered idempotently for that superblock. On unmount, the VFS invokes the kill callback, which queues work to:</p>
+<ul>
+<li>Cancel ongoing async COPY operations (<code>nfsd4_cancel_copy_by_sb</code>)</li>
+<li>Release NLM locks (<code>nlmsvc_unlock_all_by_sb</code>)</li>
+<li>Revoke NFSv4 state (<code>nfsd4_revoke_states</code>)</li>
+</ul>
+<p>The revocation runs on a dedicated workqueue (<code>nfsd_pin_wq</code>) to avoid deadlocks. Chuck Lever notes:</p>
+<blockquote>
+<p>"If state revocation takes an unexpectedly long time (e.g., when re-exporting an NFS mount whose backend server is unresponsive), periodic warnings are emitted every 30 seconds." <a href="https://lore.kernel.org/linux-nfs/20260108004016.3907158-6-cel@kernel.org/">Chuck Lever</a></p>
+</blockquote>
+<h3>Patch 6/6: Close cached files on filesystem unmount</h3>
+<p>Even after NFSv4 state is revoked, the <code>nfsd_file</code> cache can hold open NFSv2/3 file handles that pin the filesystem. This patch extends the revocation mechanism to also close cached file handles belonging to the target superblock.</p>
+<blockquote>
+<p>"When a filesystem is unmounted while NFS is exporting it, the unmount can fail with EBUSY even after NFSv4 state has been revoked." <a href="https://lore.kernel.org/linux-nfs/20260108004016.3907158-7-cel@kernel.org/">Chuck Lever</a></p>
+</blockquote>
+<h2>Key Technical Discussion</h2>
+<h3>Jeff Layton's Alternative Proposal</h3>
+<p>Jeff Layton reviewed the series and raised an important architectural concern regarding the <code>fs_pin</code> infrastructure's long-term viability:</p>
+<blockquote>
+<p>"One thing I want to point out here is that the only user of fs_pin is the BSD process accounting subsystem, which would be really nice to get rid of at some point." <a href="https://lore.kernel.org/linux-nfs/206cb47d470bb06b26175755adec013cfac759d7.camel@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<p>He suggested an alternative approach:</p>
+<blockquote>
+<p>"An alternate idea might be to plumb an srcu notifier chain into the umount codepath, similar to the lease_notifier_chain in fs/locks.c. Then nfsd could register to be notified when there is a umount attempt and do the right thing to tear down state." <a href="https://lore.kernel.org/linux-nfs/206cb47d470bb06b26175755adec013cfac759d7.camel@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<p>This feedback points toward a potential v3 redesign that would decouple NFSD's unmount notification from <code>fs_pin</code>, which is slated for eventual removal once BSD process accounting is eliminated.</p>
+<h3>Changes Since v1</h3>
+<p>Chuck Lever noted several improvements over the initial submission:</p>
+<ul>
+<li>Explained why <code>drop_client()</code> is being renamed</li>
+<li>Finished implementing revocation on umount</li>
+<li>Renamed <code>pin_insert_group</code></li>
+<li>Clarified log output and code comments</li>
+<li>Hold <code>nfsd_mutex</code> while closing <code>nfsd_files</code></li>
+</ul>
+<h2>Significance for NFS Development</h2>
+<p>This series represents a major quality-of-life improvement for NFS server administrators, particularly in containerized and automated environments:</p>
+<ol>
+<li>
+<p><strong>Elimination of manual state revocation</strong>: Administrators no longer need to manually invoke <code>/proc/fs/nfsd/unlock_fs</code> before unmounting exported filesystems. The server handles cleanup automatically.</p>
+</li>
+<li>
+<p><strong>Client notification via standard error codes</strong>: Clients receive <code>NFS4ERR_ADMIN_REVOKED</code> through standard NFSv4 mechanisms, allowing applications to handle state loss gracefully rather than encountering silent failures.</p>
+</li>
+<li>
+<p><strong>Comprehensive state cleanup</strong>: The series addresses all forms of state that can pin a filesystem — NFSv4 opens, locks, delegations, async COPY operations, NLM locks, and cached NFSv2/3 file handles.</p>
+</li>
+<li>
+<p><strong>VFS integration</strong>: By extending <code>fs_pin</code> to support modular filesystems and superblock-only pins, this work lays groundwork for other subsystems that may need mount lifecycle notifications.</p>
+</li>
+<li>
+<p><strong>Deadlock avoidance</strong>: The careful separation of <code>pin_insert_sb()</code> from <code>mnt_pin_kill()</code> demonstrates sophisticated understanding of VFS lock ordering constraints.</p>
+</li>
+</ol>
+<h2>Conclusion</h2>
+<p>This v2 submission is a polished, well-reviewed feature addition to the NFS server stack. While Jeff Layton's feedback about <code>fs_pin</code>'s eventual removal suggests potential architectural changes for future iterations, the current approach provides a functional and safe solution using existing kernel infrastructure. The series received <code>Reviewed-by</code> tags from both NeilBrown and Jeff Layton on the VFS patches, indicating strong maintainer support for the core mechanism.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260108004016.3907158-1-cel@kernel.org/">2026-01-08 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 0/6] Automatic NFSv4 state revocation on filesystem unmount</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260108004016.3907158-2-cel@kernel.org/">2026-01-08 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 1/6] nfsd: cancel async COPY operations when admin revokes filesystem state</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260108004016.3907158-3-cel@kernel.org/">2026-01-08 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 2/6] fs: export pin_insert and pin_remove for modular filesystems</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260108004016.3907158-5-cel@kernel.org/">2026-01-08 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 4/6] fs: invoke group_pin_kill() during mount teardown</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260108004016.3907158-4-cel@kernel.org/">2026-01-08 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 3/6] fs: add pin_insert_sb() for superblock-only pins</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260108004016.3907158-7-cel@kernel.org/">2026-01-08 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 6/6] nfsd: close cached files on filesystem unmount</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260108004016.3907158-6-cel@kernel.org/">2026-01-08 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 5/6] nfsd: revoke NFSv4 state when filesystem is unmounted</a></li>
+</ul>
+  </main>
+</body>
+</html>

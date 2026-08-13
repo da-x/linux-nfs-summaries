@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS Client: Deadlock Found in Proposed Lock/Unlock Race Fix Leaves UAF Unresolved</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-08</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS Client: Deadlock Found in Proposed Lock/Unlock Race Fix Leaves UAF Unresolved</h1>
+<h2>Summary</h2>
+<h1>NFS Client: Deadlock Discovered in Proposed Lock/Unlock Race Fix</h1>
+<h2>Overview</h2>
+<p>This week saw a significant development in an ongoing effort to fix a use-after-free (UAF) bug in the NFS client's file locking subsystem. The discussion, initiated months earlier by Li Lingfeng of Huawei, has taken a critical turn: the proposed solution was found to introduce a <strong>deadlock</strong>, casting doubt on the viability of the approach and leaving the original UAF issue unresolved.</p>
+<h2>Background (Prior Weeks)</h2>
+<p>The thread originated in July 2025 with <a href="https://lore.kernel.org/linux-nfs/20250715030559.2906634-1-lilingfeng3@huawei.com/">Li Lingfeng's PATCH v2 submission</a>, which aimed to fix a race condition between NFS lock/unlock operations and file open operations. The original bug involved a scenario where:</p>
+<ol>
+<li>Thread T1 holds multiple locks on a file, with one lock operation extending an existing lock and releasing another.</li>
+<li>Thread T2 triggers the NFS state manager (e.g., after a server restart), which reclaims open state and accesses file locks.</li>
+<li>Thread T3 opens the file in write-only mode, accessing locks that have been freed by T1's operations — resulting in a <strong>use-after-free</strong>.</li>
+</ol>
+<p>The proposed fix in v2 was to use <code>nfsi-&gt;rwsem</code> (a read-write semaphore on the NFS inode) to protect file locks from concurrent access during reclaim and open operations. A <a href="https://lore.kernel.org/linux-nfs/03488bcb-f2c2-4da7-913e-d262ff73ada3@huawei.com/">friendly ping was sent in September 2025</a>, but the patch did not gain traction or review feedback during that period.</p>
+<h2>This Week's Development: Deadlock Identified</h2>
+<p>On January 7, Li Lingfeng <a href="https://lore.kernel.org/linux-nfs/5e9ea3a8-d3ab-4fdf-9365-502866c9224d@huawei.com/">returned with a critical finding</a>: the <code>rwsem</code>-based solution introduces a deadlock under specific conditions.</p>
+<h3>The Deadlock Scenario</h3>
+<p>Li Lingfeng detailed a two-thread deadlock involving the NFS state manager and an unlock operation:</p>
+<blockquote>
+<p>"Recently, we found that this solution can introduce a deadlock issue"</p>
+</blockquote>
+<p>The deadlock unfolds as follows:</p>
+<ul>
+<li>
+<p><strong>Thread T1</strong> (user-space flock/unlock path):</p>
+<ul>
+<li><code>nfs_flock</code> → <code>do_unlk</code> → <code>nfs4_proc_lock</code> → <code>nfs4_proc_unlck</code></li>
+<li>Acquires <code>down_read(&amp;nfsi-&gt;rwsem)</code> (holding the read lock)</li>
+<li>Calls <code>rpc_wait_for_completion_task</code>, waiting for an RPC task to complete</li>
+<li>The RPC callback (<code>nfs4_locku_done</code>) triggers error recovery, causing the RPC task to sleep on <code>&amp;clp-&gt;cl_rpcwaitq</code></li>
+</ul>
+</li>
+<li>
+<p><strong>Thread T2</strong> (NFS state manager):</p>
+<ul>
+<li><code>nfs4_state_manager</code> → <code>nfs4_do_reclaim</code> → <code>nfs4_reclaim_open_state</code> → <code>nfs4_reclaim_locks</code></li>
+<li>Attempts <code>down_write(&amp;nfsi-&gt;rwsem)</code> — but this blocks because T1 holds a read lock that will never be released (T1 is waiting for the RPC task, which in turn waits for T2 to wake it)</li>
+</ul>
+</li>
+</ul>
+<p>This is a classic <strong>ABBA deadlock</strong>: T1 holds <code>rwsem</code> and waits for the state manager; T2 (the state manager) needs <code>rwsem</code> to proceed.</p>
+<h3>Key Conclusion</h3>
+<p>Li Lingfeng concluded:</p>
+<blockquote>
+<p>"It seems that using &amp;nfsi-&gt;rwsem to protect file locks is not a good idea."</p>
+</blockquote>
+<p>The developer then posed an open question to the community:</p>
+<blockquote>
+<p>"Does anyone have a viable approach to address this UAF issue?"</p>
+</blockquote>
+<h2>Assessment</h2>
+<p>This discussion centers on a <strong>bug fix</strong> — specifically, a race condition leading to use-after-free in the NFS client's file locking code. The original bug was reported by Zhang Jian and the initial approach suggested by Yangerkun, both from Huawei.</p>
+<p>The evolution of the thread reveals:</p>
+<ol>
+<li><strong>July 2025</strong>: Initial patch proposal using <code>rwsem</code> protection.</li>
+<li><strong>September 2025</strong>: Follow-up ping with no further activity.</li>
+<li><strong>January 2026</strong>: Discovery that the proposed fix introduces a deadlock, effectively invalidating the approach.</li>
+</ol>
+<p>As of this week's final message, <strong>no alternative solution has been proposed</strong>. The UAF bug remains unfixed, and the community is being asked to contribute ideas for a viable resolution. This underscores the complexity of concurrent locking in the NFS client, where interactions between user-space lock operations, RPC error recovery, and the state manager create subtle deadlock hazards.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/5e9ea3a8-d3ab-4fdf-9365-502866c9224d@huawei.com/">2026-01-07 Li Lingfeng <a href="mailto:lilingfeng3@huawei.com">lilingfeng3@huawei.com</a> — Re: [PATCH v2] nfs: fix the race of lock/unlock and open</a></li>
+</ul>
+  </main>
+</body>
+</html>

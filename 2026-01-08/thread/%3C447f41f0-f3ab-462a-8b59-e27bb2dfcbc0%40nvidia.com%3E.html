@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS EOF Page Pollution Fix Causes ext4 Corruption in Nested VMs</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-08</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS EOF Page Pollution Fix Causes ext4 Corruption in Nested VMs</h1>
+<h2>Summary</h2>
+<h1>NFS EOF Page Pollution Fix Causes ext4 Checksum Corruption in Nested VMs</h1>
+<p><strong>Type:</strong> Bug fix regression investigation</p>
+<h2>Overview</h2>
+<p>NVIDIA engineers reported a filesystem corruption regression traced to Trond Myklebust's "eof page pollution" protection fix in the NFS client. The issue manifests as intermittent ext4 checksum errors during boot of nested virtual machines, where qcow2 disk images stored on an NFSv4.2 share are used as backing storage for VMs running ext4 filesystems.</p>
+<h2>Key Technical Details</h2>
+<h3>The Regression</h3>
+<p>Mark Bloch from NVIDIA opened the thread reporting that their internal regression tests began exhibiting ext4 checksum errors after a specific commit: <a href="https://lore.kernel.org/linux-nfs/447f41f0-f3ab-462a-8b59-e27bb2dfcbc0@nvidia.com/">As reported by Mark</a>:</p>
+<blockquote>
+<p>We've recently started seeing filesystem issues in our internal regression runs, and we were able to bisect the problem down to the following commit:</p>
+<p>commit b1817b18ff20e69f5accdccefaf78bf5454bede2
+Author: Trond Myklebust <a href="mailto:trond.myklebust@hammerspace.com">trond.myklebust@hammerspace.com</a>
+Date:   Thu Sep 4 18:46:16 2025 -0400</p>
+<pre><code>NFS: Protect against 'eof page pollution'
+</code></pre>
+</blockquote>
+<p>The original commit was designed to fix xfstest <code>generic/363</code>, addressing a scenario where users mmap() an area beyond end-of-file and write data into the folio straddling EOF. When the file length is subsequently extended, the NFS client must discard that folio data to prevent corruption.</p>
+<h3>Symptoms</h3>
+<p>The regression manifests as intermittent ext4 directory checksum failures during boot:</p>
+<pre><code>EXT4-fs warning (device vda2): ext4_dirblock_csum_verify:375: inode #263414: comm updatedb: No space for directory leaf checksum. Please run e2fsck -D.
+EXT4-fs error (device vda2): __ext4_find_entry:1624: inode #263414: comm updatedb: checksumming directory block 0
+</code></pre>
+<p>The issue occurs in roughly half of nested VM boots, making it non-deterministic but reproducible.</p>
+<h3>Confirmation of Causality</h3>
+<p>Trond Myklebust initially expressed skepticism about the connection between NFS and ext4 corruption: <a href="https://lore.kernel.org/linux-nfs/43278ef7e260f46de5a7130331f30e12b916f89a.camel@kernel.org/">As noted by Trond</a>:</p>
+<blockquote>
+<p>I'm having trouble seeing how those issues can be related unless ext4 and NFS are somehow sharing the same folios. Does reverting just commit b1817b18ff20 and b2036bb65114 actually fix the ext4 problem?</p>
+</blockquote>
+<p>Mark confirmed that reverting both commits eliminated the issue: <a href="https://lore.kernel.org/linux-nfs/3e7d4222-9326-4761-819f-114831919c80@nvidia.com/">As confirmed by Mark</a>:</p>
+<blockquote>
+<p>Yes, after reverting those two commits we no longer can reproduce it.</p>
+</blockquote>
+<h3>Nested VM Architecture</h3>
+<p>Mark explained the complex nested virtualization setup: <a href="https://lore.kernel.org/linux-nfs/3e7d4222-9326-4761-819f-114831919c80@nvidia.com/">As described by Mark</a>:</p>
+<blockquote>
+<p>Say we have host A. On host A we run VM B. Inside VM B we run VM C.</p>
+<p>Inside VM B we have a mount (nfs one) which holds the .img files. [...] inside VM C, it's a regular ext4 mount: /dev/vda2 on / type ext4 (rw,relatime)</p>
+</blockquote>
+<p>The setup involves:</p>
+<ul>
+<li><strong>Host A</strong>: Physical host running VM B</li>
+<li><strong>VM B</strong>: Runs QEMU with qcow2 images stored on an NFSv4.2 mount (<code>discard=unmap</code>), hosting VM C</li>
+<li><strong>VM C</strong>: Guest VM with ext4 root filesystem backed by the qcow2 image</li>
+</ul>
+<h3>Trond's Follow-Up Questions</h3>
+<p>Trond sought to understand whether the interaction between NFS discard/unmap operations and the EOF page pollution fix might be the culprit: <a href="https://lore.kernel.org/linux-nfs/d6419d6b1e24c2a704a44f6347bfcfa59fa195c2.camel@kernel.org/">As asked by Trond</a>:</p>
+<blockquote>
+<p>OK so if I'm understanding correctly, this is organised as ext4 partitions that are stored in qcow2 images that are again stored on a NFSv4.2 partition.</p>
+<p>Do these qcow2 images have a file size that is fixed at creation time, or is the file size dynamic?
+Also, does changing the "discard" option from "unmap" to "ignore" make any difference to the outcome?</p>
+</blockquote>
+<p>Bar Friedman joined the thread on January 6th, copying in additional NVIDIA engineers for further investigation.</p>
+<h2>Current Status</h2>
+<p>The discussion remains open-ended as of this week's window. Key questions remain:</p>
+<ol>
+<li>Whether qcow2 images use fixed or dynamic sizing</li>
+<li>Whether disabling NFS discard/unmap operations affects the outcome</li>
+<li>The precise mechanism by which the EOF page pollution fix corrupts data in nested VM scenarios</li>
+</ol>
+<h2>Significance for NFS Client Development</h2>
+<p>This regression highlights a subtle interaction between:</p>
+<ul>
+<li>The NFS client's EOF page protection logic (designed to prevent data leakage beyond file boundaries)</li>
+<li>NFSv4.2 discard/unmap operations on sparse files (qcow2 images)</li>
+<li>Nested virtualization workloads where filesystem layers are stacked through block devices</li>
+</ul>
+<p>The fact that reverting the fix eliminates ext4 corruption suggests the EOF page pollution protection may be incorrectly zeroing or invalidating pages that should remain intact in certain discard-heavy workloads.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/447f41f0-f3ab-462a-8b59-e27bb2dfcbc0@nvidia.com/">2026-01-04 Mark Bloch <a href="mailto:mbloch@nvidia.com">mbloch@nvidia.com</a> — Possible regression after NFS eof page pollution fix (ext4 checksum errors)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/43278ef7e260f46de5a7130331f30e12b916f89a.camel@kernel.org/">2026-01-04 Trond Myklebust <a href="mailto:trondmy@kernel.org">trondmy@kernel.org</a> — Re: Possible regression after NFS eof page pollution fix (ext4 checksum errors)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/3e7d4222-9326-4761-819f-114831919c80@nvidia.com/">2026-01-05 Mark Bloch <a href="mailto:mbloch@nvidia.com">mbloch@nvidia.com</a> — Re: Possible regression after NFS eof page pollution fix (ext4 checksum errors)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/d6419d6b1e24c2a704a44f6347bfcfa59fa195c2.camel@kernel.org/">2026-01-05 Trond Myklebust <a href="mailto:trondmy@kernel.org">trondmy@kernel.org</a> — Re: Possible regression after NFS eof page pollution fix (ext4 checksum errors)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/DS2PR12MB97124A12DBC3EAE91A5DF9A8D487A@DS2PR12MB9712.namprd12.prod.outlook.com/">2026-01-06 Bar Friedman <a href="mailto:bfriedman@nvidia.com">bfriedman@nvidia.com</a> — Re: Possible regression after NFS eof page pollution fix (ext4 checksum errors)</a></li>
+</ul>
+  </main>
+</body>
+</html>

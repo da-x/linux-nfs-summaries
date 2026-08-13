@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSv4 State Revocation: fs_pin Rejected, SRCU Notifier Proposed</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-15</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSv4 State Revocation: fs_pin Rejected, SRCU Notifier Proposed</h1>
+<h2>Summary</h2>
+<h1>Automatic NFSv4 State Revocation on Filesystem Unmount: Architectural Reassessment</h1>
+<h2>Overview</h2>
+<p>This week's discussion centered on Chuck Lever's <strong>[PATCH v2 0/6] Automatic NFSv4 state revocation on filesystem unmount</strong> series, which was initially submitted last week. The series aims to automatically revoke NFSv4 client state (opens, locks, delegations) when an exported filesystem is unmounted — eliminating the need for administrators to manually invoke <code>/proc/fs/nfsd/unlock_fs</code>. This is classified as a <strong>new feature</strong> for the NFS server (NFSD).</p>
+<p>The week's activity was dominated by VFS maintainers raising fundamental concerns about the <code>fs_pin</code> infrastructure that the series relies upon, ultimately signaling that the current approach may need to be abandoned in favor of an alternative mechanism.</p>
+<h2>Key Technical Arguments</h2>
+<h3>The <code>fs_pin</code> Infrastructure Is Not a Good Foundation</h3>
+<p>The most consequential development this week was VFS maintainer Al Viro's strong objection to building new NFSD infrastructure on top of <code>fs_pin</code>:</p>
+<blockquote>
+<p>"FWIW, fs_pin had never been a good API and experiments with using it for core stuff had failed - we ended up with dput_to_list() and teaching shrink lists to DTRT with mixed-fs lists instead. TBH, I'd rather not see it growing more users." <a href="https://lore.kernel.org/linux-nfs/20260110164946.GD3634291@ZenIV/">Al Viro</a></p>
+</blockquote>
+<p>This concern was echoed by Jeff Layton, who noted that <code>fs_pin</code>'s sole current consumer — BSD process accounting — is slated for removal:</p>
+<blockquote>
+<p>"One thing I want to point out here is that the only user of fs_pin is the BSD process accounting subsystem, which would be really nice to get rid of at some point." <a href="https://lore.kernel.org/linux-nfs/206cb47d470bb06b26175755adec013cfac759d7.camel@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<p>Chuck Lever acknowledged the feedback and conceded that a different approach would be needed:</p>
+<blockquote>
+<p>"Fair enough. I will look for a different solution." <a href="https://lore.kernel.org/linux-nfs/0599548b-49c1-44e0-b0a8-a077cbdfbcce@kernel.org/">Chuck Lever</a></p>
+</blockquote>
+<h3>Per-Mount vs. Per-Superblock Granularity</h3>
+<p>Al Viro also identified a deeper architectural issue: the series conflates per-mount and per-superblock semantics:</p>
+<blockquote>
+<p>"more serious problem is that you are mixing per-mount and per-fs things here." <a href="https://lore.kernel.org/linux-nfs/20260110164946.GD3634291@ZenIV/">Al Viro</a></p>
+</blockquote>
+<p>In response, Chuck Lever clarified the distinction between <code>pin_insert()</code> (per-mount) and <code>pin_insert_sb()</code> (per-superblock):</p>
+<blockquote>
+<p>"The 'locking context' rationale in the commit message is stale. The actual distinction between pin_insert() and pin_insert_sb() is semantic: per-mount versus per-superblock granularity." <a href="https://lore.kernel.org/linux-nfs/50610e1c-7f09-4840-b2b2-f211dd6cdd5f@app.fastmail.com/">Chuck Lever</a></p>
+</blockquote>
+<p>NeilBrown (from prior week, referenced this week) had raised concern that unmounting a bind mount would revoke NFSv4 state for the entire filesystem — an unintended side effect of superblock-level pins. Chuck Lever agreed:</p>
+<blockquote>
+<p>"I agree that isn't the desired behavior." <a href="https://lore.kernel.org/linux-nfs/50610e1c-7f09-4840-b2b2-f211dd6cdd5f@app.fastmail.com/">Chuck Lever</a></p>
+</blockquote>
+<h3>The Write Count Problem</h3>
+<p>Al Viro probed whether NFSD's open files would prevent read-only remounts even after unexport, demonstrating with a shell example that any file opened for write blocks <code>remount,ro</code> until the final <code>fput()</code>:</p>
+<blockquote>
+<p>"You don't need to be in the middle of write(2); just having a file opened for write prevents r/o remount." <a href="https://lore.kernel.org/linux-nfs/20260110220816.GE3634291@ZenIV/">Al Viro</a></p>
+</blockquote>
+<p>He then asked Chuck Lever to clarify the desired semantics:</p>
+<blockquote>
+<p>"Do you want to be able to * umount without an unexport? * remount read-only without an unexport?" <a href="https://lore.kernel.org/linux-nfs/20260110220816.GE3634291@ZenIV/">Al Viro</a></p>
+</blockquote>
+<p>Chuck Lever clarified that <strong>unexport should remain a prerequisite</strong> for configuration changes, and the goal is to make unmount work reliably <em>after</em> unexport:</p>
+<blockquote>
+<p>"I think unexport is a reasonable pre-requisite for any configuration changes to the local mount on the NFS server. So IMHO we don't want either of those." <a href="https://lore.kernel.org/linux-nfs/c04214f2-74c6-4b7f-9805-9130e888bee9@app.fastmail.com/">Chuck Lever</a></p>
+</blockquote>
+<blockquote>
+<p>"The issue I'm trying to resolve is that even after unexport, unmount doesn't work reliably. Triggering 'unlock_filesystem' automatically on unmount should be able to mitigate or fully address that." <a href="https://lore.kernel.org/linux-nfs/c04214f2-74c6-4b7f-9805-9130e888bee9@app.fastmail.com/">Chuck Lever</a></p>
+</blockquote>
+<h3>Proposed Alternative: SRCU Notifier Chain</h3>
+<p>Jeff Layton proposed an alternative mechanism that avoids <code>fs_pin</code> entirely:</p>
+<blockquote>
+<p>"An alternate idea might be to plumb an srcu notifier chain into the umount codepath, similar to the lease_notifier_chain in fs/locks.c. Then nfsd could register to be notified when there is a umount attempt and do the right thing to tear down state." <a href="https://lore.kernel.org/linux-nfs/206cb47d470bb06b26175755adec013cfac759d7.camel@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<p>Christian Brauner, another VFS maintainer, endorsed this direction:</p>
+<blockquote>
+<p>"Doesn't sound too bad." <a href="https://lore.kernel.org/linux-nfs/20260112-dingo-aufwuchs-a118f763554a@brauner/">Christian Brauner</a></p>
+</blockquote>
+<h2>Evolution of the Discussion</h2>
+<table><thead><tr><th>Date</th><th>Participant</th><th>Key Point</th></tr></thead><tbody>
+<tr><td>Jan 9</td><td>Chuck Lever</td><td>Clarified that <code>pin_insert()</code> vs. <code>pin_insert_sb()</code> distinction is semantic (per-mount vs. per-superblock), not about locking context. Acknowledged bind-mount revocation issue.</td></tr>
+<tr><td>Jan 9</td><td>Jeff Layton</td><td>Flagged <code>fs_pin</code> deprecation risk; proposed SRCU notifier chain alternative.</td></tr>
+<tr><td>Jan 10</td><td>Al Viro</td><td>Stated <code>fs_pin</code> is a poor API and should not grow new users; raised per-mount vs. per-fs granularity concern.</td></tr>
+<tr><td>Jan 10</td><td>Chuck Lever</td><td>Agreed to seek an alternative solution; explained the NFSv4 state retention problem after unexport.</td></tr>
+<tr><td>Jan 10</td><td>Al Viro</td><td>Probed write-count semantics and asked whether umount/remount-ro should work without unexport.</td></tr>
+<tr><td>Jan 10</td><td>Chuck Lever</td><td>Confirmed unexport remains a prerequisite; goal is reliable unmount <em>after</em> unexport.</td></tr>
+<tr><td>Jan 12</td><td>Christian Brauner</td><td>Endorsed Jeff Layton's SRCU notifier chain proposal.</td></tr>
+</tbody></table>
+<h2>Final Conclusions</h2>
+<p>The discussion this week resulted in a <strong>clear pivot away from the <code>fs_pin</code>-based approach</strong>:</p>
+<ol>
+<li>
+<p><strong><code>fs_pin</code> is not suitable</strong> as a foundation for NFSD's unmount notification, per Al Viro's authoritative assessment that it "had never been a good API" and should not grow new users.</p>
+</li>
+<li>
+<p><strong>The SRCU notifier chain</strong> proposed by Jeff Layton has received positive feedback from both Christian Brauner and appears to be the preferred path forward for v3 of this series.</p>
+</li>
+<li>
+<p><strong>The problem statement remains valid</strong>: After unexport, NFSv4 client state (opens, locks, delegations) keeps files open on the server, preventing clean unmount. The goal is automatic cleanup at unmount time, with unexport remaining a prerequisite.</p>
+</li>
+<li>
+<p><strong>A v3 redesign is expected</strong> that replaces <code>fs_pin</code> with an SRCU-based notifier mechanism in the VFS unmount path, analogous to the existing <code>lease_notifier_chain</code> in <code>fs/locks.c</code>.</p>
+</li>
+</ol>
+<p>This represents a significant course correction for NFS server development, with the architectural foundation of the feature being reworked before implementation details can be finalized.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/50610e1c-7f09-4840-b2b2-f211dd6cdd5f@app.fastmail.com/">2026-01-09 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v2 4/6] fs: invoke group_pin_kill() during mount teardown</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/206cb47d470bb06b26175755adec013cfac759d7.camel@kernel.org/">2026-01-09 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v2 0/6] Automatic NFSv4 state revocation on filesystem unmount</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260110164946.GD3634291@ZenIV/">2026-01-10 Al Viro <a href="mailto:viro@zeniv.linux.org.uk">viro@zeniv.linux.org.uk</a> — Re: [PATCH v2 4/6] fs: invoke group_pin_kill() during mount teardown</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/0599548b-49c1-44e0-b0a8-a077cbdfbcce@kernel.org/">2026-01-10 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v2 4/6] fs: invoke group_pin_kill() during mount teardown</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260110220816.GE3634291@ZenIV/">2026-01-10 Al Viro <a href="mailto:viro@zeniv.linux.org.uk">viro@zeniv.linux.org.uk</a> — Re: [PATCH v2 4/6] fs: invoke group_pin_kill() during mount teardown</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/c04214f2-74c6-4b7f-9805-9130e888bee9@app.fastmail.com/">2026-01-10 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v2 4/6] fs: invoke group_pin_kill() during mount teardown</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260112-dingo-aufwuchs-a118f763554a@brauner/">2026-01-12 Christian Brauner <a href="mailto:brauner@kernel.org">brauner@kernel.org</a> — Re: [PATCH v2 0/6] Automatic NFSv4 state revocation on filesystem unmount</a></li>
+</ul>
+  </main>
+</body>
+</html>

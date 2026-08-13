@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS: Fix directory delegation state recovery crashes</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-08</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS: Fix directory delegation state recovery crashes</h1>
+<h2>Summary</h2>
+<h1>NFS Client Directory Delegation Bug Fix: Iterative Crash Resolution</h1>
+<p><strong>Type:</strong> Bug fix — critical kernel crashes in the NFS client related to directory delegation state recovery.</p>
+<h2>Background (Prior Weeks)</h2>
+<p>This thread traces back to Anna Schumaker's original patch <a href="https://lore.kernel.org/linux-nfs/20251219201344.380279-1-anna@kernel.org/">Fix directory delegation verifier checks</a>, submitted December 19, which aimed to optimize directory delegation verifier handling for performance. Christoph Hellwig reported that applying this patch led to kernel Oops crashes when running his delegation benchmarking script and the <code>generic/633</code> xfstests test. On December 31, Trond Myklebust proposed an initial fix addressing <code>nfs_clear_verifier_delegated()</code> for delegated directories [id://53d40f4781783f9b79196bb30975b788be8bb969.camel@hammerspace.com].</p>
+<h2>This Week's Discussion (Jan 6–8, 2026)</h2>
+<h3>First Crash Report: <code>nfs_end_delegation_return</code> Oops</h3>
+<p>On January 6, Christoph Hellwig reported that Trond's initial fix resolved the original crash but introduced a new one in <code>generic/633</code>:</p>
+<blockquote>
+<p>"It does. But now generic/633 crashes reliably" [id://aVyp3SIddHB5sMhp@infradead.org]</p>
+</blockquote>
+<p>The crash manifested as a general protection fault at <code>nfs_end_delegation_return+0xda/0x390</code>, triggered during a <code>chown</code> operation via the call path: <code>chown_common → notify_change → nfs_setattr → nfs4_proc_setattr → nfs_end_delegation_return</code>. The Oops indicated access to a non-canonical address (<code>0xcccccccccccccd0c</code>), suggesting use-after-free or uninitialized pointer corruption in delegation return handling.</p>
+<h3>First Iteration of Fix: Blocking State Recovery for Directories</h3>
+<p>Trond Myklebust responded with frustration but determination, proposing another patch while warning that persistent issues might necessitate disabling directory delegations entirely:</p>
+<blockquote>
+<p>"Sigh... One last patch on top of all the previous ones, but if we hit another issue I think we need to consider just disabling directory delegations on the client until all the remaining issues can be fixed in the next release." [id://1df4bb7ff3e6fd607c1811d75fcd6dcb860e320e.camel@kernel.org]</p>
+</blockquote>
+<p>The patch, titled <strong>"NFSv4.x: Directory delegations don't require any state recovery"</strong>, addressed the core insight that the state recovery code in <code>nfs_end_delegation_return()</code> was designed for regular files (to recover cached open and lock state) but had "no function for directory delegations, and may cause corruption." Trond also asked Anna Schumaker:</p>
+<blockquote>
+<p>"Anna, are you able to reproduce these bugs?" [id://1df4bb7ff3e6fd607c1811d75fcd6dcb860e320e.camel@kernel.org]</p>
+</blockquote>
+<h3>Second Crash Report: <code>nfs_inode_find_state_and_recover</code> Oops</h3>
+<p>Christoph tested the new patch and reported it still crashed <code>generic/633</code>, this time at a different location:</p>
+<blockquote>
+<p>"This still crashes generic/633" [id://aV3ttYmT2vAtPDws@infradead.org]</p>
+</blockquote>
+<p>The new Oops occurred in <code>nfs_inode_find_state_and_recover+0x9c/0x260</code>, called from <code>nfs4_delegreturn_done</code> via the RPC async workqueue. The crash again involved a non-canonical address (<code>0xcccccccccccccd50</code>), indicating that the state recovery path was still being exercised for directory delegations in a code path not covered by Trond's first patch.</p>
+<h3>Second Iteration of Fix: Completing the State Recovery Block</h3>
+<p>Trond acknowledged the incompleteness of his fix and provided an incremental patch, noting:</p>
+<blockquote>
+<p>"Thanks for doing all this testing, Christoph. I really appreciate it. The previous patch was incomplete." [id://d8ddd23a18985ae360855931f185d0e24c466310.camel@kernel.org]</p>
+</blockquote>
+<p>The follow-up patch, <strong>"NFSv4.x: Directory delegations don't require any state recovery (part 2)"</strong>, addressed the second crash site in <code>nfs_inode_find_state_and_recover()</code>. Trond clarified his integration plan:</p>
+<blockquote>
+<p>"This is incremental to yesterday's patch, but I'll squash them together in the testing branch, since they're both about blocking state recovery in the non-regular file case." [id://d8ddd23a18985ae360855931f185d0e24c466310.camel@kernel.org]</p>
+</blockquote>
+<h3>Resolution and Remaining Concerns</h3>
+<p>Christoph confirmed the combined fix resolved the crash:</p>
+<blockquote>
+<p>"This fixes generic/633. I've kicked off a full xfstests run and will report back." [id://aV58KBha24bpbLUf@infradead.org]</p>
+</blockquote>
+<p>Anna Schumaker then weighed in with her own testing results, revealing a version-specific nuance:</p>
+<blockquote>
+<p>"I finally hit Christoph's crasher this morning, and this patch did help when running with NFS v4.1 but I still see the problem with v4.2. I haven't dug into it enough to know if it's just harder to hit now, though." [id://0bc24199-7e23-4419-bc70-17ad4bebd690@oracle.com]</p>
+</blockquote>
+<p>She offered to take over debugging:</p>
+<blockquote>
+<p>"Do you want me to take back over debugging this from here?" [id://0bc24199-7e23-4419-bc70-17ad4bebd690@oracle.com]</p>
+</blockquote>
+<p>In his final message of the week, Christoph reported positive results from the full xfstests suite but flagged a separate regression:</p>
+<blockquote>
+<p>"xfstests survives without crashing. However since 6.19-rc a bunch of timestamp related tests keep failing." [id://aV93q3w00seoH5xC@infradead.org]</p>
+</blockquote>
+<h2>Key Technical Arguments and Conclusions</h2>
+<ol>
+<li>
+<p><strong>Root Cause:</strong> The NFS client's state recovery infrastructure in <code>nfs_end_delegation_return()</code> and <code>nfs_inode_find_state_and_recover()</code> was designed for regular file delegations (recovering open/lock state). When applied to directory delegations, these code paths accessed invalid memory, causing kernel crashes.</p>
+</li>
+<li>
+<p><strong>Fix Strategy:</strong> Two complementary patches were needed to block state recovery for non-regular file delegations at both the delegation return completion path and the inode state recovery lookup path. These will be squashed into a single commit.</p>
+</li>
+<li>
+<p><strong>Open Question:</strong> Anna's observation that the crash persists with NFS v4.2 (but not v4.1) suggests there may be additional code paths or protocol differences between versions that need investigation. This remains unresolved at week's end.</p>
+</li>
+<li>
+<p><strong>Contingency Plan:</strong> Trond indicated willingness to disable directory delegations on the client entirely if further issues emerged, underscoring the severity of the bugs introduced by the directory delegation feature (commit <code>156b09482933</code>).</p>
+</li>
+</ol>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/aVyp3SIddHB5sMhp@infradead.org/">2026-01-06 "hch@infradead.ori" <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [PATCH] NFS: Fix directory delegation verifier checks</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/1df4bb7ff3e6fd607c1811d75fcd6dcb860e320e.camel@kernel.org/">2026-01-06 Trond Myklebust <a href="mailto:trondmy@kernel.org">trondmy@kernel.org</a> — Re: [PATCH] NFS: Fix directory delegation verifier checks</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aV3ttYmT2vAtPDws@infradead.org/">2026-01-07 "hch@infradead.ori" <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [PATCH] NFS: Fix directory delegation verifier checks</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/d8ddd23a18985ae360855931f185d0e24c466310.camel@kernel.org/">2026-01-07 Trond Myklebust <a href="mailto:trondmy@kernel.org">trondmy@kernel.org</a> — Re: [PATCH] NFS: Fix directory delegation verifier checks</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aV58KBha24bpbLUf@infradead.org/">2026-01-07 "hch@infradead.ori" <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [PATCH] NFS: Fix directory delegation verifier checks</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/0bc24199-7e23-4419-bc70-17ad4bebd690@oracle.com/">2026-01-07 Anna Schumaker <a href="mailto:anna.schumaker@oracle.com">anna.schumaker@oracle.com</a> — Re: [PATCH] NFS: Fix directory delegation verifier checks</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aV93q3w00seoH5xC@infradead.org/">2026-01-08 "hch@infradead.ori" <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [PATCH] NFS: Fix directory delegation verifier checks</a></li>
+</ul>
+  </main>
+</body>
+</html>

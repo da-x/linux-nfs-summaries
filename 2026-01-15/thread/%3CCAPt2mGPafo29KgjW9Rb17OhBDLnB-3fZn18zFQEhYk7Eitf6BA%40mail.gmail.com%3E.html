@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS Server refcount_t Underflow: Empty ftrace Buffer on v6.18 Re-export Crash</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-15</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS Server refcount_t Underflow: Empty ftrace Buffer on v6.18 Re-export Crash</h1>
+<h2>Summary</h2>
+<h1>NFS Server refcount_t Underflow Debugging: Empty ftrace Buffer on v6.18 Re-export Crash</h1>
+<h2>Classification: Bug fix (ongoing investigation)</h2>
+<h2>Background</h2>
+<p>This thread, initiated in late December 2025, tracks an ongoing investigation into a kernel crash affecting NFS server (NFSD) re-export deployments running Linux v6.18. The bug manifests as a <code>refcount_t</code> underflow in the NFSv4.1+ session sequence completion path (<code>nfsd4_sequence_done</code>), leading to use-after-free warnings and system instability. Daire Byrne reported intermittent crashes after upgrading from v6.4 to v6.18.0, occurring roughly once every two weeks on high-throughput (50 Gbps) re-export servers where NetApp NFSv3 mounts are re-exported as NFSv4 to Linux clients.</p>
+<p>Last week, Chuck Lever provided refined debugging guidance after initial ftrace data proved too voluminous — the <code>nfsd_slot_seqid_sequence</code> tracepoint fires on every compound operation, saturating buffers at 50 Gbps throughput. He recommended increasing buffer sizes, disabling noisy tracepoints, using kprobes for direct refcount underflow capture, and extending panic timeouts.</p>
+<h2>This Week's Activity (January 9, 2026)</h2>
+<h3>Empty ftrace Buffer on Crash</h3>
+<p>On January 9, Daire Byrne reported that the first crash under the new debugging configuration occurred quickly — but yielded no useful trace data:</p>
+<blockquote>
+<p>"Well, my first crash with the latest debug params was quick, but the ftrace buffer was empty..." <a href="https://lore.kernel.org/linux-nfs/CAPt2mGOecb1WR1Q42YE_RkbqqQo=AbvOOp84ZeJLJOc42CKyHQ@mail.gmail.com/">Daire Byrne</a></p>
+</blockquote>
+<p>The kernel oops output confirmed an empty trace buffer:</p>
+<pre><code>[22183.614070] Dumping ftrace buffer:
+[22183.615747]    (ftrace buffer empty)
+[22183.617613] CR2: ffd6eb25124a0a08
+</code></pre>
+<h3>Debug Configuration Issues Identified</h3>
+<p>Daire Byrne shared the exact commands he used to implement Chuck Lever's suggestions, revealing two problems:</p>
+<p><strong>1. The kprobe for <code>refcount_warn_saturate</code> failed to register:</strong></p>
+<blockquote>
+<p>"I couldn't add the refcount_warn_saturate kprobe though: trace_kprobe: Could not probe notrace function refcount_warn_saturate" <a href="https://lore.kernel.org/linux-nfs/CAPt2mGOecb1WR1Q42YE_RkbqqQo=AbvOOp84ZeJLJOc42CKyHQ@mail.gmail.com/">Daire Byrne</a></p>
+</blockquote>
+<p>This indicates the function was compiled with the <code>notrace</code> attribute, preventing kprobe instrumentation — a common issue with core kernel functions where tracing could cause recursion.</p>
+<p><strong>2. The ftrace buffer remained empty despite tracepoint configuration:</strong></p>
+<p>Daire confirmed he saw the expected NFSd trace events available in <code>/sys/kernel/debug/tracing/trace</code>, but they were not captured during the oops dump:</p>
+<blockquote>
+<p>"I definitely see the requested nfsd trace stuff in /sys/kernel/debug/tracing/trace now, so not sure why it didn't dump on the oops last time around." <a href="https://lore.kernel.org/linux-nfs/CAPt2mGOecb1WR1Q42YE_RkbqqQo=AbvOOp84ZeJLJOc42CKyHQ@mail.gmail.com/">Daire Byrne</a></p>
+</blockquote>
+<p>This suggests either a configuration issue with <code>ftrace_dump_on_oops</code> or that the tracepoints were not actually enabled at crash time.</p>
+<h3>Next Steps</h3>
+<p>Daire Byrne indicated he would retry the debugging approach and then test the candidate fix patch:</p>
+<blockquote>
+<p>"I'll try it again and then try the suggested patch." <a href="https://lore.kernel.org/linux-nfs/CAPt2mGOecb1WR1Q42YE_RkbqqQo=AbvOOp84ZeJLJOc42CKyHQ@mail.gmail.com/">Daire Byrne</a></p>
+</blockquote>
+<p>The candidate fix in question is <code>cbfd91d22776</code> ("nfsd: never defer requests during idmap lookup") from Chuck Lever's <code>nfsd-testing</code> branch, which was identified last week as potentially relevant to the refcount underflow issue.</p>
+<h2>Technical Significance</h2>
+<p>This week highlights the practical challenges of debugging intermittent kernel crashes in production NFS server environments at scale:</p>
+<ol>
+<li>
+<p><strong>Notrace functions block kprobes</strong>: Core kernel functions like <code>refcount_warn_saturate</code> may be compiled with <code>notrace</code>, preventing direct instrumentation via kprobes — requiring alternative approaches such as kernel recompilation with different debug options or using hardware-based tracing (e.g., perf, ftrace dynamic events).</p>
+</li>
+<li>
+<p><strong>ftrace_dump_on_oops reliability</strong>: Even with correct tracepoint configuration, the dump mechanism may fail to capture data, possibly due to timing issues during oops handling or incorrect buffer state management.</p>
+</li>
+<li>
+<p><strong>The debugging path remains open</strong>: Despite setbacks in trace data collection, the investigation continues with refined methodology and a candidate patch under evaluation.</p>
+</li>
+</ol>
+<h2>Status</h2>
+<p><strong>Open — under investigation.</strong> No root cause has been identified or fix merged. The candidate fix (<code>cbfd91d22776</code>) has not yet been tested by Daire Byrne. Debugging infrastructure issues (empty ftrace buffer, failed kprobe registration) need to be resolved before useful crash data can be captured.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/CAPt2mGOecb1WR1Q42YE_RkbqqQo=AbvOOp84ZeJLJOc42CKyHQ@mail.gmail.com/">2026-01-09 Daire Byrne <a href="mailto:daire@dneg.com">daire@dneg.com</a> — Re: refcount_t underflow (nfsd4_sequence_done?) with v6.18 re-export</a></li>
+</ul>
+  </main>
+</body>
+</html>

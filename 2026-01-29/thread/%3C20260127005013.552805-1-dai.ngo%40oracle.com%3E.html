@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD Layout Recall Timeout: Fencing Integration, Data Safety Debate, and Architectural Rework</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-29</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD Layout Recall Timeout: Fencing Integration, Data Safety Debate, and Architectural Rework</h1>
+<h2>Summary</h2>
+<h1>NFSD Layout Recall Timeout and Lease Manager Fencing Integration</h1>
+<h2>Summary</h2>
+<p><strong>Type:</strong> Bug fix / Protocol safety enhancement (NFSD server-side pNFS block layout recall handling)</p>
+<h2>Overview</h2>
+<p>Dai Ngo submitted version 4 of a patch to enforce timeouts on NFSv4.1/pNFS layout recalls and integrate fencing through the kernel lease manager framework (<a href="https://lore.kernel.org/linux-nfs/20260127005013.552805-1-dai.ngo@oracle.com/">PATCH v4 1/1</a>). The patch addresses a critical server-side reliability issue: when a layout conflict triggers a recall, the absence of a timeout can cause excessive <code>nfsd</code> threads to block indefinitely in <code>__break_lease</code>, degrading or halting the server's ability to service incoming requests.</p>
+<p>As Dai explained in the cover letter:</p>
+<blockquote>
+<p>"When a layout conflict triggers a recall, enforcing a timeout is necessary to prevent excessive nfsd threads from being blocked in __break_lease ensuring the server continues servicing incoming requests efficiently."</p>
+</blockquote>
+<p>The patch introduces a new <code>lm_breaker_timedout</code> callback in the lease manager operations structure, enabling NFSD to trigger SCSI Persistent Reservation (PR) fencing when a layout recall times out — preventing the original client from continuing to access the underlying block device while another client is being granted exclusive access.</p>
+<h2>Key Technical Arguments</h2>
+<h3>1. Timeout Enforcement and Fencing Integration</h3>
+<p>The patch adds <code>lm_breaker_timedout</code> to <code>lease_manager_operations</code>, invoked when a lease recall times out. For NFSD's lease manager, this callback schedules an asynchronous worker to fence the client via SCSI PR operations if the layout type supports fencing. The conflicting file_lease remains on the <code>flc_list</code> until fencing completes, ensuring no other clients can access the file prematurely.</p>
+<h3>2. Chuck Lever's Review: Error Handling and Race Conditions</h3>
+<p>Chuck Lever raised several significant concerns in his review <a href="https://lore.kernel.org/linux-nfs/88a3edc5-4928-4235-a555-a7017d5ca502@app.fastmail.com/">on Jan 27</a>:</p>
+<p><strong>Error distinction removal:</strong> The removed code distinguished between retryable errors (e.g., path failures) and permanent errors (<code>PR_STS_IOERR</code>, <code>PR_STS_RESERVATION_CONFLICT</code>), but the new code clears the fence on any error:</p>
+<blockquote>
+<p>"The removed code distinguishes retryable errors (such as path failures) from permanent errors (PR_STS_IOERR, PR_STS_RESERVATION_CONFLICT), but the new code clears the fence on any error, potentially causing infinite retry loops as warned in the removed comment."</p>
+</blockquote>
+<p><strong>Race condition on fenced state:</strong> Chuck identified a potential TOCTOU race with <code>ls_fenced</code>:</p>
+<blockquote>
+<p>"Fair enough for ls_fence_retry_cnt, but are you sure there isn't a TOCTOU issue here for ls_fenced? Isn't there a race possible with the server receiving the client's callback while lm_breaker_timeout is running?"</p>
+</blockquote>
+<p><strong>Reference counting race:</strong> The increment of <code>ls_fence_retry_cnt</code> after <code>mod_delayed_work()</code> was flagged as racy:</p>
+<blockquote>
+<p>"Incrementing after the mod_delayed_work() call is racy."</p>
+</blockquote>
+<p>Chuck also noted a missing <code>cancel_delayed_work_sync()</code> when freeing the layout stateid.</p>
+<h3>3. Jeff Layton's Review: Simplifying the Architecture</h3>
+<p>Jeff Layton <a href="https://lore.kernel.org/linux-nfs/5d2288d77498582f78152bdb411222930a7e5978.camel@kernel.org/">on Jan 27</a> proposed a simpler architectural approach:</p>
+<blockquote>
+<p>"I don't understand what this new mutex is protecting, and this all seems overly complex. It feels kind of like you want nfsd to be driving the fencing retries, but I don't think we really do."</p>
+</blockquote>
+<p>He suggested making <code>-&gt;fence_client</code> return a bool/int indicating success or failure, with the workqueue job responsible for requeuing itself if retry is needed:</p>
+<blockquote>
+<p>"I'd just make -&gt;fence_client a bool or int return, and have it indicate whether the client was successfully fenced or not. If it was successfully fenced, then have the caller call lease_modify() to remove the lease. If it wasn't successfully fenced, have the caller (the workqueue job) requeue itself if you want to retry."</p>
+</blockquote>
+<p>Jeff also emphasized the need for admin visibility when fencing fails:</p>
+<blockquote>
+<p>"The cases where the fencing didn't work after too many retries, or the job couldn't be queued should probably get a pr_warn or something. The admin needs to know that data corruption is possible and that they might need to nuke the client manually."</p>
+</blockquote>
+<h3>4. Reference Counting Safety Concerns</h3>
+<p>Jeff Layton <a href="https://lore.kernel.org/linux-nfs/d4bcac6c312a5ea1691536e9b029fb00d8c77cac.camel@kernel.org/">follow-up on Jan 27</a> raised concerns about the safety of using <code>refcount_inc</code>/<code>dec</code> for protecting layout stateid lifetime during fencing:</p>
+<blockquote>
+<p>"Is that safe? That's done in nfsd_break_one_deleg() for similar reasons, but there is a comment over that function explaining why it's OK. We'll need to validate that the lease is always released before the sc_count goes to 0 here too."</p>
+</blockquote>
+<p>Dai acknowledged this was unsafe:</p>
+<blockquote>
+<p>"No, it's not safe. I have to think of other ways to make sure the layout stateid is valid when the fence worker runs." <a href="https://lore.kernel.org/linux-nfs/93798e6a-671d-4cde-a31e-4fcffa0ea5e8@oracle.com/">Dai Ngo</a></p>
+</blockquote>
+<h3>5. The Fundamental Data Safety Challenge</h3>
+<p>Chuck Lever articulated the core challenge with any timeout-based fencing scheme <a href="https://lore.kernel.org/linux-nfs/050225b0-1cf4-4a6c-ab49-7427db70ae7c@kernel.org/">on Jan 27</a>:</p>
+<blockquote>
+<p>"Fine, but with the new retry escape clause, as mentioned below, the server and client can be left in opposite states, it looks like: One believes the fence succeeded, and one believes it still has full device access. Am I incorrect about that? This is the bane of every timeout-based scheme I know about, and why we have the 'hard' mount option."</p>
+</blockquote>
+<p>He further noted:</p>
+<blockquote>
+<p>"A warning doesn't seem like it would prevent data corruption. (I'm not against a warning, in and of itself... it just does not seem to me to be sufficient). I would really like this mechanism to be more data-safe. It needs to deal properly with network partitions and other problems."</p>
+</blockquote>
+<h3>6. Dai's Proposed Resolution: Infinite Retry with Warning</h3>
+<p>In response, Dai proposed abandoning the fixed retry limit in favor of infinite retries with admin warnings <a href="https://lore.kernel.org/linux-nfs/ce920f39-42d5-4147-94f6-836cf7b1438f@oracle.com/">on Jan 28</a>:</p>
+<blockquote>
+<p>"You're right, the server and client can be left in opposite states if we still can not fence the client after so many retries. If we want to be safe then pr_warn the admin then retry forever which effectively prevents all other clients to access the conflict file until it's manually resolved by the admin."</p>
+</blockquote>
+<p>He elaborated:</p>
+<blockquote>
+<p>"I propose pr_warn the admin and retry forever for now until we can find a better option. I expect this to be a very rare condition so it should not effect most environments."</p>
+</blockquote>
+<p>Dai also restored the distinction between permanent errors (<code>PR_STS_IOERR</code>, <code>PR_STS_RESERVATION_CONFLICT</code>) treated as non-error cases, and other errors (including <code>ENOMEM</code>) treated as retryable.</p>
+<h3>7. Architectural Refinement: Lease Modify Responsibility</h3>
+<p>Jeff Layton clarified the expected flow for <code>lm_breaker_timedout</code> <a href="https://lore.kernel.org/linux-nfs/ac6601d20f1f48db9eca7ba204be8030fc16a1d0.camel@kernel.org/">on Jan 28</a>:</p>
+<blockquote>
+<p>"The lm_breaker_timedout() function (or the workqueue job it spawns) is then responsible for calling lease_modify() at the appropriate time. In most cases you're going to need to queue a workqueue job to fence, and you don't want to clear out the lease until after it's done."</p>
+</blockquote>
+<p>Dai acknowledged this design direction <a href="https://lore.kernel.org/linux-nfs/267c6448-20b6-46f4-b287-833bbbff8479@oracle.com/">on Jan 28</a>:</p>
+<blockquote>
+<p>"Oh I see, thank you!"</p>
+</blockquote>
+<h2>Evolution of the Discussion</h2>
+<p>The discussion progressed through several distinct phases over two days:</p>
+<ol>
+<li>
+<p><strong>Initial submission (Jan 27)</strong>: Dai posted v4 with a fixed retry limit of 5 and NFSD-driven fencing retries.</p>
+</li>
+<li>
+<p><strong>Review concerns (Jan 27 afternoon)</strong>: Chuck Lever and Jeff Layton independently identified architectural issues — Chuck focused on error handling semantics, race conditions, and the fundamental data safety problem; Jeff proposed simplifying by having the workqueue job drive retries rather than NFSD.</p>
+</li>
+<li>
+<p><strong>Dai's responses (Jan 27 evening)</strong>: Dai acknowledged multiple concerns — the unsafe reference counting, the need to restore error distinction logic, and agreed to rework the architecture per Jeff's suggestion.</p>
+</li>
+<li>
+<p><strong>Deep dive on data safety (Jan 27-28)</strong>: Chuck Lever articulated why any fixed retry limit risks leaving server and client in inconsistent states. Dai proposed infinite retries with <code>pr_warn</code> as a pragmatic solution for this rare edge case.</p>
+</li>
+<li>
+<p><strong>Architectural alignment (Jan 28)</strong>: Jeff Layton clarified the expected callback contract — <code>lm_breaker_timedout</code> should either call <code>lease_modify()</code> itself or delegate that responsibility to the spawned workqueue job. Dai confirmed understanding and agreed to rework accordingly.</p>
+</li>
+</ol>
+<h2>Final Conclusions</h2>
+<p>As of the end of this week's window, <strong>no consensus has been reached</strong> and no v5 patch has been posted. The key unresolved items are:</p>
+<ul>
+<li><strong>Retry strategy</strong>: Shift from fixed retry count (5) toward infinite retries with <code>pr_warn</code> logging to prevent data corruption when server and client disagree on reservation state.</li>
+<li><strong>Architectural simplification</strong>: Move fencing retry logic into the workqueue job rather than having NFSD drive retries, per Jeff Layton's suggestion.</li>
+<li><strong>Reference counting safety</strong>: A new approach is needed to ensure layout stateid lifetime during asynchronous fencing operations, as the current <code>refcount_inc</code>/<code>nfs4_put_stid</code> pattern was deemed unsafe.</li>
+<li><strong>Error handling semantics</strong>: Restore distinction between permanent errors (<code>PR_STS_IOERR</code>, <code>PR_STS_RESERVATION_CONFLICT</code>) and retryable errors, with appropriate comments explaining the rationale.</li>
+<li><strong>Callback contract</strong>: <code>lm_breaker_timedout()</code> should be responsible for calling <code>lease_modify()</code> at the appropriate time (either directly or via the spawned workqueue job).</li>
+</ul>
+<h2>Significance for NFS Development</h2>
+<p>This patch addresses a critical reliability gap in NFSD's pNFS block layout implementation. Without timeout enforcement on layout recalls, a slow or unresponsive client can block all <code>nfsd</code> threads attempting to resolve layout conflicts, effectively DoS-ing the NFS server. The integration with the kernel lease manager framework also represents an important architectural advancement, enabling NFSD to leverage generic lease infrastructure for pNFS recall semantics.</p>
+<p>The fundamental challenge identified by Chuck Lever — that timeout-based fencing inherently risks inconsistent state between server and client — echoes the classic "hard vs. soft" mount dilemma in NFS. This discussion highlights the ongoing tension between server-side liveness guarantees and data safety in distributed storage systems.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260127005013.552805-1-dai.ngo@oracle.com/">2026-01-27 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — [PATCH v4 1/1] NFSD: Enforce Timeout on Layout Recall and Integrate Lease Manager Fencing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/88a3edc5-4928-4235-a555-a7017d5ca502@app.fastmail.com/">2026-01-27 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v4 1/1] NFSD: Enforce Timeout on Layout Recall and Integrate Lease Manager Fencing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/5d2288d77498582f78152bdb411222930a7e5978.camel@kernel.org/">2026-01-27 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v4 1/1] NFSD: Enforce Timeout on Layout Recall and Integrate Lease Manager Fencing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/d4bcac6c312a5ea1691536e9b029fb00d8c77cac.camel@kernel.org/">2026-01-27 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v4 1/1] NFSD: Enforce Timeout on Layout Recall and Integrate Lease Manager Fencing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/d8040fde-ccdd-443c-928a-9bff93641294@oracle.com/">2026-01-27 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — Re: [PATCH v4 1/1] NFSD: Enforce Timeout on Layout Recall and Integrate Lease Manager Fencing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/93798e6a-671d-4cde-a31e-4fcffa0ea5e8@oracle.com/">2026-01-27 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — Re: [PATCH v4 1/1] NFSD: Enforce Timeout on Layout Recall and Integrate Lease Manager Fencing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/c034364d-1a41-4d4e-a211-16a07afe695f@oracle.com/">2026-01-27 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — Re: [PATCH v4 1/1] NFSD: Enforce Timeout on Layout Recall and Integrate Lease Manager Fencing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/050225b0-1cf4-4a6c-ab49-7427db70ae7c@kernel.org/">2026-01-27 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v4 1/1] NFSD: Enforce Timeout on Layout Recall and Integrate Lease Manager Fencing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ce920f39-42d5-4147-94f6-836cf7b1438f@oracle.com/">2026-01-28 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — Re: [PATCH v4 1/1] NFSD: Enforce Timeout on Layout Recall and Integrate Lease Manager Fencing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/c566182b-2256-45a0-844e-a7c8614ec895@oracle.com/">2026-01-28 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — Re: [PATCH v4 1/1] NFSD: Enforce Timeout on Layout Recall and Integrate Lease Manager Fencing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ac6601d20f1f48db9eca7ba204be8030fc16a1d0.camel@kernel.org/">2026-01-28 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v4 1/1] NFSD: Enforce Timeout on Layout Recall and Integrate Lease Manager Fencing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/267c6448-20b6-46f4-b287-833bbbff8479@oracle.com/">2026-01-28 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — Re: [PATCH v4 1/1] NFSD: Enforce Timeout on Layout Recall and Integrate Lease Manager Fencing</a></li>
+</ul>
+  </main>
+</body>
+</html>

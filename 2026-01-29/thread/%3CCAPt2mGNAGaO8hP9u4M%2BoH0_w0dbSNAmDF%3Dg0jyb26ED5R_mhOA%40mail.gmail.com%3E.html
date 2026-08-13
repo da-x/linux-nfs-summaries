@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>knfsd Read IOPS Ceiling: Lock Contention Investigation into xpt_mutex Bottleneck</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-29</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>knfsd Read IOPS Ceiling: Lock Contention Investigation into xpt_mutex Bottleneck</h1>
+<h2>Summary</h2>
+<h1>knfsd Read IOPS Limits: Lock Contention Investigation Begins</h1>
+<h2>Summary</h2>
+<p><strong>Type:</strong> Performance investigation / Bug diagnosis (not yet a confirmed bug fix)</p>
+<h2>Overview</h2>
+<p>Daire Byrne from DNEG initiated an investigation into the aggregate read IOPS ceiling of the Linux NFS server (knfsd) under a random 4K read workload. The discussion reveals that knfsd appears to hit a hard performance plateau at approximately <strong>300–400K IOPS</strong>, regardless of how many clients are added, and across a wide range of hardware configurations and kernel versions. Chuck Lever and Dai Ngo joined the investigation, with Chuck identifying specific lock contention hotspots through <code>lockstat</code> analysis.</p>
+<h2>The Problem: A Hard IOPS Ceiling</h2>
+<p>Daire Byrne reported that his random 4K read workload saturates the NFS server with around 100 client hosts, after which aggregate IOPS "pretty much flatlines no matter how many more clients you add (I tried up to 500 clients)." He noted:</p>
+<blockquote>
+<p>"And this 300-400k iops limit is probably the maximum that anyone can get, because I tested a wide range of hardware and kernel vintages. The results are all very similar." <a href="https://lore.kernel.org/linux-nfs/CAPt2mGOhR_XSifdTOCkRnTZ36mWgZXAHVxv=SCbonw0yLR8a_A@mail.gmail.com/">Daire Byrne</a></p>
+</blockquote>
+<p>He clarified that his interest was in aggregate server performance rather than per-client throughput:</p>
+<blockquote>
+<p>"I guess I am less interested in improving the per client performance, more the aggregate performance of the server." <a href="https://lore.kernel.org/linux-nfs/CAPt2mGOhR_XSifdTOCkRnTZ36mWgZXAHVxv=SCbonw0yLR8a_A@mail.gmail.com/">Daire Byrne</a></p>
+</blockquote>
+<h2>Initial Suggestions</h2>
+<h3>Client-Side Slot Table Tuning</h3>
+<p>Dai Ngo from Oracle suggested increasing the NFS client's session slot table, which defaults to 64 entries:</p>
+<blockquote>
+<p>"Have you tried to increase the slot table on the NFS client side? By default it has 64 entries... Try to double it to see if that makes any different." <a href="https://lore.kernel.org/linux-nfs/dd2ac9c1-5656-499f-b97c-4c5155523330@oracle.com/">Dai Ngo</a></p>
+</blockquote>
+<p>He noted the server supports up to 2048 slots per session on newer kernels. Daire confirmed this had no effect on aggregate server performance.</p>
+<h3>Lock Contention Hypothesis</h3>
+<p>Chuck Lever hypothesized that the workload was hitting contended spin locks:</p>
+<blockquote>
+<p>"At risk of being glib, the performance data suggests your workload is tickling one or more contended spin locks." <a href="https://lore.kernel.org/linux-nfs/a1b6c46f-e49d-4ae6-ae5e-3c08ed40e359@app.fastmail.com/">Chuck Lever</a></p>
+</blockquote>
+<p>He directed Daire to use the kernel's <code>lockstat</code> tool, documented in <code>Documentation/locking/lockstat.rst</code>.</p>
+<h2>Lockstat Analysis: xpt_mutex Identified as Problematic</h2>
+<p>Daire Byrne shared lockstat data with Chuck. After reviewing it, Chuck identified a significant issue with the <code>xpt_mutex</code>:</p>
+<blockquote>
+<p>"There's kind of no denying it, the xpt_mutex numbers are shitty. The maximum hold time on that mutex is 293379.40 usecs, with a mean hold time of nearly 16 usec, giving it the worst mean wait time by an order of magnitude. And it's not even a contended lock." <a href="https://lore.kernel.org/linux-nfs/723418cf-cec6-4afc-906e-b93a55e85fc9@app.fastmail.com/">Chuck Lever</a></p>
+</blockquote>
+<p>This mutex, part of the SunRPC thread pool dispatch path, was exhibiting extremely high hold times despite not being highly contended — suggesting a structural problem rather than simple contention.</p>
+<h2>Cross-Kernel Consistency</h2>
+<p>Daire noted that this performance plateau appears consistent across multiple kernel generations:</p>
+<blockquote>
+<p>"We have a few generations of hardware and OS versions like RHEL8 (4.18), RHEL9 (5.14) and mainline (v6.18) in production, but I see similar performance plateaus for this workload in all cases (~300k iops/s)." <a href="https://lore.kernel.org/linux-nfs/CAPt2mGNkGbWujzTzxoTGTvAWoOL9aUUhN93SEJQYJTQyV4xu7Q@mail.gmail.com/">Daire Byrne</a></p>
+</blockquote>
+<p>He also recalled seeing different lock contention patterns on older kernels:</p>
+<blockquote>
+<p>"I distinctly remember seeing high nfsd_file_lru_remove &amp; nfsd_file_put (perf lock record) contention on the RHEL9 (5.14) kernel which I don't see now on mainline." <a href="https://lore.kernel.org/linux-nfs/CAPt2mGNkGbWujzTzxoTGTvAWoOL9aUUhN93SEJQYJTQyV4xu7Q@mail.gmail.com/">Daire Byrne</a></p>
+</blockquote>
+<p>This suggests that while the overall IOPS ceiling has remained consistent, the underlying bottleneck may have shifted across kernel versions — from file cache contention in older kernels to <code>xpt_mutex</code> issues on mainline.</p>
+<h2>Next Steps: TCP Send Path Investigation</h2>
+<p>Chuck Lever committed to investigating the issue further:</p>
+<blockquote>
+<p>"True, having a 'good' starting point is a pre-requisite for obtaining quality bisection results. I'm going to try some simple experiments here to see if I can spot any structural problems with the TCP send path." <a href="https://lore.kernel.org/linux-nfs/d9926f9e-50bf-46e7-9109-21b30dd695c1@app.fastmail.com/">Chuck Lever</a></p>
+</blockquote>
+<p>Daire Byrne offered to collect lockstat data across multiple kernel versions for comparative analysis.</p>
+<h2>Significance for NFS Server Development</h2>
+<p>This thread highlights a potential structural performance limitation in the knfsd server under high-concurrency random read workloads. Key takeaways:</p>
+<ol>
+<li><strong>The <code>xpt_mutex</code> in the SunRPC thread pool dispatch path</strong> is exhibiting problematic hold times (up to 293ms maximum, ~16μs mean), which could be a throughput bottleneck for small I/O patterns.</li>
+<li><strong>File cache contention has been addressed</strong> in newer kernels (the <code>nfsd_file_lru_remove</code> and <code>nfsd_file_put</code> hotspots seen on RHEL9/5.14 are gone), but the overall IOPS ceiling persists.</li>
+<li><strong>The bottleneck appears to be structural</strong> rather than hardware-dependent, as similar ceilings appear across diverse configurations.</li>
+</ol>
+<p>This investigation is ongoing, with Chuck Lever planning experiments on the TCP send path and potentially posting patches to address identified contention points. The thread continues into the following week (see subsequent messages in February 2026), where further analysis of <code>lwq</code> spinlock contention and <code>nfsd_setuser</code> group sort performance is discussed.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/CAPt2mGNAGaO8hP9u4M+oH0_w0dbSNAmDF=g0jyb26ED5R_mhOA@mail.gmail.com/">2026-01-25 Daire Byrne — knfsd read iops limits?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/a1b6c46f-e49d-4ae6-ae5e-3c08ed40e359@app.fastmail.com/">2026-01-25 Chuck Lever — Re: knfsd read iops limits?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/dd2ac9c1-5656-499f-b97c-4c5155523330@oracle.com/">2026-01-25 Dai Ngo — Re: knfsd read iops limits?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAPt2mGOhR_XSifdTOCkRnTZ36mWgZXAHVxv=SCbonw0yLR8a_A@mail.gmail.com/">2026-01-25 Daire Byrne — Re: knfsd read iops limits?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAPt2mGNL4neF1NX7_1=9svnNz_iXhadHw0AEjZ_B-50-vwNtUg@mail.gmail.com/">2026-01-25 Daire Byrne — Re: knfsd read iops limits?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/723418cf-cec6-4afc-906e-b93a55e85fc9@app.fastmail.com/">2026-01-26 Chuck Lever — Re: knfsd read iops limits?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAPt2mGNkGbWujzTzxoTGTvAWoOL9aUUhN93SEJQYJTQyV4xu7Q@mail.gmail.com/">2026-01-26 Daire Byrne — Re: knfsd read iops limits?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/d9926f9e-50bf-46e7-9109-21b30dd695c1@app.fastmail.com/">2026-01-26 Chuck Lever — Re: knfsd read iops limits?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAPt2mGNbZm9YDjuCUwJHiJUQUUnKQtbf1ggYPzAytgWjMp68LA@mail.gmail.com/">2026-01-27 Daire Byrne — Re: knfsd read iops limits?</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/CAPt2mGNAGaO8hP9u4M+oH0_w0dbSNAmDF=g0jyb26ED5R_mhOA@mail.gmail.com/">2026-01-25 Daire Byrne <a href="mailto:daire@dneg.com">daire@dneg.com</a> — knfsd read iops limits?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/a1b6c46f-e49d-4ae6-ae5e-3c08ed40e359@app.fastmail.com/">2026-01-25 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: knfsd read iops limits?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/dd2ac9c1-5656-499f-b97c-4c5155523330@oracle.com/">2026-01-25 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — Re: knfsd read iops limits?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAPt2mGOhR_XSifdTOCkRnTZ36mWgZXAHVxv=SCbonw0yLR8a_A@mail.gmail.com/">2026-01-25 Daire Byrne <a href="mailto:daire@dneg.com">daire@dneg.com</a> — Re: knfsd read iops limits?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAPt2mGNL4neF1NX7_1=9svnNz_iXhadHw0AEjZ_B-50-vwNtUg@mail.gmail.com/">2026-01-25 Daire Byrne <a href="mailto:daire@dneg.com">daire@dneg.com</a> — Re: knfsd read iops limits?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/723418cf-cec6-4afc-906e-b93a55e85fc9@app.fastmail.com/">2026-01-26 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: knfsd read iops limits?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAPt2mGNkGbWujzTzxoTGTvAWoOL9aUUhN93SEJQYJTQyV4xu7Q@mail.gmail.com/">2026-01-26 Daire Byrne <a href="mailto:daire@dneg.com">daire@dneg.com</a> — Re: knfsd read iops limits?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/d9926f9e-50bf-46e7-9109-21b30dd695c1@app.fastmail.com/">2026-01-26 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: knfsd read iops limits?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAPt2mGNbZm9YDjuCUwJHiJUQUUnKQtbf1ggYPzAytgWjMp68LA@mail.gmail.com/">2026-01-27 Daire Byrne <a href="mailto:daire@dneg.com">daire@dneg.com</a> — Re: knfsd read iops limits?</a></li>
+</ul>
+  </main>
+</body>
+</html>

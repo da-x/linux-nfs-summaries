@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD/SunRPC Layering Cleanup: rq_private Pointer and Removal of NFSv4-Specific svc_rqst Fields</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-15</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD/SunRPC Layering Cleanup: rq_private Pointer and Removal of NFSv4-Specific svc_rqst Fields</h1>
+<h2>Summary</h2>
+<h1>Fixing Layering Violations Between NFSD and SunRPC via <code>rq_private</code></h1>
+<p><strong>Type:</strong> Bug fix / code cleanup (architectural refactoring)</p>
+<p>On Tuesday, January 13th, Jeff Layton posted a two-patch series titled "<a href="https://lore.kernel.org/linux-nfs/20260113-rq_private-v1-0-88ed308364e6@kernel.org/">fix up some layering violations</a>" targeting the NFS server (nfsd) and the SunRPC service layer. The patches address long-standing architectural issues where nfsd-specific state was embedded directly in the generic <code>struct svc_rqst</code>, violating the clean separation between the RPC transport layer and the NFS server implementation.</p>
+<h2>Motivation and Background</h2>
+<p>Layton explains the rationale:</p>
+<blockquote>
+<p>"The rq_lease_breaker and rq_cachetype fields are only used by nfsd. These patches shrink struct svc_rqst slightly and makes the layering between the two a little cleaner. In the case of rq_lease_breaker, I think this also gives us a little more type safety."</p>
+</blockquote>
+<p>The <code>rq_lease_breaker</code> field in particular has been described as "always a NFSv4 specific layering violation in svc_rqst" [id://20260113-rq_private-v1-1-88ed308364e6@kernel.org]. It was needed because nfsd requires thread-local storage accessible from the <code>svc_rqst</code> pointer during request processing.</p>
+<h2>Patch Details</h2>
+<h3>Patch 1: Introducing <code>svc_rqst-&gt;rq_private</code> and Removing <code>rq_lease_breaker</code></h3>
+<p>The first patch [id://20260113-rq_private-v1-1-88ed308364e6@kernel.org] adds a new <code>rq_private</code> pointer to <code>struct svc_rqst</code>, explicitly reserved for use by the service threads handling requests — the sunrpc core code does not touch it. In nfsd, a new <code>struct nfsd_thread_local_info</code> is defined and allocated on the stack; a pointer to this structure is stored in <code>rq_private</code>. The former <code>rq_lease_breaker</code> field is replaced with an <code>ntli_lease_breaker</code> field within this new structure.</p>
+<h3>Patch 2: Moving <code>rq_cachetype</code> into nfsd's Thread-Local Info</h3>
+<p>The second patch [id://20260113-rq_private-v1-2-88ed308364e6@kernel.org] extends the same cleanup to <code>rq_cachetype</code>, which is also exclusively used by nfsd. It is moved into <code>struct nfsd_thread_local_info</code>.</p>
+<h2>Review Discussion: Stack Allocation Concerns</h2>
+<p>Benjamin Coddington provided a quick review of both patches [id://D867076E-FF23-47C5-87BD-5DE805DF4ED1@hammerspace.com]:</p>
+<blockquote>
+<p>"Both look good to me: Reviewed-by: Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a>"</p>
+</blockquote>
+<p>Chuck Lever, however, raised an architectural concern about the stack-based allocation of <code>struct nfsd_thread_local_info</code> [id://5806015a-ad18-4bc9-a320-2fdab4d86969@app.fastmail.com]:</p>
+<blockquote>
+<p>"This assumes sizeof(structure nfsd_thread_local_info) will always be small enough that it is reasonable to keep on the stack. I can't say that would be a good bet in the long run."</p>
+</blockquote>
+<p>He suggested dynamic allocation via <code>kmalloc</code> instead, noting:</p>
+<blockquote>
+<p>"And we don't need the perfect reliability of not doing a dynamic allocation here. If kmalloc(sizeof(struct nfsd_thread_local_info)) fails, the thread exits immediately, no harm."</p>
+</blockquote>
+<p>Lever also pointed out a practical limitation of stack-based storage for future extensions:</p>
+<blockquote>
+<p>"Also, scatter-gather lists could not be stored directly in this object because it is on the stack. If Ben wanted to stick a 32-byte buffer in struct nfsd_thread_local_info to be used with the crypto API, it would have to be a pointer to it, not the buffer itself."</p>
+</blockquote>
+<p>Jeff Layton acknowledged the concern but pushed back on the need for dynamic allocation at this stage [id://71ddafd443a0e13f79cea09ba2b3ac4f106163ce.camel@kernel.org]:</p>
+<blockquote>
+<p>"Not sure how much space Ben will need (if any). We certainly could have nfsd allocate this separately. I didn't see the point for something that is only a few bytes though."</p>
+</blockquote>
+<p>Chuck Lever proposed a compromise — adding a build-time assertion as a safety tripwire [id://6f112559-43e0-41ad-864c-03b1841920d2@app.fastmail.com]:</p>
+<blockquote>
+<p>"If we are designing for today, another approach would be to set up a BUILD_WARN_ON or other type of static build failure if this structure grows larger than, say 256 bytes -- then add dynamic allocation at that point."</p>
+</blockquote>
+<p>Layton remained skeptical [id://3b5faf0e9bb08c779854e3aaa8b30fb12e86b25e.camel@kernel.org]:</p>
+<blockquote>
+<p>"I don't see us growing this to huge proportions. I think that's the sort of thing we just have to watch out for as maintainers. If you really insist on a BUILD_WARN_ON tripwire, I'll add one, but it seems like overkill to me."</p>
+</blockquote>
+<p>Chuck Lever stood his ground with characteristic bluntness [id://d9060e6f-f1d5-4322-80fa-3794770c0153@app.fastmail.com]:</p>
+<blockquote>
+<p>"I think a tripwire documents the assumption made here in a single line... no different than a lockdep_assert. More critically, though, maintainers tend to have a very short memory. Not a trustworthy lot, really."</p>
+</blockquote>
+<p>He suggested <code>static_assert(sizeof(struct nfsd_thread_local_info) &lt; 256);</code> as the concrete safeguard.</p>
+<h2>Final Outcome</h2>
+<p>Despite the unresolved discussion about the stack-size tripwire, Chuck Lever applied both patches to the <code>nfsd-testing</code> tree on January 14th [id://176841919290.418760.6153318776379161550.b4-ty@oracle.com]:</p>
+<blockquote>
+<p>"Applied to nfsd-testing, thanks!"</p>
+</blockquote>
+<p>The commits are:</p>
+<ul>
+<li><strong>Patch 1/2</strong>: <code>2f9a5cd51d92</code> — "nfsd/sunrpc: add svc_rqst-&gt;rq_private pointer and remove rq_lease_breaker"</li>
+<li><strong>Patch 2/2</strong>: <code>a5428a9e04ff</code> — "nfsd/sunrpc: move rq_cachetype into struct nfsd_thread_local_info"</li>
+</ul>
+<h2>Significance for NFS Client Development</h2>
+<p>While this series primarily targets the NFS server (nfsd) and sunRPC infrastructure, it is relevant to the broader NFS client ecosystem. The cleanup removes NFSv4-specific state from the generic RPC request structure, improving the modular boundaries that both server and client subsystems depend upon. The <code>rq_private</code> mechanism also provides a cleaner path for future nfsd extensions — such as crypto buffers or scatter-gather lists — without further polluting the shared <code>svc_rqst</code> structure.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260113-rq_private-v1-0-88ed308364e6@kernel.org/">2026-01-13 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 0/2] nfsd/sunrpc: fix up some layering violations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260113-rq_private-v1-1-88ed308364e6@kernel.org/">2026-01-13 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 1/2] nfsd/sunrpc: add svc_rqst-&gt;rq_private pointer and remove rq_lease_breaker</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260113-rq_private-v1-2-88ed308364e6@kernel.org/">2026-01-13 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 2/2] nfsd/sunrpc: move rq_cachetype into struct nfsd_thread_local_info</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/D867076E-FF23-47C5-87BD-5DE805DF4ED1@hammerspace.com/">2026-01-13 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — Re: [PATCH 0/2] nfsd/sunrpc: fix up some layering violations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/5806015a-ad18-4bc9-a320-2fdab4d86969@app.fastmail.com/">2026-01-13 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 1/2] nfsd/sunrpc: add svc_rqst-&gt;rq_private pointer and remove rq_lease_breaker</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/71ddafd443a0e13f79cea09ba2b3ac4f106163ce.camel@kernel.org/">2026-01-13 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 1/2] nfsd/sunrpc: add svc_rqst-&gt;rq_private pointer and remove rq_lease_breaker</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/6f112559-43e0-41ad-864c-03b1841920d2@app.fastmail.com/">2026-01-13 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 1/2] nfsd/sunrpc: add svc_rqst-&gt;rq_private pointer and remove rq_lease_breaker</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/3b5faf0e9bb08c779854e3aaa8b30fb12e86b25e.camel@kernel.org/">2026-01-13 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 1/2] nfsd/sunrpc: add svc_rqst-&gt;rq_private pointer and remove rq_lease_breaker</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/d9060e6f-f1d5-4322-80fa-3794770c0153@app.fastmail.com/">2026-01-13 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 1/2] nfsd/sunrpc: add svc_rqst-&gt;rq_private pointer and remove rq_lease_breaker</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/176841919290.418760.6153318776379161550.b4-ty@oracle.com/">2026-01-14 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 0/2] nfsd/sunrpc: fix up some layering violations</a></li>
+</ul>
+  </main>
+</body>
+</html>

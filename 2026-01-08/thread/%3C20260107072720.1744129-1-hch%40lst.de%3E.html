@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS Client: Introducing LRU-Based Delegation Eviction</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-01-08</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS Client: Introducing LRU-Based Delegation Eviction</h1>
+<h2>Summary</h2>
+<h2>NFS Client Delegation LRU: A Major Rework for Performance and Correctness</h2>
+<p>Christoph Hellwig posted a substantial 24-patch series to introduce a Least Recently Used (LRU) list for NFS delegations, aiming to fix long-standing inefficiencies in how the NFS client manages delegation state. The series is focused on <strong>NFS client development</strong>, specifically improving delegation lifecycle management through architectural cleanup and a new eviction strategy.</p>
+<h3>The Problem: Inefficient Delegation Returns</h3>
+<p>The current NFS client implementation struggles with delegations not associated with an open file descriptor. As Hellwig explained in the cover letter [20260107072720.1744129-1-hch@lst.de]:</p>
+<blockquote>
+<p>"currently the NFS client is rather inefficient at managing delegations not associated with an open file. If the number of delegations is above the watermark, the delegation for a free file is immediately returned, even if delegations that were unused for much longer would be available."</p>
+</blockquote>
+<p>Additionally, the periodic freeing mechanism was overly aggressive:</p>
+<blockquote>
+<p>"Also the periodic freeing marks delegations as not referenced for return, even if the file was open and thus force the return on close."</p>
+</blockquote>
+<h3>The Solution: LRU-Based Eviction</h3>
+<p>The series introduces a dedicated LRU list for delegations. When the delegation count exceeds a configured watermark, the client now returns the <em>least recently used</em> delegations rather than immediately returning the most recently freed one. This mirrors the referenced-flag-based eviction policies already used by the VFS inode and dentry caches.</p>
+<p>Key technical changes in the series include:</p>
+<ul>
+<li>Removal of legacy helper functions (<code>__nfs_client_for_each_server</code>, <code>nfs_client_mark_return_unused_delegation_types</code>, <code>nfs_client_mark_return_all_delegations</code>) [20260107072720.1744129-2-hch@lst.de] through [20260107072720.1744129-4-hch@lst.de].</li>
+<li>Simplification of delegation attachment/detachment logic and removal of the <code>NFS_DELEGATION_INODE_FREEING</code> flag [20260107072720.1744129-5-hch@lst.de] through [20260107072720.1744129-10-hch@lst.de].</li>
+<li>Introduction of a separate delegation return list and LRU-based eviction when over the watermark [20260107072720.1744129-23-hch@lst.de].</li>
+<li>A less aggressive periodic cleanup that avoids marking open-but-unused delegations for forced return on close [20260107072720.1744129-24-hch@lst.de].</li>
+</ul>
+<h3>Performance Impact</h3>
+<p>Hellwig reported dramatic improvements for workloads involving repeated module imports (e.g., Python virtual environments):</p>
+<blockquote>
+<p>"For a workload simulating repeated runs of a python program importing a lot of modules, this leads to a 97% reduction of on-the-wire operations, and ~40% speedup even for a fast local NFS server."</p>
+</blockquote>
+<h3>Discussion: LRU vs. LFU and Future Heuristics</h3>
+<p>Chuck Lever questioned whether alternative eviction policies such as Least Frequently Used (LFU) had been considered [0b0b21c1-0bfd-4e2e-9deb-f368a66f5e9c@app.fastmail.com]:</p>
+<blockquote>
+<p>"I'm curious if you tried other methodologies like LFU to decide which delegation to return?"</p>
+</blockquote>
+<p>Hellwig dismissed LFU as impractical due to its overhead:</p>
+<blockquote>
+<p>"LFU I guess means least frequently used. That would imply tracking usage frequency, and rotating a list of other lookup structure a lot. The first is something not really provided in the delegation code, and the latter tends to be really horrible for in terms of cache dirtying."</p>
+</blockquote>
+<p>Sagi Grimberg acknowledged the complexity but suggested that more sophisticated heuristics could be valuable future enhancements [ea31c230-1ace-4721-872e-2313b497214f@grimberg.me]:</p>
+<blockquote>
+<p>"I think that there is merit for tracking file usage frequency and accounting it for deleg return policy, and I don't necessarily think that it would not be worth the overhead (compared to sending rpcs to the server)... but I agree that its a much heavier lift (it can always be done incrementally to this patchset)."</p>
+</blockquote>
+<p>Grimberg also proposed several ideas:</p>
+<ul>
+<li>Holding read delegations longer than write delegations, since shared files in Python/bash workloads are "likely to be updated very rarely, yet accessed frequently by lots of clients."</li>
+<li>Using file modification time (<code>mtime</code>) as a heuristic — files with old <code>mtime</code> values could have their delegations held "with 'low risk' of a conflict."</li>
+<li>Relying more on server-initiated delegation recalls rather than client-side watermark thresholds.</li>
+</ul>
+<p>Hellwig pushed back on the complexity argument, noting:</p>
+<blockquote>
+<p>"There's a reason the rest of the kernel uses fairly simple LRU (or rather modified LRU / clock like) eviction policies like this, in that the sampling is quite overboard. I'm not going to keep you from looking into this, but I don't think it's worthwhile."</p>
+</blockquote>
+<h3>Client vs. Server Interests in Delegation Recall</h3>
+<p>Grimberg suggested that servers might be better positioned to solicit preemptive delegation recalls [ea31c230-1ace-4721-872e-2313b497214f@grimberg.me]:</p>
+<blockquote>
+<p>"And, in general, I think that the server is in a much better position to solicit preemptive delegation recalls as opposed to the client voluntarily return delegations when crossing a somewhat arbitrary delegation_watermark."</p>
+</blockquote>
+<p>Chuck Lever countered that server and client have "orthogonal interests" [45ba87f3-2322-424b-95b1-9129a2537545@app.fastmail.com]:</p>
+<blockquote>
+<p>"The server is concerned with resource utilization -- memory consumed, slots in tables, and so on -- that other active clients might benefit from having freed. The server doesn't really care which delegations are returned. A client wants to keep delegation state that applications are using, and it knows best which ones those are."</p>
+</blockquote>
+<p>Hellwig agreed, pointing to <code>RECALL_ANY</code> as the protocol mechanism that could bridge this gap [20260108153546.GA7623@lst.de]:</p>
+<blockquote>
+<p>"Yes. A good way to deal with that is implementing RECALL_ANY as I mentioned, which with these changes could reclaim off the end of the LRU. But as this series is a big change already, and doing fine grained recalls is another huge one I'd rather wait a bit before going there."</p>
+</blockquote>
+<h3>Conclusion</h3>
+<p>This series represents a significant architectural improvement to NFS client delegation management. By replacing the simplistic immediate-return-on-close behavior with an LRU-based eviction policy, the patchset delivers substantial performance gains for common workloads while simplifying the delegation codebase. The discussion also laid groundwork for future enhancements, including <code>RECALL_ANY</code> support and potentially more sophisticated delegation retention heuristics.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107072720.1744129-1-hch@lst.de/">2026-01-07 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — add a LRU for delegations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107072720.1744129-2-hch@lst.de/">2026-01-07 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 01/24] NFS: remove __nfs_client_for_each_server</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107072720.1744129-3-hch@lst.de/">2026-01-07 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 02/24] NFS: remove nfs_client_mark_return_unused_delegation_types</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107072720.1744129-4-hch@lst.de/">2026-01-07 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 03/24] NFS: remove nfs_client_mark_return_all_delegations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107072720.1744129-5-hch@lst.de/">2026-01-07 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 04/24] NFS: remove the NULL inode check in nfs4_inode_return_delegation_on_close</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107072720.1744129-6-hch@lst.de/">2026-01-07 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 05/24] NFS: remove nfs_inode_detach_delegation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107072720.1744129-7-hch@lst.de/">2026-01-07 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 06/24] NFS: remove nfs_start_delegation_return</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107072720.1744129-8-hch@lst.de/">2026-01-07 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 07/24] NFS: assert rcu_read_lock is held in nfs_start_delegation_return_locked</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107072720.1744129-9-hch@lst.de/">2026-01-07 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 08/24] NFS: drop the _locked postfix from nfs_start_delegation_return</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107072720.1744129-10-hch@lst.de/">2026-01-07 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 09/24] NFS: remove NFS_DELEGATION_INODE_FREEING</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107072720.1744129-11-hch@lst.de/">2026-01-07 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 10/24] NFS: open code nfs_delegation_need_return</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107072720.1744129-12-hch@lst.de/">2026-01-07 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 11/24] NFS: remove nfs_free_delegation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107072720.1744129-13-hch@lst.de/">2026-01-07 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 12/24] NFS: rewrite nfs_delegations_present in terms of nr_active_delegations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107072720.1744129-14-hch@lst.de/">2026-01-07 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 13/24] NFS: move delegation lookup into can_open_delegated</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107072720.1744129-15-hch@lst.de/">2026-01-07 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 14/24] NFS: return bool from nfs_detach_delegation{,_locked}</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107072720.1744129-16-hch@lst.de/">2026-01-07 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 15/24] NFS: move the deleg_cur check out of nfs_detach_delegation_locked</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107072720.1744129-17-hch@lst.de/">2026-01-07 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 16/24] NFS: simplify the detached delegation check in update_open_stateid</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107072720.1744129-18-hch@lst.de/">2026-01-07 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 17/24] NFS: take a delegation reference in nfs4_get_valid_delegation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107072720.1744129-19-hch@lst.de/">2026-01-07 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 18/24] NFS: don't consume a delegation reference in nfs_end_delegation_return</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107072720.1744129-20-hch@lst.de/">2026-01-07 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 19/24] NFS: use refcount_inc_not_zero nfs_start_delegation_return</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107072720.1744129-21-hch@lst.de/">2026-01-07 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 20/24] NFS: use a local RCU critical section in nfs_start_delegation_return</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107072720.1744129-22-hch@lst.de/">2026-01-07 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 21/24] NFS: reformat nfs_mark_delegation_revoked</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107072720.1744129-23-hch@lst.de/">2026-01-07 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 22/24] NFS: add a separate delegation return list</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107072720.1744129-24-hch@lst.de/">2026-01-07 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 23/24] NFS: return delegations from the end of a LRU when over the watermark</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107072720.1744129-25-hch@lst.de/">2026-01-07 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 24/24] NFS: make nfs_mark_return_unreferenced_delegations less aggressive</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/0b0b21c1-0bfd-4e2e-9deb-f368a66f5e9c@app.fastmail.com/">2026-01-07 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: add a LRU for delegations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260107162202.GA23066@lst.de/">2026-01-07 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: add a LRU for delegations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ea31c230-1ace-4721-872e-2313b497214f@grimberg.me/">2026-01-07 Sagi Grimberg <a href="mailto:sagi@grimberg.me">sagi@grimberg.me</a> — Re: add a LRU for delegations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260108134635.GA8624@lst.de/">2026-01-08 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: add a LRU for delegations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/45ba87f3-2322-424b-95b1-9129a2537545@app.fastmail.com/">2026-01-08 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: add a LRU for delegations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260108153546.GA7623@lst.de/">2026-01-08 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: add a LRU for delegations</a></li>
+</ul>
+  </main>
+</body>
+</html>
