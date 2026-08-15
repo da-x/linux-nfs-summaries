@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VFS ID-Mappings Support in NFS: Use Cases and Implementation Strategies</title>
+  <meta name="description" content="This week, the Linux NFS mailing list saw a significant discussion regarding the integration of VFS (Virtual File System) id-mappings with the NFS client. The thread, initiated as an LSF/MM/BPF topic, explores how NFS can support user…">
+  <meta property="og:title" content="VFS ID-Mappings Support in NFS: Use Cases and Implementation Strategies">
+  <meta property="og:description" content="This week, the Linux NFS mailing list saw a significant discussion regarding the integration of VFS (Virtual File System) id-mappings with the NFS client. The thread, initiated as an LSF/MM/BPF topic, explores how NFS can support user…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-02-19T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="VFS ID-Mappings Support in NFS: Use Cases and Implementation Strategies">
+  <meta name="twitter:description" content="This week, the Linux NFS mailing list saw a significant discussion regarding the integration of VFS (Virtual File System) id-mappings with the NFS client. The thread, initiated as an LSF/MM/BPF topic, explores how NFS can support user…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-02-19</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>VFS ID-Mappings Support in NFS: Use Cases and Implementation Strategies</h1>
+<h2>Summary</h2>
+<h1>VFS ID-Mappings Support in NFS: Use Cases and Implementation Strategies</h1>
+<p>This week, the Linux NFS mailing list saw a significant discussion regarding the integration of VFS (Virtual File System) id-mappings with the NFS client. The thread, initiated as an LSF/MM/BPF topic, explores how NFS can support user namespace remapping, a feature critical for modern containerized environments like LXC/Incus and Kubernetes.</p>
+<h2>Discussion Overview</h2>
+<p>The conversation began with Alexander Mikhalitsyn proposing VFS id-mapping support for NFS <a href="https://lore.kernel.org/linux-nfs/65a53a2d6fcc053edeed688a8c8d580c03bd6f3b.camel@mihalicyn.com/">1</a>. Jeff Layton and Trond Myklebust, key NFS maintainers, sought to clarify the specific use cases and technical challenges involved. The discussion evolved from understanding basic AUTH_SYS scenarios to addressing the complexities of AUTH_GSS and NFSv4 idmapping.</p>
+<h2>Key Technical Arguments</h2>
+<h3>Use Case Clarification</h3>
+<p>Jeff Layton requested a concrete example to understand the problem better:</p>
+<blockquote>
+<p>"Could you lay out an example of how you would use them with NFS in a real environment so I understand the problem better? I'd start by assuming a simple setup with AUTH_SYS and no NFSv4 idmapping involved, since that case should be fairly straightforward." <a href="https://lore.kernel.org/linux-nfs/d11b39cb43ffe437868eef4bc1c01d3bce8509e9.camel@kernel.org/">2</a></p>
+</blockquote>
+<p>Alexander Mikhalitsyn explained the LXC/Incus use case, where idmapped mounts allow delegating filesystems to containers without remapping between container user namespaces and the superblock's user namespace:</p>
+<blockquote>
+<p>"At the same time host's system administrator wants to avoid remapping between container's user ns and sb-&gt;s_user_ns (which is init_user_ns for those filesystems). [motivation here is that in many cases you may want to have the same subtree to be shared with other containers and even host users too and you want UIDs to be "compatible", i.e UID 1000 in one container and UID 1000 in another container should land as UID 1000 on the filesystem's inode]" <a href="https://lore.kernel.org/linux-nfs/CAJqdLrqNzXRwMF2grTGCkaMKCEXAwemQLEi3wsL5Lp2W9D-ZVg@mail.gmail.com/">3</a></p>
+</blockquote>
+<p>Kohei Sugihara from Preferred Networks later added the Kubernetes use case, highlighting the need for ReadWriteMany (RWX) access mode with consistent UID/GID views across multiple pods:</p>
+<blockquote>
+<p>"Our goal is here: 1: Mount the same NFS export as a persistent volume from multiple Kubernetes Pods running on different compute nodes... 3: We can access the export from the container as 1000:1000. At minimum, ownership should be consistent from the container view" <a href="https://lore.kernel.org/linux-nfs/CAGY9O4mFJz1fbVUUsdhvFTBcgAGcYYrQBLQxkdOWoQe7LvDYWQ@mail.gmail.com/">10</a></p>
+</blockquote>
+<h3>Technical Challenges with Authentication</h3>
+<p>Trond Myklebust raised concerns about strong authentication methods:</p>
+<blockquote>
+<p>"As the NFS and RPC protocols stand today, strong authentication will defeat any client side idmapping scheme, because the server can't know what uids or gids the client is using on its end; it just knows about the account that was used to authenticate." <a href="https://lore.kernel.org/linux-nfs/f86345b7aa2b69e15c67ca0d8344533d8f099931.camel@kernel.org/">4</a></p>
+</blockquote>
+<p>He suggested that a generic implementation would require protocol extensions:</p>
+<blockquote>
+<p>"I think if you do want to implement something generic, you're going to have to consider how the client and server can exchange (and store) the information needed to allow the client to perform the mapping of file owners/group owners on its end... It would be a very different security model than the one used by NFS today, and almost certainly require protocol extensions." <a href="https://lore.kernel.org/linux-nfs/f86345b7aa2b69e15c67ca0d8344533d8f099931.camel@kernel.org/">4</a></p>
+</blockquote>
+<h3>Proposed Implementation Approaches</h3>
+<p>Jeff Layton suggested that for simple AUTH_SYS cases, the conversion could happen at the RPC client layer without protocol extensions:</p>
+<blockquote>
+<p>"So in this case, it sounds like you would need just do that conversion (maybe at the RPC client layer?) when issuing an RPC. You don't really need a protocol extension for that case." <a href="https://lore.kernel.org/linux-nfs/e0be58df89ffaf41763312dfffe8402fdcb9d023.camel@kernel.org/">7</a></p>
+</blockquote>
+<p>NeilBrown provided additional insights on handling different authentication and NFS versions:</p>
+<blockquote>
+<p>"If you use krb5 and NFSv3 then you really want the mapping between krb5 identity and uid to be the same on client and server, so then when an application creates a file and the stats it, it sees that it owns it." <a href="https://lore.kernel.org/linux-nfs/177146267901.8396.9601896246772305364@noble.neil.brown.name/">9</a></p>
+</blockquote>
+<p>For NFSv4 with idmapper, he suggested:</p>
+<blockquote>
+<p>"With NFSv4 and the idmapper you wouldn't need (or want) the kernel idmapping to be used at all. You would want the idmapper deamon to run in the user-namespace and map from on-the-wire names to the appropriate app-level uids." <a href="https://lore.kernel.org/linux-nfs/177146267901.8396.9601896246772305364@noble.neil.brown.name/">9</a></p>
+</blockquote>
+<h2>Evolution of the Discussion</h2>
+<p>The thread progressed from initial proposal to detailed use case explanations, then to technical feasibility analysis. Key milestones included:</p>
+<ol>
+<li><strong>Initial Proposal</strong>: Alexander Mikhalitsyn introduced the topic <a href="https://lore.kernel.org/linux-nfs/65a53a2d6fcc053edeed688a8c8d580c03bd6f3b.camel@mihalicyn.com/">1</a></li>
+<li><strong>Use Case Clarification</strong>: Jeff Layton requested concrete examples, leading to explanations from both LXC/Incus and Kubernetes perspectives <a href="https://lore.kernel.org/linux-nfs/d11b39cb43ffe437868eef4bc1c01d3bce8509e9.camel@kernel.org/">2</a>, <a href="https://lore.kernel.org/linux-nfs/CAJqdLrqNzXRwMF2grTGCkaMKCEXAwemQLEi3wsL5Lp2W9D-ZVg@mail.gmail.com/">3</a>, <a href="https://lore.kernel.org/linux-nfs/CAGY9O4mFJz1fbVUUsdhvFTBcgAGcYYrQBLQxkdOWoQe7LvDYWQ@mail.gmail.com/">10</a></li>
+<li><strong>Technical Challenges</strong>: Trond Myklebust highlighted authentication-related complexities <a href="https://lore.kernel.org/linux-nfs/f86345b7aa2b69e15c67ca0d8344533d8f099931.camel@kernel.org/">4</a></li>
+<li><strong>Implementation Strategies</strong>: The group discussed potential approaches, with consensus forming around starting with simple AUTH_SYS cases <a href="https://lore.kernel.org/linux-nfs/e0be58df89ffaf41763312dfffe8402fdcb9d023.camel@kernel.org/">7</a>, <a href="https://lore.kernel.org/linux-nfs/CAJqdLrri3ojGyus71Mzk1rsLaCKo5HZMqP=UNNvR0sn9Oyxk-g@mail.gmail.com/">8</a></li>
+</ol>
+<h2>Final Conclusions</h2>
+<p>The discussion concluded with agreement on a phased approach:</p>
+<ol>
+<li><strong>Start Simple</strong>: Focus initially on AUTH_SYS without NFSv4 idmapping, as suggested by Jeff Layton <a href="https://lore.kernel.org/linux-nfs/d11b39cb43ffe437868eef4bc1c01d3bce8509e9.camel@kernel.org/">2</a></li>
+<li><strong>Client-Side Implementation</strong>: For simple cases, UID conversion can happen at the RPC client layer without protocol extensions <a href="https://lore.kernel.org/linux-nfs/e0be58df89ffaf41763312dfffe8402fdcb9d023.camel@kernel.org/">7</a></li>
+<li><strong>Iterative Development</strong>: Alexander Mikhalitsyn offered to prepare RFC patches for the simple case before LSF/MM/BPF <a href="https://lore.kernel.org/linux-nfs/CAJqdLrri3ojGyus71Mzk1rsLaCKo5HZMqP=UNNvR0sn9Oyxk-g@mail.gmail.com/">8</a></li>
+<li><strong>Future Complexity</strong>: AUTH_GSS and NFSv4 idmapping will require more sophisticated solutions, potentially involving protocol extensions or changes to how the idmapper daemon operates <a href="https://lore.kernel.org/linux-nfs/f86345b7aa2b69e15c67ca0d8344533d8f099931.camel@kernel.org/">4</a>, <a href="https://lore.kernel.org/linux-nfs/177146267901.8396.9601896246772305364@noble.neil.brown.name/">9</a></li>
+</ol>
+<p>Kohei Sugihara emphasized the importance of this work for container security:</p>
+<blockquote>
+<p>"Kubernetes and the container community actively work on host isolation using the Linux user namespace feature. Recently they experienced RCE vulnerabilities on container runtime but it could be mitigated by host isolation using the user namespace isolation" <a href="https://lore.kernel.org/linux-nfs/CAGY9O4mFJz1fbVUUsdhvFTBcgAGcYYrQBLQxkdOWoQe7LvDYWQ@mail.gmail.com/">10</a></p>
+</blockquote>
+<p>This thread represents an important step toward improving NFS compatibility with modern containerized environments, balancing security requirements with operational simplicity.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/65a53a2d6fcc053edeed688a8c8d580c03bd6f3b.camel@mihalicyn.com/">2026-02-18 Alexander Mikhalitsyn <a href="mailto:alexander@mihalicyn.com">alexander@mihalicyn.com</a> — [LSF/MM/BPF TOPIC] VFS idmappings support in NFS</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/d11b39cb43ffe437868eef4bc1c01d3bce8509e9.camel@kernel.org/">2026-02-18 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [LSF/MM/BPF TOPIC] VFS idmappings support in NFS</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAJqdLrqNzXRwMF2grTGCkaMKCEXAwemQLEi3wsL5Lp2W9D-ZVg@mail.gmail.com/">2026-02-18 Alexander Mikhalitsyn <a href="mailto:alexander@mihalicyn.com">alexander@mihalicyn.com</a> — Re: [LSF/MM/BPF TOPIC] VFS idmappings support in NFS</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/f86345b7aa2b69e15c67ca0d8344533d8f099931.camel@kernel.org/">2026-02-18 Trond Myklebust <a href="mailto:trondmy@kernel.org">trondmy@kernel.org</a> — Re: [LSF/MM/BPF TOPIC] VFS idmappings support in NFS</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/a0eab8f07873e38fa4c5d958de6b75761d690874.camel@kernel.org/">2026-02-18 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [LSF/MM/BPF TOPIC] VFS idmappings support in NFS</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAJqdLroQZPUmNS2Z2TuR5qcmzwOHw-Q9rxp5pqPz8PnrH3j-Tg@mail.gmail.com/">2026-02-18 Alexander Mikhalitsyn <a href="mailto:alexander@mihalicyn.com">alexander@mihalicyn.com</a> — Re: [LSF/MM/BPF TOPIC] VFS idmappings support in NFS</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/e0be58df89ffaf41763312dfffe8402fdcb9d023.camel@kernel.org/">2026-02-18 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [LSF/MM/BPF TOPIC] VFS idmappings support in NFS</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAJqdLrri3ojGyus71Mzk1rsLaCKo5HZMqP=UNNvR0sn9Oyxk-g@mail.gmail.com/">2026-02-18 Alexander Mikhalitsyn <a href="mailto:alexander@mihalicyn.com">alexander@mihalicyn.com</a> — Re: [LSF/MM/BPF TOPIC] VFS idmappings support in NFS</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177146267901.8396.9601896246772305364@noble.neil.brown.name/">2026-02-19 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [LSF/MM/BPF TOPIC] VFS idmappings support in NFS</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAGY9O4mFJz1fbVUUsdhvFTBcgAGcYYrQBLQxkdOWoQe7LvDYWQ@mail.gmail.com/">2026-02-19 Kohei Sugihara <a href="mailto:ksugihara@preferred.jp">ksugihara@preferred.jp</a> — Re: [LSF/MM/BPF TOPIC] VFS idmappings support in NFS</a></li>
+</ul>
+  </main>
+</body>
+</html>

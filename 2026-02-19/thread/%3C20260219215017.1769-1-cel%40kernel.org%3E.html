@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS Server UAF Fix: Deferred Cleanup in Cache Show Callbacks</title>
+  <meta name="description" content="This thread presents a two-patch series from Chuck Lever addressing a critical use-after-free (UAF) bug in the NFS server (nfsd) subsystem. The patches are a direct response to a crash report filed earlier this week by Misbah Anjum N, who…">
+  <meta property="og:title" content="NFS Server UAF Fix: Deferred Cleanup in Cache Show Callbacks">
+  <meta property="og:description" content="This thread presents a two-patch series from Chuck Lever addressing a critical use-after-free (UAF) bug in the NFS server (nfsd) subsystem. The patches are a direct response to a crash report filed earlier this week by Misbah Anjum N, who…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-02-19T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS Server UAF Fix: Deferred Cleanup in Cache Show Callbacks">
+  <meta name="twitter:description" content="This thread presents a two-patch series from Chuck Lever addressing a critical use-after-free (UAF) bug in the NFS server (nfsd) subsystem. The patches are a direct response to a crash report filed earlier this week by Misbah Anjum N, who…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-02-19</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS Server UAF Fix: Deferred Cleanup in Cache Show Callbacks</h1>
+<h2>Summary</h2>
+<h1>Addressing Use-After-Free in NFS Server Cache Show Callbacks</h1>
+<h2>Classification: Critical Bug Fix (NFS Server / SUNRPC)</h2>
+<p>This thread presents a two-patch series from Chuck Lever addressing a <strong>critical use-after-free (UAF) bug</strong> in the NFS server (<code>nfsd</code>) subsystem. The patches are a direct response to a crash report filed earlier this week by Misbah Anjum N, who documented 100% reproducible kernel panics on ppc64le systems when diagnostic tools read <code>/proc/fs/nfsd/*</code> files.</p>
+<hr />
+<h2>Background: The Crash Report</h2>
+<p>Earlier this week, Misbah Anjum N reported a severe regression in the SUNRPC cache layer:</p>
+<blockquote>
+<p>"I'm reporting a critical use-after-free bug in linux-next NFS server code that causes kernel crashes when sosreport reads /proc/fs/nfsd/* files. This appears to be a recent regression affecting ppc64le systems." <a href="https://lore.kernel.org/linux-nfs/dcd371d3a95815a84ba7de52cef447b8@linux.ibm.com/">dcd371d3a95815a84ba7de52cef447b8@linux.ibm.com</a></p>
+</blockquote>
+<p>The crashes manifested as NULL pointer dereferences in <code>d_path()</code> and corrupted pointer accesses in <code>cache_check_rcu()</code>, with faulting addresses decoding to ASCII strings like <code>"export_cap"</code> and <code>"libz.so."</code> — classic indicators of freed memory being reallocated.</p>
+<p>Chuck Lever noted that a prior fix had addressed one instance of this UAF class, but additional instances remained:</p>
+<blockquote>
+<p>"That fix addressed one instance of this problem; there are actually several more, all in the same UAF class. I have a patch series nearly complete to address these issues."</p>
+</blockquote>
+<hr />
+<h2>The Patch Series</h2>
+<p>Chuck Lever submitted a two-patch series titled <strong>[PATCH v1 0/2] Address UAF in sunrpc cache show callbacks</strong> <a href="https://lore.kernel.org/linux-nfs/20260219215017.1769-1-cel@kernel.org/">20260219215017.1769-1-cel@kernel.org</a>, describing the effort as follows:</p>
+<blockquote>
+<p>"Attempt to address three crashes reported here."</p>
+</blockquote>
+<p>He noted the patches were compile-tested and regression-tested, but required validation on PowerPC hardware:</p>
+<blockquote>
+<p>"as I do not have a PowerPC system handy, I will need someone who has one to test whether they actually address the crashes."</p>
+</blockquote>
+<h3>Patch 1/2: Defer Sub-Object Cleanup in Export Put Callbacks</h3>
+<p><strong>Subject:</strong> <a href="https://lore.kernel.org/linux-nfs/20260219215017.1769-2-cel@kernel.org/">NFSD: Defer sub-object cleanup in export put callbacks</a></p>
+<p>This patch addresses the core race condition. The problem lies in <code>svc_export_put()</code>, which calls <code>path_put()</code> and <code>auth_domain_put()</code> immediately when the last reference drops — <em>before</em> the RCU grace period expires. Meanwhile, RCU readers in <code>e_show()</code> and <code>c_show()</code> access <code>ex_path</code> (via <code>seq_path</code>/<code>d_path</code>) and <code>ex_client-&gt;name</code> (via <code>seq_escape</code>) without holding a reference. If <code>cache_clean</code> removes the entry and drops the last reference concurrently, sub-objects are freed while still in use:</p>
+<blockquote>
+<p>"RCU readers in e_show() and c_show() access both ex_path (via seq_path/d_path) and ex_client-&gt;name (via seq_escape) without holding a reference. If cache_clean removes the entry and drops the last reference concurrently, the sub-objects are freed while still in use, producing a NULL pointer dereference in d_path."</p>
+</blockquote>
+<p>A previous fix (commit 2530766492ec) had moved <code>kfree</code> of <code>ex_uuid</code> and <code>ex_stats</code> into the <code>call_rcu</code> callback, but left <code>path_put()</code> and <code>auth_domain_put()</code> running before the grace period because those operations may sleep and <code>call_rcu</code> callbacks execute in softirq context.</p>
+<p><strong>The Solution:</strong> Replace <code>call_rcu</code>/<code>kfree_rcu</code> with <code>queue_rcu_work()</code>, which defers the callback until after the RCU grace period and executes it in process context where sleeping is permitted:</p>
+<blockquote>
+<p>"Replace call_rcu/kfree_rcu with queue_rcu_work(), which defers the callback until after the RCU grace period and executes it in process context where sleeping is permitted. This allows path_put() and auth_domain_put() to be moved into the deferred callback alongside the other resource releases."</p>
+</blockquote>
+<p>The patch also applies the same fix to <code>expkey_put()</code>, which exhibits the identical pattern with <code>ek_path</code> and <code>ek_client</code>. A dedicated workqueue scopes the shutdown drain to only NFSD export release work items, avoiding stalls on unrelated subsystem work.</p>
+<p><strong>Fixes cited:</strong></p>
+<ul>
+<li><code>c224edca7af0</code> ("nfsd: no need get cache ref when protected by rcu")</li>
+<li><code>1b10f0b603c0</code> ("SUNRPC: no need get cache ref when protected by rcu")</li>
+</ul>
+<h3>Patch 2/2: Hold Net Reference for Lifetime of <code>/proc/fs/nfs/exports</code> fd</h3>
+<p><strong>Subject:</strong> <a href="https://lore.kernel.org/linux-nfs/20260219215017.1769-3-cel@kernel.org/">NFSD: Hold net reference for the lifetime of /proc/fs/nfs/exports fd</a></p>
+<p>This patch addresses a second, related UAF scenario involving network namespace teardown. The <code>/proc/fs/nfs/exports</code> proc entry is created at module init and persists for the module's lifetime. However, <code>exports_proc_open()</code> captures the caller's current network namespace without taking a reference on it:</p>
+<blockquote>
+<p>"If the namespace is subsequently torn down (e.g. container destruction after the opener does setns() to a different namespace), nfsd_net_exit() calls nfsd_export_shutdown() which frees the cache. Subsequent reads on the still-open fd dereference the freed cache_detail, walking a freed hash table."</p>
+</blockquote>
+<p><strong>The Solution:</strong> Hold a reference on <code>struct net</code> for the lifetime of the open file descriptor:</p>
+<blockquote>
+<p>"Hold a reference on the struct net for the lifetime of the open file descriptor. This prevents nfsd_net_exit() from running -- and thus prevents nfsd_export_shutdown() from freeing the cache -- while any exports fd is open."</p>
+</blockquote>
+<p>The patch leverages the fact that <code>cache_detail</code> already stores its net pointer (<code>cd-&gt;net</code>, set by <code>cache_create_net()</code>), so <code>exports_release()</code> can retrieve it without additional per-file storage.</p>
+<p><strong>Fixes cited:</strong></p>
+<ul>
+<li><code>96d851c4d28d</code> ("nfsd: use proper net while reading "exports" file")</li>
+</ul>
+<hr />
+<h2>Technical Evolution and Key Arguments</h2>
+<h3>The Root Cause Class</h3>
+<p>Both patches address bugs introduced by an optimization that removed explicit cache reference counting under the assumption that RCU protection was sufficient. As Chuck Lever's commit messages indicate, commits <code>c224edca7af0</code> and <code>1b10f0b603c0</code> eliminated reference-taking in certain code paths with the rationale "no need get cache ref when protected by rcu." However, this reasoning overlooked cases where:</p>
+<ol>
+<li>Sub-objects (paths, auth domains) require sleeping operations for cleanup, which cannot be performed in RCU callback context.</li>
+<li>File descriptors outlive their originating network namespace.</li>
+</ol>
+<h3>The Deferred Cleanup Pattern</h3>
+<p>The introduction of <code>queue_rcu_work()</code> represents a significant architectural refinement. By deferring cleanup to process context after the RCU grace period, the patch ensures that:</p>
+<ul>
+<li>All RCU readers have completed before any sub-object is freed.</li>
+<li>Sleeping operations (<code>path_put()</code>, <code>auth_domain_put()</code>) can be safely performed.</li>
+<li>A dedicated workqueue prevents shutdown stalls on unrelated subsystems.</li>
+</ul>
+<hr />
+<h2>Conclusions</h2>
+<p>This thread documents a <strong>targeted, high-severity bug fix</strong> for use-after-free vulnerabilities in the NFS server's SUNRPC cache layer. The key takeaways are:</p>
+<ol>
+<li>
+<p><strong>The bug is critical and reproducible:</strong> Kernel panics occur 100% of the time when diagnostic tools access <code>/proc/fs/nfsd/*</code> on affected systems (ppc64le confirmed, ARM64 also reported internally).</p>
+</li>
+<li>
+<p><strong>The root cause is a class of RCU-related UAF bugs:</strong> Optimizations that removed reference counting under the assumption of RCU protection introduced races between cache cleanup and proc file reads.</p>
+</li>
+<li>
+<p><strong>The fix employs deferred workqueue-based cleanup:</strong> By using <code>queue_rcu_work()</code> instead of <code>call_rcu</code>, Chuck Lever ensures sub-object cleanup occurs safely in process context after the RCU grace period.</p>
+</li>
+<li>
+<p><strong>Network namespace lifetime must be tied to fd lifetime:</strong> Holding a net reference for the duration of an open <code>/proc/fs/nfs/exports</code> file descriptor prevents premature cache destruction during container teardown.</p>
+</li>
+<li>
+<p><strong>Validation on PowerPC hardware is pending:</strong> Chuck Lever explicitly requested testing from PowerPC maintainers, as he lacks access to such systems.</p>
+</li>
+</ol>
+<p>The patches modify three files (<code>fs/nfsd/export.c</code>, <code>fs/nfsd/export.h</code>, <code>fs/nfsd/nfsctl.c</code>) with 78 insertions and 14 deletions, representing a focused but impactful correction to NFS server stability.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260219215017.1769-1-cel@kernel.org/">2026-02-19 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v1 0/2] Address UAF in sunrpc cache show callbacks</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260219215017.1769-2-cel@kernel.org/">2026-02-19 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v1 1/2] NFSD: Defer sub-object cleanup in export put callbacks</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260219215017.1769-3-cel@kernel.org/">2026-02-19 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v1 2/2] NFSD: Hold net reference for the lifetime of /proc/fs/nfs/exports fd</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>pNFS: Suppress Misleading &quot;Server wrote zero bytes&quot; Warning on MDS Retry</title>
+  <meta name="description" content="This thread, initiated by Red Hat&#39;s Olga Kornievskaia on 2026-02-19, addresses a misleading kernel warning that surfaces during Parallel NFS (pNFS) I/O error recovery. The fix targets the NFS client&#39;s file layout driver and writeback path…">
+  <meta property="og:title" content="pNFS: Suppress Misleading &quot;Server wrote zero bytes&quot; Warning on MDS Retry">
+  <meta property="og:description" content="This thread, initiated by Red Hat&#39;s Olga Kornievskaia on 2026-02-19, addresses a misleading kernel warning that surfaces during Parallel NFS (pNFS) I/O error recovery. The fix targets the NFS client&#39;s file layout driver and writeback path…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-02-19T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="pNFS: Suppress Misleading &quot;Server wrote zero bytes&quot; Warning on MDS Retry">
+  <meta name="twitter:description" content="This thread, initiated by Red Hat&#39;s Olga Kornievskaia on 2026-02-19, addresses a misleading kernel warning that surfaces during Parallel NFS (pNFS) I/O error recovery. The fix targets the NFS client&#39;s file layout driver and writeback path…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-02-19</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>pNFS: Suppress Misleading "Server wrote zero bytes" Warning on MDS Retry</h1>
+<h2>Summary</h2>
+<h1>pNFS: Improve Misleading "Server wrote zero bytes" Error on MDS Retry</h1>
+<h2>Classification: Bug Fix (NFS Client / pNFS File Layout Driver)</h2>
+<p>This thread, initiated by Red Hat's Olga Kornievskaia on 2026-02-19, addresses a misleading kernel warning that surfaces during Parallel NFS (pNFS) I/O error recovery. The fix targets the NFS client's file layout driver and writeback path to suppress a spurious "Server wrote zero bytes" log message when an I/O operation is destined to be retried successfully against the Metadata Server (MDS).</p>
+<hr />
+<h2>The Problem</h2>
+<p>When a pNFS I/O error occurs, the Linux NFS client retries the operation against the MDS as a fallback. However, before this retry takes place, the kernel logs a warning:</p>
+<blockquote>
+<p>"Server wrote zero bytes"</p>
+</blockquote>
+<p>This message is misleading because the subsequent MDS retry will succeed, meaning there is no actual data loss or persistent failure. Administrators monitoring system logs may interpret this warning as evidence of ongoing storage issues when none exist.</p>
+<p>Olga Kornievskaia explained the core issue in her patch submission:</p>
+<blockquote>
+<p>"When a pnfs error occurs, the IO is retried against the MDS. However, the initial IO leads to the kernel logging 'Serer wrote zero bytes' when in fact the MDS IO will not fail and thus the error misleads administrators that the system is experiencing issues." <a href="https://lore.kernel.org/linux-nfs/20260219192327.34732-1-okorniev@redhat.com/">20260219192327.34732-1-okorniev@redhat.com</a></p>
+</blockquote>
+<p>Her proposed fix recognizes that a "retry-against-MDS" type of error has occurred and suppresses the warning accordingly. The patch touches two files: <code>fs/nfs/filelayout/filelayout.c</code> and <code>fs/nfs/write.c</code>.</p>
+<hr />
+<h2>Review Discussion with Trond Myklebust</h2>
+<p>NFS client maintainer Trond Myklebust engaged promptly, questioning whether the fix was necessary given existing safeguards in the code. He pointed to a status check in <code>nfs_pgio_result()</code>:</p>
+<blockquote>
+<p>"Hmm... Is this needed? Shouldn't the test for task-&gt;tk_status &lt; 0 in nfs_pgio_result() ensure that we can't call nfs_writeback_result() in the above case?" <a href="https://lore.kernel.org/linux-nfs/c6be70378ce90b3316c997bfc9443172eaa145c5.camel@hammerspace.com/">c6be70378ce90b3316c997bfc9443172eaa145c5.camel@hammerspace.com</a></p>
+</blockquote>
+<p>Olga clarified the mechanism: the <code>task-&gt;tk_status</code> is reset to 0 by <code>filelayout_reset_write()</code> in the file layout driver, which calls <code>pnfs_write_done_resend_to_mds(hdr)</code>. This means the error status is cleared before reaching <code>nfs_writeback_result()</code>, allowing the misleading warning to fire:</p>
+<blockquote>
+<p>"task_status is 0 when it gets to nfs_writeback_done because in filelayout/filelayout.c in filelayout_reset_write() is doing this: task-&gt;tk_status = pnfs_write_done_resend_to_mds(hdr);" <a href="https://lore.kernel.org/linux-nfs/CAN-5tyFec2nw1=1-wsGYj4TnXmSbw4p+qW_1v9sPD+nPKiP1Gg@mail.gmail.com/">CAN-5tyFec2nw1=1-wsGYj4TnXmSbw4p+qW_1v9sPD+nPKiP1Gg@mail.gmail.com</a></p>
+</blockquote>
+<hr />
+<h2>Evolving the Fix</h2>
+<p>Trond then proposed a potentially cleaner approach. He questioned whether the short-write condition should even be entered when the page list is empty, suggesting a more targeted guard:</p>
+<blockquote>
+<p>"Oh... So isn't the hdr-&gt;pages list actually empty? Should we even bother entering the short write condition when that happens?" <a href="https://lore.kernel.org/linux-nfs/00f3d1fe8b61410ad2296d76f0603a51e8e9991b.camel@kernel.org/">00f3d1fe8b61410ad2296d76f0603a51e8e9991b.camel@kernel.org</a></p>
+</blockquote>
+<blockquote>
+<p>"IOW: Why not just change that test at the top of nfs_writeback_result() to read something like: <code>if (resp-&gt;count &lt; argp-&gt;count &amp;&amp; !list_empty(hdr-&gt;pages))</code>" <a href="https://lore.kernel.org/linux-nfs/00f3d1fe8b61410ad2296d76f0603a51e8e9991b.camel@kernel.org/">00f3d1fe8b61410ad2296d76f0603a51e8e9991b.camel@kernel.org</a></p>
+</blockquote>
+<p>This alternative approach would prevent the warning from firing when no pages remain to be written — a condition that naturally occurs during pNFS MDS retry scenarios.</p>
+<hr />
+<h2>Key Technical Takeaways</h2>
+<ul>
+<li><strong>Bug type</strong>: Misleading log message (not a data integrity or functional bug). The actual I/O succeeds via MDS retry; the issue is purely about noisy/incorrect kernel logging that could alarm administrators.</li>
+<li><strong>Root cause</strong>: The <code>filelayout_reset_write()</code> function resets <code>task-&gt;tk_status</code> to 0 when preparing for an MDS retry, which allows the writeback completion path to proceed and emit the "Server wrote zero bytes" warning despite no actual short write having occurred.</li>
+<li><strong>Proposed solutions</strong>: (1) Olga's original patch: explicitly check for a retry-against-MDS error before printing the warning. (2) Trond's suggested refinement: add a <code>!list_empty(hdr-&gt;pages)</code> guard to the short-write condition in <code>nfs_writeback_result()</code>, which would more directly address the underlying logic gap.</li>
+<li><strong>Status</strong>: The thread concluded with Trond's suggestion for an improved fix. No final resolution or patch acceptance was recorded within this week's window.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260219192327.34732-1-okorniev@redhat.com/">2026-02-19 Olga Kornievskaia <a href="mailto:okorniev@redhat.com">okorniev@redhat.com</a> — [PATCH 1/1] pnfs: improve "Server wrote zero bytes" error</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/c6be70378ce90b3316c997bfc9443172eaa145c5.camel@hammerspace.com/">2026-02-19 Trond Myklebust <a href="mailto:trondmy@hammerspace.com">trondmy@hammerspace.com</a> — Re: [PATCH 1/1] pnfs: improve "Server wrote zero bytes" error</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAN-5tyFec2nw1=1-wsGYj4TnXmSbw4p+qW_1v9sPD+nPKiP1Gg@mail.gmail.com/">2026-02-19 Olga Kornievskaia <a href="mailto:aglo@umich.edu">aglo@umich.edu</a> — Re: [PATCH 1/1] pnfs: improve "Server wrote zero bytes" error</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/00f3d1fe8b61410ad2296d76f0603a51e8e9991b.camel@kernel.org/">2026-02-19 Trond Myklebust <a href="mailto:trondmy@kernel.org">trondmy@kernel.org</a> — Re: [PATCH 1/1] pnfs: improve "Server wrote zero bytes" error</a></li>
+</ul>
+  </main>
+</body>
+</html>

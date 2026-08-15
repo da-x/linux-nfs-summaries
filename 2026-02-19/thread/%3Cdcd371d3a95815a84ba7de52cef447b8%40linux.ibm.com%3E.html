@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS Server Use-After-Free in cache_check_rcu() on ppc64le</title>
+  <meta name="description" content="This thread opens with a critical bug report from IBM&#39;s Misbah Anjum N, documenting a 100% reproducible use-after-free in the NFS server (nfsd) subsystem that triggers kernel panics on ppc64le systems when diagnostic tools read…">
+  <meta property="og:title" content="NFS Server Use-After-Free in cache_check_rcu() on ppc64le">
+  <meta property="og:description" content="This thread opens with a critical bug report from IBM&#39;s Misbah Anjum N, documenting a 100% reproducible use-after-free in the NFS server (nfsd) subsystem that triggers kernel panics on ppc64le systems when diagnostic tools read…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-02-19T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS Server Use-After-Free in cache_check_rcu() on ppc64le">
+  <meta name="twitter:description" content="This thread opens with a critical bug report from IBM&#39;s Misbah Anjum N, documenting a 100% reproducible use-after-free in the NFS server (nfsd) subsystem that triggers kernel panics on ppc64le systems when diagnostic tools read…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-02-19</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS Server Use-After-Free in cache_check_rcu() on ppc64le</h1>
+<h2>Summary</h2>
+<h1>NFS Server Use-After-Free in <code>cache_check_rcu()</code> on ppc64le</h1>
+<h2>Classification: Critical Bug Fix (NFS Server / SUNRPC)</h2>
+<p>This thread opens with a critical bug report from IBM's Misbah Anjum N, documenting a <strong>100% reproducible use-after-free</strong> in the NFS server (<code>nfsd</code>) subsystem that triggers kernel panics on ppc64le systems when diagnostic tools read <code>/proc/fs/nfsd/*</code> files.</p>
+<hr />
+<h2>The Bug Report</h2>
+<p>On 2026-02-19, Misbah Anjum N filed a detailed bug report titled:</p>
+<blockquote>
+<p>"[BUG] [powerpc] [next-20260216/17] nfsd: use-after-free in cache_check_rcu() triggered by sosreport on ppc64le" <a href="https://lore.kernel.org/linux-nfs/dcd371d3a95815a84ba7de52cef447b8@linux.ibm.com/">dcd371d3a95815a84ba7de52cef447b8@linux.ibm.com</a></p>
+</blockquote>
+<p>The crash manifests in the SUNRPC cache layer function <code>cache_check_rcu()</code> when the <code>sosreport</code> diagnostic tool reads NFS export information from <code>/proc</code>. The reporter emphasized the severity and reproducibility:</p>
+<blockquote>
+<p>"I'm reporting a critical use-after-free bug in linux-next NFS server code that causes kernel crashes when sosreport reads /proc/fs/nfsd/* files. This appears to be a recent regression affecting ppc64le systems."</p>
+</blockquote>
+<blockquote>
+<p>"The bug is 100% reproducible and shows corrupted pointers containing ASCII strings (library names, export cache names) instead of valid kernel addresses, indicating freed memory has been reallocated."</p>
+</blockquote>
+<h3>Key Technical Details</h3>
+<ul>
+<li><strong>Affected kernels</strong>: <code>6.19.0-next-20260216</code> and <code>6.19.0-next-20260217</code></li>
+<li><strong>Architecture</strong>: ppc64le (IBM Power11, 9080-HEX)</li>
+<li><strong>Trigger</strong>: Loading the <code>nfsd</code> module (<code>modprobe nfsd</code>) followed by running <code>sosreport</code> — no active NFS exports required.</li>
+<li><strong>Reproduction rate</strong>: 100%, typically crashing within 30–60 seconds.</li>
+</ul>
+<p>The reporter provided three distinct crash traces:</p>
+<ol>
+<li>
+<p><strong>Crash #1</strong> (kernel 6.19.0-next-20260216): Use-after-free in <code>cache_check_rcu+0x44/0x2c0 [sunrpc]</code>, called from <code>e_show+0x40/0x260 [nfsd]</code>. The faulting address <code>0x657079745f70618b</code> decodes to ASCII characters resembling <code>"export_cap"</code> — a telltale sign of freed memory being reallocated with user-space strings.</p>
+</li>
+<li>
+<p><strong>Crash #2</strong> (kernel 6.19.0-next-20260217): A NULL pointer dereference in <code>d_path+0x44/0x210</code>, called from <code>seq_path</code> → <code>svc_export_show+0x1d4/0x5a0 [nfsd]</code> → <code>c_show+0xa4/0x1c0 [sunrpc]</code>.</p>
+</li>
+<li>
+<p><strong>Crash #3</strong> (kernel 6.19.0-next-20260217): Another <code>cache_check_rcu()</code> crash, this time with a faulting address <code>0x2e6o732e7a62696c</code> that decodes to <code>"libz.so."</code> — again, freed memory containing library name strings.</p>
+</li>
+</ol>
+<p>The call traces consistently show the crash path flowing through:</p>
+<pre><code>sosreport → proc_reg_read → vfs_read → seq_read → seq_read_iter → e_show/c_show [nfsd/sunrpc] → cache_check_rcu [sunrpc]
+</code></pre>
+<h3>Important Observations from the Reporter</h3>
+<blockquote>
+<ol>
+<li>Direct <code>cat /proc/fs/nfsd/exports</code> does NOT trigger the crash</li>
+<li>The crash is triggered by sosreport's specific access pattern to /proc/fs/nfsd/* files</li>
+<li>No NFS exports or active NFS server configuration needed</li>
+<li>Reproducible 100% of the time with sosreport</li>
+</ol>
+</blockquote>
+<p>The reporter noted they were pursuing two next steps: crash dump analysis and a git bisect to identify the offending commit.</p>
+<hr />
+<h2>Subsequent Thread Activity (Outside This Week's Window)</h2>
+<p>For context, the thread continued months later with significant follow-ups:</p>
+<ul>
+<li><strong>April 30, 2026</strong>: Misbah Anjum N reported completing a git bisect and confirmed the bug had propagated to mainline (kernel v7.0). The bisect identified merge commit <code>da6b5aae84beb0</code> ("Merge tag 'platform-drivers-x86-v7.1-1'") as the first bad commit, though this was an x86 platform driver merge — suggesting a coincidental timing rather than a direct causal link. The reporter noted:</li>
+</ul>
+<blockquote>
+<p>"The use-after-free bug in cache_check_rcu() that I originally reported in linux-next (6.19.0-next-20260216/17) has now propagated into mainline and is confirmed present in mainline."</p>
+</blockquote>
+<blockquote>
+<p>"This bug is causing failures on ppc64le systems: 1. Kernel panics: 100% reproducible crashes when sosreport runs 2. CI/Testing failures: All automated Avocado-vt KVM testing on ppc64le is failing" <a href="https://lore.kernel.org/linux-nfs/8cf80f450085ac17164e8fa1391e9635@linux.ibm.com/">8cf80f450085ac17164e8fa1391e9635@linux.ibm.com</a></p>
+</blockquote>
+<ul>
+<li><strong>May 1, 2026</strong>: Jeff Layton responded, noting the bisect result was a merge commit unlikely to be the true cause, and recommended KASAN testing:</li>
+</ul>
+<blockquote>
+<p>"The commit you landed on is a merge commit and is not likely to be the cause, particularly since that merge was for x86 drivers and you're seeing this on PPC." <a href="https://lore.kernel.org/linux-nfs/d6701b40b8b7c143f87ecec0afb08af8a2867358.camel@kernel.org/">d6701b40b8b7c143f87ecec0afb08af8a2867358.camel@kernel.org</a></p>
+</blockquote>
+<ul>
+<li><strong>May 1, 2026</strong>: Chuck Lever provided crucial context, clarifying that a prior fix had been applied in February for one instance of this UAF class, but that additional instances remained:</li>
+</ul>
+<blockquote>
+<p>"You didn't miss it. We responded to that report in February with a fix that you and Neil both reviewed and it is in v7.0 now."</p>
+</blockquote>
+<blockquote>
+<p>"That fix addressed one instance of this problem; there are actually several more, all in the same UAF class. I have a patch series nearly complete to address these issues."</p>
+</blockquote>
+<blockquote>
+<p>"The issue Misbah reports here is not the same as the February issue, though it is very similar." <a href="https://lore.kernel.org/linux-nfs/8e8847fb-0eff-46b0-97dc-fe683c706db3@app.fastmail.com/">8e8847fb-0eff-46b0-97dc-fe683c706db3@app.fastmail.com</a></p>
+</blockquote>
+<p>Chuck Lever also confirmed the bug was not ppc64le-specific:</p>
+<blockquote>
+<p>"We have an internal bug reporting the same stack trace on ARM64."</p>
+</blockquote>
+<hr />
+<h2>Summary of Conclusions</h2>
+<p>This thread documents a <strong>critical use-after-free regression in the NFS server's SUNRPC cache layer</strong>, specifically in <code>cache_check_rcu()</code>. The bug:</p>
+<ol>
+<li>Causes kernel panics when diagnostic tools (like <code>sosreport</code>) read <code>/proc/fs/nfsd/*</code> files.</li>
+<li>Is 100% reproducible on ppc64le and also affects ARM64.</li>
+<li>Represents a class of UAF bugs in cache content file handlers — one instance was fixed in February, but additional instances remained unfixed at the time of this report.</li>
+<li>Was being actively addressed by Chuck Lever with a patch series to resolve all remaining instances of this UAF class.</li>
+</ol>
+<p>The corrupted pointers containing ASCII strings (e.g., <code>"export_cap"</code>, <code>"libz.so."</code>) provide strong evidence that freed kernel memory is being accessed after reallocation, a classic use-after-free pattern with serious security implications.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/dcd371d3a95815a84ba7de52cef447b8@linux.ibm.com/">2026-02-19 Misbah Anjum N <a href="mailto:misanjum@linux.ibm.com">misanjum@linux.ibm.com</a> — [BUG] [powerpc] [next-20260216/17] nfsd: use-after-free in cache_check_rcu() triggered by sosreport on ppc64le</a></li>
+</ul>
+  </main>
+</body>
+</html>

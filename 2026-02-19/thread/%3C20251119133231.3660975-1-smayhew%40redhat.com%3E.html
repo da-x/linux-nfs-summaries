@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SUNRPC GSS Slack Fix Shifted to rpc.gssd Encryption Type Rework</title>
+  <meta name="description" content="This thread tracks the ongoing resolution of Debian bug #1120598 (&quot;NFS: readdir(/) returns -5&quot;), which manifests as XDR decoding failures when a Kerberos-protected NFSv4 client uses SHA2-based encryption types. The root cause involves…">
+  <meta property="og:title" content="SUNRPC GSS Slack Fix Shifted to rpc.gssd Encryption Type Rework">
+  <meta property="og:description" content="This thread tracks the ongoing resolution of Debian bug #1120598 (&quot;NFS: readdir(/) returns -5&quot;), which manifests as XDR decoding failures when a Kerberos-protected NFSv4 client uses SHA2-based encryption types. The root cause involves…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-02-19T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="SUNRPC GSS Slack Fix Shifted to rpc.gssd Encryption Type Rework">
+  <meta name="twitter:description" content="This thread tracks the ongoing resolution of Debian bug #1120598 (&quot;NFS: readdir(/) returns -5&quot;), which manifests as XDR decoding failures when a Kerberos-protected NFSv4 client uses SHA2-based encryption types. The root cause involves…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-02-19</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>SUNRPC GSS Slack Fix Shifted to rpc.gssd Encryption Type Rework</h1>
+<h2>Summary</h2>
+<h1>SUNRPC GSS Slack Estimate Issue — Shift to rpc.gssd Fix</h1>
+<h2>Classification: Bug fix (GSS/Kerberos authentication, NFS client-side)</h2>
+<p>This thread tracks the ongoing resolution of Debian bug #1120598 ("NFS: readdir(/) returns -5"), which manifests as XDR decoding failures when a Kerberos-protected NFSv4 client uses SHA2-based encryption types. The root cause involves mismatched encryption types (enctypes) between machine credentials and user credentials, leading to incorrect slack estimates in the SUNRPC layer.</p>
+<h2>Background (Prior Weeks)</h2>
+<p>The thread originated with <a href="https://lore.kernel.org/linux-nfs/20251119133231.3660975-1-smayhew@redhat.com/">Scott Mayhew's November 2025 kernel patch</a> titled "SUNRPC: Check if we need to recalculate slack estimates," which attempted to address the issue within the kernel by adding logic to recalculate slack variables when the incoming GSS verifier exceeded previously recorded sizes. <a href="https://lore.kernel.org/linux-nfs/522f612d-e792-45c0-8bca-73eb3f075897@oracle.com/">As noted in the January 2026 summary</a>, Chuck Lever reviewed the patch but concluded:</p>
+<blockquote>
+<p>"After further consideration, we concluded the above change is not an adequate repair for this issue."</p>
+</blockquote>
+<p>The kernel-side approach was deemed insufficient, prompting a search for a more fundamental solution.</p>
+<h2>This Week's Activity (February 13–14, 2026)</h2>
+<h3>Strategic Pivot to rpc.gssd</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/aY-pe7-FhRpPy5J2@aion/">On February 13, Scott Mayhew responded</a> to Debian maintainer Salvatore Bonaccorso's earlier inquiry, explaining the new direction after deeper investigation:</p>
+<blockquote>
+<p>"I think it would be better to try to address this from the rpc.gssd side instead of trying to make the kernel cope with having to bounce around between different encryption types."</p>
+</blockquote>
+<p>Mayhew then pointed to a <a href="https://lore.kernel.org/linux-nfs/20260213224012.2608126-1-smayhew@redhat.com/T/#t">new RFC patch series for nfs-utils</a> titled "[nfs-utils PATCH RFC 0/4] Rework the handling of encryption types in rpc.gssd."</p>
+<h3>The New Approach: Fixing Encryption Type Handling in rpc.gssd</h3>
+<p>The four-patch series addresses the core issue at its source — within <code>rpc.gssd</code>, the userspace daemon responsible for Kerberos credential management. The problem, as <a href="https://lore.kernel.org/linux-nfs/20260213224012.2608126-1-smayhew@redhat.com/">described by Mayhew</a>, is that when the krb5 library performs a TGS (Ticket Granting Service) request, it initially does so with referrals enabled, disregarding the enctypes list supplied by the application:</p>
+<blockquote>
+<p>"The core issue is that when the krb5 library does a TGS request, it initially does so with referrals enabled, disregarding the enctypes list supplied by the requesting application. It still checks the resulting ticket to ensure that it's using one of the requested enctypes, but it may not the highest priority enctype from our list."</p>
+</blockquote>
+<p>This discrepancy can cause the machine credential and user credentials (particularly in constrained-delegation scenarios via gssproxy) to use different encryption types, leading to XDR decoding failures. The patches aim to ensure that the enctype list passed to <code>limit_krb5_enctypes()</code> matches the ordering of the default list in the krb5 library.</p>
+<p>The series includes:</p>
+<ol>
+<li><strong>gssd: remove the limit-to-legacy-enctypes option</strong> — Cleans up deprecated single-DES encryption type support (deprecated by RFC 6649 in 2012).</li>
+<li><strong>gssd: add enctypes_list_to_string()</strong> — Adds a helper for human-readable enctype listing.</li>
+<li><strong>gssd: get the permitted enctypes from the krb5 library on startup</strong> — Retrieves the library's permitted enctypes at initialization.</li>
+<li><strong>gssd: add a helper to determine the set of encryption types to pass to limit_krb5_enctypes()</strong> — Implements logic to properly order and filter enctypes across three sources: <code>allowed-enctypes</code> from nfs.conf, kernel upcall enctypes, and library-permitted enctypes.</li>
+</ol>
+<h3>Community Response</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/aZCbdCSOiE_nk3M6@eldamar.lan/">Salvatore Bonaccorso acknowledged the update on February 14</a>:</p>
+<blockquote>
+<p>"Thank you for the notice, I will watch the thread there with the new patches."</p>
+</blockquote>
+<h2>Significance for NFS Client Development</h2>
+<p>This represents a notable architectural decision: rather than patching the kernel's SUNRPC layer to handle edge cases in verifier sizing, the fix is being pursued at the userspace <code>rpc.gssd</code> level. This approach addresses the root cause — inconsistent encryption type selection between machine and user credentials — rather than treating symptoms in the kernel. For NFS client deployments using Kerberos security (sec=krb5/krb5i/krb5p), particularly with constrained delegation via gssproxy, this fix is critical to resolving I/O errors caused by XDR decoding failures.</p>
+<h2>Status</h2>
+<p><strong>In progress.</strong> The kernel patch remains unmerged and has been superseded by the nfs-utils RFC series. The community awaits review and feedback on the new approach. Debian users tracking bug #1120598 should monitor the <a href="https://lore.kernel.org/linux-nfs/20260213224012.2608126-1-smayhew@redhat.com/T/#t">nfs-utils thread</a> for further developments.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/aY-pe7-FhRpPy5J2@aion/">2026-02-13 Scott Mayhew <a href="mailto:smayhew@redhat.com">smayhew@redhat.com</a> — Re: [PATCH] SUNRPC: Check if we need to recalculate slack estimates</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aZCbdCSOiE_nk3M6@eldamar.lan/">2026-02-14 Salvatore Bonaccorso <a href="mailto:carnil@debian.org">carnil@debian.org</a> — Re: [PATCH] SUNRPC: Check if we need to recalculate slack estimates</a></li>
+</ul>
+  </main>
+</body>
+</html>

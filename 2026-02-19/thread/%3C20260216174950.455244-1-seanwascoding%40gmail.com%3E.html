@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fixing RISC-V Build Warnings in NFS Client and MACB Driver</title>
+  <meta name="description" content="This week, Sean Chang submitted a two-patch series aimed at resolving compiler warnings encountered during RISC-V kernel builds. The series was split into subsystem-specific commits: one addressing unused variable warnings in the NFS…">
+  <meta property="og:title" content="Fixing RISC-V Build Warnings in NFS Client and MACB Driver">
+  <meta property="og:description" content="This week, Sean Chang submitted a two-patch series aimed at resolving compiler warnings encountered during RISC-V kernel builds. The series was split into subsystem-specific commits: one addressing unused variable warnings in the NFS…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-02-19T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Fixing RISC-V Build Warnings in NFS Client and MACB Driver">
+  <meta name="twitter:description" content="This week, Sean Chang submitted a two-patch series aimed at resolving compiler warnings encountered during RISC-V kernel builds. The series was split into subsystem-specific commits: one addressing unused variable warnings in the NFS…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-02-19</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Fixing RISC-V Build Warnings in NFS Client and MACB Driver</h1>
+<h2>Summary</h2>
+<h1>Fixing RISC-V Build Warnings in NFS Client and MACB Driver</h1>
+<p>This week, Sean Chang submitted a two-patch series aimed at resolving compiler warnings encountered during RISC-V kernel builds. The series was split into subsystem-specific commits: one addressing unused variable warnings in the NFS client code and another fixing a format-truncation warning in the Cadence MACB ethernet driver. While both patches are bug fixes, the discussion surrounding them reveals interesting insights into configuration-dependent code paths and toolchain diagnostics.</p>
+<h2>NFS Client: Unused Variable Warnings</h2>
+<p>The first patch, <code>[PATCH v2 1/2] nfs: fix unused variable warnings</code> [id://20260216174950.455244-2-seanwascoding@gmail.com], targets three files within the NFS subsystem:</p>
+<ul>
+<li><code>fs/nfs/flexfilelayout/flexfilelayout.c</code></li>
+<li><code>fs/nfs/flexfilelayout/flexfilelayoutdev.c</code></li>
+<li><code>fs/nfs/nfs4proc.c</code></li>
+</ul>
+<p>The fix involves adding the <code>__maybe_unused</code> attribute to variables that are only referenced within debug macros. Andrew Lunn questioned the necessity of this change, noting that there was no explicit <code>#ifdef</code> guarding the code in question:</p>
+<blockquote>
+<p>"There is no #ifdef'ery here. How is ptr not used? Is status always true, so the goto it always taken? But then rpcdata should also be unused?" [id://2e3bf4db-cea6-4f55-a82b-4e99bb3f44fe@lunn.ch]</p>
+</blockquote>
+<p>Sean Chang clarified that the issue arises when <code>CONFIG_SUNRPC_DEBUG</code> is disabled. In this configuration, the <code>dprintk</code> macro expands to a no-op (<code>do {} while (0)</code>), effectively removing all references to variables used exclusively within those debug statements. For instance, in <code>nfs4_proc_create_session</code>, the variable <code>ptr</code> is only read inside a <code>dprintk</code> call:</p>
+<blockquote>
+<p>"If CONFIG_SUNRPC_DEBUG is not enabled, dprintk expands to do {} while (0) during preprocessing. This means unsigned *ptr has no remaining references in the function, as its only 'read' was inside the macro." [id://CAAb=EJVmDS7vKHsw77SARnD9uff-9vBrg97jo3tbYJS-z1KAgw@mail.gmail.com]</p>
+</blockquote>
+<p>Sean also explained why other variables like <code>rpcdata</code> did not trigger similar warnings: the compiler's unused-variable check considers all possible code paths. Since <code>rpcdata</code> is used in a function call that is reachable under normal execution, it does not generate a warning, whereas <code>ptr</code> becomes completely unreferenced when debug output is disabled.</p>
+<h2>MACB Driver: Format-Truncation Warning</h2>
+<p>The second patch, <code>[PATCH v2 2/2] net: macb: fix format-truncation warning</code> [id://20260216174950.455244-3-seanwascoding@gmail.com], addresses a warning in the MACB ethernet driver related to string truncation. The original code used <code>snprintf</code> to populate a 32-byte buffer (<code>ETH_GSTRING_LEN</code>) with ethtool statistics strings. Andrew Lunn pointed out that these strings are special: they are fixed-length, not null-terminated, and should ideally be handled using helpers from <code>linux/ethtool.h</code>:</p>
+<blockquote>
+<p>"These strings are special, in that they are fixed length, 32 bytes long, and not \0 terminated. There are some helpers at the end of linux/ethtool.h for dealing with these strings. You might want to use them." [id://f71cdfa7-25f8-487d-b727-39ae962401a4@lunn.ch]</p>
+</blockquote>
+<p>Andrew also raised concerns about the buffer size and questioned why only RISC-V builds were triggering this warning:</p>
+<blockquote>
+<p>"Also, it looks like stat_string might be one byte too short. snprintf() will \0 terminate, so you need it big enough to hold the \0, and then this memcpy() will discard it. I also wonder, why is just one architecture complaining about this?" [id://f71cdfa7-25f8-487d-b727-39ae962401a4@lunn.ch]</p>
+</blockquote>
+<p>Sean Chang responded by switching to <code>ethtool_sprintf()</code>, which properly handles the 32-byte ethtool string boundaries without manual <code>snprintf</code> and <code>memcpy</code> calls. He also investigated the architecture-specific nature of the warning, discovering that it was not unique to RISC-V but rather dependent on kernel configuration:</p>
+<blockquote>
+<p>"I also found that the x86_64 defconfig does not enable CONFIG_MACB because it requires CONFIG_COMMON_CLK (which is also disabled by default on x86), whereas the RISC-V defconfig has both enabled." [id://CAAb=EJXQjraL=VEod0N8Pm5tuQ5UE9UbrdxdZQ+ArKVhDUT83w@mail.gmail.com]</p>
+</blockquote>
+<p>Further testing confirmed that the warning appeared on ARM and ARM64 builds as well when <code>CONFIG_MACB</code> was enabled:</p>
+<blockquote>
+<p>"It proves that even if I switch to a different platform, like arm, arm32, x86_64, riscv64, it still shows the same warning." [id://CAAb=EJUSEwrYrUWGcxwn+kQXAzzFO9_VHaVxAq738PtOYEraYw@mail.gmail.com]</p>
+</blockquote>
+<p>Andrew Lunn agreed that using <code>ethtool_sprintf()</code> was the correct approach but emphasized the importance of documenting the rationale in the commit message:</p>
+<blockquote>
+<p>"I do agree ethtool_sprintf() is better. But we want the commit message to reflect why we are making this change. Is it because ethtool_sprintf() is better, or are we working around toolchain bugs?" [id://00ebdd77-d6ef-48f2-a25d-8d8b3c7dc7a8@lunn.ch]</p>
+</blockquote>
+<p>Sean concluded that the change should be framed as an improvement to prevent data truncation and properly handle ethtool string boundaries, rather than merely a workaround for toolchain-specific warnings.</p>
+<h2>Conclusion</h2>
+<p>This thread highlights two distinct types of bug fixes in the Linux kernel:</p>
+<ol>
+<li><strong>NFS Client</strong>: A configuration-dependent issue where debug macros cause variables to become unused when <code>CONFIG_SUNRPC_DEBUG</code> is disabled. The fix involves adding <code>__maybe_unused</code> attributes to silence compiler warnings.</li>
+<li><strong>MACB Driver</strong>: A potential data truncation issue in ethtool statistics string handling, resolved by adopting the standardized <code>ethtool_sprintf()</code> helper function.</li>
+</ol>
+<p>Both fixes underscore the importance of considering various build configurations and toolchain behaviors when addressing compiler warnings. The discussion also demonstrates the collaborative effort between developers to ensure that patches are not only technically correct but also well-documented and justified.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260216174950.455244-1-seanwascoding@gmail.com/">2026-02-16 Sean Chang <a href="mailto:seanwascoding@gmail.com">seanwascoding@gmail.com</a> — [PATCH v2 0/2] Fix warnings for RISC-V builds</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260216174950.455244-2-seanwascoding@gmail.com/">2026-02-16 Sean Chang <a href="mailto:seanwascoding@gmail.com">seanwascoding@gmail.com</a> — [PATCH v2 1/2] nfs: fix unused variable warnings</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260216174950.455244-3-seanwascoding@gmail.com/">2026-02-16 Sean Chang <a href="mailto:seanwascoding@gmail.com">seanwascoding@gmail.com</a> — [PATCH v2 2/2] net: macb: fix format-truncation warning</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/f71cdfa7-25f8-487d-b727-39ae962401a4@lunn.ch/">2026-02-16 Andrew Lunn <a href="mailto:andrew@lunn.ch">andrew@lunn.ch</a> — Re: [PATCH v2 2/2] net: macb: fix format-truncation warning</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/2e3bf4db-cea6-4f55-a82b-4e99bb3f44fe@lunn.ch/">2026-02-16 Andrew Lunn <a href="mailto:andrew@lunn.ch">andrew@lunn.ch</a> — Re: [PATCH v2 1/2] nfs: fix unused variable warnings</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAAb=EJVmDS7vKHsw77SARnD9uff-9vBrg97jo3tbYJS-z1KAgw@mail.gmail.com/">2026-02-17 Sean <a href="mailto:seanwascoding@gmail.com">seanwascoding@gmail.com</a> — Re: [PATCH v2 1/2] nfs: fix unused variable warnings</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAAb=EJWNSvTHuUX862vLmA2s1uKO0vy_x9OSZ6VXqY9X-+JNsg@mail.gmail.com/">2026-02-17 Sean Chang <a href="mailto:seanwascoding@gmail.com">seanwascoding@gmail.com</a> — Re: [PATCH v2 2/2] net: macb: fix format-truncation warning</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/00ebdd77-d6ef-48f2-a25d-8d8b3c7dc7a8@lunn.ch/">2026-02-17 Andrew Lunn <a href="mailto:andrew@lunn.ch">andrew@lunn.ch</a> — Re: [PATCH v2 2/2] net: macb: fix format-truncation warning</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAAb=EJXQjraL=VEod0N8Pm5tuQ5UE9UbrdxdZQ+ArKVhDUT83w@mail.gmail.com/">2026-02-17 Sean Chang <a href="mailto:seanwascoding@gmail.com">seanwascoding@gmail.com</a> — Re: [PATCH v2 2/2] net: macb: fix format-truncation warning</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/a7c960af-ad60-4aef-93ef-f79657dbe4e5@lunn.ch/">2026-02-17 Andrew Lunn <a href="mailto:andrew@lunn.ch">andrew@lunn.ch</a> — Re: [PATCH v2 2/2] net: macb: fix format-truncation warning</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAAb=EJUSEwrYrUWGcxwn+kQXAzzFO9_VHaVxAq738PtOYEraYw@mail.gmail.com/">2026-02-18 Sean Chang <a href="mailto:seanwascoding@gmail.com">seanwascoding@gmail.com</a> — Re: [PATCH v2 2/2] net: macb: fix format-truncation warning</a></li>
+</ul>
+  </main>
+</body>
+</html>
