@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD: Layout Recall Timeout and Fencing Integration (v10)</title>
+  <meta name="description" content="This week, the Linux NFS community reviewed v10 of a significant server-side patch by Dai Ngo (Oracle) titled &quot;[PATCH v10 1/1] NFSD: Enforce timeout on layout recall and integrate lease manager fencing&quot;…">
+  <meta property="og:title" content="NFSD: Layout Recall Timeout and Fencing Integration (v10)">
+  <meta property="og:description" content="This week, the Linux NFS community reviewed v10 of a significant server-side patch by Dai Ngo (Oracle) titled &quot;[PATCH v10 1/1] NFSD: Enforce timeout on layout recall and integrate lease manager fencing&quot;…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-02-12T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSD: Layout Recall Timeout and Fencing Integration (v10)">
+  <meta name="twitter:description" content="This week, the Linux NFS community reviewed v10 of a significant server-side patch by Dai Ngo (Oracle) titled &quot;[PATCH v10 1/1] NFSD: Enforce timeout on layout recall and integrate lease manager fencing&quot;…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-02-12</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD: Layout Recall Timeout and Fencing Integration (v10)</h1>
+<h2>Summary</h2>
+<h1>NFSD: Enforcing Layout Recall Timeouts and Integrating Lease Fencing</h1>
+<p>This week, the Linux NFS community reviewed <strong>v10</strong> of a significant server-side patch by Dai Ngo (Oracle) titled "[PATCH v10 1/1] NFSD: Enforce timeout on layout recall and integrate lease manager fencing" [id://20260210181632.1161855-1-dai.ngo@oracle.com]. While primarily an NFSD (server) change, this work is critical for the stability of environments using Parallel NFS (PNFS) layouts, ensuring that misbehaving or stalled clients do not block server resources indefinitely.</p>
+<h2>Key Technical Arguments</h2>
+<p>The patch addresses a scenario where a layout conflict triggers a recall. Without a timeout, <code>nfsd</code> threads can become blocked in <code>__break_lease</code>, degrading server performance for all clients.</p>
+<blockquote>
+<p>"When a layout conflict triggers a recall, enforcing a timeout is necessary to prevent excessive nfsd threads from being blocked in __break_lease ensuring the server continues servicing incoming requests efficiently." [id://20260210181632.1161855-1-dai.ngo@oracle.com]</p>
+</blockquote>
+<p>The solution introduces a new callback, <code>lm_breaker_timedout</code>, within <code>lease_manager_operations</code>. If a layout recall times out and the client has not released the layout, the server initiates a "fencing" operation (using SCSI Persistent Reserve PREEMPT) to revoke the client's access to the underlying block device. This fencing occurs asynchronously via a system workqueue with exponential backoff, ensuring the conflicting lease remains active until the fence is complete, thereby preventing other clients from accessing the file prematurely.</p>
+<h2>Evolution of Discussion and Bug Discovery</h2>
+<p>The review process uncovered both administrative improvements and a critical latent bug in the kernel's lease management code.</p>
+<h3>Administrative and Logging Feedback</h3>
+<p>Jeff Layton [id://eb1757d7f2409ffb792d800166daff8a8c63b09e.camel@kernel.org] raised concerns about log verbosity, noting that the current implementation might "fire too often." He suggested:</p>
+<blockquote>
+<p>"It'd be better to do it just once. This may mean tracking a per-client flag of some sort."</p>
+</blockquote>
+<p>Layton also emphasized the need for better administrative visibility, particularly in containerized environments where <code>dmesg</code> access is restricted, and requested documentation updates in <code>Documentation/admin-guide/nfs/pnfs-scsi-server.rst</code>.</p>
+<h3>Critical Bug: Tight Spin in Lease Breaking</h3>
+<p>Chuck Lever identified a severe bug in the interaction between the new timeout logic and the existing <code>__break_lease</code> function [id://a06f4c17-8227-4c04-b270-5c064b7de79c@app.fastmail.com].</p>
+<p>When <code>lm_breaker_timedout</code> returns false (indicating the lease should remain on the list for fencing), <code>__break_lease</code> loops and recomputes the wait timeout. However, because the original timeout has already expired, <code>fl_break_time</code> is in the past. The calculation <code>break_time -= jiffies</code> results in a large unsigned value that wraps to a negative signed long when passed to <code>wait_event_interruptible_timeout()</code>.</p>
+<blockquote>
+<p>"schedule_timeout() treats negative values as a bug: it prints a KERN_ERR message with dump_stack() and returns immediately without sleeping... On a uniprocessor system the fence worker workqueue thread never gets scheduled because the spinning task never calls schedule(), so the system hangs." [id://a06f4c17-8227-4c04-b270-5c064b7de79c@app.fastmail.com]</p>
+</blockquote>
+<p>Lever suggested that <code>lm_breaker_timedout</code> should extend <code>fl_break_time</code> before returning false to allow the server thread to sleep properly.</p>
+<h2>Final Conclusions and Next Steps</h2>
+<p>Dai Ngo acknowledged all feedback in two separate responses [id://88bdf658-19c3-4203-8948-5aaa64718b47@oracle.com], [id://1677f1ed-27db-4525-ae3e-5e4d12a9f5a9@oracle.com].</p>
+<p>Regarding the critical spin-lock bug, Dai proposed a more robust fix within <code>__break_lease</code> itself, rather than patching it specifically for layouts. This approach would also protect against similar issues with timed-out delegations:</p>
+<blockquote>
+<p>"I think this issue should be addressed by __break_lease since we can have the same problem with timed out delegation... if (break_time &lt; jiffies) break_time = jiffies + lease_break_time * HZ;" [id://1677f1ed-27db-4525-ae3e-5e4d12a9f5a9@oracle.com]</p>
+</blockquote>
+<p>Dai confirmed that v11 of the patch will include:</p>
+<ol>
+<li>Per-client logging flags to reduce spam.</li>
+<li>Inclusion of client IDs in logs for easier administration.</li>
+<li>Documentation updates for PNFS SCSI server fencing.</li>
+<li>The generalized fix for <code>__break_lease</code> timestamp wrap-around.</li>
+<li>Code cleanups (removing unused variables, fixing backoff logic).</li>
+</ol>
+<p>This discussion highlights the rigorous review process ensuring that new NFS features like layout fencing do not introduce regressions in core kernel subsystems like file locking, ultimately safeguarding the reliability of NFS storage for all clients.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260210181632.1161855-1-dai.ngo@oracle.com/">2026-02-10 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — [PATCH v10 1/1] NFSD: Enforce timeout on layout recall and integrate lease manager fencing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/eb1757d7f2409ffb792d800166daff8a8c63b09e.camel@kernel.org/">2026-02-10 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v10 1/1] NFSD: Enforce timeout on layout recall and integrate lease manager fencing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/a06f4c17-8227-4c04-b270-5c064b7de79c@app.fastmail.com/">2026-02-10 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v10 1/1] NFSD: Enforce timeout on layout recall and integrate lease manager fencing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/88bdf658-19c3-4203-8948-5aaa64718b47@oracle.com/">2026-02-11 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — Re: [PATCH v10 1/1] NFSD: Enforce timeout on layout recall and integrate lease manager fencing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/1677f1ed-27db-4525-ae3e-5e4d12a9f5a9@oracle.com/">2026-02-11 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — Re: [PATCH v10 1/1] NFSD: Enforce timeout on layout recall and integrate lease manager fencing</a></li>
+</ul>
+  </main>
+</body>
+</html>

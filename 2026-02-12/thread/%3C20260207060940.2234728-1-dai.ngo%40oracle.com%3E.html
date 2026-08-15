@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD Layout Recall Timeout v7: Fencing Retry Policy Resolved, Code Review Nits Addressed</title>
+  <meta name="description" content="Discussion type: Bug fix / reliability enhancement for NFS server (NFSD) pNFS layout recall handling.">
+  <meta property="og:title" content="NFSD Layout Recall Timeout v7: Fencing Retry Policy Resolved, Code Review Nits Addressed">
+  <meta property="og:description" content="Discussion type: Bug fix / reliability enhancement for NFS server (NFSD) pNFS layout recall handling.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-02-12T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSD Layout Recall Timeout v7: Fencing Retry Policy Resolved, Code Review Nits Addressed">
+  <meta name="twitter:description" content="Discussion type: Bug fix / reliability enhancement for NFS server (NFSD) pNFS layout recall handling.">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-02-12</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD Layout Recall Timeout v7: Fencing Retry Policy Resolved, Code Review Nits Addressed</h1>
+<h2>Summary</h2>
+<h1>NFSD Layout Recall Timeout v7: Fencing Retry Policy Resolved, Code Review Nits Addressed</h1>
+<h2>Overview</h2>
+<p><strong>Discussion type:</strong> Bug fix / reliability enhancement for NFS server (NFSD) pNFS layout recall handling.</p>
+<p>This week saw the posting of <strong>version 7</strong> of Dai Ngo's patch series, <strong>[PATCH v7 1/1] NFSD: Enforce timeout on layout recall and integrate lease manager fencing</strong>, followed by a thorough review from Jeff Layton and Chuck Lever. The patch addresses a critical server-side reliability issue where excessive nfsd threads can be blocked indefinitely during pNFS block layout recalls, potentially causing server starvation. It introduces a new <code>lm_breaker_timedout</code> callback in the VFS lease manager infrastructure to enforce timeouts and integrate SCSI PR (Persistent Reservation) fencing.</p>
+<h2>Bridge from Prior Weeks</h2>
+<p>As summarized in prior reports, v5 had incorporated significant fixes including reference counting corrections, increased fence retry counts (from 5 to 20), proper worker cancellation on cleanup, and restored error-handling comments. A key improvement agreed upon was unlocking the lease immediately after fencing completes (via <code>kernel_setlease()</code> with <code>F_UNLCK</code>) to allow waiting tasks to proceed sooner. v6 incorporated this fix and prompted a debate from Jeff Layton about whether giving up on fencing after a fixed number of retries risks data corruption. Layton argued:</p>
+<blockquote>
+<p>"It seems like the answer to this ought to be 'yes' by default. If you give up on fencing, then it seems like you're opening the door to data corruption."</p>
+</blockquote>
+<p>v7, posted this week, directly responds to that concern by changing the default behavior to retry fencing indefinitely.</p>
+<h2>Key Technical Arguments</h2>
+<h3>1. Fencing Retry Policy: Default Changed to "Retry Forever"</h3>
+<p>In response to Jeff Layton's concerns about data corruption risk from fixed retry limits, Dai Ngo changed v7 to retry fencing on error forever by default:</p>
+<blockquote>
+<p>"Change to retry fencing on error forever by default."</p>
+</blockquote>
+<p>A module parameter <code>nfsd4_fence_max_retries</code> was added to allow administrators to override this behavior if needed. The patch documentation notes:</p>
+<blockquote>
+<p>"The admin can control this behavior by setting nfsd4_fence_max_retries"</p>
+</blockquote>
+<p>Jeff Layton gave the patch a positive review with only minor nits:</p>
+<blockquote>
+<p>"Thanks, Dai. I think this one looks good."
+<code>Reviewed-by: Jeff Layton &lt;jlayton@kernel.org&gt;</code></p>
+</blockquote>
+<h3>2. Chuck Lever's Detailed Code Review</h3>
+<p>Chuck Lever provided an extensive review covering several issues:</p>
+<h4>Bug in Lease Disposal Logic</h4>
+<p>Lever identified a subtle bug in the <code>time_out_leases</code> loop where the <code>remove</code> variable is initialized before the loop but never reset to <code>true</code> at the start of each iteration. This could cause leases with no <code>lm_breaker_timedout</code> callback to inherit a stale <code>false</code> value, preventing their disposal:</p>
+<blockquote>
+<p>"The 'remove' variable is initialized before the loop but is never reset to true at the start of each iteration. If a lease's lm_breaker_timedout callback returns false, 'remove' stays false for all subsequent leases in the list."</p>
+</blockquote>
+<p>Dai Ngo confirmed this was correct and agreed to fix it:</p>
+<blockquote>
+<p>"Yes, it should be initialized inside the loop. Fix in v8."</p>
+</blockquote>
+<h4>Concerns About Locking and Module Boundaries</h4>
+<p>Lever expressed reservations about holding <code>flc_lock</code> while calling into another module's callback:</p>
+<blockquote>
+<p>"I'm still not enthusiastic about holding flc_lock while calling another module. Especially since holding that lock does not appear to be documented in an API contract..."</p>
+</blockquote>
+<p>Dai Ngo pointed out that the locking requirement is documented in <code>Documentation/filesystems/locking.rst</code>.</p>
+<h4>Questioning the Need for the Admin Tunable</h4>
+<p>Lever challenged the rationale for the <code>nfsd4_fence_max_retries</code> module parameter, noting that limiting retries introduces a data corruption risk and asking for a concrete use case:</p>
+<blockquote>
+<p>"I haven't seen a clear use case stated for an admin needing to set this value."
+"The documenting comment does not underscore that limiting the number of retries -- setting this value -- is a data corruption risk."
+"I'd rather not add this setting unless there is an actual real world purpose in front of us."</p>
+</blockquote>
+<p>Dai Ngo agreed to remove the knob:</p>
+<blockquote>
+<p>"Ok, I'll remove this knob in v8."</p>
+</blockquote>
+<h4>Potential Deadlock Concerns</h4>
+<p>Lever raised a question about potential deadlock between <code>nfsd4_close_layout()</code> acquiring <code>fi_lock</code> and calling <code>kernel_setlease()</code>, which could interact with locks held by the fence worker. Dai Ngo clarified:</p>
+<blockquote>
+<p>"nfsd4_close_layout() releases the fi_lock before calling kernel_setlease()."</p>
+</blockquote>
+<h4>Testing Confirmation for Client Expiry</h4>
+<p>Lever asked whether expiring a client actually breaks the fence retry loop. Dai Ngo confirmed manual testing:</p>
+<blockquote>
+<p>"nfsd4_revoke_states calls nfsd4_close_layout to remove all file leases. I manually tested it."</p>
+</blockquote>
+<p>To which Lever responded:</p>
+<blockquote>
+<p>"Excellent!"</p>
+</blockquote>
+<h4>Additional Code Nits Fixed in v8</h4>
+<p>Several smaller issues were identified and accepted for fixing:</p>
+<ul>
+<li>
+<p><strong>Format specifier bug:</strong> The <code>%pISpc</code> format was receiving the wrong pointer type. Lever suggested:</p>
+<blockquote>
+<p>"Should this be (struct sockaddr *)&amp;ls-&gt;ls_stid.sc_client-&gt;cl_addr?"</p>
+</blockquote>
+<p>Dai Ngo agreed: "Yes, fix in v8."</p>
+</li>
+<li>
+<p><strong>Exponential back-off for retry delays:</strong> Lever questioned the use of a literal <code>1</code> (jiffy) delay between fence retries:</p>
+<blockquote>
+<p>""1" -- is that 1 jiffy? Could this use an exponential back-off instead?"</p>
+</blockquote>
+<p>Dai Ngo agreed to fix.</p>
+</li>
+<li>
+<p><strong>Typos and formatting:</strong> A typo ("orker" instead of "worker") and a blank comment line were noted and accepted for correction.</p>
+</li>
+</ul>
+<h2>Evolution of the Discussion</h2>
+<p>The discussion followed a clear progression:</p>
+<ol>
+<li><strong>Dai Ngo</strong> posted v7 on February 7, incorporating the "retry forever" default in response to prior concerns about data corruption risk from fixed retry limits.</li>
+<li><strong>Jeff Layton</strong> reviewed and provided a <code>Reviewed-by</code> with only minor nits (explicit zero initialization of a global variable).</li>
+<li><strong>Chuck Lever</strong> conducted a thorough code review identifying a genuine bug in the lease disposal logic, questioning the need for the admin tunable, raising deadlock concerns, and flagging several code quality issues.</li>
+<li><strong>Dai Ngo</strong> responded on February 9, agreeing to all of Lever's suggestions and confirming fixes for v8.</li>
+</ol>
+<h2>Final Conclusions</h2>
+<ul>
+<li><strong>v7 has been posted</strong> with the critical change of defaulting to infinite fencing retries, directly addressing Jeff Layton's data corruption concerns from prior weeks.</li>
+<li><strong>Jeff Layton granted <code>Reviewed-by</code></strong>, signaling strong approval of the patch direction.</li>
+<li><strong>Chuck Lever identified a genuine bug</strong> in the lease disposal loop logic that must be fixed before the patch can be merged.</li>
+<li><strong>The admin tunable (<code>nfsd4_fence_max_retries</code>) will be removed</strong> per Chuck Lever's request, as no concrete use case was presented to justify exposing a data-corruption-risk parameter.</li>
+<li><strong>v8 is expected</strong> to address all identified issues: the <code>remove</code> variable initialization bug, the format specifier fix, exponential back-off for retry delays, typo corrections, and removal of the admin knob.</li>
+</ul>
+<h2>Significance for NFS Client Development</h2>
+<p>While this is primarily a server-side change, it has important implications for pNFS clients:</p>
+<ul>
+<li><strong>Data safety</strong>: The fencing mechanism prevents data corruption when layout recalls time out and the original client still holds exclusive block device access. This is critical for pNFS block layouts where clients access storage devices directly.</li>
+<li><strong>Server responsiveness</strong>: Enforcing timeouts prevents nfsd thread starvation during layout conflicts, ensuring the server continues servicing incoming requests from all clients.</li>
+<li><strong>Improved concurrency</strong>: The lease-unlocking-after-fencing fix reduces blocking time for other clients waiting on conflicting layouts.</li>
+<li><strong>Operational clarity</strong>: Removing the admin tunable simplifies the operational model — the default behavior (retry forever) is the safest, and administrators can intervene via client state revocation if fencing fails persistently.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260207060940.2234728-1-dai.ngo@oracle.com/">2026-02-07 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — [PATCH v7 1/1] NFSD: Enforce timeout on layout recall and integrate lease manager fencing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/c3000ddc3cd66f43898c7f7dd9926804d2280878.camel@kernel.org/">2026-02-07 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v7 1/1] NFSD: Enforce timeout on layout recall and integrate lease manager fencing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ebcb1893-bf03-4637-bf0c-918eb42705bd@app.fastmail.com/">2026-02-07 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v7 1/1] NFSD: Enforce timeout on layout recall and integrate lease manager fencing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/e66142e7-ae6e-4d4a-b2fd-2507d2948f77@oracle.com/">2026-02-09 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — Re: [PATCH v7 1/1] NFSD: Enforce timeout on layout recall and integrate lease manager fencing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/e2a7dd77-246d-4af5-a30b-ba726951ff84@kernel.org/">2026-02-09 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v7 1/1] NFSD: Enforce timeout on layout recall and integrate lease manager fencing</a></li>
+</ul>
+  </main>
+</body>
+</html>

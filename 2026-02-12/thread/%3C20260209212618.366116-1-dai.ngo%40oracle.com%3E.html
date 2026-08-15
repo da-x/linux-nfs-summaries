@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD: Enforce Layout Recall Timeout with Lease Manager Fencing Integration</title>
+  <meta name="description" content="This week, Dai Ngo submitted version 8 of a significant patch series aimed at hardening the NFS server&#39;s handling of pNFS layout recalls. The work addresses a critical reliability issue where excessive nfsd threads could become blocked…">
+  <meta property="og:title" content="NFSD: Enforce Layout Recall Timeout with Lease Manager Fencing Integration">
+  <meta property="og:description" content="This week, Dai Ngo submitted version 8 of a significant patch series aimed at hardening the NFS server&#39;s handling of pNFS layout recalls. The work addresses a critical reliability issue where excessive nfsd threads could become blocked…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-02-12T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSD: Enforce Layout Recall Timeout with Lease Manager Fencing Integration">
+  <meta name="twitter:description" content="This week, Dai Ngo submitted version 8 of a significant patch series aimed at hardening the NFS server&#39;s handling of pNFS layout recalls. The work addresses a critical reliability issue where excessive nfsd threads could become blocked…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-02-12</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD: Enforce Layout Recall Timeout with Lease Manager Fencing Integration</h1>
+<h2>Summary</h2>
+<h1>NFSD: Enforcing Layout Recall Timeouts and Integrating Lease Manager Fencing (v8)</h1>
+<p>This week, Dai Ngo submitted version 8 of a significant patch series aimed at hardening the NFS server's handling of pNFS layout recalls. The work addresses a critical reliability issue where excessive <code>nfsd</code> threads could become blocked during layout conflicts, potentially degrading server performance. The solution introduces a timeout mechanism for layout recalls and integrates with the kernel's lease manager to trigger client fencing when timeouts occur.</p>
+<h2>Technical Context and Problem Statement</h2>
+<p>The discussion centers on <strong>NFS client development</strong> from the server-side perspective—specifically, how the NFSD handles block layout conflicts in pNFS (parallel NFS). When a layout conflict triggers a recall, the server must wait for the client to release its exclusive access. Without a timeout, this wait can block <code>nfsd</code> threads indefinitely if the client is unresponsive or malicious.</p>
+<p>Dai Ngo explained the necessity of the change:</p>
+<blockquote>
+<p>"When a layout conflict triggers a recall, enforcing a timeout is necessary to prevent excessive nfsd threads from being blocked in __break_lease ensuring the server continues servicing incoming requests efficiently."</p>
+</blockquote>
+<p>The patch introduces a new callback <code>lm_breaker_timedout</code> in the <code>lease_manager_operations</code> structure. This allows the lease manager (NFSD) to decide whether a timed-out lease should be disposed of or kept while fencing operations proceed. For block layouts, if the client has not been fenced, the server initiates a fence operation to prevent further access to the underlying block device.</p>
+<h2>Evolution of the Patch (v8)</h2>
+<p>This is the eighth iteration of the patch, reflecting extensive refinement:</p>
+<ul>
+<li><strong>v2–v4</strong>: Addressed locking requirements, added retry counts for fencing, and corrected reference counting on layout stateids.</li>
+<li><strong>v5–v6</strong>: Improved error handling, ensured leases are unlocked promptly after fencing, and moved initialization to allocation time.</li>
+<li><strong>v7</strong>: Changed default behavior to retry fencing indefinitely, with an optional admin-controlled maximum retry limit.</li>
+<li><strong>v8</strong>: Removed the configurable retry knob, implemented exponential backoff for retries, and fixed minor issues ("nits").</li>
+</ul>
+<p>Dai Ngo noted a design decision regarding lease disposal:</p>
+<blockquote>
+<p>"I experimented with having the fence worker handle lease disposal after fencing the client. However, this requires the lease code to export the lease_dispose_list function... This approach adds unnecessary complexity and reduces code clarity... Instead, the lm_breaker_timedout operation should simply notify the lease code about how to handle a lease that times out during a lease break, rather than directly manipulating the lease list."</p>
+</blockquote>
+<h2>Review Feedback from Chuck Lever</h2>
+<p>Chuck Lever provided detailed review comments on v8, focusing on correctness and convention:</p>
+<ol>
+<li>
+<p><strong>Timeout Values</strong>: He questioned whether an hour (3600 seconds) between retries was too long and suggested capping the maximum at 3 minutes. He also requested a constant to document the maximum timeout.</p>
+<blockquote>
+<p>"Assuming you meant 3600 seconds and not 3600 jiffies, is an hour between retries too long? Maybe the maximum should be capped at 3 minutes or something?"</p>
+</blockquote>
+</li>
+<li>
+<p><strong>Jiffies Conversion</strong>: Lever pointed out that <code>mod_delayed_work()</code> expects jiffies, not seconds:</p>
+<blockquote>
+<p>"Since mod_delayed_work() takes jiffies as its third argument, you need a '* HZ' here."</p>
+</blockquote>
+</li>
+<li>
+<p><strong>Initialization Safety</strong>: He recommended moving <code>INIT_DELAYED_WORK</code> to the allocation function for safety:</p>
+<blockquote>
+<p>"Can this INIT_DELAYED_WORK be moved to nfsd4_alloc_layout_stateid()? INIT at allocation time is more conventional and safer."</p>
+</blockquote>
+</li>
+<li>
+<p><strong>State Tracking</strong>: Lever suggested using <code>delayed_work_pending()</code> instead of a separate boolean flag to track whether fencing is in progress:</p>
+<blockquote>
+<p>"Seems like there are two sources of truth about whether a fence is in progress here. Would it make sense to replace ls_fence_in_progress with a call to delayed_work_pending()?"</p>
+</blockquote>
+</li>
+</ol>
+<h2>Conclusion and Next Steps</h2>
+<p>Dai Ngo acknowledged all of Chuck Lever's feedback and confirmed that fixes would be included in v9:</p>
+<blockquote>
+<p>"Fix in v9."<br />
+"Yes, let just use delayed_work_pending(). Fix in v9."</p>
+</blockquote>
+<p>The patch remains under active development, with the next version expected to address timeout capping, jiffies conversion, initialization safety, and state tracking simplification. This work represents an important bug fix and robustness improvement for NFSD's pNFS block layout support, ensuring that the server can recover from unresponsive clients without resource exhaustion.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260209212618.366116-1-dai.ngo@oracle.com/">2026-02-09 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — [PATCH v8 1/1] NFSD: Enforce timeout on layout recall and integrate lease manager fencing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/e957053b-53d2-4291-afaa-d5dc08f8c44b@app.fastmail.com/">2026-02-10 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v8 1/1] NFSD: Enforce timeout on layout recall and integrate lease manager fencing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/e817b590-3b41-4403-b17f-3114e04c0e96@oracle.com/">2026-02-10 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — Re: [PATCH v8 1/1] NFSD: Enforce timeout on layout recall and integrate lease manager fencing</a></li>
+</ul>
+  </main>
+</body>
+</html>

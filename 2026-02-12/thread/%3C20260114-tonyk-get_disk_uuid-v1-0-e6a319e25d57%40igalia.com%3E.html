@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>overlayfs: uuid=off Cannot Solve btrfs Clone File Handle Problem; Patch Queued for 7.0</title>
+  <meta name="description" content="This week&#39;s single message in this long-running thread delivered a substantive technical clarification from Amir Goldstein regarding the fundamental limitations of overlayfs&#39;s uuid=off mount option when used with btrfs cloned images — the…">
+  <meta property="og:title" content="overlayfs: uuid=off Cannot Solve btrfs Clone File Handle Problem; Patch Queued for 7.0">
+  <meta property="og:description" content="This week&#39;s single message in this long-running thread delivered a substantive technical clarification from Amir Goldstein regarding the fundamental limitations of overlayfs&#39;s uuid=off mount option when used with btrfs cloned images — the…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-02-12T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="overlayfs: uuid=off Cannot Solve btrfs Clone File Handle Problem; Patch Queued for 7.0">
+  <meta name="twitter:description" content="This week&#39;s single message in this long-running thread delivered a substantive technical clarification from Amir Goldstein regarding the fundamental limitations of overlayfs&#39;s uuid=off mount option when used with btrfs cloned images — the…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-02-12</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>overlayfs: uuid=off Cannot Solve btrfs Clone File Handle Problem; Patch Queued for 7.0</h1>
+<h2>Summary</h2>
+<h1>overlayfs: <code>uuid=off</code> Limitations with btrfs Clones Clarified, Patch Queued for 7.0 PR</h1>
+<h2>Summary</h2>
+<p>This week's single message in this long-running thread delivered a substantive technical clarification from Amir Goldstein regarding the fundamental limitations of overlayfs's <code>uuid=off</code> mount option when used with btrfs cloned images — the core use case driving this discussion for SteamOS A/B partitioning. While Goldstein confirmed that his patch has been pushed to the overlayfs-next branch and could be submitted during the 7.0 merge window, he also drew a hard line on what <code>uuid=off</code> can and cannot solve.</p>
+<h2>Background (Brief)</h2>
+<p>This thread originated from André Almeida's rejected 3-patch series proposing to repurpose <code>export_operations::get_uuid()</code> for overlayfs origin file handles, targeting btrfs cloned images used in SteamOS A/B partitioning. After Christoph Hellwig firmly opposed that approach, the discussion pivoted to extending overlayfs's existing <code>uuid=off</code> mount option. Over the prior five weeks, Goldstein developed a patch lifting <code>uuid=off</code>'s same-filesystem restriction, clarified its semantics (it must be enabled from the first mount), and tested it internally. Last week, Almeida reported initial success but encountered a reboot-related failure, recommending deferral to kernel 7.1 [id://05c37282-715e-4334-82e6-aea3241f15eb@igalia.com].</p>
+<h2>Key Technical Arguments This Week</h2>
+<h3>Amir Goldstein: <code>uuid=off</code> Must Be Consistent Across All Mounts</h3>
+<p>Responding to Almeida's report that he believed he "forgot to add <code>uuid=off</code> somewhere in the mount scripts," Goldstein emphasized a critical operational requirement [id://CAOQ4uxgzK7qYDFWYT62jH_zq8JkLGussD5ro4cKDqSNQqBiVUA@mail.gmail.com]:</p>
+<blockquote>
+<p>"Not only on the <em>first</em> mount - on <em>all</em> the mounts. Unless you use 'uuid=off' consistently, overlayfs will deny the mount."</p>
+</blockquote>
+<p>This clarification underscores that <code>uuid=off</code> is not a one-time declaration but a persistent policy: every subsequent mount of the same overlayfs must also specify the option, or the mount will be rejected outright.</p>
+<h3>The Fundamental btrfs Clone Problem: File Handles, Not Just UUIDs</h3>
+<p>The most significant technical contribution this week was Goldstein's explanation of why <code>uuid=off</code> alone cannot solve the SteamOS cloned-image problem. Almeida reported that rebooting to the "other partition" still triggered a "failed to verify upper root origin" error. Goldstein questioned whether the issue was truly about UUIDs at all, pointing out that btrfs clones produce different file handles for the same logical file:</p>
+<blockquote>
+<p>"Overlayfs verifies the origin by file handle + UUID. We allow relaxing UUID check with uuid=off but isn't it the case for btrfs that the same file in different clones will have a different file handle, because of different root_objectid?"</p>
+</blockquote>
+<p>He cited the relevant btrfs code showing how file handles encode <code>root_objectid</code>:</p>
+<pre><code class="language-c">fid-&gt;objectid = btrfs_ino(BTRFS_I(inode));
+fid-&gt;root_objectid = btrfs_root_id(BTRFS_I(inode)-&gt;root);
+fid-&gt;gen = inode-&gt;i_generation;
+</code></pre>
+<p>This led to a crucial distinction:</p>
+<blockquote>
+<p>"That means that you can use 'uuid=off' to overcome the ephemeral nature of the btrfs clone UUID, but you cannot use it to mount an overlayfs that was created in one btrfs clone from another clone."</p>
+</blockquote>
+<p>In other words, <code>uuid=off</code> addresses UUID instability (the filesystem UUID changes between clones), but it does <em>not</em> address file handle instability (the same file has a different <code>root_objectid</code> in each clone). These are two separate problems, and <code>uuid=off</code> only solves the first.</p>
+<h3>No "fileid=off" Option Will Be Added</h3>
+<p>When confronted with this limitation, Goldstein was unequivocal:</p>
+<blockquote>
+<p>"Sorry, no 'fileid=off' option, this is out of the question."</p>
+</blockquote>
+<p>He explained that the alternative is to disable the overlayfs index entirely:</p>
+<blockquote>
+<p>"You are free to use 'index=off' to avoid those requirements, but the essence of 'index=on' is that the lower file can be uniquely identified and therefore, changing the lower file's unique id is game over."</p>
+</blockquote>
+<p>This draws a clear boundary: if users want <code>index=on</code> (which provides performance and correctness benefits), they must accept that the lower layer's file identity — both UUID <em>and</em> file handle — must remain stable across mounts. For btrfs clones where both change, <code>uuid=off</code> is insufficient, and <code>index=off</code> becomes the only option.</p>
+<h3>Patch Status: Queued for 7.0 Merge Window</h3>
+<p>Despite the limitations, Goldstein confirmed that his patch has been integrated into his development tree:</p>
+<blockquote>
+<p>"I pushed this patch to overlayfs-next branch. It is an internal logic change in overlayfs that does not conflict with other code, so there should not be a problem to send a PR on the second half of the 7.0 merge window if this is useful."</p>
+</blockquote>
+<p>However, he reiterated his conditional stance on submission:</p>
+<blockquote>
+<p>"I think that the change itself makes sense because there was never a justification for the strict rule of both upper/lower on the same fs for uuid=off, but I am still not going to send it without knowing that someone finds this useful for their workload."</p>
+</blockquote>
+<h2>Evolution of the Discussion</h2>
+<p>The thread's trajectory over its full six-week lifespan:</p>
+<ul>
+<li><strong>Weeks 1–2 (Jan 14–22):</strong> Almeida's original approach rejected; discussion pivoted to <code>uuid=off</code> as an existing mechanism.</li>
+<li><strong>Week 3 (Jan 23–29):</strong> Almeida misused <code>uuid=off</code>; Goldstein clarified it must be enabled from the first mount and provided documentation improvements.</li>
+<li><strong>Week 4 (Feb 5):</strong> Almeida reported initial success but a remaining reboot issue; recommended deferral to 7.1.</li>
+<li><strong>Week 5 (Feb 6, this week):</strong> Goldstein clarified that <code>uuid=off</code> cannot solve the btrfs clone file handle problem, ruled out any "fileid=off" option, and confirmed the patch is queued for potential 7.0 submission.</li>
+</ul>
+<h2>Final Conclusions</h2>
+<ol>
+<li>
+<p><strong><code>uuid=off</code> has a hard limitation with btrfs clones.</strong> It can address UUID instability but not file handle instability caused by differing <code>root_objectid</code> values across clones [id://CAOQ4uxgzK7qYDFWYT62jH_zq8JkLGussD5ro4cKDqSNQqBiVUA@mail.gmail.com]. This is a fundamental architectural constraint, not a bug.</p>
+</li>
+<li>
+<p><strong>No "fileid=off" option will be added.</strong> Goldstein firmly rejected the idea of relaxing file handle verification, stating it is "out of the question" [id://CAOQ4uxgzK7qYDFWYT62jH_zq8JkLGussD5ro4cKDqSNQqBiVUA@mail.gmail.com]. The only alternative for users needing this flexibility is <code>index=off</code>.</p>
+</li>
+<li>
+<p><strong>The patch is queued but submission is conditional.</strong> Goldstein has pushed the change to overlayfs-next and could submit a pull request during the 7.0 merge window, but only if someone confirms it serves their workload [id://CAOQ4uxgzK7qYDFWYT62jH_zq8JkLGussD5ro4cKDqSNQqBiVUA@mail.gmail.com].</p>
+</li>
+<li>
+<p><strong><code>uuid=off</code> must be used consistently on all mounts.</strong> Not just the first mount, but every subsequent mount of the same overlayfs [id://CAOQ4uxgzK7qYDFWYT62jH_zq8JkLGussD5ro4cKDqSNQqBiVUA@mail.gmail.com].</p>
+</li>
+</ol>
+<h2>Classification</h2>
+<p><strong>Type:</strong> Feature extension (overlayfs <code>uuid=off</code> support for cross-filesystem setups)</p>
+<p><strong>NFS Client Relevance:</strong> Indirect. This is fundamentally an overlayfs discussion, though it touches on file handle encoding semantics that are foundational to NFS exports and the exportfs subsystem. The original <code>get_uuid()</code> infrastructure served pNFS block layout, and Hellwig previously noted that "encoding the uuid into the file handle in the kernel is the right thing for NFS as well."</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxgzK7qYDFWYT62jH_zq8JkLGussD5ro4cKDqSNQqBiVUA@mail.gmail.com/">2026-02-06 Amir Goldstein <a href="mailto:amir73il@gmail.com">amir73il@gmail.com</a> — Re: [PATCH 3/3] ovl: Use real disk UUID for origin file handles</a></li>
+</ul>
+  </main>
+</body>
+</html>

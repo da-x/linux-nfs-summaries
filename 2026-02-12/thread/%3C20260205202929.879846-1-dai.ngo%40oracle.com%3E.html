@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD Layout Recall Timeout: Lease Removal Timing and Patch Structure Review</title>
+  <meta name="description" content="Discussion type: Bug fix / reliability enhancement for NFS server (NFSD) pNFS layout recall handling.">
+  <meta property="og:title" content="NFSD Layout Recall Timeout: Lease Removal Timing and Patch Structure Review">
+  <meta property="og:description" content="Discussion type: Bug fix / reliability enhancement for NFS server (NFSD) pNFS layout recall handling.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-02-12T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSD Layout Recall Timeout: Lease Removal Timing and Patch Structure Review">
+  <meta name="twitter:description" content="Discussion type: Bug fix / reliability enhancement for NFS server (NFSD) pNFS layout recall handling.">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-02-12</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD Layout Recall Timeout: Lease Removal Timing and Patch Structure Review</h1>
+<h2>Summary</h2>
+<h1>NFSD Layout Recall Timeout and Lease Manager Fencing — PATCH v5 Review (Feb 6)</h1>
+<h2>Overview</h2>
+<p><strong>Discussion type:</strong> Bug fix / reliability enhancement for NFS server (NFSD) pNFS layout recall handling.</p>
+<p>This week's activity centered on the review of <strong>version 5</strong> of Dai Ngo's patch series, <strong>[PATCH v5 1/1] NFSD: Enforce timeout on layout recall and integrate lease manager fencing</strong>, which was posted on February 5. The patch addresses a critical reliability issue where excessive nfsd threads can be blocked indefinitely during pNFS layout recalls, potentially causing server starvation. It introduces a new <code>lm_breaker_timedout</code> callback in the VFS lease manager infrastructure to enforce timeouts and integrate SCSI PR fencing via the kernel lease manager.</p>
+<p>Six messages were exchanged on February 6, involving Christoph Hellwig, Jeff Layton, and Dai Ngo. The discussion focused on two main topics: (1) patch structure (single combined patch vs. split VFS/nfsd patches), and (2) the precise timing of lease removal after fencing completes.</p>
+<h2>Bridge from Prior Week</h2>
+<p>As summarized in the previous week's report, v5 incorporated significant fixes from the rigorous v4 review by Chuck Lever and Jeff Layton, including reference counting corrections, increased fence retry counts (from 5 to 20), proper worker cancellation on cleanup, and restored error-handling comments. The patch had evolved through five versions addressing fundamental data-safety concerns around timeout-based fencing schemes.</p>
+<h2>Key Technical Arguments</h2>
+<h3>1. Patch Structure: Combined vs. Split Approach</h3>
+<p>Christoph Hellwig raised a structural concern about the patch mixing VFS core infrastructure with NFSD-specific code:</p>
+<blockquote>
+<p>"Most of this is over my head (but I'll still try to come up with good comments if I can find some time to learn/relearn the lease code), but one thing I noticed is that this mixes up VFS and nfsd code. You probably want to split this into a core infrastructure and a nfsd patch."</p>
+</blockquote>
+<p>Dai Ngo clarified that earlier versions had separated the patch, but reviewers suggested combining them:</p>
+<blockquote>
+<p>"I did separate the patch into a core infrastructure patch (lease code) and nfsd patch in earlier version. But I think Jeff or Chuck suggested to combine them into one patch since nfsd is the only consumer of the newly introduce lm_breaker_timedout operation."</p>
+</blockquote>
+<p>He then asked for guidance from Jeff Layton and Chuck Lever on whether to maintain the combined approach or revert to splitting.</p>
+<h3>2. Lease Removal Timing After Fencing</h3>
+<p>Jeff Layton identified a subtle timing issue in the lease lifecycle: when <code>remove</code> is false and <code>lease_modify()</code> does not execute immediately (the common case where a workqueue job is queued), the question arises of when the lease is actually removed. He questioned whether the code assumed the layout stateid's reference count would naturally drop to zero after fencing:</p>
+<blockquote>
+<p>"When remove is false, and lease_modify() doesn't happen (i.e., the common case where we queue the wq job), when do you actually remove the lease?"</p>
+</blockquote>
+<blockquote>
+<p>"Are you just assuming that after the client is fenced, that the layout stateid's refcount will go to zero? I'm curious what drives that process, if so."</p>
+</blockquote>
+<p>Dai Ngo explained the two-step mechanism: first, the fence worker sets <code>ls_fenced</code> to true upon completion; second, when <code>__break_lease/time_out_leases</code> calls <code>lm_breaker_timedout</code> again, <code>nfsd4_layout_lm_breaker_timedout</code> returns true because <code>ls_fenced</code> is set. Regarding reference counting:</p>
+<blockquote>
+<p>"No, after completing the fence operation, the fenced worker drops the reference count on the layout stateid by calling nfs4_put_stid(). If the reference drops to 0 then the layout stateid is freed at this point, otherwise it will be freed when the CB_RECALL callback times out."</p>
+</blockquote>
+<p>Jeff Layton then proposed an improvement: unlocking the lease immediately after fencing completes, rather than waiting for the next <code>lm_breaker_timedout</code> invocation, to allow waiting tasks to proceed sooner:</p>
+<blockquote>
+<p>"In principle the stateid could stick around for a while after the fence has occurred. It would be better to unlock the lease as soon as the fencing is done, so that tasks waiting on it can proceed (a'la kernel_setlease() with F_UNLCK)."</p>
+</blockquote>
+<p>Dai Ngo accepted this suggestion:</p>
+<blockquote>
+<p>"Good suggestion, fix in v6."</p>
+</blockquote>
+<h2>Evolution of the Discussion</h2>
+<p>The discussion followed a clear progression:</p>
+<ol>
+<li><strong>Christoph Hellwig</strong> opened with a structural critique about mixing VFS and NFSD code, prompting Dai to seek guidance on patch organization.</li>
+<li><strong>Jeff Layton</strong> dove into the technical details of lease lifecycle management, questioning when leases are actually removed in the common case.</li>
+<li><strong>Dai Ngo</strong> provided detailed explanations of the fencing workflow and reference counting mechanics.</li>
+<li><strong>Jeff Layton</strong> refined his critique, suggesting immediate lease unlocking post-fencing for better concurrency.</li>
+<li><strong>Dai Ngo</strong> agreed to implement the improvement in v6.</li>
+</ol>
+<h2>Final Conclusions</h2>
+<ul>
+<li>The patch structure question (combined vs. split) remained open at week's end, pending further input from Jeff Layton and Chuck Lever.</li>
+<li>A concrete improvement was agreed upon: unlocking the lease immediately after fencing completes (via <code>kernel_setlease()</code> with <code>F_UNLCK</code>), to be implemented in v6. This enhances server responsiveness by allowing waiting tasks to proceed sooner rather than waiting for the next timeout callback invocation.</li>
+<li>Dai Ngo confirmed that v6 would incorporate this fix, indicating active iteration toward a final submission.</li>
+</ul>
+<h2>Significance for NFS Client Development</h2>
+<p>While this is primarily a server-side change, it has important implications for pNFS clients:</p>
+<ul>
+<li><strong>Data safety</strong>: The fencing mechanism prevents data corruption when layout recalls time out and the original client still holds exclusive block device access.</li>
+<li><strong>Server responsiveness</strong>: Enforcing timeouts prevents nfsd thread starvation during layout conflicts, ensuring the server continues servicing incoming client requests.</li>
+<li><strong>Improved concurrency</strong>: The agreed-upon v6 fix to unlock leases immediately post-fencing will further reduce blocking for other clients waiting on conflicting layouts.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260206061617.GA25655@lst.de/">Christoph Hellwig — Structural critique: VFS/nfsd code mixing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/9194ce4db4391c0e6428f97b05fcee53706fb485.camel@kernel.org/">Jeff Layton — Lease removal timing question</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/6a28e81b-1e2e-4457-8bec-4312e6d3246f@oracle.com/">Dai Ngo — Explanation of fencing workflow and refcounting</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/9905f5f0-ff88-4c36-9541-8f82109e26c5@oracle.com/">Dai Ngo — Patch structure clarification</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/3cb09bd01df3d43293f2f443ebb6b4a10ea50dee.camel@kernel.org/">Jeff Layton — Suggestion for immediate lease unlocking post-fencing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/623f06a7-4e41-4703-95ef-b3476fc4549a@oracle.com/">Dai Ngo — Agreement to fix in v6</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260206061617.GA25655@lst.de/">2026-02-06 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: [PATCH v5 1/1] NFSD: Enforce timeout on layout recall and integrate lease manager fencing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/9194ce4db4391c0e6428f97b05fcee53706fb485.camel@kernel.org/">2026-02-06 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v5 1/1] NFSD: Enforce timeout on layout recall and integrate lease manager fencing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/6a28e81b-1e2e-4457-8bec-4312e6d3246f@oracle.com/">2026-02-06 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — Re: [PATCH v5 1/1] NFSD: Enforce timeout on layout recall and integrate lease manager fencing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/9905f5f0-ff88-4c36-9541-8f82109e26c5@oracle.com/">2026-02-06 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — Re: [PATCH v5 1/1] NFSD: Enforce timeout on layout recall and integrate lease manager fencing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/3cb09bd01df3d43293f2f443ebb6b4a10ea50dee.camel@kernel.org/">2026-02-06 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v5 1/1] NFSD: Enforce timeout on layout recall and integrate lease manager fencing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/623f06a7-4e41-4703-95ef-b3476fc4549a@oracle.com/">2026-02-06 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — Re: [PATCH v5 1/1] NFSD: Enforce timeout on layout recall and integrate lease manager fencing</a></li>
+</ul>
+  </main>
+</body>
+</html>

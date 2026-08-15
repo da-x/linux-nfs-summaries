@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD Layout Recall Timeout v11: Final Fixes for Fencing Integration and Lease Spin-Lock Bug</title>
+  <meta name="description" content="Discussion type: Bug fix / reliability enhancement for NFS server (NFSD) pNFS layout recall handling.">
+  <meta property="og:title" content="NFSD Layout Recall Timeout v11: Final Fixes for Fencing Integration and Lease Spin-Lock Bug">
+  <meta property="og:description" content="Discussion type: Bug fix / reliability enhancement for NFS server (NFSD) pNFS layout recall handling.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-02-12T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSD Layout Recall Timeout v11: Final Fixes for Fencing Integration and Lease Spin-Lock Bug">
+  <meta name="twitter:description" content="Discussion type: Bug fix / reliability enhancement for NFS server (NFSD) pNFS layout recall handling.">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-02-12</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD Layout Recall Timeout v11: Final Fixes for Fencing Integration and Lease Spin-Lock Bug</h1>
+<h2>Summary</h2>
+<h1>NFSD Layout Recall Timeout and Fencing Integration — PATCH v11 Posted (Feb 12)</h1>
+<h2>Overview</h2>
+<p><strong>Discussion type:</strong> Bug fix / reliability enhancement for NFS server (NFSD) pNFS layout recall handling.</p>
+<p>This week culminated with the posting of <strong>version 11</strong> of Dai Ngo's patch series, <strong>[PATCH v11 1/1] NFSD: Enforce timeout on layout recall and integrate lease manager fencing</strong> [id://20260212222403.3305141-1-dai.ngo@oracle.com], on February 12. This submission represents the latest iteration in an extensive, multi-week review process involving Jeff Layton and Chuck Lever, addressing a critical server-side reliability issue where <code>nfsd</code> threads can be blocked indefinitely during pNFS block layout recalls.</p>
+<h2>Bridge from Prior Weeks</h2>
+<p>This patch has evolved through eleven iterations since early January. Key milestones include:</p>
+<ul>
+<li><strong>v5–v6 (Feb 5–6):</strong> Fixed reference counting, and incorporated Jeff Layton's suggestion to unlock leases immediately after fencing completes via <code>kernel_setlease()</code> with <code>F_UNLCK</code> [id://3cb09bd01df3d43293f2f443ebb6b4a10ea50dee.camel@kernel.org].</li>
+<li><strong>v7 (Feb 7):</strong> Changed the default fencing retry policy to "retry forever" in response to Jeff Layton's data corruption concerns [id://c3000ddc3cd66f43898c7f7dd9926804d2280878.camel@kernel.org]. Layton granted <code>Reviewed-by</code>.</li>
+<li><strong>v8 (Feb 9):</strong> Removed the admin tunable per Chuck Lever's request, implemented exponential back-off for retries, and fixed a bug in the lease disposal loop where the <code>remove</code> variable was not reinitialized inside the loop [id://e957053b-53d2-4291-afaa-d5dc08f8c44b@app.fastmail.com].</li>
+<li><strong>v9 (Feb 10):</strong> Capped maximum fence retry delay at 3 minutes, fixed a jiffies-vs-seconds unit conversion bug in <code>mod_delayed_work()</code>, moved <code>INIT_DELAYED_WORK</code> to allocation time, and replaced a redundant boolean flag with <code>delayed_work_pending()</code> [id://e817b590-3b41-4403-b17f-3114e04c0e96@oracle.com].</li>
+<li><strong>v10 (Feb 10):</strong> Fixed the initial fence worker delay from 1 jiffy to 1 second. Chuck Lever identified a <strong>critical latent bug</strong> in <code>__break_lease</code>: when <code>lm_breaker_timedout</code> returns false, the expired <code>fl_break_time</code> causes an unsigned wrap-around, leading to a tight spin loop that can hang uniprocessor systems [id://a06f4c17-8227-4c04-b270-5c064b7de79c@app.fastmail.com].</li>
+<li><strong>v11 (Feb 12):</strong> Addresses all v10 feedback, including the critical spin-loop bug fix and administrative improvements.</li>
+</ul>
+<h2>Key Technical Arguments in v11</h2>
+<h3>The Core Problem: Server Thread Starvation</h3>
+<p>Dai Ngo articulated the fundamental motivation for this patch:</p>
+<blockquote>
+<p>"When a layout conflict triggers a recall, enforcing a timeout is necessary to prevent excessive nfsd threads from being blocked in __break_lease ensuring the server continues servicing incoming requests efficiently." [id://20260212222403.3305141-1-dai.ngo@oracle.com]</p>
+</blockquote>
+<p>Without a timeout mechanism, unresponsive or malicious pNFS clients holding block layouts can cause <code>nfsd</code> threads to block indefinitely in <code>__break_lease</code>, leading to server starvation and degrading service for all other NFS clients.</p>
+<h3>The Solution: Timeout with SCSI PR Fencing</h3>
+<p>The patch introduces a new callback <code>lm_breaker_timedout</code> in the VFS <code>lease_manager_operations</code> structure. When a layout recall times out:</p>
+<ol>
+<li>If the layout type supports fencing and the client has not been fenced, a SCSI Persistent Reservation (PR) PREEMPT operation is triggered asynchronously via a system workqueue.</li>
+<li>The conflicting file lease remains on the <code>flc_list</code> until fencing completes, guaranteeing that no other clients can access the file prematurely.</li>
+<li>Once fencing succeeds, the lease is unlocked immediately (via <code>kernel_setlease()</code> with <code>F_UNLCK</code>), allowing waiting tasks to proceed.</li>
+</ol>
+<h3>Critical Bug Fix: <code>__break_lease</code> Timestamp Wrap-Around</h3>
+<p>Chuck Lever identified a severe bug in v10 [id://a06f4c17-8227-4c04-b270-5c064b7de79c@app.fastmail.com]:</p>
+<blockquote>
+<p>"schedule_timeout() treats negative values as a bug: it prints a KERN_ERR message with dump_stack() and returns immediately without sleeping... On a uniprocessor system the fence worker workqueue thread never gets scheduled because the spinning task never calls schedule(), so the system hangs."</p>
+</blockquote>
+<p>Dai Ngo proposed a generalized fix within <code>__break_lease</code> itself, rather than patching it specifically for layouts:</p>
+<blockquote>
+<p>"I think this issue should be addressed by __break_lease since we can have the same problem with timed out delegation... if (break_time &lt; jiffies) break_time = jiffies + lease_break_time * HZ;" [id://1677f1ed-27db-4525-ae3e-5e4d12a9f5a9@oracle.com]</p>
+</blockquote>
+<p>This fix protects against similar issues with timed-out delegations as well, making the kernel's lease management code more robust overall.</p>
+<h3>Administrative Improvements in v11</h3>
+<p>Jeff Layton raised concerns about log verbosity during the v10 review [id://eb1757d7f2409ffb792d800166daff8a8c63b09e.camel@kernel.org]:</p>
+<blockquote>
+<p>"It'd be better to do it just once. This may mean tracking a per-client flag of some sort."</p>
+</blockquote>
+<p>v11 addresses this by:</p>
+<ul>
+<li>Limiting fence failure logging to once (per-client).</li>
+<li>Including unique client identifiers in fence log messages for easier administration.</li>
+<li>Adding logging of successful fencing operations.</li>
+<li>Adding recovery procedures in <code>pnfs-block-server.rst</code> and <code>pnfs-scsi-server.rst</code>.</li>
+</ul>
+<h3>Design Philosophy: Clean Module Boundaries</h3>
+<p>A recurring theme throughout the patch's evolution has been maintaining clean boundaries between the VFS lease code and NFSD-specific logic. Dai Ngo explained a key design decision:</p>
+<blockquote>
+<p>"I experimented with having the fence worker handle lease disposal after fencing the client. However, this requires the lease code to export the lease_dispose_list function... This approach adds unnecessary complexity and reduces code clarity, as it exposes internal lease code details to the nfsd worker, which should not be the case." [id://20260212222403.3305141-1-dai.ngo@oracle.com]</p>
+</blockquote>
+<blockquote>
+<p>"Instead, the lm_breaker_timedout operation should simply notify the lease code about how to handle a lease that times out during a lease break, rather than directly manipulating the lease list." [id://20260212222403.3305141-1-dai.ngo@oracle.com]</p>
+</blockquote>
+<h2>Final Conclusions</h2>
+<ul>
+<li><strong>v11 has been posted</strong> on February 12, incorporating all feedback from the v9 and v10 review cycles.</li>
+<li>The patch now addresses a critical latent bug in <code>__break_lease</code> that could cause system hangs on uniprocessor systems when fencing is in progress.</li>
+<li>Administrative improvements include per-client logging flags, client identifiers in log messages, and updated documentation with recovery procedures.</li>
+<li>Code cleanups include removing an unused <code>dispose</code> list, simplifying the fence delay computation, and adding a description for <code>MAX_FENCE_DELAY</code>.</li>
+<li>The patch touches 10 files across the VFS lease subsystem (<code>fs/locks.c</code>, <code>include/linux/filelock.h</code>), NFSD layout code (<code>fs/nfsd/nfs4layouts.c</code>, <code>fs/nfsd/blocklayout.c</code>), and documentation, with a net change of +264/-16 lines.</li>
+</ul>
+<h2>Significance for NFS Development</h2>
+<p>This patch represents an important <strong>bug fix and robustness improvement</strong> for NFSD's pNFS block layout support:</p>
+<ul>
+<li><strong>Data safety:</strong> The fencing mechanism prevents data corruption when layout recalls time out and the original client still holds exclusive block device access — a critical concern for pNFS block layouts where clients access storage devices directly.</li>
+<li><strong>Server responsiveness:</strong> Enforcing timeouts prevents <code>nfsd</code> thread starvation during layout conflicts, ensuring the server continues servicing incoming requests from all clients.</li>
+<li><strong>Improved concurrency:</strong> The lease-unlocking-after-fencing fix reduces blocking time for other clients waiting on conflicting layouts.</li>
+<li><strong>Operational safety:</strong> The default "retry forever" policy eliminates the risk of giving up on fencing and exposing the system to data corruption, while the 3-minute delay cap ensures reasonable retry intervals.</li>
+<li><strong>Kernel-wide robustness:</strong> The <code>__break_lease</code> timestamp wrap-around fix protects against similar issues with timed-out delegations, benefiting all NFS clients using delegation-based caching.</li>
+</ul>
+<h2>Messages This Week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260212222403.3305141-1-dai.ngo@oracle.com/">2026-02-12 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — [PATCH v11 1/1] NFSD: Enforce timeout on layout recall and integrate lease manager fencing</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260212222403.3305141-1-dai.ngo@oracle.com/">2026-02-12 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — [PATCH v11 1/1] NFSD: Enforce timeout on layout recall and integrate lease manager fencing</a></li>
+</ul>
+  </main>
+</body>
+</html>

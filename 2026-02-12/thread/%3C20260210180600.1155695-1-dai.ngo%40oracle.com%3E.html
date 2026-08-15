@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD Layout Recall Timeout v9: Final Fixes Incorporated, Awaiting Review</title>
+  <meta name="description" content="Discussion type: Bug fix / reliability enhancement for NFS server (NFSD) pNFS layout recall handling.">
+  <meta property="og:title" content="NFSD Layout Recall Timeout v9: Final Fixes Incorporated, Awaiting Review">
+  <meta property="og:description" content="Discussion type: Bug fix / reliability enhancement for NFS server (NFSD) pNFS layout recall handling.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-02-12T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSD Layout Recall Timeout v9: Final Fixes Incorporated, Awaiting Review">
+  <meta name="twitter:description" content="Discussion type: Bug fix / reliability enhancement for NFS server (NFSD) pNFS layout recall handling.">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-02-12</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD Layout Recall Timeout v9: Final Fixes Incorporated, Awaiting Review</h1>
+<h2>Summary</h2>
+<h1>NFSD: Enforce Layout Recall Timeout — PATCH v9 Posted (Feb 10)</h1>
+<h2>Overview</h2>
+<p><strong>Discussion type:</strong> Bug fix / reliability enhancement for NFS server (NFSD) pNFS layout recall handling.</p>
+<p>This week, Dai Ngo posted <strong>version 9</strong> of his patch series, <strong>[PATCH v9 1/1] NFSD: Enforce timeout on layout recall and integrate lease manager fencing</strong>, on February 10. This submission addresses all review feedback from Chuck Lever on the previous version (v8), bringing the patch closer to merge-readiness. No replies were received within this week's window as of the reporting deadline.</p>
+<h2>Bridge from Prior Weeks</h2>
+<p>This patch has evolved through nine iterations since early January, addressing a critical server-side reliability issue in pNFS block layout handling. Key milestones from prior weeks include:</p>
+<ul>
+<li><strong>v5–v6 (Feb 5–6):</strong> Fixed reference counting, increased fence retry counts to 20, and incorporated Jeff Layton's suggestion to unlock leases immediately after fencing completes via <code>kernel_setlease()</code> with <code>F_UNLCK</code>.</li>
+<li><strong>v7 (Feb 7):</strong> Changed the default fencing retry policy to "retry forever" in response to Jeff Layton's data corruption concerns, and added a module parameter for admin override. Jeff Layton granted <code>Reviewed-by</code>.</li>
+<li><strong>v8 (Feb 9):</strong> Removed the admin tunable per Chuck Lever's request, implemented exponential back-off for retries, and fixed several code quality issues. However, Chuck Lever identified additional bugs requiring fixes in v9.</li>
+</ul>
+<h2>Key Technical Changes in v9</h2>
+<p>Dai Ngo's v9 submission incorporates four specific fixes requested by Chuck Lever during his review of v8:</p>
+<h3>1. Capped Maximum Fence Retry Delay at 3 Minutes</h3>
+<p>Chuck Lever had questioned whether an hour-long delay between retries was excessive:</p>
+<blockquote>
+<p>"Assuming you meant 3600 seconds and not 3600 jiffies, is an hour between retries too long? Maybe the maximum should be capped at 3 minutes or something?"</p>
+</blockquote>
+<p>v9 now limits the fence worker's maximum delay to 3 minutes, ensuring that even with exponential back-off, the server does not wait unreasonably long between fencing attempts.</p>
+<h3>2. Fixed Delay Argument from Seconds to Jiffies</h3>
+<p>Lever identified a unit conversion bug:</p>
+<blockquote>
+<p>"Since mod_delayed_work() takes jiffies as its third argument, you need a '* HZ' here."</p>
+</blockquote>
+<p>v9 corrects the delay argument to use jiffies rather than seconds when calling <code>mod_delayed_work()</code>.</p>
+<h3>3. Moved <code>INIT_DELAYED_WORK</code> to Allocation Time</h3>
+<p>For safety and convention, Lever recommended:</p>
+<blockquote>
+<p>"Can this INIT_DELAYED_WORK be moved to nfsd4_alloc_layout_stateid()? INIT at allocation time is more conventional and safer."</p>
+</blockquote>
+<p>v9 moves the delayed work initialization to <code>nfsd4_alloc_layout_stateid()</code>, ensuring the work structure is properly initialized before any use.</p>
+<h3>4. Replaced Boolean Flag with <code>delayed_work_pending()</code></h3>
+<p>Lever noted redundant state tracking:</p>
+<blockquote>
+<p>"Seems like there are two sources of truth about whether a fence is in progress here. Would it make sense to replace ls_fence_inprogress with a call to delayed_work_pending()?"</p>
+</blockquote>
+<p>v9 removes the <code>ls_fence_inprogress</code> boolean and uses <code>delayed_work_pending()</code> instead, eliminating the dual-source-of-truth problem.</p>
+<h2>Technical Context: The Problem Being Solved</h2>
+<p>The patch addresses a fundamental reliability issue in NFSD's pNFS block layout support. When a layout conflict triggers a recall, the server must wait for the client to release exclusive access. Without a timeout mechanism, unresponsive or malicious clients can cause excessive <code>nfsd</code> threads to block indefinitely in <code>__break_lease</code>, leading to server starvation.</p>
+<p>Dai Ngo summarized the core motivation:</p>
+<blockquote>
+<p>"When a layout conflict triggers a recall, enforcing a timeout is necessary to prevent excessive nfsd threads from being blocked in __break_lease ensuring the server continues servicing incoming requests efficiently."</p>
+</blockquote>
+<p>The solution introduces a new <code>lm_breaker_timedout</code> callback in the VFS <code>lease_manager_operations</code> structure. For NFSD's lease manager, this callback handles layout recall timeouts by triggering SCSI PR (Persistent Reservation) fencing to prevent the unresponsive client from accessing the underlying block device. The conflicting file lease remains on the <code>flc_list</code> until fencing completes, guaranteeing that no other clients can access the file prematurely.</p>
+<h2>Design Philosophy: Clean Module Boundaries</h2>
+<p>A recurring theme throughout the patch's evolution has been maintaining clean boundaries between the VFS lease code and NFSD-specific logic. Dai Ngo explained a key design decision:</p>
+<blockquote>
+<p>"I experimented with having the fence worker handle lease disposal after fencing the client. However, this requires the lease code to export the lease_dispose_list function... This approach adds unnecessary complexity and reduces code clarity, as it exposes internal lease code details to the nfsd worker, which should not be the case."</p>
+</blockquote>
+<blockquote>
+<p>"Instead, the lm_breaker_timedout operation should simply notify the lease code about how to handle a lease that times out during a lease break, rather than directly manipulating the lease list."</p>
+</blockquote>
+<h2>Significance for NFS Development</h2>
+<p>This patch represents an important <strong>bug fix and robustness improvement</strong> for NFSD's pNFS block layout support:</p>
+<ul>
+<li><strong>Data safety:</strong> The fencing mechanism prevents data corruption when layout recalls time out and the original client still holds exclusive block device access — a critical concern for pNFS block layouts where clients access storage devices directly.</li>
+<li><strong>Server responsiveness:</strong> Enforcing timeouts prevents <code>nfsd</code> thread starvation during layout conflicts, ensuring the server continues servicing incoming requests from all clients.</li>
+<li><strong>Improved concurrency:</strong> The lease-unlocking-after-fencing fix (from v6) reduces blocking time for other clients waiting on conflicting layouts.</li>
+<li><strong>Operational safety:</strong> The default "retry forever" policy (from v7) eliminates the risk of giving up on fencing and exposing the system to data corruption, while the 3-minute delay cap (v9) ensures reasonable retry intervals.</li>
+</ul>
+<h2>Current Status</h2>
+<p>As of this week's reporting deadline, <strong>v9 has been posted but no review replies have been received</strong>. Given that:</p>
+<ul>
+<li>Jeff Layton previously granted <code>Reviewed-by</code> on v7,</li>
+<li>Chuck Lever's feedback on v8 has been fully addressed in v9,</li>
+<li>The patch has undergone nine iterations of refinement,</li>
+</ul>
+<p>the submission appears to be in a strong position for eventual merge, pending final review acknowledgment.</p>
+<h2>Messages This Week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260210180600.1155695-1-dai.ngo@oracle.com/">2026-02-10 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — [PATCH v9 1/1] NFSD: Enforce timeout on layout recall and integrate lease manager fencing</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260210180600.1155695-1-dai.ngo@oracle.com/">2026-02-10 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — [PATCH v9 1/1] NFSD: Enforce timeout on layout recall and integrate lease manager fencing</a></li>
+</ul>
+  </main>
+</body>
+</html>

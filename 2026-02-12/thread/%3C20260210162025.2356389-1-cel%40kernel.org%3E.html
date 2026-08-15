@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD TCP Lock Contention Reduction: v2 Patch Series with Dedicated Receiver Threads and Flat Combining</title>
+  <meta name="description" content="Performance optimization / architectural redesign. This eight-patch v2 series targets significant scalability bottlenecks in the NFS server (NFSD) TCP transport layer, specifically addressing lock contention on receive and transmit paths.">
+  <meta property="og:title" content="NFSD TCP Lock Contention Reduction: v2 Patch Series with Dedicated Receiver Threads and Flat Combining">
+  <meta property="og:description" content="Performance optimization / architectural redesign. This eight-patch v2 series targets significant scalability bottlenecks in the NFS server (NFSD) TCP transport layer, specifically addressing lock contention on receive and transmit paths.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-02-12T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSD TCP Lock Contention Reduction: v2 Patch Series with Dedicated Receiver Threads and Flat Combining">
+  <meta name="twitter:description" content="Performance optimization / architectural redesign. This eight-patch v2 series targets significant scalability bottlenecks in the NFS server (NFSD) TCP transport layer, specifically addressing lock contention on receive and transmit paths.">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-02-12</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD TCP Lock Contention Reduction: v2 Patch Series with Dedicated Receiver Threads and Flat Combining</h1>
+<h2>Summary</h2>
+<h1>NFSD TCP Scalability: v2 Patch Series Reduces Lock Contention via Dedicated Receiver Threads and Flat Combining</h1>
+<h2>Classification</h2>
+<p><strong>Performance optimization / architectural redesign</strong>. This eight-patch v2 series targets significant scalability bottlenecks in the NFS server (NFSD) TCP transport layer, specifically addressing lock contention on receive and transmit paths.</p>
+<h2>Bridge from Prior Week</h2>
+<p>Last week, Chuck Lever <a href="https://lore.kernel.org/linux-nfs/20260205155729.6841-1-cel@kernel.org/">submitted a seven-patch RFC series</a> titled "sunrpc: Reduce lock contention for NFSD TCP sockets." That RFC proposed dedicated TCP receiver threads, flat combining for socket sends, and a workqueue affinity scope fallback mechanism. However, the foundational workqueue patch (Patch 1/7) was rejected by workqueue maintainer Tejun Heo. Chuck Lever subsequently pivoted to a kthread-based alternative for svcrdma, avoiding the contested workqueue pool spin lock entirely.</p>
+<p>This week, Chuck Lever <a href="https://lore.kernel.org/linux-nfs/20260210162025.2356389-1-cel@kernel.org/">submitted the v2 iteration</a> of the series, now expanded to eight patches and refined based on RFC feedback. The rejected workqueue patch has been dropped, and the remaining patches have been reworked for clarity and correctness.</p>
+<h2>This Week's Activity</h2>
+<p>On February 10, Chuck Lever posted the complete v2 patch series. The cover letter summarizes the core problem:</p>
+<blockquote>
+<p>"High-throughput NFSD workloads exhibit significant lock contention on TCP connections. Worker threads compete for the socket lock during receives and serialize on xpt_mutex during sends, limiting scalability."</p>
+</blockquote>
+<p>The series addresses both paths with two major architectural changes:</p>
+<h3>Receive Path: Dedicated Kernel Thread per TCP Connection</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260210162025.2356389-6-cel@kernel.org/">As described in Patch 5/8</a>, the receive-side socket lock contention is eliminated by dedicating one kernel thread per TCP socket to handle all <code>sock_recvmsg()</code> calls:</p>
+<blockquote>
+<p>"In the current architecture, multiple nfsd threads compete for the same socket, serializing on the socket lock inside sock_recvmsg(). A single receiver kthread per TCP connection issues all sock_recvmsg() calls and enqueues complete RPC messages for nfsd threads to process."</p>
+</blockquote>
+<p>The design uses a lock-free <code>llist</code> queue to pass complete RPC messages from the receiver to nfsd worker threads, with flow control limiting queue depth to 64 messages per socket. The receiver kthread is placed on the NUMA node associated with the service pool handling the accept, mirroring svcrdma's NUMA-aware resource allocation strategy.</p>
+<h3>Transmit Path: Flat Combining for Socket Sends</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260210162025.2356389-7-cel@kernel.org/">As detailed in Patch 6/8</a>, the transmit path employs a flat combining pattern to reduce mutex contention:</p>
+<blockquote>
+<p>"High contention on xpt_mutex during TCP reply transmission limits nfsd scalability. When multiple threads send replies on the same connection, mutex handoff triggers optimistic spinning that consumes substantial CPU time. Profiling on high-throughput workloads shows approximately 15% of cycles spent in the spin-wait path."</p>
+</blockquote>
+<p>Rather than each thread acquiring <code>xpt_mutex</code> independently, threads enqueue their send requests to a lock-free <code>llist</code>. The first thread to acquire the mutex becomes the "combiner" and processes all pending sends in a batch, amortizing the lock acquisition cost across multiple operations. TCP auto-corking naturally coalesces segments once the first send places data in flight.</p>
+<h3>Supporting Changes</h3>
+<p>The series includes several supporting improvements:</p>
+<ol>
+<li>
+<p><strong>Usercopy bypass for kernel iterators</strong> (<a href="https://lore.kernel.org/linux-nfs/20260210162025.2356389-3-cel@kernel.org/">Patch 2/8</a>): Profiling revealed that hardened usercopy checks consume roughly 1.3% of CPU in the TCP receive path when both source and destination reside in kernel address space. The patch bypasses these checks for kernel-only iterators (ITER_BVEC/KVEC), benefiting NFSD and NVMe-TCP.</p>
+</li>
+<li>
+<p><strong>Per-transport page recycling pool</strong> (<a href="https://lore.kernel.org/linux-nfs/20260210162025.2356389-5-cel@kernel.org/">Patch 4/8</a>): A lock-free <code>svc_page_pool</code> mechanism enables efficient page reuse between receive operations, reducing overhead in the page allocator hot path under high load.</p>
+</li>
+<li>
+<p><strong>Unified fore and backchannel send paths</strong> (<a href="https://lore.kernel.org/linux-nfs/20260210162025.2356389-8-cel@kernel.org/">Patch 7/8</a>): The backchannel implementation previously acquired <code>xpt_mutex</code> directly while the fore channel used flat combining, leading to starvation of callback operations under heavy load. Routing backchannel sends through the same flat combining infrastructure eliminates this issue:</p>
+</li>
+</ol>
+<blockquote>
+<p>"High latency in callback processing for NFSv4.1+ sessions can occur when the fore channel sustains heavy request traffic... Delegation recalls and other callback operations carry time constraints that make this starvation problematic."</p>
+</blockquote>
+<ol start="4">
+<li><strong>Explicit TCP socket buffer sizes</strong> (<a href="https://lore.kernel.org/linux-nfs/20260210162025.2356389-9-cel@kernel.org/">Patch 8/8</a>): NFSD TCP sockets now use explicit buffer sizes (approximately 16MB with default NFS payload sizes) rather than relying on system defaults, improving throughput on high-speed networks without requiring system-wide sysctl adjustments.</li>
+</ol>
+<h2>Changes Since RFC</h2>
+<p>The cover letter notes several refinements from the RFC iteration:</p>
+<ul>
+<li>Drop the affinity scope patch (rejected by workqueue maintainer)</li>
+<li>Skip user memory hardening for kernel-to-kernel copies</li>
+<li>Avoid invoking <code>wake_up</code> when the receive is already running</li>
+<li>Refactor <code>svc_tcp_receiver_thread()</code> for legibility</li>
+<li>Do not set <code>MSG_MORE</code> during batched sends</li>
+</ul>
+<h2>Conclusion</h2>
+<p>This v2 series represents a significant architectural evolution in NFSD's TCP transport layer, moving away from shared-lock contention toward dedicated receiver threads and lock-free batching for transmits. The changes mirror the svcrdma architecture's approach to NUMA-aware resource allocation and message queuing. With no replies recorded within this week's window, the series awaits community review and testing. If accepted, these changes could substantially improve NFSD scalability on high-throughput workloads, particularly on systems with large bandwidth-delay products where TCP buffer sizing and lock contention have been limiting factors.</p>
+<h2>Key Messages</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260210162025.2356389-1-cel@kernel.org/">Cover letter: [PATCH v2 0/8] sunrpc: Reduce lock contention for NFSD TCP sockets</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260210162025.2356389-2-cel@kernel.org/">Patch 1/8: Add XPT flags missing from SVC_XPRT_FLAG_LIST</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260210162025.2356389-3-cel@kernel.org/">Patch 2/8: net: datagram: bypass usercopy checks for kernel iterators</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260210162025.2356389-4-cel@kernel.org/">Patch 3/8: split svc_data_ready into protocol-specific callbacks</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260210162025.2356389-5-cel@kernel.org/">Patch 4/8: add per-transport page recycling pool</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260210162025.2356389-6-cel@kernel.org/">Patch 5/8: add dedicated TCP receiver thread</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260210162025.2356389-7-cel@kernel.org/">Patch 6/8: implement flat combining for TCP socket sends</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260210162025.2356389-8-cel@kernel.org/">Patch 7/8: unify fore and backchannel server TCP send paths</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260210162025.2356389-9-cel@kernel.org/">Patch 8/8: Set explicit TCP socket buffer sizes for NFSD</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260210162025.2356389-1-cel@kernel.org/">2026-02-10 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 0/8] sunrpc: Reduce lock contention for NFSD TCP sockets</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260210162025.2356389-3-cel@kernel.org/">2026-02-10 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 2/8] net: datagram: bypass usercopy checks for kernel iterators</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260210162025.2356389-2-cel@kernel.org/">2026-02-10 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 1/8] sunrpc: Add XPT flags missing from SVC_XPRT_FLAG_LIST</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260210162025.2356389-4-cel@kernel.org/">2026-02-10 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 3/8] sunrpc: split svc_data_ready into protocol-specific callbacks</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260210162025.2356389-5-cel@kernel.org/">2026-02-10 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 4/8] sunrpc: add per-transport page recycling pool</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260210162025.2356389-6-cel@kernel.org/">2026-02-10 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 5/8] sunrpc: add dedicated TCP receiver thread</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260210162025.2356389-8-cel@kernel.org/">2026-02-10 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 7/8] sunrpc: unify fore and backchannel server TCP send paths</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260210162025.2356389-7-cel@kernel.org/">2026-02-10 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 6/8] sunrpc: implement flat combining for TCP socket sends</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260210162025.2356389-9-cel@kernel.org/">2026-02-10 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 8/8] sunrpc: Set explicit TCP socket buffer sizes for NFSD</a></li>
+</ul>
+  </main>
+</body>
+</html>

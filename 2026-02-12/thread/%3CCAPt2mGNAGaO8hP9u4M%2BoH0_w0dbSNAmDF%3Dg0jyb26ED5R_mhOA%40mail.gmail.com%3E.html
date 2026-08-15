@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>knfsd IOPS Investigation: lwq Spinlock and nfsd_setuser Contention Identified; Patches Promised</title>
+  <meta name="description" content="Type: Performance investigation / Bug diagnosis leading to upcoming patches">
+  <meta property="og:title" content="knfsd IOPS Investigation: lwq Spinlock and nfsd_setuser Contention Identified; Patches Promised">
+  <meta property="og:description" content="Type: Performance investigation / Bug diagnosis leading to upcoming patches">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-02-12T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="knfsd IOPS Investigation: lwq Spinlock and nfsd_setuser Contention Identified; Patches Promised">
+  <meta name="twitter:description" content="Type: Performance investigation / Bug diagnosis leading to upcoming patches">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-02-12</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>knfsd IOPS Investigation: lwq Spinlock and nfsd_setuser Contention Identified; Patches Promised</h1>
+<h2>Summary</h2>
+<h1>knfsd Read IOPS Limits: Pinpointing lwq Spinlock and nfsd_setuser Contention Hotspots</h1>
+<h2>Summary</h2>
+<p><strong>Type:</strong> Performance investigation / Bug diagnosis leading to upcoming patches</p>
+<h2>Overview</h2>
+<p>This week's continuation of the ongoing knfsd read IOPS ceiling investigation [bridged from last week's summary on <code>xpt_mutex</code> contention] saw Daire Byrne and Chuck Lever drill deeper into lock contention profiles. After confirming that earlier patches addressing <code>xpt_mutex</code> were effective, the discussion shifted to two newly identified bottlenecks: the <strong>lwq spinlock in the SunRPC thread dispatcher</strong> and the <strong>group sort operation in <code>nfsd_setuser</code></strong>. Chuck Lever committed to posting patches for both issues.</p>
+<h2>Bridging from Prior Week</h2>
+<p>Last week (ending 2026-01-29), the investigation identified the <code>xpt_mutex</code> in the SunRPC thread pool dispatch path as a significant bottleneck, with hold times up to 293ms and a mean wait time an order of magnitude worse than other locks. Chuck Lever noted:</p>
+<blockquote>
+<p>"There's kind of no denying it, the xpt_mutex numbers are shitty. The maximum hold time on that mutex is 293379.40 usecs, with a mean hold time of nearly 16 usec, giving it the worst mean wait time by an order of magnitude." <a href="https://lore.kernel.org/linux-nfs/723418cf-cec6-4afc-906e-b93a55e85fc9@app.fastmail.com/">Chuck Lever</a></p>
+</blockquote>
+<p>Patches to address <code>xpt_mutex</code> via flat combining were subsequently tested. This week, Daire Byrne reported back on those results and provided fresh profiling data.</p>
+<h2>This Week's Discussion: Two New Hotspots Identified</h2>
+<h3>Confirmation of xpt_mutex Patch Effectiveness</h3>
+<p>Daire Byrne shared updated lockstat data after applying the patch series. Chuck Lever confirmed the patches were working as intended:</p>
+<blockquote>
+<p>"The lockstat data shows that the patches are applied and that flat combining is reducing xpt_mutex contention, as designed." <a href="https://lore.kernel.org/linux-nfs/110b6190-ed55-41d0-a3ca-580ebc38c1e5@app.fastmail.com/">Chuck Lever</a></p>
+</blockquote>
+<p>However, a new bottleneck emerged. Chuck observed:</p>
+<blockquote>
+<p>"This time, the lwq spinlock in the thread pool dispatch path shows very high contention (246M events, 54k seconds total wait)." <a href="https://lore.kernel.org/linux-nfs/110b6190-ed55-41d0-a3ca-580ebc38c1e5@app.fastmail.com/">Chuck Lever</a></p>
+</blockquote>
+<p>He requested a <code>perf record</code> profile to determine whether this spinlock was the throughput-limiting factor or if nfsd threads were spending time elsewhere.</p>
+<h3>Perf Analysis Reveals Two Contention Areas</h3>
+<p>After Daire Byrne provided perf data, Chuck Lever identified two significant contention areas:</p>
+<blockquote>
+<p>"Thanks. The two significant contention areas are the lwq idle list in the SunRPC thread dispatcher and the group sort in nfsd_setuser. I'll post some patches to test in a day or two." <a href="https://lore.kernel.org/linux-nfs/d97b4a81-7fbe-405e-b5dd-82e74630c9d9@app.fastmail.com/">Chuck Lever</a></p>
+</blockquote>
+<h3>The Role of Group Membership Complexity</h3>
+<p>Daire Byrne provided critical context regarding the <code>nfsd_setuser</code> hotspot. His environment uses <code>--manage-gids</code> with SSSD bridging to Active Directory, resulting in extremely large group memberships:</p>
+<blockquote>
+<p>"For this workload, on the server, I am a member of 737 groups...." <a href="https://lore.kernel.org/linux-nfs/CAPt2mGNVMthai4J0QRSaJdWHP4X+K_mzqBxWQGUzdOihMyU_KQ@mail.gmail.com/">Daire Byrne</a></p>
+</blockquote>
+<p>Chuck Lever confirmed this was directly relevant:</p>
+<blockquote>
+<p>"Right, the group_sort() done for every nfsd_setuser() will be a significant overhead for you." <a href="https://lore.kernel.org/linux-nfs/5ce9e049-1c6c-445d-8d02-44892db8760b@app.fastmail.com/">Chuck Lever</a></p>
+</blockquote>
+<h3>Empirical Validation: Running as Root Improves IOPS</h3>
+<p>To isolate the impact of <code>nfsd_setuser</code>, Daire Byrne ran his 200-client fio workload as root (who belongs to only 4 groups) instead of his regular user account. The results were telling:</p>
+<blockquote>
+<p>"Out of curiosity, I ran the 200 client fio tasks as 'root' (4 groups) instead of my user and it looks like nfsd_setuser drops out of the perf report (attached). Now it's all mostly lwq_dequeue, and the average iops performance (across multiple runs) increased from ~470k -&gt; 500k iops/s. So a small but measurable difference." <a href="https://lore.kernel.org/linux-nfs/CAPt2mGM6WfCwwW5z-9DqX=SY8S2i0RSLiW9n3bu4aMT8t=sDtw@mail.gmail.com/">Daire Byrne</a></p>
+</blockquote>
+<p>This experiment confirmed that <code>nfsd_setuser</code>'s group sorting overhead was a measurable contributor to the IOPS ceiling, particularly in environments with complex AD-integrated group memberships. With that bottleneck removed, the remaining contention centered on <code>lwq_dequeue</code> in the SunRPC thread dispatcher.</p>
+<h2>Key Technical Arguments and Evolution</h2>
+<ol>
+<li>
+<p><strong>From xpt_mutex to lwq spinlock</strong>: The investigation successfully addressed the initial <code>xpt_mutex</code> bottleneck via flat combining patches, but revealed a deeper issue in the lightweight queue (lwq) dispatch path's idle list management.</p>
+</li>
+<li>
+<p><strong>nfsd_setuser as an environment-dependent hotspot</strong>: The group sort operation within <code>nfsd_setuser</code> was identified as a significant overhead for environments with large group memberships (e.g., AD-integrated setups via SSSD). This is not a universal bottleneck but can be material in enterprise deployments.</p>
+</li>
+<li>
+<p><strong>Upcoming patches</strong>: Chuck Lever committed to posting patches addressing both the lwq idle list contention and the <code>nfsd_setuser</code> group sort overhead within days of this discussion.</p>
+</li>
+</ol>
+<h2>Significance for NFS Server Development</h2>
+<p>This thread represents a methodical, data-driven approach to diagnosing knfsd performance limitations under high-concurrency random read workloads. Key takeaways:</p>
+<ul>
+<li><strong>The <code>xpt_mutex</code> fix is validated</strong>, but the underlying SunRPC thread dispatcher architecture continues to present contention challenges via the lwq spinlock.</li>
+<li><strong><code>nfsd_setuser</code> group sorting</strong> is a previously under-appreciated performance factor for environments with large group memberships, adding measurable overhead to every NFS request requiring user context setup.</li>
+<li><strong>Chuck Lever's upcoming patches</strong> promise targeted improvements to both hotspots, potentially raising the aggregate IOPS ceiling beyond the current ~470–500K range observed in testing.</li>
+</ul>
+<h2>Messages This Week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/CAPt2mGOsCLrG30s7mrOvd3N5t018T+gJhGWd88pw0WbOnagO=A@mail.gmail.com/">2026-02-09 Daire Byrne — Re: knfsd read iops limits?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/110b6190-ed55-41d0-a3ca-580ebc38c1e5@app.fastmail.com/">2026-02-10 Chuck Lever — Re: knfsd read iops limits?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAPt2mGPMvQMyMcNUnznqU=0pSZ4xVDB32Q61_gTkL9TvHyKXrA@mail.gmail.com/">2026-02-10 Daire Byrne — Re: knfsd read iops limits?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/d97b4a81-7fbe-405e-b5dd-82e74630c9d9@app.fastmail.com/">2026-02-10 Chuck Lever — Re: knfsd read iops limits?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAPt2mGNVMthai4J0QRSaJdWHP4X+K_mzqBxWQGUzdOihMyU_KQ@mail.gmail.com/">2026-02-11 Daire Byrne — Re: knfsd read iops limits?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/5ce9e049-1c6c-445d-8d02-44892db8760b@app.fastmail.com/">2026-02-11 Chuck Lever — Re: knfsd read iops limits?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAPt2mGM6WfCwwW5z-9DqX=SY8S2i0RSLiW9n3bu4aMT8t=sDtw@mail.gmail.com/">2026-02-11 Daire Byrne — Re: knfsd read iops limits?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAPt2mGPt=aWmnA1oNBaH_MN27vq6f8ajj1pwF5nT9hWc+3M6Zw@mail.gmail.com/">2026-02-11 Daire Byrne — Re: knfsd read iops limits?</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/CAPt2mGOsCLrG30s7mrOvd3N5t018T+gJhGWd88pw0WbOnagO=A@mail.gmail.com/">2026-02-09 Daire Byrne <a href="mailto:daire@dneg.com">daire@dneg.com</a> — Re: knfsd read iops limits?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/110b6190-ed55-41d0-a3ca-580ebc38c1e5@app.fastmail.com/">2026-02-10 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: knfsd read iops limits?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAPt2mGPMvQMyMcNUnznqU=0pSZ4xVDB32Q61_gTkL9TvHyKXrA@mail.gmail.com/">2026-02-10 Daire Byrne <a href="mailto:daire@dneg.com">daire@dneg.com</a> — Re: knfsd read iops limits?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/d97b4a81-7fbe-405e-b5dd-82e74630c9d9@app.fastmail.com/">2026-02-10 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: knfsd read iops limits?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAPt2mGNVMthai4J0QRSaJdWHP4X+K_mzqBxWQGUzdOihMyU_KQ@mail.gmail.com/">2026-02-11 Daire Byrne <a href="mailto:daire@dneg.com">daire@dneg.com</a> — Re: knfsd read iops limits?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/5ce9e049-1c6c-445d-8d02-44892db8760b@app.fastmail.com/">2026-02-11 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: knfsd read iops limits?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAPt2mGM6WfCwwW5z-9DqX=SY8S2i0RSLiW9n3bu4aMT8t=sDtw@mail.gmail.com/">2026-02-11 Daire Byrne <a href="mailto:daire@dneg.com">daire@dneg.com</a> — Re: knfsd read iops limits?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAPt2mGPt=aWmnA1oNBaH_MN27vq6f8ajj1pwF5nT9hWc+3M6Zw@mail.gmail.com/">2026-02-11 Daire Byrne <a href="mailto:daire@dneg.com">daire@dneg.com</a> — Re: knfsd read iops limits?</a></li>
+</ul>
+  </main>
+</body>
+</html>
