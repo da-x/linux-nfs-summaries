@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>sunrpc: Fix dprintk() no-op compilation errors for W=1 builds</title>
+  <meta name="description" content="Type: Bug fix — compilation warning/error in the SUNRPC debug infrastructure affecting NFS client and server code.">
+  <meta property="og:title" content="sunrpc: Fix dprintk() no-op compilation errors for W=1 builds">
+  <meta property="og:description" content="Type: Bug fix — compilation warning/error in the SUNRPC debug infrastructure affecting NFS client and server code.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-02-05T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="sunrpc: Fix dprintk() no-op compilation errors for W=1 builds">
+  <meta name="twitter:description" content="Type: Bug fix — compilation warning/error in the SUNRPC debug infrastructure affecting NFS client and server code.">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-02-05</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>sunrpc: Fix dprintk() no-op compilation errors for W=1 builds</h1>
+<h2>Summary</h2>
+<h2>sunrpc: Fix compilation error (<code>make W=1</code>) when dprintk() is no-op</h2>
+<p><strong>Type:</strong> Bug fix — compilation warning/error in the SUNRPC debug infrastructure affecting NFS client and server code.</p>
+<h3>Overview</h3>
+<p>Andy Shevchenko submitted a patch to address Clang compiler errors triggered by <code>make W=1</code> builds when the <code>dprintk()</code> macro expands to a no-op. The core issue was that variables set only for use inside <code>dprintk()</code> calls were flagged as "set but not used" when debugging was disabled, since <code>dprintk()</code> was previously mapped to an empty statement rather than to <code>no_printk()</code>.</p>
+<h3>The Problem</h3>
+<p>When <code>RPC_DEBUG</code> is disabled, the <code>dprintk()</code> macro in <code>include/linux/sunrpc/debug.h</code> was defined as a no-op that silently discarded its arguments. This meant that any variables assigned solely for formatting within <code>dprintk()</code> calls became unused from the compiler's perspective. Clang with <code>-Werror,-Wunused-but-set-variable</code> flagged three specific locations:</p>
+<blockquote>
+<p>"variable 'ret' set but not used" — in <code>flexfilelayoutdev.c:56</code>
+"variable 'err' set but not used" — in <code>flexfilelayout.c:1505</code>
+"variable 'ptr' set but not used" — in <code>nfs4proc.c:9244</code></p>
+</blockquote>
+<p><a href="https://lore.kernel.org/linux-nfs/20260204010415.2149607-1-andriy.shevchenko@linux.intel.com/">As described by Andy Shevchenko</a>, the fix forwards <code>dprintk()</code> parameters to <code>no_printk()</code>, which properly consumes them while still enabling format-string checking even when debugging is disabled.</p>
+<h3>Build Robot Feedback: A New Class of Errors</h3>
+<p>The kernel test robot (LKP) quickly identified a significant problem with v1. The change from an empty no-op to <code>no_printk()</code> exposed a pre-existing issue in <code>fs/nfsd/nfsfh.c</code>. That file uses <code>RPC_IFDEBUG(char buf[...])</code> to conditionally declare a buffer — the variable only exists when debugging is enabled. When <code>dprintk()</code> was a true no-op, the arguments (including references to <code>buf</code>) were discarded at the preprocessor level. Once <code>dprintk()</code> forwarded to <code>no_printk()</code>, the compiler attempted to evaluate all arguments, and <code>buf</code> became an undeclared identifier:</p>
+<blockquote>
+<p>"error: 'buf' undeclared (first use in this function)" — in <code>fs/nfsd/nfsfh.c:110</code></p>
+</blockquote>
+<p>This error was reported across multiple configurations: m68k-defconfig with GCC 15.2, x86_64-kexec with Clang 20.1.8, and x86_64-rhel-9.4 with GCC 14.2. Additionally, sparse analysis on powerpc exposed type-incompatibility warnings in several NFS client files (<code>getroot.c</code>, <code>namespace.c</code>, <code>nfs4super.c</code>, <code>super.c</code>, <code>fs_context.c</code>) where conditional expressions mixed <code>void</code> (from the no-op path) with <code>int</code>.</p>
+<h3>Community Response</h3>
+<p>Geert Uytterhoeven, who had attempted a similar fix years earlier, endorsed the approach in principle:</p>
+<blockquote>
+<p>"Definitely. I tried something similar a few years ago, but ran into build errors from the robots, and gave up due to lack of time."</p>
+</blockquote>
+<p>He provided an <code>Acked-by</code> tag for the principle and shared his own unsent local fix that addressed the same <code>nfsfh.c</code> issue — confirming this was a known obstacle. Andy acknowledged the feedback:</p>
+<blockquote>
+<p>"For the matter of fact, I also get into errors from LKP (I compiled only part of this, need to enable more to cover these cases)."</p>
+</blockquote>
+<p>Andy confirmed he would perform additional testing and fixes before resubmitting, noting that Geert's local fix addressed the same call site flagged by the robots.</p>
+<h3>Resolution</h3>
+<p>By end of day on February 4th, Andy Shevchenko announced that a v2 series had been submitted:</p>
+<blockquote>
+<p>"v2 just has been sent. You Cc'ed only on patch 3, but it should be available in full here https://lore.kernel.org/r/20260204094500.2443455-1-andriy.shevchenko@linux.intel.com"</p>
+</blockquote>
+<p>The v2 series (outside this thread's scope) was structured as a multi-patch set, with patch 3 specifically addressing the <code>nfsfh.c</code> issue flagged by the build robots. The v1 thread itself concluded without a final resolution within its own messages; the discussion effectively transitioned to the v2 submission.</p>
+<h3>Significance for NFS Client Development</h3>
+<p>This fix touches core SUNRPC debug infrastructure used extensively throughout the NFS client and server codebase. While primarily a build-system improvement, it has two important side effects:</p>
+<ol>
+<li><strong>Format-string validation at all build levels:</strong> By routing <code>dprintk()</code> through <code>no_printk()</code> rather than discarding arguments entirely, format strings are validated even when debugging is disabled — catching potential bugs earlier.</li>
+<li><strong>Clean W=1 builds for NFS code:</strong> The fix resolves compilation errors in key NFS client files including the FlexFile Layout Driver (<code>flexfilelayoutdev.c</code>, <code>flexfilelayout.c</code>) and NFSv4 procedure handling (<code>nfs4proc.c</code>), enabling stricter warning-level builds across the NFS subsystem.</li>
+</ol>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260204010415.2149607-1-andriy.shevchenko@linux.intel.com/">2026-02-04 Andy Shevchenko <a href="mailto:andriy.shevchenko@linux.intel.com">andriy.shevchenko@linux.intel.com</a> — [PATCH v1 1/1] sunrpc: Fix compilation error (<code>make W=1</code>) when dprintk() is no-op</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aYKcNds-XsVLRjcC@smile.fi.intel.com/">2026-02-04 Andy Shevchenko <a href="mailto:andriy.shevchenko@linux.intel.com">andriy.shevchenko@linux.intel.com</a> — Re: [PATCH v1 1/1] sunrpc: Fix compilation error (<code>make W=1</code>) when dprintk() is no-op</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/202602041401.iqlBqvkr-lkp@intel.com/">2026-02-04 kernel test robot <a href="mailto:lkp@intel.com">lkp@intel.com</a> — Re: [PATCH v1 1/1] sunrpc: Fix compilation error (<code>make W=1</code>) when dprintk() is no-op</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/202602041427.kUmPVYOW-lkp@intel.com/">2026-02-04 kernel test robot <a href="mailto:lkp@intel.com">lkp@intel.com</a> — Re: [PATCH v1 1/1] sunrpc: Fix compilation error (<code>make W=1</code>) when dprintk() is no-op</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/202602040816.q9CtxevA-lkp@intel.com/">2026-02-04 kernel test robot <a href="mailto:lkp@intel.com">lkp@intel.com</a> — Re: [PATCH v1 1/1] sunrpc: Fix compilation error (<code>make W=1</code>) when dprintk() is no-op</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/202602040857.KEEWLLQ1-lkp@intel.com/">2026-02-04 kernel test robot <a href="mailto:lkp@intel.com">lkp@intel.com</a> — Re: [PATCH v1 1/1] sunrpc: Fix compilation error (<code>make W=1</code>) when dprintk() is no-op</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAMuHMdWZx=2-y_OSjCkxmXo-3YjGjU0aH89puTcL0rmvw7E-Eg@mail.gmail.com/">2026-02-04 Geert Uytterhoeven <a href="mailto:geert@linux-m68k.org">geert@linux-m68k.org</a> — Re: [PATCH v1 1/1] sunrpc: Fix compilation error (<code>make W=1</code>) when dprintk() is no-op</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aYMMEiNCPaJIc9Rd@smile.fi.intel.com/">2026-02-04 Andy Shevchenko <a href="mailto:andriy.shevchenko@linux.intel.com">andriy.shevchenko@linux.intel.com</a> — Re: [PATCH v1 1/1] sunrpc: Fix compilation error (<code>make W=1</code>) when dprintk() is no-op</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aYMVnVv2Csz7Zi44@smile.fi.intel.com/">2026-02-04 Andy Shevchenko <a href="mailto:andriy.shevchenko@linux.intel.com">andriy.shevchenko@linux.intel.com</a> — Re: [PATCH v1 1/1] sunrpc: Fix compilation error (<code>make W=1</code>) when dprintk() is no-op</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/202602041851.8AI0nchL-lkp@intel.com/">2026-02-04 kernel test robot <a href="mailto:lkp@intel.com">lkp@intel.com</a> — Re: [PATCH v1 1/1] sunrpc: Fix compilation error (<code>make W=1</code>) when dprintk() is no-op</a></li>
+</ul>
+  </main>
+</body>
+</html>

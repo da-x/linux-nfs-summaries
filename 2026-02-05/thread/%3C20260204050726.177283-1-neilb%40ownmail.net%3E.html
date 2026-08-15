@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VFS Directory Locking Centralization: nfsd and overlayfs Impact</title>
+  <meta name="description" content="Neil Brown submitted a 13-patch series titled &quot;Further centralising of directory locking for name ops&quot; on February 4, continuing his broader effort to transition VFS directory locking from whole-directory locks to per-name locking. The…">
+  <meta property="og:title" content="VFS Directory Locking Centralization: nfsd and overlayfs Impact">
+  <meta property="og:description" content="Neil Brown submitted a 13-patch series titled &quot;Further centralising of directory locking for name ops&quot; on February 4, continuing his broader effort to transition VFS directory locking from whole-directory locks to per-name locking. The…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-02-05T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="VFS Directory Locking Centralization: nfsd and overlayfs Impact">
+  <meta name="twitter:description" content="Neil Brown submitted a 13-patch series titled &quot;Further centralising of directory locking for name ops&quot; on February 4, continuing his broader effort to transition VFS directory locking from whole-directory locks to per-name locking. The…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-02-05</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>VFS Directory Locking Centralization: nfsd and overlayfs Impact</h1>
+<h2>Summary</h2>
+<h2>Centralising Directory Locking for Name Operations — VFS Refactoring Series</h2>
+<p>Neil Brown submitted a 13-patch series titled "Further centralising of directory locking for name ops" <a href="https://lore.kernel.org/linux-nfs/20260204050726.177283-1-neilb@ownmail.net/">on February 4</a>, continuing his broader effort to transition VFS directory locking from whole-directory locks to per-name locking. The series is a <strong>VFS refactoring</strong> rather than a new feature or bug fix, though it has important implications for NFS server (nfsd) and overlayfs code paths.</p>
+<h3>Background and Motivation</h3>
+<p>In the cover letter, Brown explained:</p>
+<blockquote>
+<p>"I am working towards changing the locking rules for name-operations: locking the name rather than the whole directory."</p>
+</blockquote>
+<p>The series builds on previously introduced <code>start_creating()</code>, <code>start_removing()</code>, and <code>start_renaming()</code> interfaces that combine locking with lookup. This round addresses remaining callers outside <code>fs/namei.c</code> that still perform explicit directory locking via <code>inode_lock()</code>, <code>lock_rename()</code>, or similar primitives:</p>
+<blockquote>
+<p>"These were missed in the first pass for an assortment of uninteresting reasons."</p>
+</blockquote>
+<p>Brown noted he was running xfstests overlay tests and planned to run NFS tests as well.</p>
+<h3>Series Overview</h3>
+<p>The 13 patches span several subsystems:</p>
+<ul>
+<li><strong>Patches 01–02</strong>: Cleanup — removing unnecessary locking from procfs <code>self</code>/<code>thread-self</code> creation (called before the filesystem is live), and repositioning a kerndoc comment.</li>
+<li><strong>Patch 03</strong>: Merging <code>simple_done_creating()</code> into <code>end_creating()</code> in libfs to centralize unlocking.</li>
+<li><strong>Patches 04–05</strong>: Converting AppArmor and SELinux security module code to use <code>simple_start_creating()</code>/<code>simple_done_creating()</code>.</li>
+<li><strong>Patch 06 (nfsd)</strong>: Switching <code>purge_old()</code> in NFS server recovery code to use <code>start_removing_noperm()</code>/<code>end_removing()</code>.</li>
+<li><strong>Patch 07</strong>: Making <code>lookup_one_qstr_excl()</code> static now that it has no external callers.</li>
+<li><strong>Patches 08–12 (overlayfs)</strong>: The bulk of the changes — simplifying <code>ovl_lookup_real_one()</code>, modifying <code>ovl_create_real()</code> to re-acquire locks after creation, replacing <code>lock_rename()</code> with <code>is_subdir()</code> for sanity checks, and removing the now-unused <code>ovl_lock_rename_workdir()</code>.</li>
+<li><strong>Patch 13</strong>: Unexporting <code>lock_rename()</code>, <code>lock_rename_child()</code>, and <code>unlock_rename()</code> since they are now only used within <code>namei.c</code>.</li>
+</ul>
+<h3>NFS-Relevant Changes: nfsd purge_old() Refactoring</h3>
+<p><strong>Patch 06/13</strong> directly affects the NFS server. The change replaces explicit locking in <code>fs/nfsd/nfs4recover.c</code>'s <code>purge_old()</code> function with the centralized <code>start_removing_noperm()</code> and <code>end_removing()</code> wrappers. Brown noted:</p>
+<blockquote>
+<p>"This was not done with other start_removing changes due to conflicting in-flight patches."</p>
+</blockquote>
+<p>Jeff Layton reviewed this patch without comment, providing a straightforward Reviewed-by tag <a href="https://lore.kernel.org/linux-nfs/b4cc667f93cd16b251ba063898055b3a754e3496.camel@kernel.org/">here</a>.</p>
+<h3>Overlayfs Discussion: The Substantive Technical Debate</h3>
+<p>The most technically interesting discussion centered on the overlayfs patches, particularly <strong>patches 08 and 10</strong>.</p>
+<h4>Patch 08: Simplifying <code>ovl_lookup_real_one()</code></h4>
+<p>This patch removes explicit locking from <code>ovl_lookup_real_one()</code> in favor of <code>lookup_noperm_unlocked()</code>, arguing that consistency tests after lookup are sufficient. Amir Goldstein raised a stylistic concern about the kernel-doc comment placement:</p>
+<blockquote>
+<p>"I dislike kernel-doc inside code comments. I think this is actively discouraged and I haven't found a single example of this style in fs code."</p>
+</blockquote>
+<p>He also noted the new wording reduced clarity compared to the existing header comment, though otherwise found the patch acceptable. Jeff Layton provided a Reviewed-by <a href="https://lore.kernel.org/linux-nfs/5d273a008fc51a2fded785efbe30e5bd2a89b985.camel@kernel.org/">tag</a>.</p>
+<h4>Patch 10: <code>ovl_create_real()</code> Lock Reacquisition</h4>
+<p>This was the most contentious patch. It changes <code>ovl_create_real()</code> to drop the directory lock after creation and re-acquire a new lock for lookup, since the proposed per-name locking model won't support holding the same lock across both operations. Amir Goldstein raised two concerns:</p>
+<blockquote>
+<p>"According to the new locking rules, if the hashed dentry itself is the synchronization object, is it going to be allowed to filesystem to unhash the dentry while the dentry still in the 'creating' scope? It is hard for me to wrap my head around this."</p>
+</blockquote>
+<p>He also questioned whether this was needed due to casefold filesystems not supporting parallel creations, and expressed aesthetic concern:</p>
+<blockquote>
+<p>"OK. not saying no to this (yet) but I have to admit that it is pretty ugly that the callers of ovl_create_real() want to create a specific stable name... and yet we end up doing this weird dance here just to keep the name from newdentry."</p>
+</blockquote>
+<p>No resolution was reached within this week's window; Amir's concerns remain open.</p>
+<h4>Patch 12: Removing <code>ovl_lock_rename_workdir()</code></h4>
+<p>Amir Goldstein raised an interesting historical question about removing this unused function:</p>
+<blockquote>
+<p>"I am confused. What was this 'fix' fixing an unused function: e9c70084a64e5 ovl: fail ovl_lock_rename_workdir() if either target is unhashed"</p>
+</blockquote>
+<p>This highlights a broader VFS maintenance concern — patches were applied to functions that had already become dead code.</p>
+<h3>AppArmor Bug Fix</h3>
+<p>Jeff Layton identified a return-value bug in <strong>patch 04/13</strong> (AppArmor):</p>
+<blockquote>
+<p>"As KTR points out, this should be 'return NULL;'"</p>
+</blockquote>
+<p>This was acknowledged as a fix needed before the Reviewed-by would apply.</p>
+<h3>Review Status</h3>
+<p>Jeff Layton provided Reviewed-by tags for nearly all patches: procfs cleanup <a href="https://lore.kernel.org/linux-nfs/b62d43c08545d26772a5fff45f13832767d766bb.camel@kernel.org/">here</a>, kerndoc movement <a href="https://lore.kernel.org/linux-nfs/bcb8c138027576d6e3c9d6816b372c3b4c26695c.camel@kernel.org/">here</a>, libfs consolidation (with a nit suggesting <code>simple_done_creating()</code> become a static inline) <a href="https://lore.kernel.org/linux-nfs/8d907c67ccab1db0e7bcabe0c34c66722a2970e2.camel@kernel.org/">here</a>, SELinux <a href="https://lore.kernel.org/linux-nfs/3d8aeaea14712ad2cd0199cba62bc1398f7cc4a0.camel@kernel.org/">here</a>, nfsd <a href="https://lore.kernel.org/linux-nfs/b4cc667f93cd16b251ba063898055b3a754e3496.camel@kernel.org/">here</a>, VFS static conversion <a href="https://lore.kernel.org/linux-nfs/1a317bea80f827b85c5b43766cdbcd0bcb85463d.camel@kernel.org/">here</a>, overlayfs lookup simplification <a href="https://lore.kernel.org/linux-nfs/5d273a008fc51a2fded785efbe30e5bd2a89b985.camel@kernel.org/">here</a>, cachefiles <a href="https://lore.kernel.org/linux-nfs/4d2c35c1b627f1ad26062a92d653677d7b79bd81.camel@kernel.org/">here</a>, is_subdir usage <a href="https://lore.kernel.org/linux-nfs/c7445f68809ea699c73da0282a9e2b3f99ff3bcf.camel@kernel.org/">here</a>, dead-code removal <a href="https://lore.kernel.org/linux-nfs/11fd2fde84cffcc39798160570e24e54684c5b71.camel@kernel.org/">here</a>, and the final unexport patch <a href="https://lore.kernel.org/linux-nfs/3e5726689975c3436ec134a299c538183f6763b1.camel@kernel.org/">here</a>. Amir Goldstein reviewed patches 08, 11, and 12 with the caveats noted above.</p>
+<h3>Conclusion</h3>
+<p>This series is a significant VFS infrastructure refactoring that centralizes directory locking for name operations, paving the way for future per-name locking semantics. The NFS server impact is limited to a straightforward API migration in <code>purge_old()</code>. The overlayfs changes are more substantial and generated the most discussion, particularly around lock reacquisition patterns and dentry hashing semantics. As of this week's end, Amir Goldstein's concerns about patch 10 remain unresolved, and a minor return-value bug was identified in the AppArmor patch.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260204050726.177283-1-neilb@ownmail.net/">2026-02-04 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 00/13] Further centralising of directory locking for name ops.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260204050726.177283-2-neilb@ownmail.net/">2026-02-04 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 01/13] fs/proc: Don't lock root inode when creating "self" and "thread-self"</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260204050726.177283-3-neilb@ownmail.net/">2026-02-04 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 02/13] VFS: move the start_dirop() kerndoc comment to before start_dirop()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260204050726.177283-4-neilb@ownmail.net/">2026-02-04 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 03/13] libfs: change simple_done_creating() to use end_creating()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260204050726.177283-5-neilb@ownmail.net/">2026-02-04 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 04/13] Apparmor: Use simple_start_creating() / simple_done_creating()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260204050726.177283-6-neilb@ownmail.net/">2026-02-04 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 05/13] selinux: Use simple_start_creating() / simple_done_creating()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260204050726.177283-7-neilb@ownmail.net/">2026-02-04 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 06/13] nfsd: switch purge_old() to use start_removing_noperm()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260204050726.177283-8-neilb@ownmail.net/">2026-02-04 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 07/13] VFS: make lookup_one_qstr_excl() static.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260204050726.177283-9-neilb@ownmail.net/">2026-02-04 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 08/13] ovl: Simplify ovl_lookup_real_one()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260204050726.177283-10-neilb@ownmail.net/">2026-02-04 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 09/13] cachefiles: change cachefiles_bury_object to use start_renaming_dentry()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260204050726.177283-11-neilb@ownmail.net/">2026-02-04 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 10/13] ovl: change ovl_create_real() to get a new lock when re-opening created file.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260204050726.177283-12-neilb@ownmail.net/">2026-02-04 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 11/13] ovl: use is_subdir() for testing if one thing is a subdir of another</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260204050726.177283-13-neilb@ownmail.net/">2026-02-04 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 12/13] ovl: remove ovl_lock_rename_workdir()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260204050726.177283-14-neilb@ownmail.net/">2026-02-04 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 13/13] VFS: unexport lock_rename(), lock_rename_child(), unlock_rename()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxiYUTi=8BjRFbY_GdBZR_5CuP6680me=_xQaPcQk7EFuQ@mail.gmail.com/">2026-02-05 Amir Goldstein <a href="mailto:amir73il@gmail.com">amir73il@gmail.com</a> — Re: [PATCH 11/13] ovl: use is_subdir() for testing if one thing is a subdir of another</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxi3bNYq1b4=qL-JLi19hRwurntfLZXhUMVL003NarBdGg@mail.gmail.com/">2026-02-05 Amir Goldstein <a href="mailto:amir73il@gmail.com">amir73il@gmail.com</a> — Re: [PATCH 12/13] ovl: remove ovl_lock_rename_workdir()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/8d907c67ccab1db0e7bcabe0c34c66722a2970e2.camel@kernel.org/">2026-02-05 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 03/13] libfs: change simple_done_creating() to use end_creating()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxh-MLgwZCstwr6HyPXHVRmtj2F_=xS8pE3FN6Ex-wex4w@mail.gmail.com/">2026-02-05 Amir Goldstein <a href="mailto:amir73il@gmail.com">amir73il@gmail.com</a> — Re: [PATCH 10/13] ovl: change ovl_create_real() to get a new lock when re-opening created file.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/b62d43c08545d26772a5fff45f13832767d766bb.camel@kernel.org/">2026-02-05 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 01/13] fs/proc: Don't lock root inode when creating "self" and "thread-self"</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/bcb8c138027576d6e3c9d6816b372c3b4c26695c.camel@kernel.org/">2026-02-05 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 02/13] VFS: move the start_dirop() kerndoc comment to before start_dirop()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/3d8aeaea14712ad2cd0199cba62bc1398f7cc4a0.camel@kernel.org/">2026-02-05 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 05/13] selinux: Use simple_start_creating() / simple_done_creating()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/b4cc667f93cd16b251ba063898055b3a754e3496.camel@kernel.org/">2026-02-05 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 06/13] nfsd: switch purge_old() to use start_removing_noperm()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/1a317bea80f827b85c5b43766cdbcd0bcb85463d.camel@kernel.org/">2026-02-05 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 07/13] VFS: make lookup_one_qstr_excl() static.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/5d273a008fc51a2fded785efbe30e5bd2a89b985.camel@kernel.org/">2026-02-05 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 08/13] ovl: Simplify ovl_lookup_real_one()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/4d2c35c1b627f1ad26062a92d653677d7b79bd81.camel@kernel.org/">2026-02-05 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 09/13] cachefiles: change cachefiles_bury_object to use start_renaming_dentry()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/c7445f68809ea699c73da0282a9e2b3f99ff3bcf.camel@kernel.org/">2026-02-05 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 11/13] ovl: use is_subdir() for testing if one thing is a subdir of another</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/11fd2fde84cffcc39798160570e24e54684c5b71.camel@kernel.org/">2026-02-05 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 12/13] ovl: remove ovl_lock_rename_workdir()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/3e5726689975c3436ec134a299c538183f6763b1.camel@kernel.org/">2026-02-05 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 13/13] VFS: unexport lock_rename(), lock_rename_child(), unlock_rename()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/7fbfbeb0d57484172304b727bd888d1a1105f96d.camel@kernel.org/">2026-02-05 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 04/13] Apparmor: Use simple_start_creating() / simple_done_creating()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/00ea86285ce8dcf7860b9df3bcbcf77af87e4686.camel@kernel.org/">2026-02-05 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 12/13] ovl: remove ovl_lock_rename_workdir()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxh_Ugyy9=Vx_XOzWMTdhqVx6kAu43q+F+afhNF_Zv_9TA@mail.gmail.com/">2026-02-05 Amir Goldstein <a href="mailto:amir73il@gmail.com">amir73il@gmail.com</a> — Re: [PATCH 08/13] ovl: Simplify ovl_lookup_real_one()</a></li>
+</ul>
+  </main>
+</body>
+</html>
