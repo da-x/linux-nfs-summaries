@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>sunrpc: Fix TLS connect_worker rpc_clnt lifetime UAF</title>
+  <meta name="description" content="This week, the Linux NFS community addressed a critical use-after-free (UAF) bug in the SUNRPC subsystem affecting TCP-with-TLS transports. The issue, identified by Henry Martin, stems from improper reference counting of the rpc_clnt…">
+  <meta property="og:title" content="sunrpc: Fix TLS connect_worker rpc_clnt lifetime UAF">
+  <meta property="og:description" content="This week, the Linux NFS community addressed a critical use-after-free (UAF) bug in the SUNRPC subsystem affecting TCP-with-TLS transports. The issue, identified by Henry Martin, stems from improper reference counting of the rpc_clnt…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-03-12T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="sunrpc: Fix TLS connect_worker rpc_clnt lifetime UAF">
+  <meta name="twitter:description" content="This week, the Linux NFS community addressed a critical use-after-free (UAF) bug in the SUNRPC subsystem affecting TCP-with-TLS transports. The issue, identified by Henry Martin, stems from improper reference counting of the rpc_clnt…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-03-12</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>sunrpc: Fix TLS connect_worker rpc_clnt lifetime UAF</h1>
+<h2>Summary</h2>
+<p>This week, the Linux NFS community addressed a critical use-after-free (UAF) bug in the SUNRPC subsystem affecting TCP-with-TLS transports. The issue, identified by Henry Martin, stems from improper reference counting of the <code>rpc_clnt</code> structure when queuing TLS connection workers.</p>
+<h3>The Bug: A Critical UAF in TLS Setup</h3>
+<p>Henry Martin reported that in <code>xs_connect()</code>, the transport's client pointer (<code>transport-&gt;clnt</code>) was assigned from <code>task-&gt;tk_client</code> without taking a reference count when a TLS connect worker was queued. If the RPC task completed before the worker ran, <code>tk_client</code> could be released and its credentials (<code>cl_cred</code>) freed. Subsequently, when <code>xs_tcp_tls_setup_socket()</code> executed, it dereferenced the freed <code>upper_clnt-&gt;cl_cred</code>, leading to a slab-use-after-free in <code>rpc_new_client()</code>.</p>
+<p>Martin provided detailed KASAN output demonstrating the corruption:</p>
+<blockquote>
+<p>"BUG: KASAN: slab-use-after-free in rpc_new_client+0x387/0xdcc... Write of size 4 at addr ffff88810d67bfa8 by task kworker/u4:4/44"</p>
+</blockquote>
+<p>The proposed fix involves taking a client reference when queuing the TLS connect worker and dropping it upon exit. Additionally, any pinned client is released in <code>xs_destroy()</code> after canceling delayed work to handle cases where work is canceled before execution.</p>
+<h3>Community Validation and Real-World Impact</h3>
+<p>Jeff Layton quickly reviewed the patch, providing his approval:</p>
+<blockquote>
+<p>"Reviewed-by: Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a>"</p>
+</blockquote>
+<p>Benjamin Coddington from Hammerspace confirmed the severity of the bug in production environments without KASAN enabled. He noted that the UAF caused kernel credential cache corruption, manifesting as general protection faults:</p>
+<blockquote>
+<p>"This fixes crashes where the kernel's cred kmem cache was getting corrupted due to the UAF - we saw the slab's freelist pointer getting overwritten... That looked like this: Oops: general protection fault..."</p>
+</blockquote>
+<p>Coddington also provided a Tested-by tag and his review:</p>
+<blockquote>
+<p>"Reviewed-by: Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a>"</p>
+</blockquote>
+<h3>Architectural Discussion: Brittle Fix or Necessary Band-Aid?</h3>
+<p>While the patch was accepted as a necessary fix for stable kernels, concerns were raised about its robustness. Both Coddington and Chuck Lever pointed out that checking <code>transport-&gt;connect_worker.work.func == xs_tcp_tls_setup_socket</code> seemed "brittle."</p>
+<p>Coddington suggested a more fundamental architectural improvement:</p>
+<blockquote>
+<p>"I think we ended up with this problem because we're re-using the rpc_clnt in order to set up the lower_transport, and maybe we don't have to actually mix those layers. Chuck, Trond - can we use a 'dummy' rpc_program to create the lower rpc_clnt, and keep the lifetime of the original rpc_clnt disconnected from the sock_xprt? I can send a patch.."</p>
+</blockquote>
+<p>Chuck Lever acknowledged the architectural debt, noting that the upper/lower transport architecture was originally suggested by Trond Myklebust but implemented poorly:</p>
+<blockquote>
+<p>"The upper/lower architecture was Trond's suggestion. I just implemented it (poorly). Let's see whatcha got!"</p>
+</blockquote>
+<h3>Conclusion</h3>
+<p>This thread highlights a significant bug fix for NFS clients using TLS, preventing kernel crashes due to credential cache corruption. While the immediate fix is approved for stable kernels, the discussion has opened the door for a more robust architectural refactoring of the SUNRPC TLS transport layer to decouple client lifetimes from socket transports.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260309112041.1336519-1-bsdhenrymartin@gmail.com/">2026-03-09 bsdhenrymartin@gmail.com — [PATCH] sunrpc: fix TLS connect_worker rpc_clnt lifetime UAF</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/938915c4cf4575960db8e2c57633dc16884bc010.camel@kernel.org/">2026-03-09 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH] sunrpc: fix TLS connect_worker rpc_clnt lifetime UAF</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/FEF1FBB7-B82A-4A71-8F25-689EB5CD8F41@hammerspace.com/">2026-03-11 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — Re: [PATCH] sunrpc: fix TLS connect_worker rpc_clnt lifetime UAF</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/19d1571d-0415-42ff-b9b4-8c866f566958@kernel.org/">2026-03-11 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH] sunrpc: fix TLS connect_worker rpc_clnt lifetime UAF</a></li>
+</ul>
+  </main>
+</body>
+</html>

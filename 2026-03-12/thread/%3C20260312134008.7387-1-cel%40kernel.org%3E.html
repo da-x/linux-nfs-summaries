@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RDMA/rw: Fix MR pool exhaustion in bvec RDMA READ path</title>
+  <meta name="description" content="This week, Chuck Lever submitted a two-patch series (PATCH v2 0/2) addressing a critical Memory Region (MR) pool exhaustion bug in the RDMA core and proposing an optimization for the NFS server&#39;s RDMA implementation (svcrdma). The…">
+  <meta property="og:title" content="RDMA/rw: Fix MR pool exhaustion in bvec RDMA READ path">
+  <meta property="og:description" content="This week, Chuck Lever submitted a two-patch series (PATCH v2 0/2) addressing a critical Memory Region (MR) pool exhaustion bug in the RDMA core and proposing an optimization for the NFS server&#39;s RDMA implementation (svcrdma). The…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-03-12T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="RDMA/rw: Fix MR pool exhaustion in bvec RDMA READ path">
+  <meta name="twitter:description" content="This week, Chuck Lever submitted a two-patch series (PATCH v2 0/2) addressing a critical Memory Region (MR) pool exhaustion bug in the RDMA core and proposing an optimization for the NFS server&#39;s RDMA implementation (svcrdma). The…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-03-12</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>RDMA/rw: Fix MR pool exhaustion in bvec RDMA READ path</h1>
+<h2>Summary</h2>
+<p>This week, Chuck Lever submitted a two-patch series (<a href="https://lore.kernel.org/linux-nfs/20260312134008.7387-1-cel@kernel.org/">PATCH v2 0/2</a>) addressing a critical Memory Region (MR) pool exhaustion bug in the RDMA core and proposing an optimization for the NFS server's RDMA implementation (<code>svcrdma</code>). The discussion is focused entirely on <strong>bug fixes</strong> and performance optimizations related to NFS over RDMA.</p>
+<h3>Key Technical Arguments and Bug Fix</h3>
+<p>The primary issue, detailed in <a href="https://lore.kernel.org/linux-nfs/20260312134008.7387-2-cel@kernel.org/">Patch 1/2</a>, affects systems where IOVA-based DMA mapping is unavailable (e.g., IOMMU passthrough mode). In this scenario, <code>rdma_rw_ctx_init_bvec()</code> incorrectly falls back to checking <code>rdma_rw_io_needs_mr()</code> using the raw bvec count.</p>
+<p>Lever explains that unlike the scatterlist path, which uses a post-DMA-mapping entry count reflecting coalesced physically contiguous pages, the bvec path uses a pre-mapping page count. This discrepancy leads to significant issues:</p>
+<blockquote>
+<p>"This overstates the number of DMA entries, causing every multi-bvec RDMA READ to consume an MR from the QP's pool."</p>
+</blockquote>
+<p>Under NFS WRITE workloads, where the server performs RDMA READs to pull data from the client, this inflated demand rapidly exhausts the MR pool. The consequences are severe for system stability:</p>
+<blockquote>
+<p>"The pool is rapidly exhausted, ib_mr_pool_get() returns NULL, and rdma_rw_init_one_mr() returns -EAGAIN. svcrdma treats this as a DMA mapping failure, closes the connection, and the client reconnects -- producing a cycle of 71% RPC retransmissions and ~100 reconnections per test run."</p>
+</blockquote>
+<p>Lever notes that RDMA WRITEs (NFS READ direction) are unaffected because <code>DMA_TO_DEVICE</code> never triggers the <code>max_sgl_rd</code> check. The fix removes the <code>rdma_rw_io_needs_mr()</code> gate from the bvec path entirely, ensuring bvec RDMA operations always use the <code>map_wrs</code> path (direct WR posting without MR allocation). Lever argues that the raw page count cannot serve as a reliable input for <code>rdma_rw_io_needs_mr()</code> because physical contiguity is only discovered during DMA mapping.</p>
+<h3>Evolution of the Discussion and Optimization Proposal</h3>
+<p>This is version 2 of the patch series. In the cover letter, Lever notes:</p>
+<blockquote>
+<p>"This series now carries the original fix with review comments addressed, and a proposal for using contiguous pages for RDMA Read sink buffers in svcrdma."</p>
+</blockquote>
+<p>He recommends that the fix patch be merged into the 7.0-rc cycle, while the behavioral change can wait for the next merge window:</p>
+<blockquote>
+<p>"IMO the fix patch should go into 7.0-rc, and the RDMA Read behavior change can wait for the next merge window."</p>
+</blockquote>
+<p><a href="https://lore.kernel.org/linux-nfs/20260312134008.7387-3-cel@kernel.org/">Patch 2/2</a> proposes an optimization for <code>svc_rdma_build_read_segment()</code>. Currently, it constructs RDMA Read sink buffers by consuming pages one-at-a-time, resulting in multiple bvecs and DMA mappings for a single payload (e.g., 16 bvecs for a 64KB NFS READ).</p>
+<p>Lever proposes using a single higher-order allocation followed by <code>split_page()</code> to yield physically contiguous memory. This allows the use of a single bvec spanning the contiguous range, triggering the <code>rdma_rw_init_single_wr_bvec()</code> fast path:</p>
+<blockquote>
+<p>"A single bvec spanning the contiguous range causes rdma_rw_ctx_init_bvec() to take the rdma_rw_init_single_wr_bvec() fast path: one DMA mapping, one SGE, one WR."</p>
+</blockquote>
+<p>The implementation includes robust fallback mechanisms. It uses <code>__GFP_NORETRY | __GFP_NOWARN</code> and falls back through decreasing orders if higher-order allocations fail. Lever emphasizes that this optimization does not increase per-request page consumption and prevents accumulation under memory pressure.</p>
+<h3>Final Conclusions</h3>
+<p>The thread concludes with the submission of these two patches. The first patch is a critical bug fix for MR pool exhaustion in specific hardware configurations, while the second is a performance optimization to reduce DMA mapping overhead. Lever suggests that Christoph Hellwig influenced the contiguous page allocation approach ("Suggested-by: Christoph Hellwig"). No further discussion occurred within this week's window, leaving the patches pending review and integration into the kernel tree.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260312134008.7387-1-cel@kernel.org/">2026-03-12 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 0/2] RDMA/rw: Fix MR pool exhaustion in bvec RDMA READ path</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260312134008.7387-2-cel@kernel.org/">2026-03-12 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 1/2] RDMA/rw: Fix MR pool exhaustion in bvec RDMA READ path</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260312134008.7387-3-cel@kernel.org/">2026-03-12 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 2/2] svcrdma: Use contiguous pages for RDMA Read sink buffers</a></li>
+</ul>
+  </main>
+</body>
+</html>

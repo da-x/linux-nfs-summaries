@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RFC 53-Patch Series: Lifting VFS Lookup Out of Exclusive Directory Lock for NFS Client Concurrency</title>
+  <meta name="description" content="On March 12, Neil Brown submitted a massive [PATCH RFC 00/53] series](https://lore.kernel.org/linux-nfs/20260312214330.3885211-1-neilb@ownmail.net/) titled &quot;lift lookup out of exclive lock for dir ops&quot;, representing a major step in his…">
+  <meta property="og:title" content="RFC 53-Patch Series: Lifting VFS Lookup Out of Exclusive Directory Lock for NFS Client Concurrency">
+  <meta property="og:description" content="On March 12, Neil Brown submitted a massive [PATCH RFC 00/53] series](https://lore.kernel.org/linux-nfs/20260312214330.3885211-1-neilb@ownmail.net/) titled &quot;lift lookup out of exclive lock for dir ops&quot;, representing a major step in his…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-03-12T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="RFC 53-Patch Series: Lifting VFS Lookup Out of Exclusive Directory Lock for NFS Client Concurrency">
+  <meta name="twitter:description" content="On March 12, Neil Brown submitted a massive [PATCH RFC 00/53] series](https://lore.kernel.org/linux-nfs/20260312214330.3885211-1-neilb@ownmail.net/) titled &quot;lift lookup out of exclive lock for dir ops&quot;, representing a major step in his…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-03-12</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>RFC 53-Patch Series: Lifting VFS Lookup Out of Exclusive Directory Lock for NFS Client Concurrency</h1>
+<h2>Summary</h2>
+<h1>RFC 53-Patch Series: Lifting VFS Lookup Out of Exclusive Directory Lock</h1>
+<h2>Overview</h2>
+<p>On March 12, Neil Brown submitted a massive **[PATCH RFC 00/53] series](https://lore.kernel.org/linux-nfs/20260312214330.3885211-1-neilb@ownmail.net/) titled <em>"lift lookup out of exclive lock for dir ops"</em>, representing a major step in his long-running effort to improve concurrency of directory operations across the Linux VFS and filesystems — with significant implications for NFS client development.</p>
+<p><strong>Classification</strong>: VFS locking refactoring with broad protocol-level implications for dcache management. This is not a simple bug fix but a foundational architectural change enabling concurrent directory updates by removing the dependency on exclusive parent-directory locks during lookup operations.</p>
+<h2>Bridge from Prior Weeks</h2>
+<p>Last week, Neil Brown's earlier 15-patch series <em>"Further centralising of directory locking for name ops"</em> (v3) received substantive review from VFS maintainer Christian Brauner. Brauner identified an incidental AppArmor dentry reference count leak fix and a behavioral regression in the cachefiles subsystem <a href="2026-03-12/thread/%3C20260224222542.3458677-1-neilb%40ownmail.net%3E.html">prior summary</a>. A fixup patch was submitted and applied to <code>vfs-7.1.directory</code> on March 9 <a href="2026-03-12/thread/%3C177300347820.5556.314358492166337403%40noble.neil.brown.name%3E.html">prior summary</a>. The current 53-patch RFC series represents the next phase of this work, building on that foundation.</p>
+<h2>This Week's Activity</h2>
+<h3>The Core Problem: Exclusive Locking as a Concurrency Bottleneck</h3>
+<p>Neil Brown's cover letter outlines the fundamental issue: the VFS currently requires a shared parent lock to exclude directory-modifying operations during <code>d_alloc_parallel()</code>. This serializes directory operations unnecessarily. The series aims to:</p>
+<blockquote>
+<p>"remove this dependency so that d_alloc_parallel() can be called without locking and all directory modifying operations receive either a hashed dentry or an in-lookup dentry" <a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-1-neilb@ownmail.net/">Cover Letter</a></p>
+</blockquote>
+<p>The long-term goal is to push parent-directory locking down into individual filesystems (which can discard it if unnecessary) and use exclusive dentry locking in the VFS for all directory operations except <code>readdir</code>:</p>
+<blockquote>
+<p>"My longer term goal involves pushing the parent-directory locking down into filesystems (which can then discard it if it isn't needed) and using exclusive dentry locking in the VFS for all directory operations other than readdir" <a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-1-neilb@ownmail.net/">Cover Letter</a></p>
+</blockquote>
+<h3>Two Key Technical Challenges</h3>
+<p>Neil Brown identified two critical obstacles:</p>
+<p><strong>1. Lock Ordering and Deadlock Potential</strong>: Since <code>d_alloc_parallel()</code> effects a blocking lock, calling it while holding the directory lock creates deadlock risk when the locking order is inverted:</p>
+<blockquote>
+<p>"If we are to take the directory lock <em>after</em> calling d_alloc_parallel() (and still holding an in-lookup dentry... then we must never call d_alloc_parallel() while holding the directory lock, even a shared lock." <a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-1-neilb@ownmail.net/">Cover Letter</a></p>
+</blockquote>
+<p>This particularly affects <code>readdir</code> operations where filesystems prime the dcache using <code>d_alloc_parallel()</code> in <code>-&gt;iterate_shared</code>. The solution is a new API, <code>d_alloc_noblock()</code>, which fails rather than blocking.</p>
+<p><strong>2. Unsafe d_drop() Patterns</strong>: With <code>d_alloc_parallel()</code> running without the directory lock, holding that lock exclusively is insufficient to protect dcache manipulations:</p>
+<blockquote>
+<p>"several filesystems d_drop() a dentry and (possibly) re-hash it. This will no longer be safe as d_alloc_parallel() could run while the dentry was dropped, would find that name doesn't exist in the dcache, and would create a new dentry leading to two uncoordinated dentries with the same name." <a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-1-neilb@ownmail.net/">Cover Letter</a></p>
+</blockquote>
+<p>The fix involves enhancing <code>d_splice_alias()</code> to handle hashed, unhashed, and in-lookup dentries uniformly, eliminating the need for early <code>d_drop()</code> calls.</p>
+<h3>New APIs Introduced</h3>
+<ul>
+<li><strong><code>d_alloc_noblock()</code></strong> — Non-blocking variant of <code>d_alloc_parallel()</code> that returns <code>-EWOULDBLOCK</code> instead of sleeping</li>
+<li><strong><code>d_duplicate()</code></strong> — Creates an in-lookup dentry with the same name as an existing hashed dentry, preventing race conditions during rename operations</li>
+</ul>
+<h3>APIs Removed (at series end)</h3>
+<ul>
+<li><code>d_alloc()</code>, <code>d_rehash()</code>, <code>d_add()</code>, <code>lookup_one()</code>, <code>lookup_noperm()</code></li>
+</ul>
+<h2>NFS Client-Specific Changes</h2>
+<p>The series contains seven patches directly modifying NFS client code (patches 09–15), each addressing specific locking and dcache management issues:</p>
+<h3><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-9-neilb@ownmail.net/">PATCH 09/53</a>: Remove d_drop()/d_alloc_parallel() from nfs_atomic_open()</h3>
+<p>This patch eliminates the current workaround in <code>nfs_atomic_open()</code> where a negative dentry is discarded and recreated via <code>d_alloc_parallel()</code> to prevent races between concurrent non-create opens. Neil Brown explains:</p>
+<blockquote>
+<p>"We can achieve the same effect by causing -&gt;d_revalidate to invalidate a negative dentry when LOOKUP_OPEN is set. Doing this is consistent with the 'close to open' caching semantics of NFS which requires the server to be queried whenever opening a file — cached information must not be trusted." <a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-9-neilb@ownmail.net/">Patch 09/53</a></p>
+</blockquote>
+<p>This change removes 23 lines of code while maintaining correctness through the <code>nfs_neg_need_reval</code> mechanism.</p>
+<h3><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-10-neilb@ownmail.net/">PATCH 10/53</a>: Use d_splice_alias() in nfs_link()</h3>
+<p>Previously, <code>nfs_link()</code> called <code>d_drop()</code> followed by <code>d_add()</code> because no single API could handle both hashed and unhashed dentries. With the enhanced <code>d_splice_alias()</code>:</p>
+<blockquote>
+<p>"Recent changes to d_splice_alias() mean that it <em>can</em> work with either hashed or unhashed dentries. Future changes to locking mean that it will be unsafe to d_drop() a dentry while an operation (in this case 'link()') is still ongoing." <a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-10-neilb@ownmail.net/">Patch 10/53</a></p>
+</blockquote>
+<h3><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-11-neilb@ownmail.net/">PATCH 11/53</a>: Don't d_drop() before d_splice_alias() in nfs_add_or_obtain()</h3>
+<p>The <code>nfs_add_or_obtain()</code> function (used via <code>nfs_instantiate()</code>) previously dropped the dentry before splicing. This is no longer necessary:</p>
+<blockquote>
+<p>"As d_splice_alias() now works with hashed dentries, the d_drop() is no longer needed." <a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-11-neilb@ownmail.net/">Patch 11/53</a></p>
+</blockquote>
+<h3><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-12-neilb@ownmail.net/">PATCH 12/53</a>: Don't d_drop() before d_splice_alias() in atomic_create</h3>
+<p>When <code>atomic_create</code> fails with <code>-ENOENT</code>, the old code dropped and re-added the dentry with a NULL inode. This pattern is incompatible with the new locking model:</p>
+<blockquote>
+<p>"As d_splice_alias() now supports hashed dentries, we don't need the d_drop() until it is determined that some other error has occurred." <a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-12-neilb@ownmail.net/">Patch 12/53</a></p>
+</blockquote>
+<h3><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-13-neilb@ownmail.net/">PATCH 13/53</a>: Use d_alloc_noblock() in nfs_prime_dcache()</h3>
+<p>NFS primes the dcache with <code>readdir</code> results. Blocking during this operation is both pointless and dangerous under the new locking order:</p>
+<blockquote>
+<p>"Blocking in that case is pointless as the lookup will add info to the dcache and there is no value in the readdir waiting to see if it should add the info too." <a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-13-neilb@ownmail.net/">Patch 13/53</a></p>
+</blockquote>
+<p>The patch switches to <code>d_alloc_noblock()</code> and uses <code>try_lookup_noperm()</code> instead of <code>full_name_hash</code> and <code>d_lookup</code>.</p>
+<h3><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-14-neilb@ownmail.net/">PATCH 14/53</a>: Use d_alloc_noblock() in silly-rename</h3>
+<p>The NFS silly-rename mechanism (used to preserve deleted-but-open files on the server) is reworked to avoid normal lookups:</p>
+<blockquote>
+<p>"Rather than performing a normal lookup (which will be awkward with future locking changes) use d_alloc_noblock() to find a dentry for an unused name, and then open-code the rest of lookup_slow() to see if it is free on the server." <a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-14-neilb@ownmail.net/">Patch 14/53</a></p>
+</blockquote>
+<p>This patch adds 36 lines while removing 20, reflecting the complexity of the silly-rename path.</p>
+<h3><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-15-neilb@ownmail.net/">PATCH 15/53</a>: Use d_duplicate() in NFS</h3>
+<p>Prepares for <code>d_alloc_parallel()</code> running without directory locks by using the new <code>d_duplicate()</code> API for silly rename operations:</p>
+<blockquote>
+<p>"As preparation for d_alloc_parallel() being allowed without the directory locked, use d_duplicate() to duplicate a dentry for silly rename." <a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-15-neilb@ownmail.net/">Patch 15/53</a></p>
+</blockquote>
+<h2>Community Response</h2>
+<h3>Steven Rostedt's Feedback</h3>
+<p>Steven Rostedt noted the scale of the series and a delivery issue:</p>
+<blockquote>
+<p>"Hmm, another reason I hate being Cc'd on every patch of a patch bomb where I only need to look at one (and maybe the first) patch. For some reason, I'm missing several patches, and this is one of them :-p" <a href="https://lore.kernel.org/linux-nfs/20260312193847.28c32a2c@gandalf.local.home/">Response</a></p>
+</blockquote>
+<h3>Linus Torvalds' Response</h3>
+<p>Linus Torvalds provided initial feedback on the series, noting he received only about half the patches:</p>
+<blockquote>
+<p>"I only got about half the patches, but the ones I did get didn't raise my hackles." <a href="https://lore.kernel.org/linux-nfs/CAHk-=wh92deXvH5iXCo9mThXCBYt-jRcVu=z4kiH-f3+wZQOHA@mail.gmail.com/">Response</a></p>
+</blockquote>
+<p>However, he emphasized two critical requirements:</p>
+<blockquote>
+<p>"This is very much a 'absolutely requires ACKs from Al' series. Al?" <a href="https://lore.kernel.org/linux-nfs/CAHk-=wh92deXvH5iXCo9mThXCBYt-jRcVu=z4kiH-f3+wZQOHA@mail.gmail.com/">Response</a></p>
+</blockquote>
+<p>Linus also requested a git branch for easier review:</p>
+<blockquote>
+<p>"because I only got about half the patches, and there's 53 of them total, I'd really like to see a git branch for something like this. It makes it easier to review for me, and I suspect it makes it easier for some of the test robots too." <a href="https://lore.kernel.org/linux-nfs/CAHk-=wh92deXvH5iXCo9mThXCBYt-jRcVu=z4kiH-f3+wZQOHA@mail.gmail.com/">Response</a></p>
+</blockquote>
+<p>He also referenced prior concerns from Al Viro:</p>
+<blockquote>
+<p>"Iirc he had some fundamental concern with the last version — hopefully now fixed, but ..." <a href="https://lore.kernel.org/linux-nfs/CAHk-=wh92deXvH5iXCo9mThXCBYt-jRcVu=z4kiH-f3+wZQOHA@mail.gmail.com/">Response</a></p>
+</blockquote>
+<h2>Key Technical Arguments and Evolution</h2>
+<ol>
+<li><strong>Foundational locking change</strong>: The series represents a paradigm shift from whole-directory exclusive locking to per-dentry exclusive locking via <code>DCACHE_PAR_LOOKUP</code>, enabling true concurrent directory updates.</li>
+<li><strong>NFS client simplification</strong>: Seven NFS-specific patches collectively remove complex <code>d_drop()</code>/<code>d_alloc_parallel()</code> workarounds, replacing them with cleaner patterns using enhanced <code>d_splice_alias()</code>, <code>d_alloc_noblock()</code>, and <code>d_duplicate()</code>.</li>
+<li><strong>Deadlock prevention</strong>: The introduction of <code>d_alloc_noblock()</code> eliminates blocking in dcache-priming paths (readdir) that would otherwise create lock-order inversions.</li>
+<li><strong>Race condition elimination</strong>: The <code>d_duplicate()</code> API prevents windowed races during rename operations where two uncoordinated dentries with the same name could be created.</li>
+</ol>
+<h2>Final Conclusions</h2>
+<ul>
+<li><strong>Series status</strong>: RFC stage, awaiting Al Viro's ACK as explicitly required by Linus Torvalds. A git branch has been requested to facilitate review and automated testing.</li>
+<li><strong>NFS client impact</strong>: Significant — seven patches directly modify NFS client code, simplifying <code>nfs_atomic_open()</code>, <code>nfs_link()</code>, <code>nfs_add_or_obtain()</code>, dcache priming, and silly-rename paths. The changes remove 23+ lines of workaround code in <code>nfs_atomic_open()</code> alone while maintaining correctness through NFS's "close to open" caching semantics.</li>
+<li><strong>Risk assessment</strong>: Neil Brown acknowledged the conceptual magnitude: <em>"It is a big conceptual change and there could easily be surprising implications."</em> He noted testing was limited to NFS at submission time.</li>
+<li><strong>Next steps</strong>: The series requires Al Viro's review and ACK, availability of a git branch for reviewers and test robots, and broader filesystem maintainer engagement (the series touches xfs, ovl, coda, shmem, afs, smb/client, exfat, configfs, ext4, tracefs, cephfs, ecryptfs, gfs2, libfs, fuse, hostfs, efivarfs).</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-1-neilb@ownmail.net/">2026-03-12 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH RFC 00/53] lift lookup out of exclive lock for dir ops</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-2-neilb@ownmail.net/">2026-03-12 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 01/53] VFS: fix various typos in documentation for start_creating start_removing etc</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-3-neilb@ownmail.net/">2026-03-12 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 02/53] VFS: enhance d_splice_alias() to handle in-lookup dentries</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-4-neilb@ownmail.net/">2026-03-12 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 03/53] VFS: allow d_alloc_name() to be used with -&gt;d_hash</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-5-neilb@ownmail.net/">2026-03-12 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 04/53] VFS: use global wait-queue table for d_alloc_parallel()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-6-neilb@ownmail.net/">2026-03-12 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 05/53] VFS: introduce d_alloc_noblock()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-7-neilb@ownmail.net/">2026-03-12 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 06/53] VFS: add d_duplicate()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-8-neilb@ownmail.net/">2026-03-12 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 07/53] VFS: Add LOOKUP_SHARED flag.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-9-neilb@ownmail.net/">2026-03-12 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 08/53] VFS/xfs: drop parent lock across d_alloc_parallel() in d_add_ci()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-10-neilb@ownmail.net/">2026-03-12 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 09/53] nfs: remove d_drop()/d_alloc_parallel() from nfs_atomic_open()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-11-neilb@ownmail.net/">2026-03-12 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 10/53] nfs: use d_splice_alias() in nfs_link()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-12-neilb@ownmail.net/">2026-03-12 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 11/53] nfs: don't d_drop() before d_splice_alias()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-13-neilb@ownmail.net/">2026-03-12 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 12/53] nfs: don't d_drop() before d_splice_alias() in atomic_create.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-14-neilb@ownmail.net/">2026-03-12 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 13/53] nfs: Use d_alloc_noblock() in nfs_prime_dcache()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-15-neilb@ownmail.net/">2026-03-12 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 14/53] nfs: use d_alloc_noblock() in silly-rename</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-16-neilb@ownmail.net/">2026-03-12 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 15/53] nfs: use d_duplicate()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-17-neilb@ownmail.net/">2026-03-12 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 16/53] ovl: drop dir lock for lookups in impure readdir</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-18-neilb@ownmail.net/">2026-03-12 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 17/53] coda: don't d_drop() early.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-19-neilb@ownmail.net/">2026-03-12 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 18/53] shmem: use d_duplicate()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-39-neilb@ownmail.net/">2026-03-12 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 38/53] cephfs: Don't d_drop() before d_splice_alias()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-40-neilb@ownmail.net/">2026-03-12 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 39/53] ecryptfs: stop using d_add().</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-41-neilb@ownmail.net/">2026-03-12 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 40/53] gfs2: stop using d_add().</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-42-neilb@ownmail.net/">2026-03-12 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 41/53] libfs: stop using d_add().</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-43-neilb@ownmail.net/">2026-03-12 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 42/53] fuse: don't d_drop() before d_splice_alias()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-44-neilb@ownmail.net/">2026-03-12 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 43/53] fuse: Use d_alloc_noblock() in fuse_direntplus_link()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-45-neilb@ownmail.net/">2026-03-12 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 44/53] hostfs: don't d_drop() before d_splice_alias() in hostfs_mkdir()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-46-neilb@ownmail.net/">2026-03-12 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 45/53] efivarfs: use d_alloc_name()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-47-neilb@ownmail.net/">2026-03-12 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 46/53] Remove references to d_add() in documentation and comments.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-48-neilb@ownmail.net/">2026-03-12 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 47/53] VFS: make d_alloc() local to VFS.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-49-neilb@ownmail.net/">2026-03-12 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 48/53] VFS: remove d_add()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-50-neilb@ownmail.net/">2026-03-12 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 49/53] VFS: remove d_rehash()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-51-neilb@ownmail.net/">2026-03-12 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 50/53] VFS: remove lookup_one() and lookup_noperm()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-52-neilb@ownmail.net/">2026-03-12 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 51/53] VFS: use d_alloc_parallel() in lookup_one_qstr_excl().</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-53-neilb@ownmail.net/">2026-03-12 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 52/53] VFS: lift d_alloc_parallel above inode_lock</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-54-neilb@ownmail.net/">2026-03-12 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 53/53] VFS: remove LOOKUP_SHARED</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260312193847.28c32a2c@gandalf.local.home/">2026-03-12 Steven Rostedt <a href="mailto:rostedt@goodmis.org">rostedt@goodmis.org</a> — Re: [PATCH RFC 00/53] lift lookup out of exclive lock for dir ops</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAHk-=wh92deXvH5iXCo9mThXCBYt-jRcVu=z4kiH-f3+wZQOHA@mail.gmail.com/">2026-03-12 Linus Torvalds <a href="mailto:torvalds@linux-foundation.org">torvalds@linux-foundation.org</a> — Re: [PATCH RFC 00/53] lift lookup out of exclive lock for dir ops</a></li>
+</ul>
+  </main>
+</body>
+</html>

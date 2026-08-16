@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD Lock Regression: F_GETLK Misdiagnosis and Revised Fix Direction</title>
+  <meta name="description" content="This thread, first reported by Tj on February 24, tracks a regression introduced by commit 4cc9b9f2bf4d (&quot;nfsd: refine and rename NFSD_MAY_LOCK&quot;), which caused NFS clients to receive -ENOLCK (&quot;No locks available&quot;) when attempting file…">
+  <meta property="og:title" content="NFSD Lock Regression: F_GETLK Misdiagnosis and Revised Fix Direction">
+  <meta property="og:description" content="This thread, first reported by Tj on February 24, tracks a regression introduced by commit 4cc9b9f2bf4d (&quot;nfsd: refine and rename NFSD_MAY_LOCK&quot;), which caused NFS clients to receive -ENOLCK (&quot;No locks available&quot;) when attempting file…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-03-12T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSD Lock Regression: F_GETLK Misdiagnosis and Revised Fix Direction">
+  <meta name="twitter:description" content="This thread, first reported by Tj on February 24, tracks a regression introduced by commit 4cc9b9f2bf4d (&quot;nfsd: refine and rename NFSD_MAY_LOCK&quot;), which caused NFS clients to receive -ENOLCK (&quot;No locks available&quot;) when attempting file…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-03-12</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD Lock Regression: F_GETLK Misdiagnosis and Revised Fix Direction</h1>
+<h2>Summary</h2>
+<h1>NFSD Lock Regression: <code>F_GETLK</code> Misdiagnosis and Revised Fix Direction</h1>
+<h2>Classification: Bug Fix (NFS Server / lockd Permission Checks)</h2>
+<h2>Bridge from Prior Weeks</h2>
+<p>This thread, first reported by Tj on February 24, tracks a regression introduced by commit <code>4cc9b9f2bf4d</code> ("nfsd: refine and rename NFSD_MAY_LOCK"), which caused NFS clients to receive <code>-ENOLCK</code> ("No locks available") when attempting file locking operations on read-only files (e.g., ISO images served via NFSv3). The issue was discovered in production on the <strong>Debian openQA infrastructure</strong>, where QEMU failed to acquire "consistent read" locks on NFS-mounted disk images.</p>
+<p>In prior weeks, Neil Brown argued that the new behavior was technically correct — exclusive <code>fcntl</code>-style locks over NLM require write access by POSIX semantics — and suggested workarounds such as using <code>no_auth_nlm</code> export options or marking devices as read-only. Sasha Levin proposed a patch to restore the permission downgrade in <code>nfsd_permission()</code>, but Neil Brown resisted, contending it would break legitimate lock-denial cases. The discussion appeared stalled until this week's activity.</p>
+<h2>This Week's Activity: A Critical Misdiagnosis Corrected</h2>
+<h3>Thorsten Leemhuis Presses for Resolution</h3>
+<p>Thorsten Leemhuis <a href="https://lore.kernel.org/linux-nfs/6ba41798-9c69-44f5-9a4e-09336c75a4b9@leemhuis.info/">reopened the thread</a> on March 12, asking Jeff Layton for his opinion and emphasizing that this is a confirmed regression requiring resolution:</p>
+<blockquote>
+<p>"But as Neil mentioned, it's a regression, so it must be handled some way. And it looks like this stalled."</p>
+</blockquote>
+<p>He posed two key questions: whether other users would encounter this issue (in which case Linus would expect a fix), or whether the Debian openQA infrastructure could work around it by upgrading QEMU:</p>
+<blockquote>
+<p>"If yes, I'd say Linus expects us to fix this."</p>
+</blockquote>
+<h3>Jeff Layton Rejects the Naive Fix and Questions QEMU's Behavior</h3>
+<p>Jeff Layton <a href="https://lore.kernel.org/linux-nfs/cf78feb7ffaee6ed478afb734d2ede149597de86.camel@kernel.org/">responded firmly</a> with a NAK on Sasha Levin's proposed patch:</p>
+<blockquote>
+<p>"Yes. NAK on the patch below. It would break legitimate cases where the lock should be denied. Neil is right not to encourage its use."</p>
+</blockquote>
+<p>He acknowledged the protocol constraint — NLM lacks <code>flock()</code>-style semantics, so exclusive locks require write access — but questioned whether the old behavior was ever correct:</p>
+<blockquote>
+<p>"It may technically be a regression since it worked before, but I'm wondering whether it ever should have."</p>
+</blockquote>
+<p>Layton suggested the <code>no_auth_nlm</code> export option as a workaround and separately <a href="https://lore.kernel.org/linux-nfs/5a302dcfcb54a87366dd6a9bc5ec27df179f7f58.camel@kernel.org/">wondered if QEMU itself had a bug</a>:</p>
+<blockquote>
+<p>"Why is it opening a file read-only and then taking out an exclusive lock on it? What's the point of denying access to other readers?"</p>
+</blockquote>
+<h3>Neil Brown Corrects His Own Diagnosis: It's <code>F_GETLK</code>, Not <code>flock</code></h3>
+<p>The pivotal moment came when <a href="https://lore.kernel.org/linux-nfs/177335517622.5556.4792770517095870331@noble.neil.brown.name/">Neil Brown reversed his earlier analysis</a>. He admitted he had misdiagnosed what QEMU was actually doing:</p>
+<blockquote>
+<p>"It turns out that I mis-diagnosed the problem. i.e. I guess wrong as to what weird thing qemu is doing."</p>
+</blockquote>
+<p>QEMU is not using <code>flock()</code> at all. Instead, it uses <code>fcntl()</code> locking with the <strong><code>F_GETLK</code></strong> or <strong><code>F_OFD_GETLK</code></strong> operation — which tests whether a lock already exists rather than acquiring one:</p>
+<blockquote>
+<p>"qemu isn't using flock(). It is using fcntl() locking but at this point isn't trying to GET a lock, it is testing if a lock already exists. i.e. F_GETLK or F_OFD_GETLK."</p>
+</blockquote>
+<p>Critically, POSIX semantics dictate that <code>F_GETLK</code> does <strong>not</strong> require write access, even when querying an exclusive lock:</p>
+<blockquote>
+<p>"F_GETLK doesn't require WRITE access, even when getting an exclusive lock. But NFSD does :-)"</p>
+</blockquote>
+<p>This distinction changes the entire framing of the problem. The regression is not about whether exclusive locks should require write access (they do for <code>F_SETLK</code>/<code>F_SETLKW</code>), but rather that NFSD incorrectly demands write permission for a <em>query</em> operation (<code>F_GETLK</code>) that POSIX does not require it to enforce.</p>
+<p>Neil Brown concluded:</p>
+<blockquote>
+<p>"So maybe this is the fix that we want."</p>
+</blockquote>
+<p>He included a patch (diff omitted at ingest) targeting the lockd subsystem to correct the permission check for <code>F_GETLK</code> operations.</p>
+<h2>Key Technical Arguments and Evolution</h2>
+<ol>
+<li>
+<p><strong>Initial framing</strong>: The regression was understood as a question of whether exclusive locks on read-only files should be permitted over NLM. Neil Brown argued "no" based on POSIX <code>fcntl</code> semantics, while Sasha Levin proposed restoring the old permission downgrade.</p>
+</li>
+<li>
+<p><strong>Jeff Layton's position</strong>: He agreed with Neil Brown that blindly restoring the old behavior would break legitimate lock-denial cases, but acknowledged the regression needed addressing.</p>
+</li>
+<li>
+<p><strong>The pivot</strong>: Neil Brown's self-correction revealed the true root cause — NFSD was requiring write access for <code>F_GETLK</code> (a lock query), not just for <code>F_SETLK</code> (lock acquisition). This is a narrower and more clearly correctable bug than the broader semantic debate about exclusive locks on read-only files.</p>
+</li>
+<li>
+<p><strong>Fix direction</strong>: The proposed fix targets the lockd subsystem to distinguish between lock acquisition (<code>F_SETLK</code>) and lock testing (<code>F_GETLK</code>), ensuring that only the former requires write permission. This aligns with POSIX semantics without undermining legitimate lock-denial cases.</p>
+</li>
+</ol>
+<h2>Final Conclusions</h2>
+<ul>
+<li><strong>Bug confirmed and reclassified</strong>: The regression is not about whether exclusive locks should require write access (they do for acquisition), but rather that NFSD incorrectly enforces write permission for <code>F_GETLK</code> queries, which POSIX does not require.</li>
+<li><strong>Fix direction identified</strong>: Neil Brown proposed a targeted patch to lockd to correct the permission check for <code>F_GETLK</code>/<code>F_OFD_GETLK</code> operations. This represents a significant shift from the earlier debate about broadly restoring the old behavior.</li>
+<li><strong>Resolution pending</strong>: As of this week's window, the fix has not yet been reviewed or applied. The thread continued beyond March 12 with further discussion and patch iterations (including a <code>[PATCH] lockd: fix TEST handling when not all permissions are available</code> on March 24).</li>
+<li><strong>Workaround available</strong>: Users experiencing this issue can use the <code>no_auth_nlm</code> export option on the NFS server as an interim measure, as suggested by Jeff Layton.</li>
+</ul>
+<h2>Messages This Week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/6ba41798-9c69-44f5-9a4e-09336c75a4b9@leemhuis.info/">Thorsten Leemhuis presses for resolution</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/cf78feb7ffaee6ed478afb734d2ede149597de86.camel@kernel.org/">Jeff Layton NAKs the naive fix and suggests <code>no_auth_nlm</code></a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/5a302dcfcb54a87366dd6a9bc5ec27df179f7f58.camel@kernel.org/">Jeff Layton questions QEMU's lock behavior</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177335517622.5556.4792770517095870331@noble.neil.brown.name/">Neil Brown corrects his diagnosis: it's <code>F_GETLK</code>, not <code>flock</code></a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/6ba41798-9c69-44f5-9a4e-09336c75a4b9@leemhuis.info/">2026-03-12 Thorsten Leemhuis <a href="mailto:regressions@leemhuis.info">regressions@leemhuis.info</a> — Re: Regression: Missing check in nfsd_permission() causes -ENOLCK No locks available</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/cf78feb7ffaee6ed478afb734d2ede149597de86.camel@kernel.org/">2026-03-12 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: Regression: Missing check in nfsd_permission() causes -ENOLCK No locks available</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/5a302dcfcb54a87366dd6a9bc5ec27df179f7f58.camel@kernel.org/">2026-03-12 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: Regression: Missing check in nfsd_permission() causes -ENOLCK No locks available</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177335517622.5556.4792770517095870331@noble.neil.brown.name/">2026-03-12 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: Regression: Missing check in nfsd_permission() causes -ENOLCK No locks available</a></li>
+</ul>
+  </main>
+</body>
+</html>

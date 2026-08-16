@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSv4 Server Recovery: Resolving Session Reset via server_scope Configuration</title>
+  <meta name="description" content="This thread documents a user&#39;s journey to achieve high-availability (HA) for NFSv4, specifically focusing on the migration of client locks and sessions between cluster nodes. The discussion highlights a critical configuration requirement…">
+  <meta property="og:title" content="NFSv4 Server Recovery: Resolving Session Reset via server_scope Configuration">
+  <meta property="og:description" content="This thread documents a user&#39;s journey to achieve high-availability (HA) for NFSv4, specifically focusing on the migration of client locks and sessions between cluster nodes. The discussion highlights a critical configuration requirement…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-03-12T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSv4 Server Recovery: Resolving Session Reset via server_scope Configuration">
+  <meta name="twitter:description" content="This thread documents a user&#39;s journey to achieve high-availability (HA) for NFSv4, specifically focusing on the migration of client locks and sessions between cluster nodes. The discussion highlights a critical configuration requirement…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-03-12</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSv4 Server Recovery: Resolving Session Reset via server_scope Configuration</h1>
+<h2>Summary</h2>
+<h1>NFSv4 Server Recovery: Resolving Session Reset via <code>server_scope</code> Configuration</h1>
+<h2>Overview</h2>
+<p>This thread documents a user's journey to achieve high-availability (HA) for NFSv4, specifically focusing on the migration of client locks and sessions between cluster nodes. The discussion highlights a critical configuration requirement for successful state recovery that is not immediately obvious from standard documentation.</p>
+<p><strong>Classification:</strong> Bug Fix / Configuration Guidance (NFS Server/Client Interaction)</p>
+<h2>Discussion Evolution</h2>
+<h3>1. Initial Problem: Missing Upcall Pipe</h3>
+<p>Matthew Schumacher initiated the thread <a href="https://lore.kernel.org/linux-nfs/0d586513-819c-4af9-8c9f-8d09d326e547@schu.net/">on March 6</a>, describing an HA setup where locks were lost during failover from <code>nodeA</code> to <code>nodeB</code>. Despite using <code>nfsdcld</code> and sharing <code>/var/lib/nfs</code>, the kernel reported:</p>
+<blockquote>
+<p>"NFS: 10.255.255.3: lost 1 locks"</p>
+</blockquote>
+<p>Schumacher observed that <code>nfsdcld</code> failed to open the upcall pipe <code>/var/lib/nfs/rpc_pipefs/nfsd/cld</code>, resulting in a fallback to usermodehelper operations rather than the preferred direct kernel communication.</p>
+<p>Jeff Layton <a href="https://lore.kernel.org/linux-nfs/1fcd27cb44217d5db08e488528a2648c2906a435.camel@kernel.org/">responded</a>, noting:</p>
+<blockquote>
+<p>"The kernel failed to recognize the cld upcall for some reason, so it fell back to running the usermodehelper upcall."</p>
+</blockquote>
+<h3>2. Intermediate Fix: Kernel Configuration</h3>
+<p>Schumacher <a href="https://lore.kernel.org/linux-nfs/816d2a4b-d8bf-4242-b774-94886967430e@schu.net/">replied</a> that he identified the root cause of the missing pipe:</p>
+<blockquote>
+<p>"I figured out why /var/lib/nfs/rpc_pipefs/nfsd/cld was missing, I had CONFIG_NFSD_LEGACY_CLIENT_TRACKING enabled in the kernel."</p>
+</blockquote>
+<p>After disabling this legacy option, <code>nfsdcld</code> successfully communicated with the kernel, and the grace period ended correctly. However, locks were still lost during failover.</p>
+<h3>3. The Core Issue: Session Reset and Scope Mismatch</h3>
+<p>In a <a href="https://lore.kernel.org/linux-nfs/6214ba33-1ed3-4c8b-bba1-8d4894cb2dd1@schu.net/">follow-up on March 9</a>, Schumacher provided detailed logs showing that while client tracking was working, sessions were being reset upon failover. The client kernel logged:</p>
+<blockquote>
+<p>"nfs41_sequence_process ERROR: -10052 Reset session"
+"_nfs4_proc_exchange_id: server_scope mismatch detected"</p>
+</blockquote>
+<p>The server-side logs confirmed the session was not found in the hash table:</p>
+<blockquote>
+<p>"__find_in_sessionid_hashtbl: 1773078573:732586373:19:0 session not found"</p>
+</blockquote>
+<p>Schumacher questioned whether sessions and locks should persist across node migrations when using shared storage for <code>nfsdcld</code> state.</p>
+<h3>4. Resolution: Unified Server Scope</h3>
+<p>In the <a href="https://lore.kernel.org/linux-nfs/0173f679-f646-4d8b-afb0-3ec968d6c22b@schu.net/">final message</a>, Schumacher identified the solution. The <code>server_scope</code> parameter, which defaults to the node's hostname, must be identical across all nodes in the HA cluster. Because each node had a different hostname, the NFSv4 protocol treated them as distinct servers, causing clients to reset their sessions and lose locks.</p>
+<blockquote>
+<p>"It appears my assumption is correct because now I see my locks and sessions maintained when moving from nodeA to nodeB... the issue was this: _nfs4_proc_exchange_id: server_scope mismatch detected. The scope must be the same on all nodes in a cluster and defaults to the node hostname."</p>
+</blockquote>
+<h2>Key Technical Takeaways</h2>
+<ol>
+<li><strong>Kernel Configuration:</strong> Ensure <code>CONFIG_NFSD_LEGACY_CLIENT_TRACKING</code> is disabled to allow <code>nfsdcld</code> to use the modern upcall pipe mechanism for efficient client tracking.</li>
+<li><strong>Server Scope Consistency:</strong> For NFSv4 HA clusters using shared state storage, all nodes must be configured with the same <code>server_scope</code>. This ensures that clients recognize the failover target as the same logical server, preserving sessions and locks without requiring a full session reset.</li>
+<li><strong>Debugging Aid:</strong> The error <code>_nfs4_proc_exchange_id: server_scope mismatch detected</code> is a definitive indicator of this configuration issue.</li>
+</ol>
+<h2>Conclusion</h2>
+<p>The thread concludes with a successful resolution, emphasizing that while <code>nfsdcld</code> handles lock persistence, the NFSv4 protocol's identity verification (via <code>server_scope</code>) must also be aligned across cluster nodes to prevent session resets. This serves as an important reminder for administrators building HA NFSv4 clusters.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/0d586513-819c-4af9-8c9f-8d09d326e547@schu.net/">2026-03-06 Matthew Schumacher <a href="mailto:schu@schu.net">schu@schu.net</a> — Current state of nfsdv4 recovery.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/1fcd27cb44217d5db08e488528a2648c2906a435.camel@kernel.org/">2026-03-06 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: Current state of nfsdv4 recovery.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/816d2a4b-d8bf-4242-b774-94886967430e@schu.net/">2026-03-06 Matthew Schumacher <a href="mailto:schu@schu.net">schu@schu.net</a> — Re: Current state of nfsdv4 recovery.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/6214ba33-1ed3-4c8b-bba1-8d4894cb2dd1@schu.net/">2026-03-09 Matthew Schumacher <a href="mailto:schu@schu.net">schu@schu.net</a> — Re: Current state of nfsdv4 recovery.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/0173f679-f646-4d8b-afb0-3ec968d6c22b@schu.net/">2026-03-09 Matthew Schumacher <a href="mailto:schu@schu.net">schu@schu.net</a> — Re: Current state of nfsdv4 recovery.</a></li>
+</ul>
+  </main>
+</body>
+</html>

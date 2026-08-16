@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS: Fix kernel BUG() when mounting NFSv3 with xprtsec=tls due to unhandled TCP_TLS protocol in mountd setup</title>
+  <meta name="description" content="This week, Henry Martin submitted a targeted bug fix addressing a kernel BUG() crash that occurs when mounting an NFSv3 filesystem with the xprtsec=tls mount option. The issue stems from the NFS client&#39;s failure to handle the…">
+  <meta property="og:title" content="NFS: Fix kernel BUG() when mounting NFSv3 with xprtsec=tls due to unhandled TCP_TLS protocol in mountd setup">
+  <meta property="og:description" content="This week, Henry Martin submitted a targeted bug fix addressing a kernel BUG() crash that occurs when mounting an NFSv3 filesystem with the xprtsec=tls mount option. The issue stems from the NFS client&#39;s failure to handle the…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-03-12T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS: Fix kernel BUG() when mounting NFSv3 with xprtsec=tls due to unhandled TCP_TLS protocol in mountd setup">
+  <meta name="twitter:description" content="This week, Henry Martin submitted a targeted bug fix addressing a kernel BUG() crash that occurs when mounting an NFSv3 filesystem with the xprtsec=tls mount option. The issue stems from the NFS client&#39;s failure to handle the…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-03-12</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS: Fix kernel BUG() when mounting NFSv3 with xprtsec=tls due to unhandled TCP_TLS protocol in mountd setup</h1>
+<h2>Summary</h2>
+<h1>NFS: Fix kernel BUG() when mounting NFSv3 with xprtsec=tls</h1>
+<h2>Summary</h2>
+<p>This week, Henry Martin submitted a targeted bug fix addressing a <strong>kernel BUG() crash</strong> that occurs when mounting an NFSv3 filesystem with the <code>xprtsec=tls</code> mount option. The issue stems from the NFS client's failure to handle the <code>XPRT_TRANSPORT_TCP_TLS</code> protocol type during mountd transport setup, causing an invalid protocol value to propagate into timeout initialization code.</p>
+<h3>The Bug: Unhandled TCP_TLS Protocol in Mount Transport Setup</h3>
+<p>When a user mounts an NFSv3 share with <code>xprtsec=tls</code>, the NFS client upgrades <code>nfs_server.protocol</code> to <code>XPRT_TRANSPORT_TCP_TLS</code>. However, the function <code>nfs_set_mount_transport_protocol()</code> — responsible for configuring the transport protocol used by the mount daemon (mountd) client — does not recognize this new protocol type. As a result, <code>mount_server.protocol</code> can remain in an invalid state.</p>
+<p>Martin explained:</p>
+<blockquote>
+<p>"xprtsec=tls upgrades nfs_server.protocol to XPRT_TRANSPORT_TCP_TLS. For NFSv3, nfs_set_mount_transport_protocol() does not handle XPRT_TRANSPORT_TCP_TLS, and mount_server.protocol can remain invalid."</p>
+</blockquote>
+<p>This invalid protocol value is then passed into <code>nfs_init_timeout_values()</code>, which contains a <code>BUG()</code> assertion for unrecognized protocol types — triggering an immediate kernel panic.</p>
+<p>The crash trace included in the patch submission shows the failure path clearly:</p>
+<blockquote>
+<p>"kernel BUG at fs/nfs/client.c:512! Oops: invalid opcode: 0000 [#9] SMP KASAN NOPTI"</p>
+</blockquote>
+<p>The call trace confirms the crash originates from <code>nfs_init_timeout_values+0x235/0x27a</code>, invoked through <code>nfs_mount</code> → <code>nfs_request_mount</code> → <code>nfs_try_get_tree</code> → <code>nfs_get_tree</code>.</p>
+<h3>The Fix: Map TCP_TLS to TCP for mountd Transport</h3>
+<p>The proposed fix is minimal — a single-line addition in <code>fs/nfs/fs_context.c</code> that treats <code>XPRT_TRANSPORT_TCP_TLS</code> the same as plain TCP or RDMA when configuring the mountd transport. Martin noted:</p>
+<blockquote>
+<p>"Handle XPRT_TRANSPORT_TCP_TLS like TCP/RDMA and map it to TCP for mountd transport setup."</p>
+</blockquote>
+<p>This is a reasonable approach because the mount protocol itself (portmap/mountd) does not support TLS; TLS encryption applies only to the NFS data channel. Therefore, mapping <code>TCP_TLS</code> down to plain <code>TCP</code> for the mountd connection is semantically correct.</p>
+<p>The patch includes:</p>
+<ul>
+<li><strong>Fixes tag:</strong> <code>c8407f2e560c</code> ("NFS: Add an "xprtsec=" NFS mount option") — identifying the commit that introduced the regression.</li>
+<li><strong>Cc: stable@vger.kernel.org</strong> — indicating this should be backported to stable kernels.</li>
+</ul>
+<h3>Context: Part of a Broader TLS Hardening Effort</h3>
+<p>This patch is closely related to another fix submitted by Henry Martin earlier in the same week (<a href="https://lore.kernel.org/linux-nfs/20260309112041.1336519-1-bsdhenrymartin@gmail.com/">sunrpc: fix TLS connect_worker rpc_clnt lifetime UAF</a>), which addressed a use-after-free bug in the SUNRPC TLS transport layer. Together, these patches represent ongoing hardening of the NFS client's TLS support, which was introduced relatively recently and has been exposed to real-world testing by developers and vendors such as Hammerspace.</p>
+<h3>Classification</h3>
+<ul>
+<li><strong>Type:</strong> Bug fix</li>
+<li><strong>Component:</strong> NFS client (<code>fs/nfs/</code>)</li>
+<li><strong>Severity:</strong> Kernel crash (BUG() / Oops) — high severity, affecting any NFSv3 mount with <code>xprtsec=tls</code></li>
+<li><strong>Status:</strong> Patch submitted; no replies received within this week's window</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260309132253.1393804-1-bsdhenrymartin@gmail.com/">2026-03-09 bsdhenrymartin@gmail.com — [PATCH] NFS: map TCP_TLS to TCP for mountd transport</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260309132253.1393804-1-bsdhenrymartin@gmail.com/">2026-03-09 bsdhenrymartin@gmail.com — [PATCH] NFS: map TCP_TLS to TCP for mountd transport</a></li>
+</ul>
+  </main>
+</body>
+</html>

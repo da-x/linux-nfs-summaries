@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS Client Hangs with NFS_CS_NO_RETRANS_TIMEOUT: Protocol Semantics Debate</title>
+  <meta name="description" content="This thread originated in August 2025 when Zhangjian from Huawei reported a severe issue on NFS client kernel 5.10: over 400,000 delegations accumulated in the NFS_DELEGATION_REVOKED state, causing massive TEST_STATEID request storms after…">
+  <meta property="og:title" content="NFS Client Hangs with NFS_CS_NO_RETRANS_TIMEOUT: Protocol Semantics Debate">
+  <meta property="og:description" content="This thread originated in August 2025 when Zhangjian from Huawei reported a severe issue on NFS client kernel 5.10: over 400,000 delegations accumulated in the NFS_DELEGATION_REVOKED state, causing massive TEST_STATEID request storms after…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-03-12T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS Client Hangs with NFS_CS_NO_RETRANS_TIMEOUT: Protocol Semantics Debate">
+  <meta name="twitter:description" content="This thread originated in August 2025 when Zhangjian from Huawei reported a severe issue on NFS client kernel 5.10: over 400,000 delegations accumulated in the NFS_DELEGATION_REVOKED state, causing massive TEST_STATEID request storms after…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-03-12</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS Client Hangs with NFS_CS_NO_RETRANS_TIMEOUT: Protocol Semantics Debate</h1>
+<h2>Summary</h2>
+<h2>Background (Prior Weeks)</h2>
+<p>This thread originated in August 2025 when Zhangjian from Huawei reported a severe issue on NFS client kernel 5.10: over 400,000 delegations accumulated in the <code>NFS_DELEGATION_REVOKED</code> state, causing massive <code>TEST_STATEID</code> request storms after any non-privileged operation. The root cause was identified as <code>NFSPROC4_CLNT_DELEGRETURN</code> procedures timing out (<code>ETIMEOUT</code>), which marked delegations as revoked on the client but left them permanently in the server's <code>clp-&gt;cl_revoked</code> list. Jeff Layton noted that <em>"v5.10 is pretty old, and there have been a number of fixes in this area in both the client and server over the last several years"</em> and suggested upgrading or backporting. Trond Myklebust offered four remedies, including garbage-collecting revoked stateids on the server side. Zhangjian pushed back, arguing that server-side timeout during delegation return was not the only path to permanent revocation accumulation and that <em>"garbaging collecting revoked stateid after a while (4) is more reasonable way to avoid this problem."</em></p>
+<h2>This Week's Activity</h2>
+<p>The thread re-emerged this week with a related but distinct question about NFS client retransmission semantics. On March 6, Zhangjian reported a new hang scenario:</p>
+<blockquote>
+<p>"1.Nfs wait for sunrpc
+2.Sunrpc send OPEN message and hang the rpc task onto sunrpc pending queue.
+3.Server never reply, and since NFS_CS_NO_RETRANS_TIMEOUT is forced and connection is ESTABLISHED, task will never be retransmitted. This cause procedures waiting on this file hang forever."</p>
+</blockquote>
+<p>Zhangjian acknowledged that <code>umount -f</code> could kill the stuck RPC tasks and noted <em>"the key to the problem most likely lies in the network layer,"</em> but asked whether NFS should retransmit after a long wait regardless of the connection state.</p>
+<h3>Trond Myklebust's Response: Protocol Compliance</h3>
+<p>NFS client maintainer Trond Myklebust responded firmly on March 6, grounding his answer in the NFSv4 specification:</p>
+<blockquote>
+<p>"Please read the NFSv4 spec. It very clearly states that the client should never retransmit unless the connection breaks."</p>
+</blockquote>
+<p>He concluded bluntly:</p>
+<blockquote>
+<p>"IOW: the problem here is your broken server, not the client."</p>
+</blockquote>
+<p>This position reflects a core design principle of the Linux NFS client: under <code>hard</code> mount semantics (the default), the client must wait indefinitely for a response on an established connection to preserve POSIX consistency guarantees. The <code>NFS_CS_NO_RETRANS_TIMEOUT</code> flag enforces this by suppressing retransmission timeouts when the TCP connection is still alive.</p>
+<h3>Zhangjian's Follow-Up: Should NFS Timeout Instead?</h3>
+<p>On March 12, Zhangjian returned with a refined question, changing the subject to <em>"should nfs timeout even with NFS_CS_NO_RETRANS_TIMEOUT?"</em> He argued:</p>
+<blockquote>
+<p>"NFSv4 spec said client should never retransmit, but not said client need to wait forever. Maybe sunrpc should tell nfs -ETIMEOUT and nfs return ERROR rather than retransmit."</p>
+</blockquote>
+<p>This is a nuanced point: the spec prohibits <em>retransmission</em>, but Zhangjian suggested that returning an error (rather than hanging indefinitely) might be acceptable behavior.</p>
+<h3>Trond Myklebust's Final Response: The Slot Exhaustion Problem</h3>
+<p>Trond responded on March 12 with a detailed explanation of why unconditional timeout-and-error semantics are not viable for NFSv4 clients under <code>hard</code> mount options:</p>
+<blockquote>
+<p>"You are 100% free to use the existing 'soft' or 'softerr' mount options if you have applications that can parse those (non-POSIX) errors."</p>
+</blockquote>
+<p>He then highlighted a critical protocol constraint from RFC 8881:</p>
+<blockquote>
+<p>"Note however that there is no way to tell the server that you are 'cancelling' an RPC call, so it will hold onto that slot until it is done executing the call (see RFC8881, Section 2.10.6.1.). So you are eventually going to run out of usable slots, and the system will gum up anyway."</p>
+</blockquote>
+<p>Trond's key conclusion was:</p>
+<blockquote>
+<p>"The default mount option is 'hard', because those are the only semantics that are compatible with POSIX and NFSv4.x."</p>
+</blockquote>
+<h2>Key Technical Arguments</h2>
+<ol>
+<li>
+<p><strong>NFSv4 retransmission rules</strong>: The NFSv4 specification explicitly forbids client retransmission on an established connection. This is by design — unlike NFSv3, NFSv4 uses a slot-based compound RPC mechanism where duplicate requests could cause undefined server behavior.</p>
+</li>
+<li>
+<p><strong><code>NFS_CS_NO_RETRANS_TIMEOUT</code> semantics</strong>: This flag prevents the SUNRPC layer from timing out and retransmitting when the TCP connection is <code>ESTABLISHED</code>. The rationale is that if the connection is alive, the server may simply be slow or busy processing a long-running operation (e.g., a delegation recall).</p>
+</li>
+<li>
+<p><strong>The slot exhaustion problem</strong>: Even if the client were to unilaterally timeout and return an error, NFSv4 provides no mechanism to cancel an in-flight RPC on the server side. The server retains the allocated slot until it completes the operation. Repeated timeouts would exhaust all available slots, causing the entire mount to stall — effectively producing the same hang Zhangjian is trying to avoid.</p>
+</li>
+<li>
+<p><strong><code>soft</code> vs <code>hard</code> mount semantics</strong>: Trond emphasized that <code>soft</code> mounts (which do timeout and return errors) are non-POSIX and should only be used by applications capable of handling those error conditions gracefully. The default <code>hard</code> mount is the only POSIX-compliant option for NFSv4.</p>
+</li>
+</ol>
+<h2>Classification</h2>
+<p>This discussion is about <strong>protocol semantics and client behavior</strong>, not a new feature or bug fix per se. It centers on whether the Linux NFS client's adherence to NFSv4 retransmission rules (no retransmit on established connections) should be relaxed to allow timeout-and-error behavior. The maintainer's position is that the current behavior is correct by specification, and workarounds exist (<code>soft</code> mount options, <code>umount -f</code>) for environments with unreliable servers.</p>
+<h2>Conclusion</h2>
+<p>No code changes resulted from this week's exchange. Trond Myklebust maintained that the Linux NFS client's behavior is spec-compliant and that the root cause lies with unresponsive servers rather than client logic. Zhangjian's concerns about indefinite hangs are acknowledged but deemed an inherent trade-off of POSIX-compatible <code>hard</code> mount semantics in NFSv4. The recommended paths forward remain: use <code>soft</code>/<code>softerr</code> mount options for applications that can tolerate non-POSIX errors, or address server-side reliability issues directly.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/23b52d16-4b74-43e4-9fff-73ac57c9ef89@huawei.com/">2026-03-06 "zhangjian (CG)" <a href="mailto:zhangjian496@huawei.com">zhangjian496@huawei.com</a> — Re: [Question]nfs: never returned delegation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/80c9ba69f1d35928ea9d21e146e60f194cff7405.camel@kernel.org/">2026-03-06 Trond Myklebust <a href="mailto:trondmy@kernel.org">trondmy@kernel.org</a> — Re: [Question]nfs: never returned delegation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/77b2c3ea-52d0-4f2f-8cca-4481f3426fc5@huawei.com/">2026-03-12 "zhangjian (CG)" <a href="mailto:zhangjian496@huawei.com">zhangjian496@huawei.com</a> — Re: [Question]nfs: should nfs timeout even with NFS_CS_NO_RETRANS_TIMEOUT ?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/c42bc9a8ccb53e4afbb74734a9705459c45d7909.camel@kernel.org/">2026-03-12 Trond Myklebust <a href="mailto:trondmy@kernel.org">trondmy@kernel.org</a> — Re: [Question]nfs: should nfs timeout even with NFS_CS_NO_RETRANS_TIMEOUT ?</a></li>
+</ul>
+  </main>
+</body>
+</html>

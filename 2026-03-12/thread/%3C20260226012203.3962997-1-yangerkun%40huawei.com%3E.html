@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Reviewed-by: NFS file-lock list UAF fix using nfsi-&gt;rwsem</title>
+  <meta name="description" content="After sitting as an unreviewed RFC since late February, Yang Erkun&#39;s patch to protect NFS file-lock list traversal with nfsi-&gt;rwsem finally attracted attention from maintainer Jeff Layton this week. The result is a Reviewed-by for what…">
+  <meta property="og:title" content="Reviewed-by: NFS file-lock list UAF fix using nfsi-&gt;rwsem">
+  <meta property="og:description" content="After sitting as an unreviewed RFC since late February, Yang Erkun&#39;s patch to protect NFS file-lock list traversal with nfsi-&gt;rwsem finally attracted attention from maintainer Jeff Layton this week. The result is a Reviewed-by for what…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-03-12T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Reviewed-by: NFS file-lock list UAF fix using nfsi-&gt;rwsem">
+  <meta name="twitter:description" content="After sitting as an unreviewed RFC since late February, Yang Erkun&#39;s patch to protect NFS file-lock list traversal with nfsi-&gt;rwsem finally attracted attention from maintainer Jeff Layton this week. The result is a Reviewed-by for what…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-03-12</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Reviewed-by: NFS file-lock list UAF fix using nfsi-&gt;rwsem</h1>
+<h2>Summary</h2>
+<h1>NFS client: use-after-free in file-lock list traversal gets review and approval</h1>
+<h2>This week at a glance</h2>
+<p>After sitting as an unreviewed RFC since late February, Yang Erkun's patch to protect NFS file-lock list traversal with <code>nfsi-&gt;rwsem</code> finally attracted attention from maintainer Jeff Layton this week. The result is a <strong>Reviewed-by</strong> for what amounts to a surgical bug fix addressing a long-standing use-after-free (UAF) hazard in the NFS client's delegation and lock-reclaim paths.</p>
+<h2>Classification</h2>
+<p>This is a <strong>bug fix</strong> on the NFS client side, not a new feature or protocol change. It targets locking discipline during per-inode file-lock list walks, carrying a <code>Fixes:</code> tag pointing to commit c69899a17ca4 ("NFSv4: Update of VFS byte range lock must be atomic with the stateid update").</p>
+<h2>Background (brief bridge from prior week)</h2>
+<p>As <a href="https://lore.kernel.org/linux-nfs/20260226012203.3962997-1-yangerkun@huawei.com/">summarized last month</a>, Li Lingfeng identified a UAF bug: traversing the file-lock list requires holding <code>flc_lock</code>, but functions like <code>nfs_delegation_claim_locks</code> and <code>nfs4_reclaim_locks</code> must release it to call blocking RPC code. The reclaim path already switched to <code>nfsi-&gt;rwsem</code>; Erkun's patch extends that discipline to the delegation-claim path and relocates <code>locks_lock_inode_wait</code> out of asynchronous RPC callbacks (<code>nfs4_lock_done</code>, <code>nfs4_locku_done</code>) into the synchronous caller <code>_nfs4_proc_setlk</code>.</p>
+<p>Erkun followed up with a gentle nudge early this week:</p>
+<blockquote>
+<p>"ping again" [id://ed0b2bc6-5e43-4b20-8883-74c0c0d3362a@huawei.com]</p>
+</blockquote>
+<h2>This week's evolution</h2>
+<p>Jeff Layton weighed in on March 9 with a straightforward endorsement:</p>
+<blockquote>
+<p>"Nice work!"<br />
+"Reviewed-by: Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a>" [id://dcf0b02002857a6be502e372ebb3e175412d7184.camel@kernel.org]</p>
+</blockquote>
+<p>Layton then added an interesting methodological aside, noting he had also run the commit log through Claude for a sanity check:</p>
+<blockquote>
+<p>"FWIW, I did point Claude at this too and it found no regressions." [id://c5c31ffa3557e0aab5c1a75d6ff69cb7c7806dc1.camel@kernel.org]</p>
+</blockquote>
+<p>Claude's summary, as relayed by Layton, distilled the fix neatly:</p>
+<blockquote>
+<p>"This patch fixes a use-after-free bug in NFS file lock list traversal. The core problem was that nfs_delegation_claim_locks released flctx-&gt;flc_lock during iteration (to call nfs4_lock_delegation_recall, which can block on RPCs) and relied on so_delegreturn_mutex for protection — but that mutex is per-state-owner, not per-inode, so multiple state owners on the same inode could race."<br />
+"The fix uses nfsi-&gt;rwsem (per-inode) for proper protection, matching the existing pattern in nfs4_reclaim_locks. It also moves locks_lock_inode_wait out of RPC callbacks (nfs4_lock_done, nfs4_locku_done) into the synchronous caller (_nfs4_proc_setlk) so it can be called under nfsi-&gt;rwsem."</p>
+</blockquote>
+<p>Erkun acknowledged the review on March 10:</p>
+<blockquote>
+<p>"Hi Jeff, thanks a lot for your review!" [id://3d7e7fa3-242f-4350-8c7f-0ea81199e16c@huawei.com]</p>
+</blockquote>
+<h2>Key technical arguments</h2>
+<p>The patch's correctness rests on two pillars:</p>
+<ol>
+<li>
+<p><strong>Per-inode protection.</strong> The old guard (<code>so_delegreturn_mutex</code>) is per-state-owner, but an inode can have multiple <code>nfs4_state</code> objects. Switching to <code>nfsi-&gt;rwsem</code> aligns with the already-established pattern in <code>nfs4_reclaim_locks</code>.</p>
+</li>
+<li>
+<p><strong>No regression of the original c69899a17ca4 fix.</strong> Erkun argued that moving <code>locks_lock_inode_wait</code> out of the async callbacks does not reintroduce the atomicity bug, because later commits (notably 0460253913e5) drain slots before reclaim, and the delegation-claim path sets the stateid only once via <code>nfs4_lock_delegation_recall</code>.</p>
+</li>
+</ol>
+<h2>Final conclusions</h2>
+<p>With Jeff Layton's Reviewed-by in hand, this patch is now well-positioned for inclusion. The discussion was brief but decisive — no objections were raised, and an independent AI-assisted review corroborated the absence of regressions. This represents a clean resolution to a bug that has been on the list's radar since at least April 2025.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/ed0b2bc6-5e43-4b20-8883-74c0c0d3362a@huawei.com/">2026-03-09 Yang Erkun — ping</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/dcf0b02002857a6be502e372ebb3e175412d7184.camel@kernel.org/">2026-03-09 Jeff Layton — Reviewed-by</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/c5c31ffa3557e0aab5c1a75d6ff69cb7c7806dc1.camel@kernel.org/">2026-03-09 Jeff Layton — Claude summary of fix</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/3d7e7fa3-242f-4350-8c7f-0ea81199e16c@huawei.com/">2026-03-10 Yang Erkun — thanks for review</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/ed0b2bc6-5e43-4b20-8883-74c0c0d3362a@huawei.com/">2026-03-09 yangerkun <a href="mailto:yangerkun@huawei.com">yangerkun@huawei.com</a> — Re: [RFC PATCH] nfs: use nfsi-&gt;rwsem to protect traversal of the file lock list</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/dcf0b02002857a6be502e372ebb3e175412d7184.camel@kernel.org/">2026-03-09 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [RFC PATCH] nfs: use nfsi-&gt;rwsem to protect traversal of the file lock list</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/c5c31ffa3557e0aab5c1a75d6ff69cb7c7806dc1.camel@kernel.org/">2026-03-09 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [RFC PATCH] nfs: use nfsi-&gt;rwsem to protect traversal of the file lock list</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/3d7e7fa3-242f-4350-8c7f-0ea81199e16c@huawei.com/">2026-03-10 yangerkun <a href="mailto:yangerkun@huawei.com">yangerkun@huawei.com</a> — Re: [RFC PATCH] nfs: use nfsi-&gt;rwsem to protect traversal of the file lock list</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>sunrpc: Refactor TLS Transport to Remove rpc_clnt Dependency</title>
+  <meta name="description" content="This week&#39;s discussion focused on an architectural refactoring of the SUNRPC subsystem&#39;s TLS transport layer, proposed by Benjamin Coddington (Hammerspace). This effort follows last week&#39;s urgent fix for a use-after-free (UAF) bug in TLS…">
+  <meta property="og:title" content="sunrpc: Refactor TLS Transport to Remove rpc_clnt Dependency">
+  <meta property="og:description" content="This week&#39;s discussion focused on an architectural refactoring of the SUNRPC subsystem&#39;s TLS transport layer, proposed by Benjamin Coddington (Hammerspace). This effort follows last week&#39;s urgent fix for a use-after-free (UAF) bug in TLS…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-03-12T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="sunrpc: Refactor TLS Transport to Remove rpc_clnt Dependency">
+  <meta name="twitter:description" content="This week&#39;s discussion focused on an architectural refactoring of the SUNRPC subsystem&#39;s TLS transport layer, proposed by Benjamin Coddington (Hammerspace). This effort follows last week&#39;s urgent fix for a use-after-free (UAF) bug in TLS…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-03-12</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>sunrpc: Refactor TLS Transport to Remove rpc_clnt Dependency</h1>
+<h2>Summary</h2>
+<h1>sunrpc: Refactor TLS Transport to Remove rpc_clnt Dependency</h1>
+<p>This week's discussion focused on an architectural refactoring of the SUNRPC subsystem's TLS transport layer, proposed by Benjamin Coddington (Hammerspace). This effort follows last week's urgent fix for a use-after-free (UAF) bug in TLS connection workers <a href="https://lore.kernel.org/linux-nfs/20260309112041.1336519-1-bsdhenrymartin@gmail.com/">summarized previously</a>, which was caused by improper lifetime management of the <code>rpc_clnt</code> structure.</p>
+<h2>The Proposal: Decoupling Transport from Client</h2>
+<p>Coddington introduced <a href="https://lore.kernel.org/linux-nfs/a57879782d2d383e2d1af292fe2b9005a43ea06c.1773263233.git.bcodding@hammerspace.com/">an RFC PATCH</a> titled "sunrpc: refactor TLS transport to remove rpc_clnt dependency." The core argument is that the TLS connection worker (<code>xs_tcp_tls_setup_socket</code>) currently requires a reference to the upper-layer <code>rpc_clnt</code> to populate arguments for <code>rpc_create()</code> when setting up the lower-layer transport. This dependency created the lifetime issues and UAF risks addressed in the previous week's patch.</p>
+<blockquote>
+<p>"It is architecturally cleaner to decouple the transport connection logic from the RPC client entirely."</p>
+</blockquote>
+<p>The proposed refactoring involves:</p>
+<ul>
+<li>Removing the <code>clnt</code> member from <code>struct sock_xprt</code>.</li>
+<li>Saving the RPC program number and version from the task during <code>xs_connect()</code> into the <code>sock_xprt</code> structure.</li>
+<li>Using these saved parameters for lower-layer client creation via dummy program definitions.</li>
+<li>Updating TLS-related tracepoints to remove the <code>rpc_clnt</code> dependency.</li>
+</ul>
+<p>Coddington admitted the patch was a work in progress:</p>
+<blockquote>
+<p>"I'm not sure I like what came out here. It adds a lot of boilerplate, and it reduces the tracepoint data... This is lightly tested by hand.."</p>
+</blockquote>
+<h2>Review and Technical Critique</h2>
+<p>Chuck Lever provided a thorough review <a href="https://lore.kernel.org/linux-nfs/25094279-518a-4477-bfdb-772a48c744b5@app.fastmail.com/">on March 12</a>, acknowledging the direction but highlighting several technical concerns:</p>
+<ol>
+<li><strong>Architectural Rationale:</strong> Lever questioned why simply bumping the reference count on <code>rpc_clnt</code> wasn't sufficient, noting that while the refactor removes "abuse" in the current code, the rationale for avoiding refcounting needed expansion.</li>
+<li><strong>Safety of NULL Credentials:</strong> He asked for a rationale in the patch description regarding why using a NULL credential is safe in this context.</li>
+<li><strong>Layering Violations and Boilerplate:</strong> Lever pointed out that creating dummy <code>rpc_program</code> definitions for every NFS version (2, 3, and 4) was a "layering violation" and added unnecessary complexity. He suggested a simpler design:
+<blockquote>
+<p>"Use a single dummy version at index 0 with args-&gt;version = 0 always, relying solely on args-&gt;prognumber for the wire program number. The TLS probe never consults cl_vers -- it uses a fixed proc via msg.rpc_proc."</p>
+</blockquote>
+</li>
+<li><strong>Tracepoint Data Loss:</strong> Lever noted that dropping the program number and version from tracepoints was problematic because this information is critical for administrators debugging AUTH_TLS failures:
+<blockquote>
+<p>"The program number and version that /are/ dropped are what actually go on the wire in the AUTH_TLS NULL call, so if the probe fails, the administrator wants to know which program/version pair was rejected..."</p>
+</blockquote>
+</li>
+<li><strong>Timeout Behavior Change:</strong> He identified an unintentional change in timeout behavior, where the source shifted from the upper-layer client's configured timeout to the transport's default timeout, potentially altering retry behavior for mounts with custom settings.</li>
+<li><strong>Coding Style:</strong> Minor nitpicks regarding indentation (spaces vs. tabs) in the new static structures.</li>
+</ol>
+<p>Despite these critiques, Lever concluded positively:</p>
+<blockquote>
+<p>"The proposed refactoring seems like a sensible direction. The UAF potential is eliminated structurally, and some of the transport-to-client coupling (and layering violation) is removed."</p>
+</blockquote>
+<h2>Next Steps</h2>
+<p>Benjamin Coddington responded <a href="https://lore.kernel.org/linux-nfs/93C11692-7008-4239-B68C-227C9F21C55C@hammerspace.com/">later on March 12</a>, acknowledging the rough spots and Lever's feedback. He explained that his initial idea of a simpler dummy program was complicated by sanity-checking code in <code>rpc_new_client()</code> that verifies version consistency.</p>
+<blockquote>
+<p>"I kinda wish I could define a completely static rpc_clnt, make a mutable copy, set prognum and version and somehow get that plumbed through the rpc_create() machinery.. then throw it away.."</p>
+</blockquote>
+<p>Coddington committed to iterating on Lever's review points for a v2 patch:</p>
+<blockquote>
+<p>"Ok - thanks for looking at this and showing interest. As you've noted there are quite a few rough spots here due to me just tacking this together quickly. Sorry for the messiness. I'll plan on iterating on your review points for a v2..."</p>
+</blockquote>
+<h2>Conclusion</h2>
+<p>This thread marks a transition from an emergency bug fix to a more robust architectural solution for NFS-over-TLS. While the immediate UAF was patched last week, this RFC discussion highlights the community's commitment to cleaning up technical debt in the SUNRPC layer. The key takeaway is the consensus that decoupling the transport layer from the <code>rpc_clnt</code> is the correct long-term strategy, even if the implementation details require further refinement to address coding style, tracepoint visibility, and timeout behavior.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/a57879782d2d383e2d1af292fe2b9005a43ea06c.1773263233.git.bcodding@hammerspace.com/">2026-03-11 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — [RFC PATCH] sunrpc: refactor TLS transport to remove rpc_clnt dependency</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/25094279-518a-4477-bfdb-772a48c744b5@app.fastmail.com/">2026-03-12 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [RFC PATCH] sunrpc: refactor TLS transport to remove rpc_clnt dependency</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/93C11692-7008-4239-B68C-227C9F21C55C@hammerspace.com/">2026-03-12 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — Re: [RFC PATCH] sunrpc: refactor TLS transport to remove rpc_clnt dependency</a></li>
+</ul>
+  </main>
+</body>
+</html>

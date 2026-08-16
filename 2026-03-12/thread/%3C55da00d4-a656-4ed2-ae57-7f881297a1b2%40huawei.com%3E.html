@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS Client Infinite Loop on nfserr_grace During Reclaim</title>
+  <meta name="description" content="Type: Bug fix (NFS client state manager) Participants: Li Lingfeng (Huawei) Week ending: 2026-03-12">
+  <meta property="og:title" content="NFS Client Infinite Loop on nfserr_grace During Reclaim">
+  <meta property="og:description" content="Type: Bug fix (NFS client state manager) Participants: Li Lingfeng (Huawei) Week ending: 2026-03-12">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-03-12T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS Client Infinite Loop on nfserr_grace During Reclaim">
+  <meta name="twitter:description" content="Type: Bug fix (NFS client state manager) Participants: Li Lingfeng (Huawei) Week ending: 2026-03-12">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-03-12</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS Client Infinite Loop on nfserr_grace During Reclaim</h1>
+<h2>Summary</h2>
+<h1>NFS Client Infinite Loop During Open Reclaim When Server Returns <code>nfserr_grace</code></h1>
+<p><strong>Type:</strong> Bug fix (NFS client state manager)<br />
+<strong>Participants:</strong> Li Lingfeng (Huawei)<br />
+<strong>Week ending:</strong> 2026-03-12</p>
+<h2>Overview</h2>
+<p>This week, Huawei engineer Li Lingfeng reported a critical bug in the NFSv4 client state manager: under certain server restart and lease expiration timing conditions, the client enters an <strong>infinite loop</strong>, rendering it completely unresponsive to user operations. The issue was introduced with a patch submitted alongside the bug report <a href="https://lore.kernel.org/linux-nfs/55da00d4-a656-4ed2-ae57-7f881297a1b2@huawei.com/">on 2026-03-11</a>.</p>
+<h2>The Bug</h2>
+<p>The problem manifests when the NFS server returns <code>NFS4ERR_GRACE</code> during open state reclaim. Li Lingfeng described the scenario:</p>
+<blockquote>
+<p>"We recently encountered an issue where the NFS client's state manager gets stuck in an infinite loop, making the client unresponsive to user operations. The problem occurs when the server returns nfserr_grace during open reclaim."</p>
+</blockquote>
+<p>The root cause lies in a race condition between three conditions on the server side:</p>
+<ol>
+<li>The session exists</li>
+<li>The <code>NFSD4_CLIENT_RECLAIM_COMPLETE</code> flag is not set</li>
+<li>The <code>op_claim_type</code> is not <code>NFS4_OPEN_CLAIM_PREVIOUS</code></li>
+</ol>
+<p>When all three hold, <code>nfsd4_open</code> returns <code>nfserr_grace</code>. On the client side, the function <code>_nfs4_open_expired</code> receives this error and <strong>retries indefinitely</strong>, trapping the state manager in a loop. The stack trace provided shows the call path:</p>
+<pre><code>nfs4_state_manager
+  nfs4_do_reclaim // NFS4CLNT_RECLAIM_NOGRACE
+   nfs4_reclaim_open_state
+    __nfs4_reclaim_open_state
+     nfs41_open_expired // ops-&gt;recover_open
+      nfs4_open_expired
+       nfs4_do_open_expired
+        _nfs4_open_expired // gets NFS4ERR_GRACE and retries
+</code></pre>
+<h2>Reproduction Steps</h2>
+<p>Li Lingfeng provided a detailed 12-step reproduction procedure involving precise timing manipulation via <code>rpcdebug</code> delays on both client and server. The key steps involve:</p>
+<ol>
+<li>Establishing a normal NFS mount with an open file handle</li>
+<li>Restarting the NFS server (after changing its hostname to force state changes)</li>
+<li>Carefully manipulating debug delays to create a window where the client has flags <code>NFS4CLNT_LEASE_EXPIRED</code>, <code>NFS4CLNT_RECLAIM_NOGRACE</code>, and <code>NFS4CLNT_MANAGER_RUNNING</code> set simultaneously</li>
+<li>Releasing the delays, which triggers the infinite loop in the <code>NFS4CLNT_RECLAIM_NOGRACE</code> branch</li>
+</ol>
+<p>The resulting kernel stack trace confirms the hang:</p>
+<blockquote>
+<p><code>[&lt;0&gt;] nfs4_handle_exception+0x245/0x600</code><br />
+<code>[&lt;0&gt;] nfs4_do_open_expired+0x2c8/0x4e0</code><br />
+...<br />
+<code>[&lt;0&gt;] nfs4_state_manager+0x1644/0x17f0</code></p>
+</blockquote>
+<h2>The Fix</h2>
+<p>A patch was submitted alongside the bug report (diff omitted from ingest but referenced in the message). The fix targets the NFS client's handling of <code>NFS4ERR_GRACE</code> during open reclaim operations, ensuring that the state manager does not retry indefinitely when this error is encountered in the <code>NFS4CLNT_RECLAIM_NOGRACE</code> phase.</p>
+<h2>Significance</h2>
+<p>This bug represents a <strong>denial-of-service condition</strong> for NFSv4 clients: once triggered, the affected mount becomes completely unresponsive, requiring either a client reboot or manual intervention to kill the stuck kernel thread. The detailed reproduction steps provided by Li Lingfeng demonstrate a sophisticated understanding of the NFS state machine and will be valuable for regression testing.</p>
+<p>As of the end of this reporting window, no replies or reviews from the NFS maintainer community have been recorded. The patch awaits review and integration.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/55da00d4-a656-4ed2-ae57-7f881297a1b2@huawei.com/">2026-03-11 Li Lingfeng <a href="mailto:lilingfeng3@huawei.com">lilingfeng3@huawei.com</a> — [BUG] Server returns nfserr_grace causing client infinite loop</a></li>
+</ul>
+  </main>
+</body>
+</html>
