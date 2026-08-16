@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>sunrpc: Fix out-of-bounds read in cache sequence iteration</title>
+  <meta name="description" content="Type: Bug Fix (Memory Safety) Component: NFS/SunRPC Cache Subsystem (net/sunrpc/cache.c) Reporter: syzbot (via Chuck Lever)">
+  <meta property="og:title" content="sunrpc: Fix out-of-bounds read in cache sequence iteration">
+  <meta property="og:description" content="Type: Bug Fix (Memory Safety) Component: NFS/SunRPC Cache Subsystem (net/sunrpc/cache.c) Reporter: syzbot (via Chuck Lever)">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-04-23T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="sunrpc: Fix out-of-bounds read in cache sequence iteration">
+  <meta name="twitter:description" content="Type: Bug Fix (Memory Safety) Component: NFS/SunRPC Cache Subsystem (net/sunrpc/cache.c) Reporter: syzbot (via Chuck Lever)">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-04-23</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>sunrpc: Fix out-of-bounds read in cache sequence iteration</h1>
+<h2>Summary</h2>
+<h1>sunrpc: Prevent Out-of-Bounds Read in <code>__cache_seq_start()</code></h1>
+<p><strong>Type:</strong> Bug Fix (Memory Safety)
+<strong>Component:</strong> NFS/SunRPC Cache Subsystem (<code>net/sunrpc/cache.c</code>)
+<strong>Reporter:</strong> syzbot (via Chuck Lever)</p>
+<h2>Overview</h2>
+<p>This thread addresses a critical memory safety bug in the SunRPC cache subsystem, specifically an out-of-bounds (OOB) read vulnerability in the sequence file iteration logic. The issue was identified by syzkaller and patched by Chuck Lever, with reviews from Benjamin Coddington and NeilBrown.</p>
+<h2>Technical Details</h2>
+<p>The bug was introduced by commit <code>7b546bd89975</code> ("sunrpc/cache: improve RCU safety in cache_list walking."), which modified the tail of <code>__cache_seq_start()</code> to unconditionally store a position value:</p>
+<pre><code class="language-c">*pos = ((long long)hash &lt;&lt; 32) + 1
+</code></pre>
+<p>This change removed a prior guard that checked if <code>hash &gt;= cd-&gt;hash_size</code>. As Chuck Lever explained in his patch submission <a href="https://lore.kernel.org/linux-nfs/20260421161126.129533-1-cel@kernel.org/">here</a>:</p>
+<blockquote>
+<p>"When the while loop exits because every remaining bucket was empty, hash equals cd-&gt;hash_size, so the stored *pos is one position past the table's last valid bucket."</p>
+</blockquote>
+<p>The vulnerability manifests when <code>seq_read_iter()</code> caches this invalid index in <code>m-&gt;index</code>. A subsequent <code>pread(2)</code> at the same file offset skips the <code>traverse()</code> function and passes the stored index back to <code>__cache_seq_start()</code>. This causes the kernel to decode <code>hash = cd-&gt;hash_size</code> and dereference <code>cd-&gt;hash_table[cd-&gt;hash_size]</code>, resulting in an eight-byte slab-out-of-bounds read past the end of the allocated hash table.</p>
+<p>KASAN reported this issue on the NFSD export cache, where the hash table size is 2048 bytes (<code>EXPORT_HASHMAX * sizeof(struct hlist_head) == 256 * 8</code>).</p>
+<h2>The Fix</h2>
+<p>Chuck Lever's patch adds a bounds check at the beginning of <code>__cache_seq_start()</code> to reject input hashes that are out of range before accessing the hash table. He noted:</p>
+<blockquote>
+<p>"cache_seq_next() already bounds-checks its own loop; the start routine needs to be symmetric."</p>
+</blockquote>
+<p>This approach ensures that the sequence iteration logic remains robust against invalid indices, preventing the OOB access.</p>
+<h2>Community Response</h2>
+<p>The patch received positive feedback from key NFS developers:</p>
+<ul>
+<li>
+<p><strong>Benjamin Coddington</strong> <a href="https://lore.kernel.org/linux-nfs/B3C1AAE8-7593-4E86-8C95-E95C57585DE9@hammerspace.com/">acknowledged</a> the fix, stating:</p>
+<blockquote>
+<p>"Thanks!! We were hunting for this one. You'll probably get a Tested-by shortly."</p>
+</blockquote>
+</li>
+<li>
+<p><strong>NeilBrown</strong> <a href="https://lore.kernel.org/linux-nfs/177682599675.1474915.15004300765582458400@noble.neil.brown.name/">reviewed</a> the patch and commented:</p>
+<blockquote>
+<p>"We could of course avoid ever storing a too-large pos but adding back a test for hash at the end of __cache_seq_start() but I prefer the approach you took as it is more robust."</p>
+</blockquote>
+</li>
+</ul>
+<h2>Conclusion</h2>
+<p>This fix resolves a syzkaller-reported out-of-bounds read vulnerability in the SunRPC cache subsystem. The patch is small, targeted, and aligns with existing bounds-checking practices in the codebase. It has been reviewed and approved by multiple NFS maintainers, indicating its readiness for inclusion in the kernel tree.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260421161126.129533-1-cel@kernel.org/">2026-04-21 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH] sunrpc: prevent out-of-bounds read in __cache_seq_start()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/B3C1AAE8-7593-4E86-8C95-E95C57585DE9@hammerspace.com/">2026-04-21 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — Re: [PATCH] sunrpc: prevent out-of-bounds read in __cache_seq_start()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177682599675.1474915.15004300765582458400@noble.neil.brown.name/">2026-04-22 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH] sunrpc: prevent out-of-bounds read in __cache_seq_start()</a></li>
+</ul>
+  </main>
+</body>
+</html>

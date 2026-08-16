@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS Client: Fix nlink drop ordering with delegation returns during REMOVE</title>
+  <meta name="description" content="This week’s thread addresses a critical bug fix in the NFS client related to inode link count (nlink) management during file removal, specifically when delegations are involved. The discussion centers on correcting a regression introduced…">
+  <meta property="og:title" content="NFS Client: Fix nlink drop ordering with delegation returns during REMOVE">
+  <meta property="og:description" content="This week’s thread addresses a critical bug fix in the NFS client related to inode link count (nlink) management during file removal, specifically when delegations are involved. The discussion centers on correcting a regression introduced…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-04-23T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS Client: Fix nlink drop ordering with delegation returns during REMOVE">
+  <meta name="twitter:description" content="This week’s thread addresses a critical bug fix in the NFS client related to inode link count (nlink) management during file removal, specifically when delegations are involved. The discussion centers on correcting a regression introduced…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-04-23</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS Client: Fix nlink drop ordering with delegation returns during REMOVE</h1>
+<h2>Summary</h2>
+<h1>NFS Client: Fixing nlink Drop and Delegation Return Ordering in REMOVE</h1>
+<p>This week’s thread addresses a critical bug fix in the NFS client related to inode link count (<code>nlink</code>) management during file removal, specifically when delegations are involved. The discussion centers on correcting a regression introduced by a previous race-condition fix, ensuring that the VFS receives proper <code>FS_DELETE_SELF</code> notifications via inotify.</p>
+<h2>Context and Problem Statement</h2>
+<p>The issue stems from commit <code>bd4928ec799b</code> ("NFS: Avoid changing nlink when file removes and attribute updates race"), which was designed to prevent races between attribute cache updates and inflight RPCs during <code>REMOVE</code> operations. However, as Roberto Bergantinos Corpas explained in his initial patch submission:</p>
+<blockquote>
+<p>"However it does not take into account that REMOVE may trigger a delegation return which also advances gencount (via the attribute refresh during delegation return), and in that case the gencount mismatch is not due to an inflight RPC that already reflected the removal."</p>
+</blockquote>
+<p>The consequence of this oversight was a failure in the LTP <code>inotify04</code> test, where the VFS failed to deliver the expected deletion notification because the generation count (<code>gencount</code>) logic did not account for the side effects of delegation returns.</p>
+<h2>Evolution of the Discussion</h2>
+<h3>Initial Proposal: Force Drop</h3>
+<p>In his first submission, Roberto proposed a targeted fix that would force the drop of <code>nlink</code> if a delegation was held prior to the remove operation. He argued:</p>
+<blockquote>
+<p>"If nlink is 1 and we have a delegation before REMOVE, we should force the drop to ensure the VFS delivers the expected FS_DELETE_SELF notification."</p>
+</blockquote>
+<p>This approach was reviewed by Olga Kornievskaia but received feedback from NFS client maintainer Trond Myklebust, who suggested a more architectural solution rather than a conditional force flag.</p>
+<h3>Maintainer Feedback: Protocol-Specific Ordering</h3>
+<p>Trond Myklebust advised moving the logic deeper into the stack to ensure correct ordering with respect to delegation returns:</p>
+<blockquote>
+<p>"The right way to go about this is to push the setting of gencount from nfs_safe_remove() down into the version-specific layer so that you can order it correctly with the delegation return and call to _nfs4_proc_remove()."</p>
+</blockquote>
+<p>This feedback highlighted the need to handle NFSv3 and NFSv4 differently, as NFSv4 involves delegation returns that must be sequenced correctly before finalizing the link count drop.</p>
+<h3>Revised Solution: Version-Specific Handlers</h3>
+<p>Roberto promptly submitted <strong>v2</strong> of the patch, incorporating Trond’s suggestion. The revised approach moves the <code>gencount</code> capture and <code>nfs_drop_nlink</code> call into the version-specific remove handlers (<code>nfs3_proc_remove</code>, <code>nfs4_proc_remove</code>, etc.). This ensures that for NFSv4, the delegation return is processed before the link count is dropped, maintaining consistency with the attribute cache.</p>
+<blockquote>
+<p>"Push the setting of gencount under each version-specific layer, reordering correctly for nfsv4 case after the delegation returns."</p>
+</blockquote>
+<h2>Technical Significance</h2>
+<p>This fix is a <strong>bug fix</strong> rather than a new feature or protocol change. It is critical for:</p>
+<ol>
+<li><strong>Correct VFS Notifications:</strong> Ensuring that inotify and other filesystem watchers receive accurate <code>FS_DELETE_SELF</code> events.</li>
+<li><strong>Delegation Integrity:</strong> Properly handling the interaction between delegation returns and attribute cache updates during removal operations.</li>
+<li><strong>Test Compliance:</strong> Resolving the LTP <code>inotify04</code> failure, which is a standard compliance test for Linux filesystems.</li>
+</ol>
+<p>The patch touches multiple files in the NFS client stack (<code>fs/nfs/dir.c</code>, <code>fs/nfs/internal.h</code>, <code>fs/nfs/nfs3proc.c</code>, <code>fs/nfs/nfs4proc.c</code>, <code>fs/nfs/proc.c</code>), reflecting the need to coordinate changes across both protocol versions.</p>
+<h2>Conclusion</h2>
+<p>The thread demonstrates a collaborative and efficient development process, with a clear problem identification, constructive maintainer feedback, and a rapid iteration to a robust solution. The final patch ensures that the NFS client correctly manages inode link counts in the presence of delegations, preserving the integrity of filesystem notifications and attribute caching.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260420114331.700769-1-rbergant@redhat.com/">2026-04-20 Roberto Bergantinos Corpas <a href="mailto:rbergant@redhat.com">rbergant@redhat.com</a> — [PATCH RESEND] nfs: force drop_nlink if we have a delegation during REMOVE</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/94e8705dcd4c4cee52e6c234a533fd4968ec4fb9.camel@kernel.org/">2026-04-20 Trond Myklebust <a href="mailto:trondmy@kernel.org">trondmy@kernel.org</a> — Re: [PATCH RESEND] nfs: force drop_nlink if we have a delegation during REMOVE</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260421100046.930082-1-rbergant@redhat.com/">2026-04-21 Roberto Bergantinos Corpas <a href="mailto:rbergant@redhat.com">rbergant@redhat.com</a> — [PATCH v2] nfs: set gencount on protocol-specific remove</a></li>
+</ul>
+  </main>
+</body>
+</html>

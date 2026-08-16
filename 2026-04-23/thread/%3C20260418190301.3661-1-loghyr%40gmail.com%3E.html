@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS client: Fix directory mtime staleness under delegation after local mutations</title>
+  <meta name="description" content="This thread addresses a bug fix in the Linux NFSv4.2 client regarding stale metadata returned for directories holding a delegation after local mutations (such as rename, create, or unlink).">
+  <meta property="og:title" content="NFS client: Fix directory mtime staleness under delegation after local mutations">
+  <meta property="og:description" content="This thread addresses a bug fix in the Linux NFSv4.2 client regarding stale metadata returned for directories holding a delegation after local mutations (such as rename, create, or unlink).">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-04-23T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS client: Fix directory mtime staleness under delegation after local mutations">
+  <meta name="twitter:description" content="This thread addresses a bug fix in the Linux NFSv4.2 client regarding stale metadata returned for directories holding a delegation after local mutations (such as rename, create, or unlink).">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-04-23</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS client: Fix directory mtime staleness under delegation after local mutations</h1>
+<h2>Summary</h2>
+<h2>Context and Problem Statement</h2>
+<p>This thread addresses a <strong>bug fix</strong> in the Linux NFSv4.2 client regarding stale metadata returned for directories holding a delegation after local mutations (such as rename, create, or unlink).</p>
+<p>Tom Haynes reported that a cross-parent <code>rename(2)</code> operation leaves the client's cached modification time (<code>mtime</code>) on both parent directories stale, even though the server correctly updates its in-memory inode timestamps. The issue was identified as entirely client-side, stemming from an interaction between directory delegations and attribute invalidation logic.</p>
+<p>As Haynes explained in the cover letter <a href="https://lore.kernel.org/linux-nfs/20260418190301.3661-1-loghyr@gmail.com/">PATCH 0/1</a>:</p>
+<blockquote>
+<p>"The local rename path calls nfs4_update_changeattr_locked() and marks NFS_INO_INVALID_NLINK | NFS_INO_INVALID_DATA on each parent. The next stat(2) enters __nfs_revalidate_inode() which early-exits on a held directory delegation, returning the cached (stale) mtime without sending a GETATTR RPC."</p>
+</blockquote>
+<p>He noted that this bug reproduces against "every NFSv4 server we tested (multiple Linux knfsd versions, reffs, FreeBSD NFS)," confirming it is a client-only defect. A known workaround was disabling directory delegations via <code>echo N &gt; /sys/module/nfsv4/parameters/directory_delegations</code>.</p>
+<h2>Proposed Fix</h2>
+<p>In <a href="https://lore.kernel.org/linux-nfs/20260418190301.3661-2-loghyr@gmail.com/">PATCH 1/1</a>, Haynes proposed a minimal change to <code>fs/nfs/inode.c</code>. The patch modifies <code>__nfs_revalidate_inode()</code> to bypass the early-exit optimization (which trusts cached attributes when a delegation is held) if the cache validity flags for <code>CHANGE</code>, <code>MTIME</code>, or <code>CTIME</code> are already marked invalid.</p>
+<blockquote>
+<p>"Keep the early-exit for the fast path, but take the RPC when CHANGE, MTIME, or CTIME are already marked invalid. The delegation alone is not a guarantee of cached-attr freshness once the code itself has flagged the cache as stale."</p>
+</blockquote>
+<p>Haynes also considered an alternative approach—calling <code>nfs_update_delegated_mtime_locked()</code> from the rename completion path—but deemed the revalidation fix "defense-in-depth for any code path that marks an attr stale without taking the delegation back."</p>
+<h2>Review and Evolution</h2>
+<p>Anna Schumaker reviewed the patch on April 23rd, questioning whether the fix should be more generic. She asked:</p>
+<blockquote>
+<p>"Is this a problem only for the attributes you've flagged, or do you think it would be a problem for size, nlink, or mode attributes as well? I'm asking because we have NFS_INO_INVALID_ATTR which includes all of these attributes which might make this a little more generic rather than carving out an exception an attribute at a time."</p>
+</blockquote>
+<p>Haynes agreed in his response <a href="https://lore.kernel.org/linux-nfs/aeosOBEN-RWr1_Ae@mana/">Re: PATCH 1/1</a>:</p>
+<blockquote>
+<p>"Agreed on at least size (and probably atime), which means a little more generic would be a good thing."</p>
+</blockquote>
+<h2>Conclusion</h2>
+<p>The discussion concluded with consensus that the fix should likely be broadened to use <code>NFS_INO_INVALID_ATTR</code> rather than checking specific timestamp flags individually. This ensures that any attribute marked stale by local mutation triggers a revalidation RPC, even when a directory delegation is held. The thread ended with Haynes acknowledging the need for this more generic approach, implying a v2 patch may follow incorporating Anna's suggestion.</p>
+<p>This fix is critical for NFS client development as it restores correctness for timestamp semantics under directory delegations, ensuring userspace applications relying on <code>stat()</code> receive up-to-date metadata after local directory modifications.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260418190301.3661-1-loghyr@gmail.com/">2026-04-18 Tom Haynes <a href="mailto:loghyr@gmail.com">loghyr@gmail.com</a> — [PATCH 0/1] nfs: fix directory mtime staleness under directory delegation after local mutations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260418190301.3661-2-loghyr@gmail.com/">2026-04-18 Tom Haynes <a href="mailto:loghyr@gmail.com">loghyr@gmail.com</a> — [PATCH 1/1] nfs: don't skip revalidate on directory delegation when attrs flagged stale</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/32c25063-3b89-4d00-87c5-3334327586c3@app.fastmail.com/">2026-04-23 "Anna Schumaker" <a href="mailto:anna@kernel.org">anna@kernel.org</a> — Re: [PATCH 1/1] nfs: don't skip revalidate on directory delegation when attrs flagged stale</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aeosOBEN-RWr1_Ae@mana/">2026-04-23 Thomas Haynes <a href="mailto:loghyr@gmail.com">loghyr@gmail.com</a> — Re: [PATCH 1/1] nfs: don't skip revalidate on directory delegation when attrs flagged stale</a></li>
+</ul>
+  </main>
+</body>
+</html>

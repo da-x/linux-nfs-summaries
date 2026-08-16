@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD: Automatic NFSv4 State Revocation on Unmount via Netlink</title>
+  <meta name="description" content="This week, Chuck Lever submitted version 9 of a nine-patch series titled &quot;Automatic NFSv4 state revocation on filesystem unmount&quot; PATCH v9 0/9. The series introduces new netlink commands to allow administrators and userspace tools (like…">
+  <meta property="og:title" content="NFSD: Automatic NFSv4 State Revocation on Unmount via Netlink">
+  <meta property="og:description" content="This week, Chuck Lever submitted version 9 of a nine-patch series titled &quot;Automatic NFSv4 state revocation on filesystem unmount&quot; PATCH v9 0/9. The series introduces new netlink commands to allow administrators and userspace tools (like…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-04-23T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSD: Automatic NFSv4 State Revocation on Unmount via Netlink">
+  <meta name="twitter:description" content="This week, Chuck Lever submitted version 9 of a nine-patch series titled &quot;Automatic NFSv4 state revocation on filesystem unmount&quot; PATCH v9 0/9. The series introduces new netlink commands to allow administrators and userspace tools (like…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-04-23</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD: Automatic NFSv4 State Revocation on Unmount via Netlink</h1>
+<h2>Summary</h2>
+<h2>Overview</h2>
+<p>This week, Chuck Lever submitted version 9 of a nine-patch series titled <strong>"Automatic NFSv4 state revocation on filesystem unmount"</strong> <a href="https://lore.kernel.org/linux-nfs/20260419-umount-kills-nfsv4-state-v9-0-0660bd06d2b6@oracle.com/">PATCH v9 0/9</a>. The series introduces new netlink commands to allow administrators and userspace tools (like <code>exportfs</code>) to cleanly revoke NFSv4 state when unmounting filesystems or removing exports. This addresses a persistent operational challenge: unmounting an underlying filesystem fails with <code>EBUSY</code> if clients hold opens, locks, delegations, or layouts.</p>
+<p>The series combines critical bug fixes for pre-existing layout revocation issues with new infrastructure to support fine-grained state cleanup via netlink, replacing the older procfs-based interfaces (<code>/proc/fs/nfsd/unlock_ip</code> and <code>/proc/fs/nfsd/unlock_fs</code>).</p>
+<h2>Critical Bug Fixes in Layout State Revocation</h2>
+<p>Before adding new features, the series patches two significant bugs in the existing admin-revoked layout state handling, originally introduced by commit <code>1e33e1414bec</code>.</p>
+<h3>Infinite Loop in Layout Revocation</h3>
+<p>Patch 1/9 <a href="https://lore.kernel.org/linux-nfs/20260419-umount-kills-nfsv4-state-v9-1-0660bd06d2b6@oracle.com/">Fixes an infinite loop</a> in <code>nfsd4_revoke_states()</code>. The function <code>find_one_sb_stid()</code> skips state IDs (<code>stids</code>) whose <code>sc_status</code> is non-zero. However, the <code>SC_TYPE_LAYOUT</code> case failed to set <code>sc_status</code> before calling <code>nfsd4_close_layout()</code>. As a result, the retry loop would repeatedly find the same layout stid, hanging the revoker indefinitely.</p>
+<blockquote>
+<p>"The retry loop therefore finds the same layout stid on every iteration, hanging the revoker indefinitely."</p>
+</blockquote>
+<h3>Memory Leak in Layout Stid Cleanup</h3>
+<p>Patch 2/9 <a href="https://lore.kernel.org/linux-nfs/20260419-umount-kills-nfsv4-state-v9-2-0660bd06d2b6@oracle.com/">Handles layout stids</a> in <code>nfsd4_drop_revoked_stid()</code>. Previously, when a client sent <code>FREE_STATEID</code> for an admin-revoked layout stid, the default branch released the lock and returned without unhashing or releasing the stid. The stid remained in the IDR and on the per-client list until the client was destroyed. The fix ensures the layout stid is properly removed from the per-client list and its reference count is dropped, triggering correct cleanup via <code>nfsd4_free_layout_stateid()</code>.</p>
+<h2>Infrastructure Refactoring</h2>
+<p>To support the new netlink commands, Lever refactored the state revocation logic:</p>
+<ul>
+<li><strong>Patch 3/9</strong> <a href="https://lore.kernel.org/linux-nfs/20260419-umount-kills-nfsv4-state-v9-3-0660bd06d2b6@oracle.com/">Extracts a utility function</a> <code>revoke_one_stid()</code> to handle per-stateid revocation. This dispatches by state type and prepares the codebase for export-scoped revocation.</li>
+<li><strong>Patch 6/9</strong> standardizes iteration over state IDs by replacing <code>idr_for_each_entry_ul</code> with a while loop using <code>idr_get_next_ul()</code>.</li>
+<li><strong>Patch 7/9</strong> <a href="https://lore.kernel.org/linux-nfs/20260419-umount-kills-nfsv4-state-v9-7-0660bd06d2b6@oracle.com/">Tracks <code>svc_export</code></a> in each <code>nfs4_stid</code>. This allows the server to identify which export a state ID was acquired through, enabling fine-grained revocation without walking inode dentry aliases.</li>
+</ul>
+<h2>New Netlink Commands for State Revocation</h2>
+<p>The core of the series introduces three new netlink commands, providing structured alternatives to the legacy procfs interfaces:</p>
+<ol>
+<li>
+<p><strong><code>NFSD_CMD_UNLOCK_IP</code></strong> <a href="https://lore.kernel.org/linux-nfs/20260419-umount-kills-nfsv4-state-v9-4-0660bd06d2b6@oracle.com/">Patch 4/9</a>: Releases NLM file locks held by a specific client IP address. This is the netlink equivalent of writing to <code>/proc/fs/nfsd/unlock_ip</code>.</p>
+</li>
+<li>
+<p><strong><code>NFSD_CMD_UNLOCK_FILESYSTEM</code></strong> <a href="https://lore.kernel.org/linux-nfs/20260419-umount-kills-nfsv4-state-v9-5-0660bd06d2b6@oracle.com/">Patch 5/9</a>: Revokes all NFS state on a superblock. This mirrors <code>/proc/fs/nfsd/unlock_fs</code> and is intended for scenarios where an entire filesystem is being unmounted.</p>
+</li>
+<li>
+<p><strong><code>NFSD_CMD_UNLOCK_EXPORT</code></strong> <a href="https://lore.kernel.org/linux-nfs/20260419-umount-kills-nfsv4-state-v9-8-0660bd06d2b6@oracle.com/">Patch 8/9</a>: This is the most significant addition. It revokes NFSv4 state acquired through exports of a <em>specific path</em>, regardless of the client. Lever explains the design rationale:</p>
+</li>
+</ol>
+<blockquote>
+<p>"UNLOCK_FILESYSTEM means 'unmounting /data, release everything on this superblock.' UNLOCK_EXPORT means 'no clients remain for /data/projectA, release only the state acquired through exports of that path.'"</p>
+</blockquote>
+<p>This command allows <code>exportfs -u</code> to clean up state when the last client for a given path disconnects, enabling the underlying filesystem to be unmounted even if other exports on the same device remain active. The design avoids <code>auth_domain</code> naming complexities by matching on path identity (<code>dentry + vfsmount</code>) rather than requiring the caller to identify specific clients.</p>
+<h3>Closing Cached File Handles</h3>
+<p><strong>Patch 9/9</strong> <a href="https://lore.kernel.org/linux-nfs/20260419-umount-kills-nfsv4-state-v9-9-0660bd06d2b6@oracle.com/">Closes cached file handles</a> when revoking export state. Even after NFSv4 state is revoked, GC-managed <code>nfsd_file</code> entries in the file cache can keep the underlying filesystem busy. The new function <code>nfsd_file_close_export()</code> walks the hash table and closes eligible entries under the target export path, ensuring the filesystem can be unmounted cleanly.</p>
+<h2>Community Feedback</h2>
+<p>Christian Brauner responded to the cover letter, expressing approval of the architectural direction:</p>
+<blockquote>
+<p>"Thanks for moving this into nfsd itself. That's great to see."</p>
+</blockquote>
+<p>This refers to the series' evolution from earlier versions that proposed VFS-level changes (e.g., SRCU unmount notifier chains) to a solution implemented entirely within NFSD via netlink, which Brauner views as a positive consolidation of responsibility.</p>
+<h2>Conclusion</h2>
+<p>This mature v9 series, reviewed by Jeff Layton, resolves long-standing operational friction in NFS server administration. By fixing critical bugs in layout revocation and introducing fine-grained netlink commands for state cleanup, it enables safer and more flexible filesystem unmounting procedures. The <code>NFSD_CMD_UNLOCK_EXPORT</code> command is particularly notable for allowing administrators to remove individual exports without disrupting other active exports on the same filesystem.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260419-umount-kills-nfsv4-state-v9-1-0660bd06d2b6@oracle.com/">2026-04-19 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v9 1/9] NFSD: Fix infinite loop in layout state revocation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260419-umount-kills-nfsv4-state-v9-0-0660bd06d2b6@oracle.com/">2026-04-19 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v9 0/9] Automatic NFSv4 state revocation on filesystem unmount</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260419-umount-kills-nfsv4-state-v9-2-0660bd06d2b6@oracle.com/">2026-04-19 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v9 2/9] NFSD: Handle layout stid in nfsd4_drop_revoked_stid()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260419-umount-kills-nfsv4-state-v9-3-0660bd06d2b6@oracle.com/">2026-04-19 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v9 3/9] NFSD: Extract revoke_one_stid() utility function</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260419-umount-kills-nfsv4-state-v9-4-0660bd06d2b6@oracle.com/">2026-04-19 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v9 4/9] NFSD: Add NFSD_CMD_UNLOCK_IP netlink command</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260419-umount-kills-nfsv4-state-v9-5-0660bd06d2b6@oracle.com/">2026-04-19 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v9 5/9] NFSD: Add NFSD_CMD_UNLOCK_FILESYSTEM netlink command</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260419-umount-kills-nfsv4-state-v9-7-0660bd06d2b6@oracle.com/">2026-04-19 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v9 7/9] NFSD: Track svc_export in nfs4_stid</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260419-umount-kills-nfsv4-state-v9-6-0660bd06d2b6@oracle.com/">2026-04-19 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v9 6/9] NFSD: Replace idr_for_each_entry_ul in find_one_sb_stid()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260419-umount-kills-nfsv4-state-v9-8-0660bd06d2b6@oracle.com/">2026-04-19 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v9 8/9] NFSD: Add NFSD_CMD_UNLOCK_EXPORT netlink command</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260419-umount-kills-nfsv4-state-v9-9-0660bd06d2b6@oracle.com/">2026-04-19 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v9 9/9] NFSD: Close cached file handles when revoking export state</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260421-aufpassen-erfuhren-93a4238cb71b@brauner/">2026-04-21 Christian Brauner <a href="mailto:brauner@kernel.org">brauner@kernel.org</a> — Re: [PATCH v9 0/9] Automatic NFSv4 state revocation on filesystem unmount</a></li>
+</ul>
+  </main>
+</body>
+</html>

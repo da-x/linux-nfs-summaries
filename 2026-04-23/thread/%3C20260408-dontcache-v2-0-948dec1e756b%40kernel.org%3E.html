@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DONTCACHE: Hybrid Flusher Proposal for Batching-Aware Writeback</title>
+  <meta name="description" content="This week saw a single but significant contribution to the ongoing RWF_DONTCACHE writeback optimization thread. Ritesh Harjani (IBM) proposed a hybrid approach that attempts to reconcile two competing concerns raised in prior weeks: Jeff…">
+  <meta property="og:title" content="DONTCACHE: Hybrid Flusher Proposal for Batching-Aware Writeback">
+  <meta property="og:description" content="This week saw a single but significant contribution to the ongoing RWF_DONTCACHE writeback optimization thread. Ritesh Harjani (IBM) proposed a hybrid approach that attempts to reconcile two competing concerns raised in prior weeks: Jeff…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-04-23T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="DONTCACHE: Hybrid Flusher Proposal for Batching-Aware Writeback">
+  <meta name="twitter:description" content="This week saw a single but significant contribution to the ongoing RWF_DONTCACHE writeback optimization thread. Ritesh Harjani (IBM) proposed a hybrid approach that attempts to reconcile two competing concerns raised in prior weeks: Jeff…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-04-23</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>DONTCACHE: Hybrid Flusher Proposal for Batching-Aware Writeback</h1>
+<h2>Summary</h2>
+<h1>DONTCACHE: Proposed Hybrid Flusher Approach Balances Batching and Selectivity</h1>
+<h2>Overview</h2>
+<p>This week saw a single but significant contribution to the ongoing <code>RWF_DONTCACHE</code> writeback optimization thread. Ritesh Harjani (IBM) proposed a <strong>hybrid approach</strong> that attempts to reconcile two competing concerns raised in prior weeks: Jeff Layton's finding that per-inode writeback loses critical I/O batching benefits, and Christoph Hellwig's and Jan Kara's concern that whole-BDI flusher wakeup is too coarse-grained.</p>
+<p><strong>Classification:</strong> This is a <strong>performance optimization / bug fix</strong> discussion for existing <code>RWF_DONTCACHE</code> functionality in the mm/writeback subsystem, with implications for NFS server (NFSD) I/O modes. No new patches were submitted this week; the thread remains in architectural debate.</p>
+<h2>Prior Context (Brief)</h2>
+<p>Over the previous two weeks, Jeff Layton submitted v2 of a three-patch series replacing inline <code>filemap_flush_range()</code> calls with <code>wakeup_flusher_threads_bdi()</code> to offload DONTCACHE writeback from the writer's hot path. Two major concerns emerged:</p>
+<ol>
+<li><strong>Coarse-grained writeback:</strong> Hellwig and Kara warned that kicking the entire BDI flusher could trigger excessive writeback of unrelated dirty pages, causing regressions in mixed workloads.</li>
+<li><strong>Batching loss:</strong> Layton's extensive benchmarking demonstrated that per-inode writeback alternatives regressed by up to <strong>-32% in multi-writer throughput</strong> and <strong>-21% in random write performance</strong> due to lost I/O batching opportunities via <code>writeback_sb_inodes()</code>.</li>
+</ol>
+<p>Last week concluded with semantic agreement that DONTCACHE means "eventually write back, don't retain in cache" rather than guaranteeing immediate writeback, and rejection of per-inode writeback approaches.</p>
+<h2>This Week's Discussion</h2>
+<h3>A Hybrid Proposal: Targeted Page Counts via Whole-BDI Flusher</h3>
+<p>On April 17, Ritesh Harjani responded to Layton's benchmark analysis with a synthesis of Hellwig's earlier suggestion and the batching requirements identified by Layton:</p>
+<blockquote>
+<p>"So, if I understood it correctly, Christoph might be talking about a different approach here. Instead of kicking flusher thread to writeback pages for a single inode, if we can track the number of dontcache pages (get_nr_dontcache_pages()), then we can kick the flusher for those many target pages." <a href="https://lore.kernel.org/linux-nfs/ik9qthvr.ritesh.list@gmail.com/">Ritesh Harjani</a></p>
+</blockquote>
+<p>The key insight is that this approach would:</p>
+<ul>
+<li><strong>Preserve I/O batching:</strong> By still using the whole-BDI flusher thread (rather than per-inode <code>write_inode_now()</code> calls), the <code>blk_plug</code>'d pass through all dirty inodes via <code>writeback_sb_inodes()</code> remains intact.</li>
+<li><strong>Limit writeback scope:</strong> Instead of triggering unbounded writeback based on total dirty pages (<code>get_nr_dirty_pages</code>), the flusher would be instructed to write back only a number of pages proportional to pending DONTCACHE folios (<code>get_nr_dontcache_pages()</code>).</li>
+</ul>
+<p>Harjani acknowledged a trade-off:</p>
+<blockquote>
+<p>"I think this way we are still reducing the dirty page cache pressure - the problem which RWF_DONTCACHE is supposed to solve. But I guess, that doesn't necessarily always mean that only dontcache marked folios will get written." <a href="https://lore.kernel.org/linux-nfs/ik9qthvr.ritesh.list@gmail.com/">Ritesh Harjani</a></p>
+</blockquote>
+<p>This aligns with Hellwig's earlier refinement from last week: "I'd only expedite writing by the number of pending dontcache folios. It would still write the least recently dirtied inodes." The distinction is that LRU ordering is preserved (maintaining batching efficiency), but the <em>volume</em> of writeback is capped proportionally to DONTCACHE pressure rather than total dirty pressure.</p>
+<p>Harjani concluded with optimism about this approach:</p>
+<blockquote>
+<p>"If we implement that then, this should still help with the batching problem you mentioned and hopefully should not cause a major regression for the workload which Jan mentioned." <a href="https://lore.kernel.org/linux-nfs/ik9qthvr.ritesh.list@gmail.com/">Ritesh Harjani</a></p>
+</blockquote>
+<h2>NFS Client/Server Relevance</h2>
+<p>While this thread targets core mm/writeback infrastructure, it directly impacts <strong>NFS server (NFSD)</strong> performance. The <code>RWF_DONTCACHE</code> mode is one of three I/O modes configurable via NFSD debugfs controls. Improving dontcache write performance benefits NFS workloads relying on this mode for low-latency, cache-bypassing writes. Layton's benchmark suite explicitly includes tests against an NFS server using fio's libnfs backend.</p>
+<p>For <strong>NFS client</strong> development, the implications are indirect but noteworthy: improved NFSD dontcache performance reduces server-side writeback latency, which can improve overall NFS round-trip times for clients performing synchronous or metadata-heavy operations against servers using this I/O mode.</p>
+<h2>Final Status</h2>
+<p>The thread remains open with no v3 patches submitted. Harjani's hybrid proposal represents a potential path forward that:</p>
+<ol>
+<li>Retains the whole-BDI flusher mechanism (preserving I/O batching)</li>
+<li>Introduces DONTCACHE-aware page counting (<code>get_nr_dontcache_pages()</code>) to limit writeback volume</li>
+<li>Accepts that non-DONTCACHE pages may be written incidentally, but caps total pressure</li>
+</ol>
+<p>Key open items remain:</p>
+<ul>
+<li>Implementation details for the new <code>WB_start_dontcache</code> bit and node counter infrastructure Hellwig originally proposed</li>
+<li>Whether Jens Axboe (block layer maintainer) will weigh in on the approach</li>
+<li>Validation that this hybrid mechanism avoids both the batching regressions identified by Layton and the noisy-neighbor regressions described by Kara</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/ik9qthvr.ritesh.list@gmail.com/">2026-04-17 Ritesh Harjani (IBM) <a href="mailto:ritesh.list@gmail.com">ritesh.list@gmail.com</a> — Re: [PATCH v2 1/3] mm: kick writeback flusher instead of inline flush for IOCB_DONTCACHE</a></li>
+</ul>
+  </main>
+</body>
+</html>

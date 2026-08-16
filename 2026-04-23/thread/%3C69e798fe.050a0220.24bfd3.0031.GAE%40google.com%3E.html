@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>syzbot Reports Slab-Out-of-Bounds Read in NFS/sunrpc Cache Sequence Iterator</title>
+  <meta name="description" content="On April 21, syzbot reported a KASAN-detected slab-out-of-bounds read in the SUNRPC cache subsystem, triggered during NFS daemon (NFSD) export cache operations. The bug was discovered on an upstream kernel tree and is reachable via…">
+  <meta property="og:title" content="syzbot Reports Slab-Out-of-Bounds Read in NFS/sunrpc Cache Sequence Iterator">
+  <meta property="og:description" content="On April 21, syzbot reported a KASAN-detected slab-out-of-bounds read in the SUNRPC cache subsystem, triggered during NFS daemon (NFSD) export cache operations. The bug was discovered on an upstream kernel tree and is reachable via…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-04-23T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="syzbot Reports Slab-Out-of-Bounds Read in NFS/sunrpc Cache Sequence Iterator">
+  <meta name="twitter:description" content="On April 21, syzbot reported a KASAN-detected slab-out-of-bounds read in the SUNRPC cache subsystem, triggered during NFS daemon (NFSD) export cache operations. The bug was discovered on an upstream kernel tree and is reachable via…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-04-23</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>syzbot Reports Slab-Out-of-Bounds Read in NFS/sunrpc Cache Sequence Iterator</h1>
+<h2>Summary</h2>
+<h2>syzbot Reports Slab-Out-of-Bounds Read in <code>cache_seq_start_rcu</code></h2>
+<p>On April 21, syzbot reported a KASAN-detected slab-out-of-bounds read in the SUNRPC cache subsystem, triggered during NFS daemon (NFSD) export cache operations. The bug was discovered on an upstream kernel tree and is reachable via unprivileged user namespaces.</p>
+<h3>The Bug Report</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/69e798fe.050a0220.24bfd3.0031.GAE@google.com/">syzbot filed the report</a> with a detailed KASAN trace showing:</p>
+<blockquote>
+<p>BUG: KASAN: slab-out-of-bounds in __cache_seq_start net/sunrpc/cache.c:1351 [inline]
+BUG: KASAN: slab-out-of-bounds in cache_seq_start_rcu+0x3fe/0x420 net/sunrpc/cache.c:1399</p>
+</blockquote>
+<p>The out-of-bounds read occurs at address <code>ffff88802ae92800</code>, which is exactly 0 bytes to the right of a 2048-byte <code>kmalloc-2k</code> allocation — the NFSD export cache's hash table (<code>EXPORT_HASHMAX * sizeof(struct hlist_head) == 256 * 8 = 2048</code> bytes). The read was triggered by a <code>pread64()</code> syscall on a procfs interface, walking through <code>seq_read_iter()</code> → <code>cache_seq_start_rcu()</code> → <code>__cache_seq_start()</code>.</p>
+<p>The allocation trace shows the hash table was created during network namespace initialization via <code>cache_create_net()</code> → <code>nfsd_export_init()</code> → <code>nfsd_net_init()</code>, triggered by an <code>unshare()</code> syscall.</p>
+<h3>Classification: Bug Fix</h3>
+<p>This is a <strong>bug fix</strong> for a memory safety issue in the SUNRPC cache subsystem, which underpins NFS client and server caching infrastructure. The bug involves reading one <code>hlist_head</code> past the end of the allocated hash table when iterating over cache entries via RCU-protected sequence files.</p>
+<h3>Root Cause Analysis</h3>
+<p>While no developer replies appeared within this week's window, related patches submitted shortly after reveal the root cause: a prior commit (<code>7b546bd89975</code>, "sunrpc/cache: improve RCU safety in cache_list walking") removed a bounds-checking guard (<code>hash &gt;= cd-&gt;hash_size</code>) from <code>__cache_seq_start()</code>. When the iteration loop exhausts all empty buckets, <code>hash</code> equals <code>cd-&gt;hash_size</code>, and the stored position pointer encodes an index one past the last valid bucket. A subsequent <code>pread()</code> at the same file offset reuses this out-of-bounds index, leading to the slab-out-of-bounds read.</p>
+<h3>Context: Independent Fixes Submitted</h3>
+<p>Two independent patches addressing this issue were submitted in the days following the report (outside this week's window):</p>
+<ol>
+<li>
+<p><strong>Chuck Lever</strong> (<a href="https://lore.kernel.org/linux-nfs/20260421161126.129533-1-cel@kernel.org/"><code>cel@kernel.org</code></a>) proposed a fix that rejects an input hash value out of range before touching the hash table, noting:</p>
+<blockquote>
+<p>"cache_seq_next() already bounds-checks its own loop; the start routine needs to be symmetric."</p>
+</blockquote>
+</li>
+<li>
+<p><strong>Alessandro Zanni</strong> (<a href="https://lore.kernel.org/linux-nfs/20260428134230.136533-1-alessandro.zanni87@gmail.com/"><code>alessandro.zanni87@gmail.com</code></a>) submitted a similar fix that verifies the hash index is within <code>hash_size</code> before dereferencing the hash table.</p>
+</li>
+</ol>
+<p>Both patches cite the same syzbot report and target the same function (<code>__cache_seq_start()</code> in <code>net/sunrpc/cache.c</code>).</p>
+<h3>Significance for NFS Client Development</h3>
+<p>While this bug manifests primarily in the NFSD (server-side) export cache, the affected code resides in <code>net/sunrpc/cache.c</code> — shared infrastructure used by both NFS client and server components. The SUNRPC cache subsystem is critical for managing various RPC-level caches including authentication, address resolution, and directory delegation state. A memory safety bug in this core infrastructure affects the reliability of all NFS operations that depend on cached data.</p>
+<h3>Conclusion</h3>
+<p>This week's activity consists solely of the initial syzbot bug report. No developer discussion or resolution occurred within the reporting window. The bug represents a genuine memory safety vulnerability reachable via unprivileged user namespaces, and two independent fixes were submitted in the following days to address the out-of-bounds read in the RCU-protected cache sequence iterator.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/69e798fe.050a0220.24bfd3.0031.GAE@google.com/">2026-04-21 syzbot <a href="mailto:syzbot+60cfa08822470bbebe44@syzkaller.appspotmail.com">syzbot+60cfa08822470bbebe44@syzkaller.appspotmail.com</a> — [syzbot] [net?] [nfs?] KASAN: slab-out-of-bounds Read in cache_seq_start_rcu</a></li>
+</ul>
+  </main>
+</body>
+</html>

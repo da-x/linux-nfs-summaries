@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RFC: Hardcoding sunrpc pool_mode to pernode and removing legacy modes</title>
+  <meta name="description" content="This week saw an RFC patch proposal from Jeff Layton aimed at simplifying the SunRPC server-side thread pool configuration by hardcoding pool_mode to pernode and removing all other legacy modes (auto, global, percpu). The discussion…">
+  <meta property="og:title" content="RFC: Hardcoding sunrpc pool_mode to pernode and removing legacy modes">
+  <meta property="og:description" content="This week saw an RFC patch proposal from Jeff Layton aimed at simplifying the SunRPC server-side thread pool configuration by hardcoding pool_mode to pernode and removing all other legacy modes (auto, global, percpu). The discussion…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-04-23T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="RFC: Hardcoding sunrpc pool_mode to pernode and removing legacy modes">
+  <meta name="twitter:description" content="This week saw an RFC patch proposal from Jeff Layton aimed at simplifying the SunRPC server-side thread pool configuration by hardcoding pool_mode to pernode and removing all other legacy modes (auto, global, percpu). The discussion…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-04-23</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>RFC: Hardcoding sunrpc pool_mode to pernode and removing legacy modes</h1>
+<h2>Summary</h2>
+<h2>Discussion Overview</h2>
+<p>This week saw an RFC patch proposal from Jeff Layton aimed at simplifying the SunRPC server-side thread pool configuration by hardcoding <code>pool_mode</code> to <code>pernode</code> and removing all other legacy modes (<code>auto</code>, <code>global</code>, <code>percpu</code>). The discussion centers on NFS server (nfsd) infrastructure, specifically how RPC service threads are mapped to NUMA nodes.</p>
+<h2>Key Technical Arguments</h2>
+<h3>The Proposal: Simplify by Hardcoding <code>pernode</code></h3>
+<p>Jeff Layton proposed a significant cleanup of the <code>svc_pool</code> machinery in <a href="https://lore.kernel.org/linux-nfs/20260423-sunrpc-pool-mode-v1-1-b7f20e35749b@kernel.org/">his RFC patch</a>. The core argument is that the complexity of multiple pool modes is no longer justified:</p>
+<blockquote>
+<p>"The SVC_POOL_AUTO/GLOBAL/PERCPU/PERNODE pool mode selection machinery was added when NUMA was new and the right default was unclear. Today, pernode is the right choice everywhere"</p>
+</blockquote>
+<p>Layton outlined two key technical justifications:</p>
+<ol>
+<li><strong>On multi-NUMA hosts</strong>: <code>pernode</code> provides one pool per node with proper thread affinity and NUMA-local memory allocation.</li>
+<li><strong>On single-node hosts</strong>: <code>pernode</code> degenerates to exactly one pool, identical to the old "global" mode, with no performance penalty since <code>svc_pool_for_cpu()</code> short-circuits when <code>sv_nrpools &lt;= 1</code>.</li>
+</ol>
+<p>He also noted that the <code>percpu</code> mode was problematic:</p>
+<blockquote>
+<p>"The percpu mode (one pool per CPU) created excessive pools relative to the number of threads most deployments run, and was only auto-selected in a narrow case (single node, &gt;2 CPUs)."</p>
+</blockquote>
+<p>The patch removes 202 lines of code while adding 29, effectively stripping out the <code>SVC_POOL_*</code> enum, mode selection heuristics, and associated switch statements.</p>
+<h3>Chuck Lever's Feedback: Backward Compatibility Concerns</h3>
+<p>Chuck Lever responded <a href="https://lore.kernel.org/linux-nfs/f61f49b8-c9c7-4a19-ba03-7f5967fcced8@app.fastmail.com/">with a nuanced critique</a>, agreeing with the end goal but raising significant concerns about the transition path:</p>
+<blockquote>
+<p>"Generally, I think the end goal of making 'per-node' the default and only setting is correct. My comments below are about how we get there."</p>
+</blockquote>
+<h4>The Backward Compatibility Issue</h4>
+<p>Lever's primary concern was that the patch claims backward compatibility while actually breaking existing configurations. He pointed out that the module parameter interface would reject legacy values with <code>-EINVAL</code>:</p>
+<blockquote>
+<p>"The concern is that the accepted input set has narrowed from four strings to one and the setters reject the legacy three with -EINVAL. For the module parameter that path runs at module load, so existing modprobe.d configs written any time in the last ~19 years will cause load-time parameter errors. Some might categorize that as a regression."</p>
+</blockquote>
+<p>He clarified the distinction between interface shape preservation and behavioral compatibility:</p>
+<blockquote>
+<p>"Or, put another way, the proposed patch implements something slightly different than true backwards compatibility. Userspace that previously set pool_mode=global/percpu/auto now gets -EINVAL, which technically speaking is a behavioral narrowing, not 'backward compatibility.'"</p>
+</blockquote>
+<h4>Proposed Alternative Approach</h4>
+<p>Lever suggested a more gradual deprecation strategy for kernel v7.2:</p>
+<blockquote>
+<p>"I might go even further and suggest that perhaps for v7.2:</p>
+<ul>
+<li>Change the behavior of 'auto' to be per-node</li>
+<li>Add a deprecation warning that is emitted when setting other modes, but don't warn when the value is specifically the only accepted one.
+Then wait a few more cycles before removal of percpu and global."</li>
+</ul>
+</blockquote>
+<p>This approach would accept-and-ignore old values (with warnings) rather than hard-failing, which Lever described as "the historically correct approach for this kind of obsoleted tuning knob."</p>
+<h4>Hardware-Specific Concerns</h4>
+<p>Lever also raised an important technical note regarding hardware platforms:</p>
+<blockquote>
+<p>"The existing pernode path assumes every online node has both CPUs and some memory. nr_online_nodes on some platforms (e.g., certain ARM64, CXL) counts memoryless or CPU-less nodes; for_each_node_with_cpus() vs. for_each_online_node() matters here."</p>
+</blockquote>
+<p>This highlights a potential bug in the current <code>pernode</code> implementation on specialized hardware architectures where NUMA nodes may lack CPUs or memory.</p>
+<h2>Evolution of the Discussion</h2>
+<p>The thread is brief, consisting of only two messages, but represents a classic kernel development pattern:</p>
+<ol>
+<li><strong>RFC Proposal</strong>: Layton presents a radical simplification patch, acknowledging it might be "too radical as a single step."</li>
+<li><strong>Constructive Feedback</strong>: Lever validates the direction but insists on a more careful backward-compatibility strategy and points out hardware edge cases.</li>
+</ol>
+<h2>Final Conclusions</h2>
+<p>No final decision was reached this week, as the thread is still in RFC stage. However, the key takeaways are:</p>
+<ul>
+<li><strong>Agreement on direction</strong>: Both developers agree that <code>pernode</code> should become the default and eventually the only mode.</li>
+<li><strong>Disagreement on pace</strong>: Layton's single-step removal approach was challenged by Lever's preference for a multi-cycle deprecation with accept-and-ignore semantics.</li>
+<li><strong>Technical debt identified</strong>: The <code>percpu</code> mode is acknowledged as creating excessive pools, and the hardware-specific behavior of <code>nr_online_nodes</code> on ARM64/CXL platforms needs attention.</li>
+</ul>
+<p>This discussion falls under <strong>NFS server infrastructure cleanup</strong> rather than a bug fix or new feature. It addresses technical debt accumulated over ~19 years of sunrpc development since NUMA-aware pool modes were first introduced. The outcome will likely influence how nfsd scales on modern multi-NUMA servers and specialized hardware platforms.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260423-sunrpc-pool-mode-v1-1-b7f20e35749b@kernel.org/">2026-04-23 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH RFC] sunrpc: hardcode pool_mode to pernode, remove other modes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/f61f49b8-c9c7-4a19-ba03-7f5967fcced8@app.fastmail.com/">2026-04-23 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH RFC] sunrpc: hardcode pool_mode to pernode, remove other modes</a></li>
+</ul>
+  </main>
+</body>
+</html>
