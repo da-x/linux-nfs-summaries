@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd: Diagnosing nfsd_file Slab Cache Leak on Shutdown</title>
+  <meta name="description" content="This week, Wolfgang Walter reported a kernel BUG occurring during the shutdown of an NFS server running vanilla stable kernel 6.18.19. The issue manifests as a slab cache error when nfsd attempts to destroy its file cache, indicating that…">
+  <meta property="og:title" content="nfsd: Diagnosing nfsd_file Slab Cache Leak on Shutdown">
+  <meta property="og:description" content="This week, Wolfgang Walter reported a kernel BUG occurring during the shutdown of an NFS server running vanilla stable kernel 6.18.19. The issue manifests as a slab cache error when nfsd attempts to destroy its file cache, indicating that…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-04-02T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd: Diagnosing nfsd_file Slab Cache Leak on Shutdown">
+  <meta name="twitter:description" content="This week, Wolfgang Walter reported a kernel BUG occurring during the shutdown of an NFS server running vanilla stable kernel 6.18.19. The issue manifests as a slab cache error when nfsd attempts to destroy its file cache, indicating that…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-04-02</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd: Diagnosing nfsd_file Slab Cache Leak on Shutdown</h1>
+<h2>Summary</h2>
+<p>This week, Wolfgang Walter reported a kernel BUG occurring during the shutdown of an NFS server running vanilla stable kernel 6.18.19. The issue manifests as a slab cache error when <code>nfsd</code> attempts to destroy its file cache, indicating that objects were not properly released.</p>
+<h3>The Bug Report</h3>
+<p>Wolfgang Walter described encountering the following BUG almost every time he rebooted his NFS server:</p>
+<blockquote>
+<p>"BUG nfsd_file (Not tainted): Objects remaining on __kmem_cache_shutdown()"</p>
+</blockquote>
+<p>The stack trace pointed directly to <code>nfsd_file_cache_shutdown</code> calling <code>kmem_cache_destroy</code>, which failed because the <code>nfsd_file</code> slab cache still contained allocated objects. This is a critical resource leak in the NFS server (<code>nfsd</code>) subsystem, where file references are not being dropped before module unload or service termination.</p>
+<h3>Diagnosis and Root Cause</h3>
+<p>NFS maintainer Chuck Lever quickly identified the likely culprit. He suggested that Wolfgang's kernel might be missing a specific fix for a reference counting leak:</p>
+<blockquote>
+<p>"Perhaps your kernel is missing commit 8072e34e1387 ("nfsd: fix nfsd_file reference leak in nfsd4_add_rdaccess_to_wrdeleg()")." <a href="https://lore.kernel.org/linux-nfs/d9a63d25-2cec-4dbc-af0e-6b1ae46266d8@app.fastmail.com/">Chuck Lever</a></p>
+</blockquote>
+<h3>Resolution and Context</h3>
+<p>Wolfgang confirmed that the patch in question is included in stable kernel 6.18.20 (as commit <code>c07dc84ed67c</code>). He provided the full commit message, which details the technical root cause:</p>
+<p>The bug originates in <code>nfsd4_add_rdaccess_to_wrdeleg()</code>. This function unconditionally overwrites <code>fp-&gt;fi_fds[O_RDONLY]</code> with a newly acquired <code>nfsd_file</code>. However, if the client already had a <code>SHARE_ACCESS_READ</code> open from a previous operation, this overwrite discarded the existing pointer without releasing its reference, effectively orphaning it.</p>
+<p>Furthermore, the interaction between delegation cleanup (<code>put_deleg_file</code>) and access counting (<code>nfs4_file_put_access</code>) meant that if another READ open existed on the file, the reference counter would remain elevated. Consequently, the <code>nfsd_file</code> reference from the delegation was never released.</p>
+<blockquote>
+<p>"Then, on server shutdown, these leaks cause __nfsd_file_cache_purge() to encounter files with an elevated reference count that cannot be cleaned up, ultimately triggering a BUG() in kmem_cache_destroy() because there are still nfsd_file objects allocated in that cache." <a href="https://lore.kernel.org/linux-nfs/e63939a5749c2cb27bfc33d223dbb954@stwm.de/">Wolfgang Walter</a></p>
+</blockquote>
+<h3>Conclusion</h3>
+<p>This thread highlights a significant bug fix for NFS server stability. The leak of <code>nfsd_file</code> references prevents clean shutdowns and triggers kernel warnings/BUGs due to slab cache inconsistencies. Users running kernels prior to the inclusion of commit <code>8072e34e1387</code> (upstream) or its stable backports are advised to upgrade to avoid this issue, particularly in environments where write delegations and read accesses coexist on the same files.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/aa45976e7e85e06a426765c5a17865c1@stwm.de/">2026-03-27 Wolfgang Walter <a href="mailto:linux@stwm.de">linux@stwm.de</a> — 6.18.19 (and probably earlier): get BUG nfsd_file (Not tainted): Objects remaining on __kmem_cache_shutdown()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/d9a63d25-2cec-4dbc-af0e-6b1ae46266d8@app.fastmail.com/">2026-03-27 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: 6.18.19 (and probably earlier): get BUG nfsd_file (Not tainted): Objects remaining on __kmem_cache_shutdown()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/e63939a5749c2cb27bfc33d223dbb954@stwm.de/">2026-03-27 Wolfgang Walter <a href="mailto:linux@stwm.de">linux@stwm.de</a> — Re: 6.18.19 (and probably earlier): get BUG nfsd_file (Not tainted): Objects remaining on __kmem_cache_shutdown()</a></li>
+</ul>
+  </main>
+</body>
+</html>

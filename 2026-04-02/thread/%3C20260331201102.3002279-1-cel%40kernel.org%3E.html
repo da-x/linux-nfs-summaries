@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>exportfs: Release NFSv4 state when last client is unexported</title>
+  <meta name="description" content="This is a bug fix / userspace enhancement to nfs-utils, specifically targeting the exportfs utility. The patch addresses a persistent operational pain point for NFS server administrators: the inability to unmount filesystems after removing…">
+  <meta property="og:title" content="exportfs: Release NFSv4 state when last client is unexported">
+  <meta property="og:description" content="This is a bug fix / userspace enhancement to nfs-utils, specifically targeting the exportfs utility. The patch addresses a persistent operational pain point for NFS server administrators: the inability to unmount filesystems after removing…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-04-02T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="exportfs: Release NFSv4 state when last client is unexported">
+  <meta name="twitter:description" content="This is a bug fix / userspace enhancement to nfs-utils, specifically targeting the exportfs utility. The patch addresses a persistent operational pain point for NFS server administrators: the inability to unmount filesystems after removing…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-04-02</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>exportfs: Release NFSv4 state when last client is unexported</h1>
+<h2>Summary</h2>
+<h1>exportfs: Release NFSv4 State When Last Client Is Unexported</h1>
+<h2>Classification</h2>
+<p>This is a <strong>bug fix / userspace enhancement</strong> to <code>nfs-utils</code>, specifically targeting the <code>exportfs</code> utility. The patch addresses a persistent operational pain point for NFS server administrators: the inability to unmount filesystems after removing exports due to lingering NFSv4 state (opens, locks, delegations).</p>
+<h2>Overview</h2>
+<p>This week, Chuck Lever submitted a standalone patch to <code>nfs-utils</code> that enables <code>exportfs -u</code> to automatically revoke NFSv4 client state when the last export entry for a given path is removed. This submission represents the long-awaited userspace integration of the kernel-side netlink UNLOCK commands (<code>NFSD_CMD_UNLOCK_IP</code>, <code>NFSD_CMD_UNLOCK_FILESYSTEM</code>, <code>NFSD_CMD_UNLOCK_EXPORT</code>) that were reviewed and accepted in prior weeks.</p>
+<p>As noted in <a href="https://lore.kernel.org/linux-nfs/20260326-umount-kills-nfsv4-state-v5-0-d2ce071b3570@oracle.com/">the review of Lever's v5 kernel series</a>, Lever had previously hinted at this userspace work:</p>
+<blockquote>
+<p>"I have a version of exportfs that performs the netlink UNLOCK command as part of unexporting... I'm sure there are some details about that logic/policy that will need more debate." — <a href="https://lore.kernel.org/linux-nfs/68739c85-3964-4cee-aea5-cb625be42caf@kernel.org/">Chuck Lever</a></p>
+</blockquote>
+<p>This patch is the realization of that promise.</p>
+<h2>Key Technical Arguments</h2>
+<h3>The Problem: EBUSY on Unmount After Export Removal</h3>
+<p>The core issue is well-documented in the NFS community. When an administrator removes an export using <code>exportfs -u</code>, the kernel's NFSv4 state (opens, locks, delegations) acquired by clients through that export remains active. These open file handles keep the underlying filesystem busy, causing subsequent <code>umount</code> attempts to fail with <code>EBUSY</code>.</p>
+<p>Lever describes this in the patch commit message:</p>
+<blockquote>
+<p>"When exportfs -u removes the last client for a given export path, NFSv4 state (opens, locks, delegations) acquired through that export may still hold the underlying filesystem busy, preventing unmount." — <a href="https://lore.kernel.org/linux-nfs/20260331201102.3002279-1-cel@kernel.org/">Chuck Lever</a></p>
+</blockquote>
+<h3>The Solution: Netlink-Driven State Revocation</h3>
+<p>The patch introduces logic into <code>exportfs</code> that, after removing an export entry, checks whether any active exports remain for the same path across all client types. If none remain, it sends the <code>NFSD_CMD_UNLOCK_EXPORT</code> command to the kernel via generic netlink, which revokes the associated NFSv4 state and closes cached file handles.</p>
+<blockquote>
+<p>"After removing an export entry, check whether any active exports remain for the same path across all client types. If none remain, send NFSD_CMD_UNLOCK_EXPORT to the kernel via generic netlink, which revokes the associated NFSv4 state and closes cached file handles." — <a href="https://lore.kernel.org/linux-nfs/20260331201102.3002279-1-cel@kernel.org/">Chuck Lever</a></p>
+</blockquote>
+<h3>Shared Netlink Helper Infrastructure</h3>
+<p>A notable architectural decision is the introduction of a new shared helper function, <code>nfsd_nl_cmd_str()</code>, in <code>support/nfs/nfsdnl.c</code>. This helper abstracts the netlink socket setup, message construction, and ACK handling for simple nfsd commands carrying a single string attribute. The helper is conditionally compiled when <code>libnl3</code> is available, gated by the existing <code>nfsdctl</code> configure option.</p>
+<p>This shared infrastructure approach suggests that future userspace tools beyond <code>exportfs</code> may leverage these netlink capabilities without duplicating socket management code.</p>
+<h3>Updated Netlink Header Definitions</h3>
+<p>The patch also updates the local <code>nfsd_netlink.h</code> copy in <code>utils/nfsdctl/</code> with the definitions for <code>NFSD_CMD_UNLOCK_IP</code>, <code>NFSD_CMD_UNLOCK_FILESYSTEM</code>, and <code>NFSD_CMD_UNLOCK_EXPORT</code>, ensuring userspace has the necessary protocol definitions to communicate with the kernel's new netlink interface.</p>
+<h2>Evolution of the Discussion</h2>
+<p>This thread consists of a single patch submission with no replies within this week's window. However, its context is deeply rooted in prior discussions:</p>
+<ol>
+<li>
+<p><strong>Kernel Infrastructure (Prior Week)</strong>: The v5 series introducing the three UNLOCK netlink commands to the kernel was reviewed by Jeff Layton, who granted <code>Reviewed-by</code> tags and engaged in technical debates about locking correctness and tracepoint efficiency. Lever stated that these commands "stand alone as a feature" even without userspace integration.</p>
+</li>
+<li>
+<p><strong>Companion Netlink Upcall Series (Prior Week)</strong>: Jeff Layton's 13-patch series adding netlink upcall support for <code>mountd</code>/<code>exportd</code> was applied to the <code>nfsd-testing</code> tree by Chuck Lever, establishing the broader netlink communication framework that this <code>exportfs</code> patch builds upon.</p>
+</li>
+<li>
+<p><strong>Policy Considerations</strong>: Lever had previously noted that "details about that logic/policy will need more debate," particularly regarding edge cases such as whether revocation should be skipped during system shutdown to allow for state recovery. This patch appears to implement a straightforward policy: revoke state only when the last export for a path is removed.</p>
+</li>
+</ol>
+<h2>Final Conclusions</h2>
+<p>This patch represents a critical piece of the puzzle in resolving the <code>EBUSY</code> unmount problem that has long plagued NFS server administrators. By integrating the kernel's new netlink UNLOCK commands into <code>exportfs</code>, users can now cleanly remove exports and subsequently unmount filesystems without manual intervention to flush stale NFSv4 state.</p>
+<p>The patch touches six files across the <code>nfs-utils</code> codebase, adding 115 lines of code while removing only 3. The introduction of the shared <code>nfsd_nl_cmd_str()</code> helper suggests a forward-looking design that will benefit future userspace tools requiring netlink communication with nfsd.</p>
+<p>As this is a standalone submission with no replies in this week's window, its ultimate fate depends on review from the <code>nfs-utils</code> maintainers and broader community feedback. Given the strong prior support for the underlying kernel infrastructure, this patch is well-positioned for acceptance.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260331201102.3002279-1-cel@kernel.org/">2026-03-31 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH] exportfs: release NFSv4 state when last client is unexported</a></li>
+</ul>
+  </main>
+</body>
+</html>

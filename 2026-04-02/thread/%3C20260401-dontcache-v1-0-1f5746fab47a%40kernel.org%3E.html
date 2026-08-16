@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>mm: Improve RWF_DONTCACHE Write Performance and Reduce Lock Contention</title>
+  <meta name="description" content="This week, Jeff Layton proposed a patch series aimed at significantly improving write performance for the RWF_DONTCACHE IO mode, which is increasingly relevant for NFS server (nfsd) configurations that allow users to select IO modes via…">
+  <meta property="og:title" content="mm: Improve RWF_DONTCACHE Write Performance and Reduce Lock Contention">
+  <meta property="og:description" content="This week, Jeff Layton proposed a patch series aimed at significantly improving write performance for the RWF_DONTCACHE IO mode, which is increasingly relevant for NFS server (nfsd) configurations that allow users to select IO modes via…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-04-02T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="mm: Improve RWF_DONTCACHE Write Performance and Reduce Lock Contention">
+  <meta name="twitter:description" content="This week, Jeff Layton proposed a patch series aimed at significantly improving write performance for the RWF_DONTCACHE IO mode, which is increasingly relevant for NFS server (nfsd) configurations that allow users to select IO modes via…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-04-02</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>mm: Improve RWF_DONTCACHE Write Performance and Reduce Lock Contention</h1>
+<h2>Summary</h2>
+<h2>Overview</h2>
+<p>This week, Jeff Layton proposed a patch series aimed at significantly improving write performance for the <code>RWF_DONTCACHE</code> IO mode, which is increasingly relevant for NFS server (<code>nfsd</code>) configurations that allow users to select IO modes via debugfs controls. The series addresses severe throughput collapses and tail latency spikes observed when using <code>RWF_DONTCACHE</code> under heavy write loads, both on local filesystems (XFS with io_uring) and over NFS.</p>
+<p>The discussion centers on two core patches modifying the memory management subsystem to rate-limit writeback triggered by <code>IOCB_DONTCACHE</code>, alongside two benchmarking suites included for transparency.</p>
+<h2>Key Technical Arguments</h2>
+<h3>The Problem: Aggressive Flushing and Serialization</h3>
+<p>Layton identified that <code>IOCB_DONTCACHE</code> currently calls <code>filemap_flush_range()</code> with <code>nr_to_write=LONG_MAX</code> on every write, flushing all dirty pages in the written range.</p>
+<blockquote>
+<p>"Under concurrent writers this creates severe serialization on the writeback submission path, causing throughput to collapse to ~47% of buffered I/O with multi-second tail latency." <a href="https://lore.kernel.org/linux-nfs/20260401-dontcache-v1-1-1f5746fab47a@kernel.org/">As stated by Jeff Layton</a></p>
+</blockquote>
+<p>Even single-client sequential writes suffered, limited to 575 MB/s versus 1442 MB/s with rate-limited writeback due to dirty throttling.</p>
+<h3>Proposed Solution: Rate-Limited Writeback</h3>
+<p>Layton proposed replacing the flush call with a new <code>filemap_dontcache_writeback_range()</code> function featuring two mechanisms <a href="https://lore.kernel.org/linux-nfs/20260401-dontcache-v1-1-1f5746fab47a@kernel.org/">as described in Patch 1/4</a>:</p>
+<ol>
+<li><strong>Skip-if-busy:</strong> Checks <code>mapping_tagged(PAGECACHE_TAG_WRITEBACK)</code> before flushing. If writeback is already in progress, the flush is skipped to eliminate contention.</li>
+<li><strong>Proportional cap:</strong> Caps <code>nr_to_write</code> to the number of pages just written, preventing a single write from starving concurrent readers.</li>
+</ol>
+<p>To address "thundering herd" issues when the writeback tag clears, Layton added an atomic flag <code>AS_DONTCACHE_FLUSHING</code> in <a href="https://lore.kernel.org/linux-nfs/20260401-dontcache-v1-2-1f5746fab47a@kernel.org/">Patch 2/4</a> to ensure only one writer flushes at a time. He also included a "dirty pressure escape hatch" that bypasses the skip-if-busy check if dirty pages exceed 75% of the <code>dirty_ratio</code> threshold.</p>
+<h3>Critique and Review</h3>
+<p>Christoph Hellwig and Ritesh Harjani provided critical feedback on April 2nd:</p>
+<ul>
+<li><strong>API Mismatch:</strong> Both reviewers noted that <code>filemap_writeback</code> in the patch had six arguments, whereas it only accepts five in mainline trees. Layton acknowledged this as a merge error: "Mea culpa... I'll post a v2 in the near future." <a href="https://lore.kernel.org/linux-nfs/01dd135adf38e35492d957a35e22c4ba5c2283d1.camel@kernel.org/">Jeff Layton</a></li>
+<li><strong>Design Concerns:</strong> Hellwig questioned the fundamental approach, suggesting that in-caller writeback might be a "bad reimplementation of the single writeback thread." He asked:
+<blockquote>
+<p>"Have you considered stopping to do in-caller writeback for IOCB_DONTCACHE vs just leaving it to the writeback daemon?" <a href="https://lore.kernel.org/linux-nfs/ac3-SU7BElHJVCEL@infradead.org/">Christoph Hellwig</a></p>
+</blockquote>
+</li>
+<li><strong>Lock Contention Theory:</strong> Harjani suggested that the performance penalty in single-writer cases might stem from <code>xa_lock</code> contention between submission and completion, noting that DONTCACHE completions remove folios from the page cache within the same lock. He recommended using <code>perf</code> to confirm this theory.</li>
+<li><strong>Coverage Gaps:</strong> Harjani pointed out that if writers skip flushes due to the busy check, background writeback must handle the data. However, subsequent writers might not overlap the skipped ranges, potentially leaving dirty pages unflushed until global pressure triggers them.</li>
+</ul>
+<h3>Evolution and Conclusion</h3>
+<p>Layton defended the strategy of having writers perform some writeback work to stay ahead of dirty limits, stating:</p>
+<blockquote>
+<p>"I think having each writer do some writeback submission work makes a lot of sense. It helps keep the dirty pages below the dirty thresholds and doesn't seem to tax each writing task <em>too</em> much." <a href="https://lore.kernel.org/linux-nfs/629f21c6591903512eb2f3f3c4d6b14a9ac7b91a.camel@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<p>However, he agreed to revisit the atomic guard mechanism and further profile lock contention. The discussion concluded with Layton committing to a v2 patch series that addresses the API errors and potentially refines the flush guard logic based on Hellwig's suggestions regarding writeback scalability.</p>
+<h2>Impact on NFS Client/Server Development</h2>
+<p>While these patches target the generic memory management layer, they are directly motivated by <code>nfsd</code> IO mode controls. Improving <code>RWF_DONTCACHE</code> performance allows NFS servers to offer a viable alternative to buffered I/O and direct I/O, providing better isolation for noisy-neighbor workloads without the overhead of full direct I/O. The benchmarking suites included in the series (<code>nfsd-io-bench</code> and <code>dontcache-bench</code>) provide valuable tools for evaluating these IO modes in future NFS server optimizations.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260401-dontcache-v1-0-1f5746fab47a@kernel.org/">2026-04-01 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 0/4] mm: improve write performance with RWF_DONTCACHE</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260401-dontcache-v1-1-1f5746fab47a@kernel.org/">2026-04-01 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 1/4] mm: fix IOCB_DONTCACHE write performance with rate-limited writeback</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260401-dontcache-v1-2-1f5746fab47a@kernel.org/">2026-04-01 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 2/4] mm: add atomic flush guard for IOCB_DONTCACHE writeback</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260401-dontcache-v1-3-1f5746fab47a@kernel.org/">2026-04-01 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 3/4] testing: add nfsd-io-bench NFS server benchmark suite</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260401-dontcache-v1-4-1f5746fab47a@kernel.org/">2026-04-01 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 4/4] testing: add dontcache-bench local filesystem benchmark suite</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ac385Il8l-krKEOQ@infradead.org/">2026-04-02 Christoph Hellwig <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [PATCH 1/4] mm: fix IOCB_DONTCACHE write performance with rate-limited writeback</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ac3-SU7BElHJVCEL@infradead.org/">2026-04-02 Christoph Hellwig <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [PATCH 2/4] mm: add atomic flush guard for IOCB_DONTCACHE writeback</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ikaam0ox.ritesh.list@gmail.com/">2026-04-02 Ritesh Harjani (IBM) <a href="mailto:ritesh.list@gmail.com">ritesh.list@gmail.com</a> — Re: [PATCH 1/4] mm: fix IOCB_DONTCACHE write performance with rate-limited writeback</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/09672fa10c77d4fbfa1a13ea16aedf79d23fd8f8.camel@kernel.org/">2026-04-02 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 1/4] mm: fix IOCB_DONTCACHE write performance with rate-limited writeback</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/01dd135adf38e35492d957a35e22c4ba5c2283d1.camel@kernel.org/">2026-04-02 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 1/4] mm: fix IOCB_DONTCACHE write performance with rate-limited writeback</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/629f21c6591903512eb2f3f3c4d6b14a9ac7b91a.camel@kernel.org/">2026-04-02 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 2/4] mm: add atomic flush guard for IOCB_DONTCACHE writeback</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/h5ptmt6n.ritesh.list@gmail.com/">2026-04-02 Ritesh Harjani (IBM) <a href="mailto:ritesh.list@gmail.com">ritesh.list@gmail.com</a> — Re: [PATCH 1/4] mm: fix IOCB_DONTCACHE write performance with rate-limited writeback</a></li>
+</ul>
+  </main>
+</body>
+</html>

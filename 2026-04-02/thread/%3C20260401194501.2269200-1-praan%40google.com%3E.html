@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RFC: Enabling PCI Peer-to-Peer DMA (P2PDMA) in NFS Client Direct I/O</title>
+  <meta name="description" content="Pranjal Shrivastava submitted an RFC patch series to introduce PCI Peer-to-Peer DMA (P2PDMA) support for the NFS client, specifically targeting the Direct I/O path. This feature aims to enable high-performance storage environments to move…">
+  <meta property="og:title" content="RFC: Enabling PCI Peer-to-Peer DMA (P2PDMA) in NFS Client Direct I/O">
+  <meta property="og:description" content="Pranjal Shrivastava submitted an RFC patch series to introduce PCI Peer-to-Peer DMA (P2PDMA) support for the NFS client, specifically targeting the Direct I/O path. This feature aims to enable high-performance storage environments to move…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-04-02T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="RFC: Enabling PCI Peer-to-Peer DMA (P2PDMA) in NFS Client Direct I/O">
+  <meta name="twitter:description" content="Pranjal Shrivastava submitted an RFC patch series to introduce PCI Peer-to-Peer DMA (P2PDMA) support for the NFS client, specifically targeting the Direct I/O path. This feature aims to enable high-performance storage environments to move…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-04-02</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>RFC: Enabling PCI Peer-to-Peer DMA (P2PDMA) in NFS Client Direct I/O</h1>
+<h2>Summary</h2>
+<h2>Overview</h2>
+<p>Pranjal Shrivastava submitted an RFC patch series to introduce <strong>PCI Peer-to-Peer DMA (P2PDMA)</strong> support for the NFS client, specifically targeting the Direct I/O path. This feature aims to enable high-performance storage environments to move data directly between PCIe endpoints—such as NVMe controllers and Network Interface Cards—bypassing system memory.</p>
+<blockquote>
+<p>"As high-performance storage environments increasingly rely on direct data movement between PCIe endpoints... support for Peer-to-Peer DMA (P2PDMA) in the network filesystem layer becomes essential."
+— <a href="https://lore.kernel.org/linux-nfs/20260401194501.2269200-1-praan@google.com/">Pranjal Shrivastava</a></p>
+</blockquote>
+<p>Currently, NFS <code>O_DIRECT</code> operations fail with <code>-EREMOTEIO</code> when user buffers reside in PCIe BAR memory due to legacy API limitations and a request lifecycle unaware of P2P pinning requirements.</p>
+<h2>Key Technical Changes</h2>
+<p>The four-patch series introduces several infrastructure changes:</p>
+<ol>
+<li><strong>Transport-Level Detection:</strong> A new <code>supports_p2pdma</code> operation is added to <code>rpc_xprt_ops</code>. For RDMA, this queries the underlying InfiniBand device via <code>ib_dma_pci_p2p_dma_supported()</code> <a href="https://lore.kernel.org/linux-nfs/20260401194501.2269200-2-praan@google.com/">1</a>.</li>
+<li><strong>64-Bit Capability Expansion:</strong> The <code>nfs_server-&gt;caps</code> bitmask is expanded from 32-bit to 64-bit to accommodate the new <code>NFS_CAP_P2PDMA</code> flag, preventing truncation bugs in bitwise operations <a href="https://lore.kernel.org/linux-nfs/20260401194501.2269200-3-praan@google.com/">2</a>.</li>
+<li><strong>Pin-Aware Request Lifecycle:</strong> A <code>PG_PINNED</code> flag is added to <code>struct nfs_page</code>. This ensures that pages extracted via <code>iov_iter_extract_pages()</code> are correctly unpinned using <code>unpin_user_page()</code> only after I/O completion, rather than using standard <code>put_page()</code> <a href="https://lore.kernel.org/linux-nfs/20260401194501.2269200-4-praan@google.com/">3</a>.</li>
+<li><strong>API Migration:</strong> The Direct I/O path migrates from the legacy <code>iov_iter_get_pages_alloc2()</code> to the modern <code>iov_iter_extract_pages()</code>, allowing the use of the <code>ITER_ALLOW_P2PDMA</code> flag <a href="https://lore.kernel.org/linux-nfs/20260401194501.2269200-5-praan@google.com/">4</a>.</li>
+</ol>
+<h2>Reviewer Feedback and Discussion Evolution</h2>
+<p>The series received significant architectural feedback from Christoph Hellwig and Chuck Lever, highlighting necessary refinements before the feature can be merged.</p>
+<h3>Separation of Concerns and API Modernization</h3>
+<p>Christoph Hellwig emphasized that the migration to <code>iov_iter_extract_pages()</code> is a critical bug fix in its own right, independent of P2PDMA support. He noted that this change "fixes potential data corruption in XFS" and urged Pranjal to split it into a separate preparation series.</p>
+<blockquote>
+<p>"Please split the conversion to iov_iter_extract_pages into a separate preparation patch, and even series. That is a long overdue change that fixes potential data corruption in XFS."
+— <a href="https://lore.kernel.org/linux-nfs/ac35ICYHuw4lEOri@infradead.org/">Christoph Hellwig</a></p>
+</blockquote>
+<p>Hellwig also suggested that the NFS I/O code should move beyond pages to <code>iov_iter_extract_bvecs</code> for better efficiency with large I/O, as buffered I/O already uses folios.</p>
+<h3>Missing pNFS Support</h3>
+<p>Hellwig pointed out a major gap in the current design: the series ignores Parallel NFS (pNFS). He argued that P2PDMA support must be validated through the layout driver for the specific file range, noting that block-style layouts can also benefit from P2P DMA.</p>
+<blockquote>
+<p>"Besides the point of splitting out the iov_iter_extract* conversion this seems to ignore pNFS. You also need to check the layout driver for the current file range and propagate P2P support or lack of through that."
+— <a href="https://lore.kernel.org/linux-nfs/ac35jH0V38pZJqYD@infradead.org/">Christoph Hellwig</a></p>
+</blockquote>
+<h3>Transport Reconnection and Stale Capabilities</h3>
+<p>Chuck Lever identified a critical flaw in the mount-time capability detection for RDMA transports. He questioned whether the transport is fully connected when <code>nfs_server_set_init_caps()</code> runs, noting that if an RDMA connection drops and reconnects to a different device, the <code>NFS_CAP_P2PDMA</code> flag would become stale.</p>
+<blockquote>
+<p>"Note that, even if this logic /is/ correct, if the transport connection is lost the transport will reconnect automatically... The NFS client layer will be none-the-wiser and the NFS_CAP_P2PDMA flag setting will be stale at that point..."
+— <a href="https://lore.kernel.org/linux-nfs/791991c2-1e8c-4041-9674-94acb4fe483c@app.fastmail.com/">Chuck Lever</a></p>
+</blockquote>
+<p>Lever proposed that P2PDMA detection must occur during <code>xprtrdma</code>'s connection flow, setting a flag in the <code>rpc_xprt</code> structure. The Direct I/O code would then check this flag dynamically for each I/O operation, ensuring correctness across reconnections.</p>
+<h2>Conclusions</h2>
+<p>This RFC series marks the beginning of P2PDMA support in the NFS client, addressing a key performance bottleneck for PCIe-attached storage and networking hardware. However, the discussion has evolved to highlight several prerequisites:</p>
+<ol>
+<li><strong>API Migration First:</strong> The transition to <code>iov_iter_extract_pages()</code> should be separated as a standalone bug fix.</li>
+<li><strong>Dynamic Capability Checking:</strong> P2PDMA support must be verified per-I/O or per-connection rather than at mount time to handle RDMA reconnections safely.</li>
+<li><strong>pNFS Integration:</strong> Future iterations must integrate with pNFS layout drivers to ensure P2P DMA is only used when the underlying storage layout supports it.</li>
+</ol>
+<p>The thread remains open for further refinement of these architectural concerns.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260401194501.2269200-1-praan@google.com/">2026-04-01 Pranjal Shrivastava <a href="mailto:praan@google.com">praan@google.com</a> — [RFC PATCH 0/4] nfs: Enable PCI Peer-to-Peer DMA (P2PDMA) support</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260401194501.2269200-2-praan@google.com/">2026-04-01 Pranjal Shrivastava <a href="mailto:praan@google.com">praan@google.com</a> — [RFC PATCH 1/4] sunrpc: add supports_p2pdma to rpc_xprt_ops</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260401194501.2269200-3-praan@google.com/">2026-04-01 Pranjal Shrivastava <a href="mailto:praan@google.com">praan@google.com</a> — [RFC PATCH 2/4] nfs: add NFS_CAP_P2PDMA and detect transport support</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260401194501.2269200-4-praan@google.com/">2026-04-01 Pranjal Shrivastava <a href="mailto:praan@google.com">praan@google.com</a> — [RFC PATCH 3/4] nfs: make nfs_page pin-aware</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260401194501.2269200-5-praan@google.com/">2026-04-01 Pranjal Shrivastava <a href="mailto:praan@google.com">praan@google.com</a> — [RFC PATCH 4/4] nfs: allow P2PDMA in direct I/O path</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ac341x4RXKoShXsB@infradead.org/">2026-04-02 Christoph Hellwig <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [RFC PATCH 3/4] nfs: make nfs_page pin-aware</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ac35ICYHuw4lEOri@infradead.org/">2026-04-02 Christoph Hellwig <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [RFC PATCH 4/4] nfs: allow P2PDMA in direct I/O path</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ac35jH0V38pZJqYD@infradead.org/">2026-04-02 Christoph Hellwig <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [RFC PATCH 0/4] nfs: Enable PCI Peer-to-Peer DMA (P2PDMA) support</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/791991c2-1e8c-4041-9674-94acb4fe483c@app.fastmail.com/">2026-04-02 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [RFC PATCH 2/4] nfs: add NFS_CAP_P2PDMA and detect transport support</a></li>
+</ul>
+  </main>
+</body>
+</html>

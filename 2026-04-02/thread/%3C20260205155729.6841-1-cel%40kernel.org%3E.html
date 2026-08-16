@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD TCP Lock Contention RFC: v2 Update — Receive Path Reworked, Client Adaptation Added</title>
+  <meta name="description" content="Performance optimization / architectural redesign (RFC patch series under active revision). This thread concerns a seven-patch RFC series originally submitted by Chuck Lever on February 5, aimed at reducing lock contention in the NFSD TCP…">
+  <meta property="og:title" content="NFSD TCP Lock Contention RFC: v2 Update — Receive Path Reworked, Client Adaptation Added">
+  <meta property="og:description" content="Performance optimization / architectural redesign (RFC patch series under active revision). This thread concerns a seven-patch RFC series originally submitted by Chuck Lever on February 5, aimed at reducing lock contention in the NFSD TCP…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-04-02T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSD TCP Lock Contention RFC: v2 Update — Receive Path Reworked, Client Adaptation Added">
+  <meta name="twitter:description" content="Performance optimization / architectural redesign (RFC patch series under active revision). This thread concerns a seven-patch RFC series originally submitted by Chuck Lever on February 5, aimed at reducing lock contention in the NFSD TCP…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-04-02</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD TCP Lock Contention RFC: v2 Update — Receive Path Reworked, Client Adaptation Added</h1>
+<h2>Summary</h2>
+<h1>NFSD TCP Lock Contention RFC: v2 Update — Receive Path Reworked, Client Adaptation Added</h1>
+<h2>Classification</h2>
+<p><strong>Performance optimization / architectural redesign</strong> (RFC patch series under active revision). This thread concerns a seven-patch RFC series originally submitted by Chuck Lever on February 5, aimed at reducing lock contention in the NFSD TCP transport layer. This week marks the first substantive follow-up after a six-week silence, with Mike Snitzer prompting an update and Chuck Lever outlining significant architectural pivots for v2.</p>
+<h2>Bridge from Prior Weeks</h2>
+<p>The thread originated <a href="https://lore.kernel.org/linux-nfs/20260205155729.6841-1-cel@kernel.org/">on February 5, 2026</a>, when Chuck Lever submitted a seven-patch RFC series titled "sunrpc: Reduce lock contention for NFSD TCP sockets." The series was a direct response to an investigation into knfsd's read IOPS ceiling (approximately 300–400K IOPS regardless of hardware). Key proposals included dedicated TCP receiver threads per connection, flat combining for socket sends, page recycling, and explicit TCP buffer sizing.</p>
+<p>On February 6, Chuck reported that Tejun Heo had rejected Patch 1/7 (the workqueue affinity scope fallback), but he had developed an alternative kthread-based solution for svcrdma to avoid workqueue pool spin lock contention. <a href="2026-02-12/thread/%3C20260205155729.6841-1-cel%40kernel.org%3E.html">See prior summary</a> for details.</p>
+<p>No further activity occurred until this week.</p>
+<h2>This Week's Activity</h2>
+<p>On March 30, Mike Snitzer <a href="https://lore.kernel.org/linux-nfs/acrHmvgWjJijCo1U@kernel.org/">reached out to Chuck</a>, breaking the six-week silence:</p>
+<blockquote>
+<p>"Curious to know your thinking on this patchset? Can you post v2 given your note about having adapted based on Tejun's feedback here?"</p>
+</blockquote>
+<p>Chuck Lever <a href="https://lore.kernel.org/linux-nfs/f3e70f87-df09-4c3d-8995-ced68a028ed8@app.fastmail.com/">responded shortly after</a> with a significant update on the direction of v2, revealing several important architectural changes:</p>
+<h3>1. Workqueue Patch Repurposed for NFS Client</h3>
+<p>Chuck clarified that the workqueue-related patch (originally Patch 1/7) is no longer relevant to the server side:</p>
+<blockquote>
+<p>"The workqueue-related patch is not important for the server, it turns out, but I've adapted it for use on the client."</p>
+</blockquote>
+<p>This is a notable shift — what began as a server-side scalability optimization has spawned an NFS <strong>client</strong> adaptation. The original patch targeted workqueue pool spin lock contention on single-LLC systems; its repurposing for the client suggests similar lock contention patterns exist in the NFS client's RPC transport layer under high-throughput workloads.</p>
+<h3>2. Receive Path Reworked: Away from Per-Connection Kthreads</h3>
+<p>The most significant architectural change concerns the receive path. The original RFC proposed a dedicated kthread per TCP connection to handle all <code>sock_recvmsg()</code> calls, eliminating socket lock contention among nfsd worker threads. However, this approach faced resistance:</p>
+<blockquote>
+<p>"One reviewer balked at the idea of starting a kthread per connection on the server."</p>
+</blockquote>
+<p>Chuck has since reworked the receive path to use <code>-&gt;read_sock</code> instead of <code>-&gt;recvmsg</code>:</p>
+<blockquote>
+<p>"I've reworked the receive side to use -&gt;read_sock instead of -&gt;recvmsg."</p>
+</blockquote>
+<p>The <code>-&gt;read_sock</code> interface is a lighter-weight socket read mechanism used in other parts of the kernel (e.g., TCP splice, RDMA). This change likely eliminates or reduces the need for per-connection kthreads while still achieving the goal of decoupling socket reads from worker thread contention — a more palatable design for reviewers concerned about thread proliferation under heavy connection loads.</p>
+<h3>3. Send Path: Flat Combining Retained, xpt_mutex Replaced</h3>
+<p>The transmit-side flat combining optimization remains intact and has been further refined:</p>
+<blockquote>
+<p>"The flat combining changes on the send side are still good."</p>
+</blockquote>
+<p>Chuck added a key improvement to the send path:</p>
+<blockquote>
+<p>"One further optimization was to replace xpt_mutex with an llist queuing mechanism."</p>
+</blockquote>
+<p>This is a significant advancement. The original RFC used flat combining <em>with</em> <code>xpt_mutex</code> — one thread acquires the mutex and processes all pending sends on behalf of waiters. The v2 approach goes further by eliminating <code>xpt_mutex</code> entirely in favor of a lock-free <code>llist</code> (lock-less linked list) queuing mechanism. This removes the mutex as a contention point altogether, representing a more aggressive concurrency optimization than the original RFC proposed.</p>
+<h3>4. Additional Improvements Pipeline</h3>
+<p>Chuck indicated that the v2 series is part of a broader effort:</p>
+<blockquote>
+<p>"A number of other improvements are in the pipeline ahead of or behind these two."</p>
+</blockquote>
+<p>This suggests additional patches (not yet disclosed) will accompany the revised TCP lock contention series, either as prerequisites or follow-on optimizations.</p>
+<h2>Technical Significance</h2>
+<p>This week's exchange reveals three important developments for NFS development:</p>
+<ol>
+<li>
+<p><strong>NFS Client Impact</strong>: The repurposing of the workqueue patch for the client side indicates that similar lock contention problems exist in the NFS client stack, expanding the scope of this effort beyond NFSD alone.</p>
+</li>
+<li>
+<p><strong>Receive Path Simplification</strong>: Moving from per-connection kthreads to <code>-&gt;read_sock</code> represents a more conservative and likely more maintainable design. It addresses reviewer concerns about thread proliferation while still targeting the core contention problem.</p>
+</li>
+<li>
+<p><strong>Send Path Aggression</strong>: Replacing <code>xpt_mutex</code> with an <code>llist</code> queuing mechanism is a more radical change than the original flat combining approach, potentially offering greater scalability gains by eliminating the mutex entirely from the critical path.</p>
+</li>
+</ol>
+<h2>Conclusion</h2>
+<p>This week marked the first meaningful follow-up to Chuck Lever's NFSD TCP lock contention RFC after a six-week period of silence. Mike Snitzer's prompt elicited a detailed status update revealing that v2 will feature a substantially reworked receive path (using <code>-&gt;read_sock</code> instead of per-connection kthreads), an enhanced send path (replacing <code>xpt_mutex</code> with <code>llist</code> queuing), and a new client-side adaptation of the workqueue optimization. A formal v2 posting has not yet appeared, but Chuck's remarks suggest it is in preparation.</p>
+<h2>Messages This Week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/acrHmvgWjJijCo1U@kernel.org/">2026-03-30 Mike Snitzer — Re: [RFC PATCH 0/7] sunrpc: Reduce lock contention for NFSD TCP sockets</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/f3e70f87-df09-4c3d-8995-ced68a028ed8@app.fastmail.com/">2026-03-30 Chuck Lever — Re: [RFC PATCH 0/7] sunrpc: Reduce lock contention for NFSD TCP sockets</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/acrHmvgWjJijCo1U@kernel.org/">2026-03-30 Mike Snitzer <a href="mailto:snitzer@kernel.org">snitzer@kernel.org</a> — Re: [RFC PATCH 0/7] sunrpc: Reduce lock contention for NFSD TCP sockets</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/f3e70f87-df09-4c3d-8995-ced68a028ed8@app.fastmail.com/">2026-03-30 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [RFC PATCH 0/7] sunrpc: Reduce lock contention for NFSD TCP sockets</a></li>
+</ul>
+  </main>
+</body>
+</html>

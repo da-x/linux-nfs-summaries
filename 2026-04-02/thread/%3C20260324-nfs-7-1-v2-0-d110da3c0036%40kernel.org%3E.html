@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS: Delegated Timestamp Semantics and removexattr ctime Fix</title>
+  <meta name="description" content="This week&#39;s discussion centered on [PATCH v2 2/2] nfs: update inode ctime after removexattr operation by Jeff Layton. The patch addresses a bug where the NFS client fails to update the inode change time (ctime) after a removexattr…">
+  <meta property="og:title" content="NFS: Delegated Timestamp Semantics and removexattr ctime Fix">
+  <meta property="og:description" content="This week&#39;s discussion centered on [PATCH v2 2/2] nfs: update inode ctime after removexattr operation by Jeff Layton. The patch addresses a bug where the NFS client fails to update the inode change time (ctime) after a removexattr…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-04-02T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS: Delegated Timestamp Semantics and removexattr ctime Fix">
+  <meta name="twitter:description" content="This week&#39;s discussion centered on [PATCH v2 2/2] nfs: update inode ctime after removexattr operation by Jeff Layton. The patch addresses a bug where the NFS client fails to update the inode change time (ctime) after a removexattr…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-04-02</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS: Delegated Timestamp Semantics and removexattr ctime Fix</h1>
+<h2>Summary</h2>
+<h1>NFS: Delegated Timestamp Semantics and <code>removexattr</code> ctime Fix</h1>
+<h2>Summary</h2>
+<p>This week's discussion centered on <strong>[PATCH v2 2/2] nfs: update inode ctime after removexattr operation</strong> by Jeff Layton. The patch addresses a bug where the NFS client fails to update the inode change time (<code>ctime</code>) after a <code>removexattr</code> operation when delegated timestamps are active, causing <strong>xfstest generic/728</strong> to fail.</p>
+<p>The thread evolved from a specific code fix into a broader debate on NFS protocol semantics regarding delegated attributes, server authority, and specification clarity. Key participants included Jeff Layton (Red Hat), Olga Kornievskaia (UMich/Hammerspace), Thomas Haynes (Hammerspace), and Rick Macklem.</p>
+<h3>The Bug and Proposed Fix</h3>
+<p>Jeff Layton identified that when a client holds a <code>WRITE_ATTRS_DELEG</code>, a <code>removexattr</code> operation updates the server's <code>ctime</code>, but the client relies on its cached value because the subsequent <code>stat()</code> does not trigger a <code>GETATTR</code>.</p>
+<blockquote>
+<p>"The client does a removexattr and then a stat to test the ctime, which doesn't change. The stat() doesn't trigger a GETATTR because of the delegated timestamps, so it relies on the cached ctime, which is wrong." <a href="https://lore.kernel.org/linux-nfs/CAN-5tyFpsuE9+5ZvAASwvTYKtcN5jNpAxi8ejde90e-vpUzFKg@mail.gmail.com/">Jeff Layton</a></p>
+</blockquote>
+<p>Layton's solution mirrors the <code>setxattr</code> implementation: append a trailing <code>GETATTR</code> to the <code>REMOVEXATTR</code> compound operation to fetch the fresh <code>ctime</code> from the server.</p>
+<h3>Debate on Server Behavior and Authority</h3>
+<p>Olga Kornievskaia questioned whether this approach relied on assumptions about server behavior, noting that the Linux NFS server (<code>nfsd</code>) does not update <code>change_attribute</code> for operations like <code>WRITE</code>, <code>CLONE</code>, or <code>COPY</code> when a delegation is held. She proposed an alternative fix but acknowledged uncertainty about other server implementations.</p>
+<blockquote>
+<p>"This approach relies on the fact that the server the serves delegated attributes would update change_attr on operations which might now necessarily happen (ie, linux server does not update change_attribute on writes or clone)." <a href="https://lore.kernel.org/linux-nfs/CAN-5tyFpsuE9+5ZvAASwvTYKtcN5jNpAxi8ejde90e-vpUzFKg@mail.gmail.com/">Olga Kornievskaia</a></p>
+</blockquote>
+<p>Thomas Haynes (Hammerspace) shifted the discussion to protocol semantics, arguing that authority should follow the delegation model similar to delegated size in RFC 8881. He explained that Hammerspace issues a <code>CB_GETATTR</code> callback to the delegating client before responding to any <code>GETATTR</code> request to ensure consistency with the client's authoritative state.</p>
+<blockquote>
+<p>"The authority follows the delegation, not the specific operation... So the spec question, as I see it, is not whether REMOVEXATTR (or any particular op) should update ctime/mtime, but whether delegated timestamps are meant to follow the same attribute-authority model as delegated size in RFC8881." <a href="https://lore.kernel.org/linux-nfs/acbJsryTMYCMlE_o@mana/">Thomas Haynes</a></p>
+</blockquote>
+<p>Olga observed that neither <code>nfsd</code> nor her tests against Hammerspace consistently adhered to this model for all operations, such as <code>CLONE</code>. Rick Macklem added historical context, noting that <code>CB_GETATTR</code> was traditionally intended for queries from <em>different</em> clients than the one holding the delegation.</p>
+<blockquote>
+<p>"I thought the requirement to do a CB_GETATTR was if the GETATTR is from a different client than the one holding the delegation... Only after a DELEGRETURN does the server have the definitive values for these attributes." <a href="https://lore.kernel.org/linux-nfs/CAM5tNy6bbauaD=qskHDHN89p_0CcUHBMY7dh7Ve=AV80dM45gw@mail.gmail.com/">Rick Macklem</a></p>
+</blockquote>
+<h3>Client-Side Rationale and Consensus</h3>
+<p>Jeff Layton provided a definitive client-side rationale for why <code>REMOVEXATTR</code> (and <code>SETXATTR</code>) cannot be cached or deferred like <code>WRITE</code> operations:</p>
+<ol>
+<li><strong>Synchronous Error Reporting:</strong> Unlike writes, which can be buffered and confirmed via <code>fsync()</code>, extended attribute operations must complete synchronously because they can fail and have no mechanism for deferred error reporting to user space.</li>
+<li><strong>Limited Delegated Update Mechanism:</strong> The delegated timestamp mechanism lacks a way to update <em>only</em> <code>ctime</code>.</li>
+</ol>
+<blockquote>
+<p>"I don't see how you could reasonably buffer a SETXATTR or REMOVEXATTR operation to be sent later... They must be done synchronously because: 1/ there's no way to update only the ctime in a delegated timestamp update ...and... 2/ these syscalls can fail, so we can't return from them until we know the outcome." <a href="https://lore.kernel.org/linux-nfs/13f1fd90b75c73e8d5220dadb6eb9d9473bc96e8.camel@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<p>Consequently, Layton concluded that both client and server must ignore the timestamp delegation for these operations. The server should update <code>ctime</code>, and the client must fetch it via a trailing <code>GETATTR</code>.</p>
+<blockquote>
+<p>"Based on that, I think the client and server both need to ignore the timestamp delegation on a SETXATTR or REMOVEXATTR... Exactly what this patch does, fwiw..." <a href="https://lore.kernel.org/linux-nfs/13f1fd90b75c73e8d5220dadb6eb9d9473bc96e8.camel@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<h3>Future Specification Clarification</h3>
+<p>The thread concluded with a productive discussion on improving the NFS specification to avoid similar ambiguities. Thomas Haynes warned against defining behavior by enumerating specific operations, advocating instead for a semantic classification based on completion models:</p>
+<blockquote>
+<p>"One concern I have with the 'ops that can report delayed error' formulation is that... the ability to convey delay is not a distinguishing property of a particular operation... It seems better to define the behavior in terms of operation properties - e.g., whether the operation is synchronously visible, can be deferred/cached at the client..." <a href="https://lore.kernel.org/linux-nfs/acxGNz07W03ijzM2@mana/">Thomas Haynes</a></p>
+</blockquote>
+<p>Haynes proposed that the spec should distinguish between operations where the client may acknowledge completion before authoritative server execution (allowing delegated timestamp authority) and those requiring synchronous authoritative execution. Layton agreed with this direction.</p>
+<blockquote>
+<p>"Ack. Sounds good to me." <a href="https://lore.kernel.org/linux-nfs/2c9dc8067c77ae8cefecd5224eebee62cecb6781.camel@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<h2>Conclusion</h2>
+<ul>
+<li><strong>Bug Fix:</strong> The immediate fix for <code>xfstest generic/728</code> is to add a trailing <code>GETATTR</code> to the <code>REMOVEXATTR</code> compound operation in the NFS client. This ensures the <code>ctime</code> is refreshed from the server, justified by the synchronous nature of extended attribute operations and the limitations of delegated timestamp updates.</li>
+<li><strong>Protocol Semantics:</strong> The discussion highlighted ambiguities in the NFS specification regarding which operations invalidate or bypass delegated timestamp authority. While <code>WRITE</code> and <code>COPY</code> are clearly handled, metadata operations like <code>SETXATTR</code>, <code>REMOVEXATTR</code>, and <code>CLONE</code> have been implemented based on assumptions rather than explicit rules.</li>
+<li><strong>Future Spec Work:</strong> There is consensus that the NFS specification needs clarification to define delegated timestamp behavior based on operation semantics (synchronous vs. deferred completion) rather than enumerating specific opcodes. This will ensure consistent behavior across different server implementations and future protocol extensions.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/CAN-5tyFpsuE9+5ZvAASwvTYKtcN5jNpAxi8ejde90e-vpUzFKg@mail.gmail.com/">2026-03-27 Olga Kornievskaia <a href="mailto:aglo@umich.edu">aglo@umich.edu</a> — Re: [PATCH v2 2/2] nfs: update inode ctime after removexattr operation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/284ca17e74af8c4f5942b2952f2bf75490dd17c0.camel@kernel.org/">2026-03-27 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v2 2/2] nfs: update inode ctime after removexattr operation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAN-5tyFsEUcSUycb4JjxH5v754SefwOH=zt24KtxEC_Ow4OjMw@mail.gmail.com/">2026-03-27 Olga Kornievskaia <a href="mailto:aglo@umich.edu">aglo@umich.edu</a> — Re: [PATCH v2 2/2] nfs: update inode ctime after removexattr operation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/80b423c66dba84b46be1084307d2c66b935065bc.camel@kernel.org/">2026-03-27 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v2 2/2] nfs: update inode ctime after removexattr operation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/acbJsryTMYCMlE_o@mana/">2026-03-27 Thomas Haynes <a href="mailto:loghyr@gmail.com">loghyr@gmail.com</a> — Re: [PATCH v2 2/2] nfs: update inode ctime after removexattr operation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAN-5tyFQrt7WyW4=qLodKS2-eckAetKjs15A6U1OOdGPSL58XQ@mail.gmail.com/">2026-03-27 Olga Kornievskaia <a href="mailto:aglo@umich.edu">aglo@umich.edu</a> — Re: [PATCH v2 2/2] nfs: update inode ctime after removexattr operation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/acbfV0C-fAy4nZ-i@mana/">2026-03-27 Thomas Haynes <a href="mailto:loghyr@gmail.com">loghyr@gmail.com</a> — Re: [PATCH v2 2/2] nfs: update inode ctime after removexattr operation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/13f1fd90b75c73e8d5220dadb6eb9d9473bc96e8.camel@kernel.org/">2026-03-31 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v2 2/2] nfs: update inode ctime after removexattr operation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAN-5tyGd1ZtL-sKvT251=BZa-38nOAEYbiZq5Bk+XN_ETX0PWA@mail.gmail.com/">2026-03-31 Olga Kornievskaia <a href="mailto:aglo@umich.edu">aglo@umich.edu</a> — Re: [PATCH v2 2/2] nfs: update inode ctime after removexattr operation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/acwVE5ZoPPLFQCLT@mana/">2026-03-31 Thomas Haynes <a href="mailto:loghyr@gmail.com">loghyr@gmail.com</a> — Re: [PATCH v2 2/2] nfs: update inode ctime after removexattr operation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/acwWuf5VMKHOfSUU@mana/">2026-03-31 Thomas Haynes <a href="mailto:loghyr@gmail.com">loghyr@gmail.com</a> — Re: [PATCH v2 2/2] nfs: update inode ctime after removexattr operation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAN-5tyFyOeo92zfCPVeJxJ-BokkvjxP384mXk8rEN0YXjftK3Q@mail.gmail.com/">2026-03-31 Olga Kornievskaia <a href="mailto:aglo@umich.edu">aglo@umich.edu</a> — Re: [PATCH v2 2/2] nfs: update inode ctime after removexattr operation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/a23b715677db8553061da684fc047185e328121b.camel@kernel.org/">2026-03-31 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v2 2/2] nfs: update inode ctime after removexattr operation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/acxGNz07W03ijzM2@mana/">2026-03-31 Thomas Haynes <a href="mailto:loghyr@gmail.com">loghyr@gmail.com</a> — Re: [PATCH v2 2/2] nfs: update inode ctime after removexattr operation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/2c9dc8067c77ae8cefecd5224eebee62cecb6781.camel@kernel.org/">2026-03-31 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v2 2/2] nfs: update inode ctime after removexattr operation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAM5tNy6bbauaD=qskHDHN89p_0CcUHBMY7dh7Ve=AV80dM45gw@mail.gmail.com/">2026-03-31 Rick Macklem <a href="mailto:rick.macklem@gmail.com">rick.macklem@gmail.com</a> — Re: [PATCH v2 2/2] nfs: update inode ctime after removexattr operation</a></li>
+</ul>
+  </main>
+</body>
+</html>
