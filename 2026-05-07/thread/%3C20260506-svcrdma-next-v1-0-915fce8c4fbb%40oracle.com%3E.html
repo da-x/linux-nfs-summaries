@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>svcrdma: Reduce Send completion path contention and fix OOM issues</title>
+  <meta name="description" content="This week, Chuck Lever submitted a two-patch series aimed at optimizing the svcrdma subsystem by reducing contention on the svcrdma_wq workqueue during the Send completion path. The discussion highlights significant performance…">
+  <meta property="og:title" content="svcrdma: Reduce Send completion path contention and fix OOM issues">
+  <meta property="og:description" content="This week, Chuck Lever submitted a two-patch series aimed at optimizing the svcrdma subsystem by reducing contention on the svcrdma_wq workqueue during the Send completion path. The discussion highlights significant performance…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-07T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="svcrdma: Reduce Send completion path contention and fix OOM issues">
+  <meta name="twitter:description" content="This week, Chuck Lever submitted a two-patch series aimed at optimizing the svcrdma subsystem by reducing contention on the svcrdma_wq workqueue during the Send completion path. The discussion highlights significant performance…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-07</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>svcrdma: Reduce Send completion path contention and fix OOM issues</h1>
+<h2>Summary</h2>
+<p>This week, Chuck Lever submitted a two-patch series aimed at optimizing the <code>svcrdma</code> subsystem by reducing contention on the <code>svcrdma_wq</code> workqueue during the Send completion path. The discussion highlights significant performance improvements for NFS over RDMA and resolves critical Out-Of-Memory (OOM) issues observed in large-scale deployments.</p>
+<h3>Technical Arguments and Evolution</h3>
+<p>The thread begins with Chuck Lever identifying a bottleneck through profiling an 8KB NFSv3 read/write workload. He noted that approximately 4% of total CPU cycles were spent on the <code>svcrdma_wq</code> unbound workqueue pool spinlock. The contention arose because each Send completion queued work to release the <code>send_ctxt</code>, which in turn queued additional items for every <code>write_info</code> chunk, causing cascading lock acquisitions <a href="https://lore.kernel.org/linux-nfs/20260506-svcrdma-next-v1-0-915fce8c4fbb@oracle.com/">As detailed by Chuck Lever</a>.</p>
+<p><strong>Patch 1: Inline Resource Release</strong>
+The first patch addresses the inner re-queueing mechanism. Lever argued that since <code>svc_rdma_write_info_free</code> already runs on <code>svcrdma_wq</code>, the extra work item adds spinlock contention without gaining parallelism. By inlining the chunk release, the patch recovers roughly 1% of CPU cycles <a href="https://lore.kernel.org/linux-nfs/20260506-svcrdma-next-v1-1-915fce8c4fbb@oracle.com/">As explained by Chuck Lever</a>.</p>
+<p><strong>Patch 2: Deferring Context Release</strong>
+The second, more ambitious patch retires the <code>svcrdma_wq</code> for send completions entirely. Instead, Send completion handlers append the <code>send_ctxt</code> to a per-transport lock-free list (<code>llist</code>). The nfsd thread then drains this list in <code>xpo_release_ctxt</code> between RPCs. This move shifts DMA unmapping and page release out of the completion context. Lever emphasized that this is crucial when an IOMMU runs in strict mode, as each unmap synchronously invalidates the IOTLB; moving this to the nfsd thread allows batching and absorbs latency where it is harmless <a href="https://lore.kernel.org/linux-nfs/20260506-svcrdma-next-v1-2-915fce8c4fbb@oracle.com/">As described by Chuck Lever</a>.</p>
+<h3>Key Conclusions and Validation</h3>
+<p>Mike Snitzer provided critical validation for the first patch, confirming its effectiveness in resolving OOM issues. He reported:</p>
+<blockquote>
+<p>"You were correct: this patch alone eliminates the OOM (we tested with both 16K and then 4K read IO from 121 clients to 8 NFS servers, no measurable memory growth while testing)."</p>
+</blockquote>
+<p>Snitzer added his Reviewed-by tag and included a Tested-by tag for Jonathan Flynn <a href="https://lore.kernel.org/linux-nfs/afz6PwRlpJFzoIQE@kernel.org/">As confirmed by Mike Snitzer</a>.</p>
+<p>Regarding the second patch, Snitzer noted that while he could not test it at the customer site due to kernel version constraints (the baseline was 6.12-stable, while the patch builds on 7.1 changes), he expressed confidence in its design:</p>
+<blockquote>
+<p>"I think your 2nd patch is ideal though, and will be able to pull it in to test in future..."</p>
+</blockquote>
+<h3>Summary of Impact</h3>
+<p>This series represents a significant optimization for NFS server-side RDMA performance. The first patch provides an immediate bug fix for OOM conditions under heavy load and reduces CPU overhead by eliminating unnecessary workqueue re-queuing. The second patch offers a deeper architectural improvement by removing workqueue contention entirely from the Send completion path, deferring expensive DMA unmapping operations to the nfsd thread context. Both patches are accepted with positive feedback from key stakeholders in the NFS community.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260506-svcrdma-next-v1-0-915fce8c4fbb@oracle.com/">2026-05-06 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 0/2] svcrdma: Reduce svcrdma_wq contention on the Send completion path</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260506-svcrdma-next-v1-1-915fce8c4fbb@oracle.com/">2026-05-06 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 1/2] svcrdma: Release write chunk resources without re-queuing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260506-svcrdma-next-v1-2-915fce8c4fbb@oracle.com/">2026-05-06 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 2/2] svcrdma: Defer send context release to xpo_release_ctxt</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/afz6PwRlpJFzoIQE@kernel.org/">2026-05-07 Mike Snitzer <a href="mailto:snitzer@kernel.org">snitzer@kernel.org</a> — Re: [PATCH 1/2] svcrdma: Release write chunk resources without re-queuing</a></li>
+</ul>
+  </main>
+</body>
+</html>

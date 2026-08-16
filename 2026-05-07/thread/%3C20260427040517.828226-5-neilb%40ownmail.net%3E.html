@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VFS Locking Debates: Synthetic Inodes, iterate_shared(), and d_rehash() Retirement for AFS/CIFS</title>
+  <meta name="description" content="Following last week’s resolution of a deadlock bug in d_move() summarized previously, this week’s discussion between Al Viro and Neil Brown shifted to broader architectural concerns around directory iteration, synthetic inode numbers, and…">
+  <meta property="og:title" content="VFS Locking Debates: Synthetic Inodes, iterate_shared(), and d_rehash() Retirement for AFS/CIFS">
+  <meta property="og:description" content="Following last week’s resolution of a deadlock bug in d_move() summarized previously, this week’s discussion between Al Viro and Neil Brown shifted to broader architectural concerns around directory iteration, synthetic inode numbers, and…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-07T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="VFS Locking Debates: Synthetic Inodes, iterate_shared(), and d_rehash() Retirement for AFS/CIFS">
+  <meta name="twitter:description" content="Following last week’s resolution of a deadlock bug in d_move() summarized previously, this week’s discussion between Al Viro and Neil Brown shifted to broader architectural concerns around directory iteration, synthetic inode numbers, and…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-07</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>VFS Locking Debates: Synthetic Inodes, iterate_shared(), and d_rehash() Retirement for AFS/CIFS</h1>
+<h2>Summary</h2>
+<h1>VFS/NFS: Locking Semantics, Synthetic Inodes, and d_rehash() Retirement Plans</h1>
+<h2>Summary</h2>
+<p>Following last week’s resolution of a deadlock bug in <code>__d_move()</code> <a href="https://lore.kernel.org/linux-nfs/20260501011132.GA3518998@ZenIV/">summarized previously</a>, this week’s discussion between Al Viro and Neil Brown shifted to broader architectural concerns around directory iteration, synthetic inode numbers, and the long-term elimination of <code>d_rehash()</code> across network filesystems. The conversation represents an ongoing <strong>protocol/locking change</strong> effort rather than a discrete bug fix, focusing on how VFS APIs should constrain (or not constrain) filesystem-specific locking strategies.</p>
+<h2>Key Technical Arguments</h2>
+<h3>1. Concerns About Locking Constraints for Filesystems with Synthetic Inodes</h3>
+<p>Al Viro pushed back against Neil’s characterization that transitional lock-dropping code would be "short-lived," warning of the risks of poorly defined constraints:</p>
+<blockquote>
+<p>"... or we'll end up with hard-to-formulate constraints on what a filesystem may do with its internal locking to use the APIs provided by fs/{dcache,namei}.c safely." [id://20260501033715.GB3518998@ZenIV]</p>
+</blockquote>
+<p>Viro highlighted that filesystems requiring synthetic inode numbers — where <code>-&gt;iterate_shared()</code> needs to know what inumbers a concurrent <code>stat(2)</code> would inject into dcache — are "not uncommon." He contrasted procfs, which lacks directory-modifying operations like <code>mkdir()</code>, with more general cases:</p>
+<blockquote>
+<p>"In procfs you are lucky to have no mkdir() and friends; the same is not true in general and we'd better have a sane answer to 'what could a filesystem like that do with its internal locking'. Or that thing will get blindly copied, with predictable results." [id://20260501033715.GB3518998@ZenIV]</p>
+</blockquote>
+<h3>2. Neil’s Counter: Synthetic Inodes Are Rare; Backing Stores Handle Locking</h3>
+<p>Neil Brown disputed the frequency of this pattern, noting he could only find it in procfs and overlayfs:</p>
+<blockquote>
+<p>"You say 'not uncommon' but I can only find it in procfs and overlayfs." [id://177763238102.1474915.1506201584306941315@noble.neil.brown.name]</p>
+</blockquote>
+<p>He argued that filesystems either use backing store inode numbers directly, populate via <code>d_make_persistent()</code>, or rely on the backing store’s own locking protocol:</p>
+<blockquote>
+<p>"In either case, the backing store has its own locking protocol to manage create/remove/iterate, so the filesystem likely doesn't need to provide one." [id://177763238102.1474915.1506201584306941315@noble.neil.brown.name]</p>
+</blockquote>
+<p>For procfs, Neil envisioned that once parent-locking is pushed down into the filesystem, all internal locking could be removed:</p>
+<blockquote>
+<p>"For procfs I imagine that once we push parent parent-locking down in to the filesystem, we'll simply remove it all from procfs. Then there will be no problem calling d_alloc_parallel() in iterate_shared as the thread which owns the in-lookup dentry will never try to lock the parent." [id://177763238102.1474915.1506201584306941315@noble.neil.brown.name]</p>
+</blockquote>
+<p>He characterized the current drop-and-retake lock pattern as purely transitional:</p>
+<blockquote>
+<p>"The current code to drop and retake the lock is only transitional code to get from here to there in manageable steps." [id://177763238102.1474915.1506201584306941315@noble.neil.brown.name]</p>
+</blockquote>
+<h3>3. Proposed VFS-Level Helper for <code>-&gt;iterate_shared()</code></h3>
+<p>Viro floated a potential VFS enhancement to handle cases where <code>d_alloc_trylock()</code> fails during directory iteration:</p>
+<blockquote>
+<p>"It might be worth teaching iterate_dir() that in such-and-such conditions it ought to save position, drop the lock, do a lookup on name stashed in dir_context, retake the lock and call back into -&gt;iterate_shared() from saved position. With helper callable by -&gt;iterate_shared() instances if they run into failing d_alloc_trylock() in a situation where they can't just shrug and move on... Not sure." [id://20260501033715.GB3518998@ZenIV]</p>
+</blockquote>
+<p>Neil responded that the VFS would likely retain a shared lock on the parent during <code>-&gt;iterate_shared()</code> to block <code>rmdir</code> while <code>readdir</code> is in progress:</p>
+<blockquote>
+<p>"I think the VFS will still be taking a shared lock on the parent when calling -&gt;iterate_shared. This is the easiest way to block rmdir while a readdir is happening." [id://177763238102.1474915.1506201584306941315@noble.neil.brown.name]</p>
+</blockquote>
+<h3>4. Eliminating <code>d_rehash()</code> from AFS and CIFS</h3>
+<p>In a significant side thread, Viro asked about Neil’s prior work removing <code>d_rehash()</code> usage from NFS in 2022, expressing interest in extending this cleanup to AFS and CIFS:</p>
+<blockquote>
+<p>"BTW, do you have AFS and CIFS counterparts of your stuff from back in 2022 that killed d_rehash() uses in fs/nfs? I would love to kill d_rehash(); exfat use is an easily removable junk, but fs/afs and fs/smb/client ones are trickier and the reasons why it needed to be killed in fs/nfs apply to those as well." [id://20260501033715.GB3518998@ZenIV]</p>
+</blockquote>
+<p>Neil confirmed that patches already exist for both filesystems, pointing to commits in his GitHub tree and corresponding lore.kernel.org threads from March 2026:</p>
+<ul>
+<li><strong>AFS</strong>: <a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-20-neilb@ownmail.net/">20260312214330.3885211-20-neilb@ownmail.net</a> and <a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-21-neilb@ownmail.net/">20260312214330.3885211-21-neilb@ownmail.net</a></li>
+<li><strong>CIFS</strong>: <a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-26-neilb@ownmail.net/">20260312214330.3885211-26-neilb@ownmail.net</a> and <a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-27-neilb@ownmail.net/">20260312214330.3885211-27-neilb@ownmail.net</a></li>
+</ul>
+<p>Neil also invoked a decade-old CIFS commit, asking wryly:</p>
+<blockquote>
+<p>"I don't suppose you have any memory of Commit: a00be0e ('cifs: don't use -&gt;d_time') from 10 years ago. Maybe you didn't even see it." [id://177763238102.1474915.1506201584306941315@noble.neil.brown.name]</p>
+</blockquote>
+<h2>Final Conclusions</h2>
+<ul>
+<li><strong>No immediate bug fix this week</strong>: The discussion was purely architectural, debating the long-term locking semantics for filesystems with synthetic inode numbers and directory-modifying operations.</li>
+<li><strong>Disagreement on prevalence</strong>: Viro views synthetic-inode filesystems as a common enough pattern to warrant careful API design; Neil considers them rare (procfs and overlayfs only) with manageable workarounds.</li>
+<li><strong>Transitional approach accepted</strong>: Neil’s drop-and-retake lock pattern is acknowledged as temporary, pending the push of parent-locking down into filesystem-specific <code>inode_operations</code>.</li>
+<li><strong><code>d_rehash()</code> retirement on track</strong>: Patches to eliminate <code>d_rehash()</code> from AFS and CIFS already exist and are available for review, extending the 2022 NFS cleanup to other network filesystems — a significant step toward simplifying VFS dcache internals.</li>
+</ul>
+<p>This discussion is about a <strong>protocol/locking change</strong> with implications for NFS client development, as well as broader VFS improvements that will benefit AFS and CIFS clients. The elimination of <code>d_rehash()</code> across multiple network filesystems represents an important cleanup effort that reduces complexity and potential race conditions in the dcache layer.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260501033715.GB3518998@ZenIV/">2026-05-01 Al Viro <a href="mailto:viro@zeniv.linux.org.uk">viro@zeniv.linux.org.uk</a> — Re: [PATCH v3 04/19] VFS: use wait_var_event for waiting in d_alloc_parallel()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177763238102.1474915.1506201584306941315@noble.neil.brown.name/">2026-05-01 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v3 04/19] VFS: use wait_var_event for waiting in d_alloc_parallel()</a></li>
+</ul>
+  </main>
+</body>
+</html>

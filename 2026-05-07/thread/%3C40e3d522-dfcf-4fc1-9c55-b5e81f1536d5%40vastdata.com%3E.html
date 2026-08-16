@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RFC: Use-After-Free Bug in NFS mTLS Connect Path</title>
+  <meta name="description" content="This week, Michael Nemanov of Vast Data submitted an RFC PATCH reporting a critical use-after-free (UAF) bug in the NFS client&#39;s mTLS (mutual TLS) connection establishment path. The discussion is classified as a bug fix investigation, with…">
+  <meta property="og:title" content="RFC: Use-After-Free Bug in NFS mTLS Connect Path">
+  <meta property="og:description" content="This week, Michael Nemanov of Vast Data submitted an RFC PATCH reporting a critical use-after-free (UAF) bug in the NFS client&#39;s mTLS (mutual TLS) connection establishment path. The discussion is classified as a bug fix investigation, with…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-07T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="RFC: Use-After-Free Bug in NFS mTLS Connect Path">
+  <meta name="twitter:description" content="This week, Michael Nemanov of Vast Data submitted an RFC PATCH reporting a critical use-after-free (UAF) bug in the NFS client&#39;s mTLS (mutual TLS) connection establishment path. The discussion is classified as a bug fix investigation, with…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-07</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>RFC: Use-After-Free Bug in NFS mTLS Connect Path</h1>
+<h2>Summary</h2>
+<h1>RFC: Use-After-Free Bug in NFS mTLS Connect Path</h1>
+<h2>Overview</h2>
+<p>This week, Michael Nemanov of Vast Data submitted an <a href="https://lore.kernel.org/linux-nfs/40e3d522-dfcf-4fc1-9c55-b5e81f1536d5@vastdata.com/">RFC PATCH</a> reporting a <strong>critical use-after-free (UAF) bug</strong> in the NFS client's mTLS (mutual TLS) connection establishment path. The discussion is classified as a <strong>bug fix</strong> investigation, with no replies received during this week's window.</p>
+<p>This report builds on prior activity: in February 2026, Debian maintainer Salvatore Bonaccorso reported a kernel panic when repeatedly attempting to mount an NFSv4 share with mismatched mTLS certificates, resulting in a NULL pointer dereference in <code>rcu_do_batch</code> (<a href="https://lore.kernel.org/linux-nfs/fdf293f1-ad7c-42c7-87b8-a2b4d338907a@unibas.ch/">thread</a>). Nemanov's submission provides deeper diagnostic insight into the underlying mechanism causing such crashes.</p>
+<h2>Key Technical Arguments</h2>
+<h3>The Bug Mechanism</h3>
+<p>Nemanov identified a race condition where a raw, unrefcounted pointer to an <code>rpc_clnt</code> structure is stored during <code>xs_connect()</code> and subsequently accessed by a delayed workqueue item after the client has been freed. The issue manifests specifically when:</p>
+<ol>
+<li>An NFS mount uses incorrect credentials (a valid client certificate that does not match the server's requirements) during TLS setup.</li>
+<li>The TLS handshake fails, triggering client teardown via <code>rpc_shutdown_client</code> → <code>rpc_free_client</code>.</li>
+<li>Meanwhile, a delayed work item scheduled by <code>xs_connect()</code> still holds a pointer to the now-freed client structure.</li>
+</ol>
+<blockquote>
+<p>"The NFS-over-TLS implementation seems to have a use-after-free bug where a raw unrefcounted pointer to an rpc_clnt is stored in xs_connect() and accessed by a delayed workqueue item after the client has been freed." <a href="https://lore.kernel.org/linux-nfs/40e3d522-dfcf-4fc1-9c55-b5e81f1536d5@vastdata.com/">Michael Nemanov</a></p>
+</blockquote>
+<h3>Diagnostic Evidence</h3>
+<p>Nemanov provided extensive kernel log traces from <code>vmcore-dmesg</code> showing the lifecycle of the RPC client from creation to use-after-free. The critical sequence is:</p>
+<pre><code>[   39.065470] @ rpc_shutdown_client: 00000000f636d223
+[   39.065580] @ rpc_free_client: put_cred 00000000f636d223    &lt;&lt; Client being destroyed
+...
+[   42.033267] @ xs_tcp_tls_setup_socket: Using clnt 00000000f636d223  &lt;&lt; Client used AFTER free
+...
+[   42.164197] ------------[ cut here ]------------
+[   42.165779] refcount_t: underflow; use-after-free.
+</code></pre>
+<p>The three-second gap between the client being freed and the delayed work accessing it is attributed to an <code>msleep(100)</code> added for reproduction purposes, though Nemanov notes this timing is not guaranteed.</p>
+<h3>Reproduction Methodology</h3>
+<p>A detailed reproduction script was provided, involving repeated mount attempts with mTLS:</p>
+<pre><code class="language-bash">for i in {1..1000}; do
+    sudo mount -o vers=4.2,proto=tcp,xprtsec=mtls remote_addr:/opt/export /mnt/export
+    sleep 5
+done
+</code></pre>
+<p>Dynamic debug traces were enabled for <code>net/sunrpc/clnt.c</code> and <code>net/sunrpc/xprtsock.c</code> to capture the lifecycle events.</p>
+<h3>Open Questions</h3>
+<p>Nemanov explicitly acknowledged uncertainty about the root cause:</p>
+<blockquote>
+<p>"I don't understand if the use-after-free is the root cause and must be fixed or a symptom of a problem elsewhere." <a href="https://lore.kernel.org/linux-nfs/40e3d522-dfcf-4fc1-9c55-b5e81f1536d5@vastdata.com/">Michael Nemanov</a></p>
+</blockquote>
+<p>He also noted puzzling behavior regarding the timing:</p>
+<blockquote>
+<p>"I am also not sure what causes the bug to manifest. It <em>might</em> be related to the timing of server's FIN (sk_state=8 in the log) and the flags it changes." <a href="https://lore.kernel.org/linux-nfs/40e3d522-dfcf-4fc1-9c55-b5e81f1536d5@vastdata.com/">Michael Nemanov</a></p>
+</blockquote>
+<h2>Evolution of the Discussion</h2>
+<p>This thread consists of a single message this week — the initial RFC submission. No replies were received from NFS maintainers or other developers during the reporting window. The submission is marked as "RFC" (Request for Comments), indicating that Nemanov is seeking guidance on whether the observed use-after-free represents the fundamental problem or merely a symptom of a deeper architectural issue in the mTLS connection handling code.</p>
+<h2>Final Conclusions</h2>
+<p>As of this week, the discussion remains in its initial investigative phase:</p>
+<ol>
+<li><strong>Bug Identified</strong>: A use-after-free condition exists in the NFS client's mTLS connect path when TLS handshakes fail due to credential mismatches.</li>
+<li><strong>Impact</strong>: The bug can cause kernel crashes (<code>refcount_t: underflow; use-after-free</code>) and has been linked to prior reports of NULL pointer dereferences in RCU cleanup paths during repeated failed mTLS mounts.</li>
+<li><strong>Status</strong>: No fix has been proposed yet. Nemanov's submission includes diagnostic patches with debug traces but no corrective code, seeking community input on the proper remediation strategy.</li>
+</ol>
+<p>This bug is particularly significant for NFS client development as it affects the relatively new NFS-over-TLS transport security feature (<code>xprtsec=mtls</code>), which is gaining adoption in enterprise environments requiring encrypted and authenticated NFS connections. The interaction between delayed workqueue scheduling and RPC client lifecycle management represents a subtle but dangerous race condition that could affect production deployments using mTLS.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/40e3d522-dfcf-4fc1-9c55-b5e81f1536d5@vastdata.com/">2026-05-03 Michael Nemanov <a href="mailto:michael.nemanov@vastdata.com">michael.nemanov@vastdata.com</a> — [RFC PATCH] Possible use-after-free bug in mTLS connect</a></li>
+</ul>
+  </main>
+</body>
+</html>

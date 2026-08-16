@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SUNRPC: Fix memory leaks and use-after-free in RPC-with-TLS</title>
+  <meta name="description" content="Chuck Lever submitted a two-patch series this week to address critical memory management bugs in the Linux kernel&#39;s RPC-over-TLS implementation. The patches, titled &quot;[PATCH 0/2] Fix a few memory bugs in RPC-with-TLS&quot;…">
+  <meta property="og:title" content="SUNRPC: Fix memory leaks and use-after-free in RPC-with-TLS">
+  <meta property="og:description" content="Chuck Lever submitted a two-patch series this week to address critical memory management bugs in the Linux kernel&#39;s RPC-over-TLS implementation. The patches, titled &quot;[PATCH 0/2] Fix a few memory bugs in RPC-with-TLS&quot;…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-07T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="SUNRPC: Fix memory leaks and use-after-free in RPC-with-TLS">
+  <meta name="twitter:description" content="Chuck Lever submitted a two-patch series this week to address critical memory management bugs in the Linux kernel&#39;s RPC-over-TLS implementation. The patches, titled &quot;[PATCH 0/2] Fix a few memory bugs in RPC-with-TLS&quot;…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-07</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>SUNRPC: Fix memory leaks and use-after-free in RPC-with-TLS</h1>
+<h2>Summary</h2>
+<p>Chuck Lever submitted a two-patch series this week to address critical memory management bugs in the Linux kernel's RPC-over-TLS implementation. The patches, titled "[PATCH 0/2] Fix a few memory bugs in RPC-with-TLS" [id://20260504-sunrpc-tls-clnt-pin-v1-0-197f359c6072@oracle.com], resolve a resource leak and a use-after-free (UAF) vulnerability that could destabilize NFS mounts secured with mutual TLS (mTLS).</p>
+<h3>Bug Fix 1: Resource Leak in Lower Client</h3>
+<p>The first patch [id://20260504-sunrpc-tls-clnt-pin-v1-1-197f359c6072@oracle.com] addresses a leak of the "lower" <code>rpc_clnt</code> structure. During the TLS handshake, <code>xs_tcp_tls_setup_socket()</code> creates a temporary client to drive the inner connection. If this process is interrupted by a signal while waiting for the <code>XPRT_LOCKED</code> state, the code previously jumped to an unlock path without calling <code>rpc_shutdown_client()</code>.</p>
+<p>Chuck Lever explained the flaw:</p>
+<blockquote>
+<p>"the killed-wait path jumps to out_unlock without calling rpc_shutdown_client(), so the clnt and its xprt leak."</p>
+</blockquote>
+<p>The fix ensures that <code>rpc_shutdown_client()</code> is called on the interrupted wait path, preventing the loss of the client and its underlying transport resources.</p>
+<h3>Bug Fix 2: Use-After-Free in Upper Client</h3>
+<p>The second patch [id://20260504-sunrpc-tls-clnt-pin-v1-2-197f359c6072@oracle.com] resolves a more severe use-after-free issue reported by Michael Nemanov. This bug occurred when an mTLS mount failed due to certificate rejection. Because nothing pinned the "upper" <code>rpc_clnt</code> across the delayed <code>connect_worker</code>, the client could be freed by the mount caller before the worker thread executed, leading to dereferences of freed memory.</p>
+<p>Lever detailed the race condition:</p>
+<blockquote>
+<p>"When a TLS handshake fails fatally... the upper rpc_clnt is freed before the queued connect_worker fires. xs_tcp_tls_setup_socket() then dereferences the freed clnt, producing the refcount_t underflow Michael Nemanov reported."</p>
+</blockquote>
+<p>To fix this, Lever introduced a new <code>rpc_hold_client()</code> helper that takes a reference on the upper client for TLS transports only, which is released when the worker exits. He noted why this was scoped to TLS:</p>
+<blockquote>
+<p>"The non-TLS connect worker (xs_tcp_setup_socket) never reads sock_xprt::clnt, so leave that path alone and avoid the clnt-holds-xprt-holds-clnt cycle that would otherwise prevent xprt destruction."</p>
+</blockquote>
+<h3>Conclusion and Testing</h3>
+<p>Michael Nemanov, who originally reported the UAF, reviewed and tested both patches. He confirmed that the fixes resolved the instability he observed:</p>
+<blockquote>
+<p>"Reviewed and tested both patches. Confirmed 3-sec delayed work was happening multiple times without UAF. Thank you."</p>
+</blockquote>
+<p>The series is marked as compile-tested by Lever and tested-by Nemanov, addressing bugs introduced in earlier SUNRPC/TLS commits. These fixes are critical for the stability of NFS clients using TLS security, ensuring that resources are properly cleaned up during handshake interruptions and that memory safety is maintained during fatal handshake failures.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260504-sunrpc-tls-clnt-pin-v1-0-197f359c6072@oracle.com/">2026-05-04 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 0/2] Fix a few memory bugs in RPC-with-TLS</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260504-sunrpc-tls-clnt-pin-v1-1-197f359c6072@oracle.com/">2026-05-04 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 1/2] SUNRPC: release lower rpc_clnt if killed waiting for XPRT_LOCKED</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260504-sunrpc-tls-clnt-pin-v1-2-197f359c6072@oracle.com/">2026-05-04 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 2/2] SUNRPC: pin upper rpc_clnt across the TLS connect_worker</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/37b7692e-5b0f-42fe-b052-84a11370efcd@vastdata.com/">2026-05-04 Michael Nemanov <a href="mailto:michael.nemanov@vastdata.com">michael.nemanov@vastdata.com</a> — Re: [PATCH 0/2] Fix a few memory bugs in RPC-with-TLS</a></li>
+</ul>
+  </main>
+</body>
+</html>

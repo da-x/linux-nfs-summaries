@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS/VFS: Resolving d_alloc_parallel() Deadlock and Locking Debates</title>
+  <meta name="description" content="This week, the discussion around Neil Brown&#39;s 19-patch series to lift directory lookups out of the exclusive inode lock (PATCH v3 00/19) reached a critical juncture. The focus shifted from broad architectural debates to resolving a…">
+  <meta property="og:title" content="NFS/VFS: Resolving d_alloc_parallel() Deadlock and Locking Debates">
+  <meta property="og:description" content="This week, the discussion around Neil Brown&#39;s 19-patch series to lift directory lookups out of the exclusive inode lock (PATCH v3 00/19) reached a critical juncture. The focus shifted from broad architectural debates to resolving a…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-07T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS/VFS: Resolving d_alloc_parallel() Deadlock and Locking Debates">
+  <meta name="twitter:description" content="This week, the discussion around Neil Brown&#39;s 19-patch series to lift directory lookups out of the exclusive inode lock (PATCH v3 00/19) reached a critical juncture. The focus shifted from broad architectural debates to resolving a…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-07</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS/VFS: Resolving d_alloc_parallel() Deadlock and Locking Debates</h1>
+<h2>Summary</h2>
+<h1>NFS/VFS: Resolving <code>d_alloc_parallel()</code> Deadlock and Locking Debates</h1>
+<h2>Summary</h2>
+<p>This week, the discussion around Neil Brown's 19-patch series to lift directory lookups out of the exclusive inode lock (<a href="https://lore.kernel.org/linux-nfs/20260427040517.828226-1-neilb@ownmail.net/">PATCH v3 00/19</a>) reached a critical juncture. The focus shifted from broad architectural debates to resolving a specific deadlock bug in the VFS dcache code that was impacting NFS client testing. Al Viro and Neil Brown collaborated to identify and fix a bug in <code>__d_move()</code> related to waking the wrong dentry, which was causing deadlocks in NFS server operations.</p>
+<h2>Key Technical Arguments and Evolution</h2>
+<h3>1. Root Cause of NFS Deadlock Identified</h3>
+<p>At the end of the prior week, Neil Brown reported a deadlock observed during testing:</p>
+<blockquote>
+<p>"Also my testing has hit a problem with some sort of deadlock in the nfs server (so accessing an XFS filesystem). They are trying to unlink a file and are waiting in d_alloc_parallel() under reconnect_path. This is running generic/467. So better hold off this patchset until I have that understood" [id://177759308866.1474915.9708613530229799376@noble.neil.brown.name]</p>
+</blockquote>
+<p>This week, Neil diagnosed the root cause, linking it directly to a bug in Al Viro's proposed <code>d_alloc_parallel()</code> refactoring:</p>
+<blockquote>
+<p>"The two problems are actually one. __d_move() is called in d_splice_alias() with the target dentry often being in-lookup. reconnect_path() does exactly this and is expected to find an existing dentry for a directory and to splice that dentry to the in-lookup dentry it has. So the wakeup of the wrong dentry in __d_move() is causing the deadlock in nfsd." [id://177759843868.1474915.6100875324018019224@noble.neil.brown.name]</p>
+</blockquote>
+<p>The bug stemmed from <code>__d_wake_in_lookup_waiters()</code> being called on the wrong dentry in <code>__d_move()</code>. Neil had previously flagged this:</p>
+<blockquote>
+<p>"That code is wrong. It only makes sense to __d_wake_in_lookup_waiters() a dentry that we know was in-lookup, and in d_move, that is target... So we need __d_wake_in_lookup_waiters(target); in d_move" [id://177759308866.1474915.9708613530229799376@noble.neil.brown.name]</p>
+</blockquote>
+<p>Al Viro confirmed the diagnosis:</p>
+<blockquote>
+<p>"Yep." [id://20260501011132.GA3518998@ZenIV]</p>
+</blockquote>
+<h3>2. Decoupling <code>d_alloc_parallel()</code> from the Larger Series</h3>
+<p>Al Viro proposed separating the <code>d_alloc_parallel()</code> fix from the rest of Neil's patchset, arguing it had standalone value:</p>
+<blockquote>
+<p>"Let's deal with d_alloc_parallel() first; it doesn't have to be tied into the rest of patchset. Does the variant I've posted + s/dentry/target/ in that call of __d_wake_in_lookup_waiters() trigger any problems in your testing? If it doesn't, let's get that part out of the way - it makes sense on its own and getting it into -next (I'm sitting on a bunch of fs/dcache.c patches, and it would fit there nicely) would be a good idea." [id://20260501011132.GA3518998@ZenIV]</p>
+</blockquote>
+<p>Neil agreed: "OK" [id://177759959922.1474915.14496442965390503813@noble.neil.brown.name].</p>
+<h3>3. Testing Results and Next Steps</h3>
+<p>Neil confirmed that the fix resolved the immediate testing failure:</p>
+<blockquote>
+<p>"generic/467 now passes repeatedly. I'm running the full set now. Shall I post the patch once all the generic/ tests pass? Or will you just use what you already have?" [id://177759994594.1474915.12208704330740243979@noble.neil.brown.name]</p>
+</blockquote>
+<h3>4. Naming and Design Concerns for <code>d_alloc_noblock()</code></h3>
+<p>Al Viro raised concerns about the naming and semantics of Neil's <code>d_alloc_noblock()</code> function, arguing it was misleading:</p>
+<blockquote>
+<p>"FWIW, your 'noblock' variant is a misnomer - it <em>is</em> a trylock analogue of d_alloc_parallel(), all right, but it might very well block; on allocations, if nothing else, and there's a chance of having that dput(dentry) in 'wouldblock' case coming right after the sucker ceased to be in-lookup and dropping the sole remaining reference. Which may block on real IO, final dput() being what it is..." [id://20260501011132.GA3518998@ZenIV]</p>
+</blockquote>
+<p>Neil was amenable to renaming: "I'm happy to rename it to d_alloc_trylock()" [id://177759959922.1474915.14496442965390503813@noble.neil.brown.name].</p>
+<h3>5. Concerns About Lock Dropping Patterns</h3>
+<p>Al Viro expressed strong reservations about the pattern of dropping and regaining caller-held locks, citing historical race conditions:</p>
+<blockquote>
+<p>"And I really dislike the 'drop and regain a caller-held lock' games - we'd been there many times and it had ended up with race galore again and again; see https://lore.kernel.org/all/20250623213747.GJ1880847@ZenIV/ for one recent example..." [id://20260501011132.GA3518998@ZenIV]</p>
+</blockquote>
+<p>Neil acknowledged the concern but defended the approach as a temporary measure:</p>
+<blockquote>
+<p>"I dislike them too. I doubt I can find solutions that either of us like, but they should be relatively short-lived. Once we push the locking down in the inode_operations the filesystem will be in a position to hold the lock only when it actually needs it (if at all). I'm confident that dropping the lock is safe." [id://177759959922.1474915.14496442965390503813@noble.neil.brown.name]</p>
+</blockquote>
+<h2>Final Conclusions</h2>
+<ul>
+<li><strong>Bug Fix</strong>: The deadlock in NFS client testing was traced to a bug in <code>__d_move()</code> where the wrong dentry was being woken up. The fix involves changing <code>__d_wake_in_lookup_waiters(dentry)</code> to <code>__d_wake_in_lookup_waiters(target)</code>.</li>
+<li><strong>Incremental Progress</strong>: Al Viro and Neil Brown agreed to decouple the <code>d_alloc_parallel()</code> refactoring from the larger series, allowing it to be merged independently into <code>-next</code>.</li>
+<li><strong>Testing Status</strong>: The specific test case (<code>generic/467</code>) that was failing now passes repeatedly. Full testing is ongoing.</li>
+<li><strong>Design Debates Continue</strong>: Concerns about lock-dropping patterns and API naming remain open, but are considered secondary to getting the core <code>d_alloc_parallel()</code> fix merged.</li>
+</ul>
+<p>This discussion represents a <strong>bug fix</strong> within the context of a larger <strong>locking/protocol change</strong> effort. The resolution of the deadlock is a significant step forward for NFS client development, as it removes a blocker for the concurrency improvements that Neil's series aims to deliver.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260501011132.GA3518998@ZenIV/">2026-05-01 Al Viro <a href="mailto:viro@zeniv.linux.org.uk">viro@zeniv.linux.org.uk</a> — Re: [PATCH v3 04/19] VFS: use wait_var_event for waiting in d_alloc_parallel()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177759843868.1474915.6100875324018019224@noble.neil.brown.name/">2026-05-01 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v3 04/19] VFS: use wait_var_event for waiting in d_alloc_parallel()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177759959922.1474915.14496442965390503813@noble.neil.brown.name/">2026-05-01 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v3 04/19] VFS: use wait_var_event for waiting in d_alloc_parallel()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177759994594.1474915.12208704330740243979@noble.neil.brown.name/">2026-05-01 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v3 04/19] VFS: use wait_var_event for waiting in d_alloc_parallel()</a></li>
+</ul>
+  </main>
+</body>
+</html>

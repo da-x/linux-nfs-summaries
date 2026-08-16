@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS Weekly: SUNRPC Cache UAF Fixed, svcrdma OOM Resolved, TLS Memory Bugs Patched, and Client Hangs Investigated</title>
+  <meta name="description" content="The longest-running bug on the list this week reached resolution. A use-after-free in cache_check_rcu() — originally reported on ppc64le in February and confirmed to affect ARM64 as well — was fully addressed by Chuck Lever&#39;s six-patch…">
+  <meta property="og:title" content="NFS Weekly: SUNRPC Cache UAF Fixed, svcrdma OOM Resolved, TLS Memory Bugs Patched, and Client Hangs Investigated">
+  <meta property="og:description" content="The longest-running bug on the list this week reached resolution. A use-after-free in cache_check_rcu() — originally reported on ppc64le in February and confirmed to affect ARM64 as well — was fully addressed by Chuck Lever&#39;s six-patch…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-07T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS Weekly: SUNRPC Cache UAF Fixed, svcrdma OOM Resolved, TLS Memory Bugs Patched, and Client Hangs Investigated">
+  <meta name="twitter:description" content="The longest-running bug on the list this week reached resolution. A use-after-free in cache_check_rcu() — originally reported on ppc64le in February and confirmed to affect ARM64 as well — was fully addressed by Chuck Lever&#39;s six-patch…">
+  <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../index.html">Summaries</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS Weekly: SUNRPC Cache UAF Fixed, svcrdma OOM Resolved, TLS Memory Bugs Patched, and Client Hangs Investigated</h1>
+<p><em>Week ending 2026-05-07</em></p>
+<h2>Critical Bug Fixes</h2>
+<h3>SUNRPC Cache Use-After-Free Finally Resolved</h3>
+<p>The longest-running bug on the list this week reached resolution. A <strong>use-after-free in <code>cache_check_rcu()</code></strong> — originally reported on ppc64le in February and confirmed to affect ARM64 as well — was fully addressed by Chuck Lever's six-patch series (<a href="thread/%253C20260501-cache-uaf-fix-v1-0-a49928bf4817%2540oracle.com%253E.html">thread</a>). The root cause involved two compounding issues: (1) the <code>/proc/net/rpc/.../content</code> open path only took a module reference, not a network namespace reference, allowing <code>cache_destroy_net()</code> to free cache structures while readers were still walking them; and (2) sub-object cleanup in caches like <code>ip_map</code> performed synchronous teardown (<code>path_put()</code>, <code>auth_domain_put()</code>) <em>before</em> the RCU grace period ended, leaving data structures in a half-dismantled state. The fix introduces a shared workqueue (<code>sunrpc_cache_wq</code>), defers all sleeping cleanup past the RCU grace period via <code>queue_rcu_work()</code>, and adds proper net reference holding for cache file lifetimes. Jeff Layton reviewed positively and Calum Mackay confirmed no more crashes with <code>sosreport</code>. The discussion thread (<a href="thread/%253Cdcd371d3a95815a84ba7de52cef447b8%2540linux.ibm.com%253E.html">thread</a>) provides additional context on the multi-architecture impact.</p>
+<h3>svcrdma OOM Under Heavy RDMA Load Fixed</h3>
+<p>A critical <strong>Out-Of-Memory condition in <code>svcrdma</code></strong> was reported by Mike Snitzer and Benjamin Coddington from Hammerspace, affecting large deployments (121 clients, 9 servers) where memory grew from ~12GB to exhaustion within seconds under 16K O_DIRECT read workloads (<a href="thread/%253C20260505215535.68412-1-snitzer%2540kernel.org%253E.html">thread</a>). The root cause was an unbounded <code>sc_send_ctxts</code> cache: send contexts were always returned to a lockless list on release, but workqueue lag caused concurrent allocations during the gap, leading to monotonic cache growth. Chuck Lever submitted a two-patch series (<a href="thread/%253C20260506-svcrdma-next-v1-0-915fce8c4fbb%2540oracle.com%253E.html">thread</a>) that eliminates the problem at its source: Patch 1 inlines resource release to avoid re-queuing on <code>svcrdma_wq</code> (recovering ~1% CPU), and Patch 2 defers send context release entirely to the nfsd thread via per-transport lock-free lists, removing workqueue contention from the Send completion path. Snitzer confirmed that <strong>Patch 1 alone eliminated the OOM</strong> in production testing.</p>
+<h3>RPC-over-TLS Memory Bugs Fixed</h3>
+<p>Chuck Lever submitted a two-patch series fixing critical memory management bugs in the NFS-over-TLS transport (<a href="thread/%253C20260504-sunrpc-tls-clnt-pin-v1-0-197f359c6072%2540oracle.com%253E.html">thread</a>). The first patch fixes a resource leak of the lower <code>rpc_clnt</code> when TLS handshake is interrupted by a signal. The second patch resolves a <strong>use-after-free in the upper <code>rpc_clnt</code></strong> originally reported by Michael Nemanov (<a href="thread/%253C40e3d522-dfcf-4fc1-9c55-b5e81f1536d5%2540vastdata.com%253E.html">thread</a>), where a failed mTLS mount caused the client to be freed before the delayed <code>connect_worker</code> fired, leading to refcount underflows. A new <code>rpc_hold_client()</code> helper pins the upper client across the TLS connect worker. Nemanov confirmed both patches resolve the instability.</p>
+<h2>NFS Client Development</h2>
+<h3>NFSv4.1 Slot Table Hang Against Windows Server</h3>
+<p>A new bug report from 郭玲兴 describes an <strong>NFSv4.1 client hang in <code>nfs4_drain_slot_tbl</code></strong> under concurrent workload when connected to a Windows Server 2022 NFS server (<a href="thread/%253C45ca6e57.1a1cc.19dfc4104df.Coremail.guolingxing%2540supcon.com%253E.html">thread</a>, <a href="thread/%253CCAPJSo4Xu8ZRmL8dbhW7PQVV0tpADKLOpfzUL-TgTCR1bgg2fEQ%2540mail.gmail.com%253E.html">follow-up</a>). The client uses <code>vers=4.1,soft,proto=tcp,timeo=60,retrans=10</code> with AUTH_SYS and no user mapping. Lionel Cons requested reproduction details; the reporter provided full environment specifics (x86_64, 16GB RAM per client VM, Windows Server 2022 v10.0.20348). The issue remains under investigation and highlights ongoing interoperability edge cases with non-Linux NFS servers.</p>
+<h3>NFSv4 State Recovery Deadlock — Still Unresolved</h3>
+<p>Zhihao Cheng pinged the unresolved <strong>state recovery deadlock</strong> that occurs when an NFS server misses its grace period (<a href="thread/%253C20260422064447.358447-1-chengzhihao1%2540huawei.com%253E.html">thread</a>). The client enters an infinite loop during <code>NFS4CLNT_RECLAIM_NOGRACE</code> when the server repeatedly returns <code>NFS4ERR_GRACE</code>. Maintainer Trond Myklebust's suggested fix did not resolve the problem, and the tension between NFSv4 spec restrictions on reclaim operations during NOGRACE and practical recovery needs remains unresolved.</p>
+<h3>NFS4ERR_SEQ_MISORDERED Fix Deployed</h3>
+<p>The long-running investigation into <code>NFS4ERR_SEQ_MISORDERED</code> errors causing severe slowdowns for Rocky 8 clients against RHEL10 servers concluded this week (<a href="thread/%253C2cb85a89-f896-4504-b1cf-e4494d344ffe%2540esat.kuleuven.be%253E.html">thread</a>). The root cause was a server-side bug in SEQUENCE replay logic that sent incorrect <code>maxslots</code> values, causing clients to discard slot state. Rik Theys confirmed deployment of the fix on kernel 7.0.3 and is monitoring for recurrence.</p>
+<h3>ENOSPC/EDQUOT Writeback Error Discussion</h3>
+<p>Piyush Sachdeva initiated a discussion on preventing silent data loss from <code>ENOSPC</code>/<code>EDQUOT</code> writeback errors on network filesystems (<a href="thread/%253Cm21pfqgzbq.fsf%2540gmail.com%253E.html">thread</a>). The core issue: buffered writes return success immediately, but if the server runs out of space during writeback, pages are marked clean and can be reclaimed under memory pressure, losing data the application believes was persisted. Jeff Layton emphasized this is a fundamental limitation of delayed writeback and recommended that applications use <code>fallocate()</code> proactively to guarantee server-side space before writing.</p>
+<h2>TLS/Security Infrastructure</h2>
+<h3>ktls-utils Keyring Regression Fixed</h3>
+<p>A regression in <code>ktls-utils</code> broke keyring-based NFS client certificate management after dual-certificate support was added (<a href="thread/%253Cfd4aaf4e-b1b7-4ca2-bc93-955c31fab317%2540grimberg.me%253E.html">thread</a>). Scott Mayhew submitted a fix, and after debate about whether the feature was "production-ready," Chuck Lever agreed to create a <code>ktls-utils-1.3-fixes</code> branch for a 1.3.1 maintenance release. The discussion also highlighted the need for better documentation of <code>cert_serial</code> and <code>privkey_serial</code> mount options in <code>nfs(5)</code> (<a href="thread/%253C20260505142038.52921-1-sagi%2540grimberg.me%253E.html">thread</a>).</p>
+<h2>VFS and Performance</h2>
+<h3>d_alloc_parallel() Deadlock Fix for NFS Testing</h3>
+<p>Neil Brown's 19-patch series to lift directory lookups out of the exclusive inode lock hit a deadlock during NFS testing in <code>generic/467</code> (<a href="thread/%253C20260427040517.828226-1-neilb%2540ownmail.net%253E.html">thread</a>). The bug was traced to <code>__d_move()</code> waking the wrong dentry in <code>__d_wake_in_lookup_waiters()</code>. Al Viro and Neil Brown agreed to decouple the <code>d_alloc_parallel()</code> fix from the larger series for independent merge.</p>
+<h3>RWF_DONTCACHE Write Performance (v6)</h3>
+<p>Jeff Layton posted v6 of his <code>RWF_DONTCACHE</code> writeback improvement series (<a href="thread/%253C20260505-dontcache-v6-0-66463805dd6a%2540kernel.org%253E.html">thread</a>), fixing concurrency bugs found by static analysis. Results: <strong>+201% throughput</strong> (298→897 MB/s), <strong>-99.7% tail latency</strong> (8.9s→28ms p99.9), and fair bandwidth sharing with buffered I/O. Jan Kara provided Reviewed-by tags.</p>
+<h3>Case Folding Behavior Exposure (v13)</h3>
+<p>Chuck Lever submitted v13 of his 15-patch series exposing filesystem case-folding behavior through VFS <code>fileattr_get()</code> (<a href="thread/%253C20260502-case-sensitivity-v13-0-aa853140311f%2540oracle.com%253E.html">thread</a>). This enables NFSD to correctly report <code>FATTR4_WORD0_CASE_INSENSITIVE</code> for Windows NFS clients and allows the NFS client to disable negative dentry caching on case-insensitive shares. Support was added for FAT, exFAT, NTFS, HFS, XFS, CIFS, NFS, vboxsf, and isofs.</p>
+<h2>Other Notable Activity</h2>
+<ul>
+<li><strong>xprtrdma workqueue optimization</strong>: Marco Crivellari's patch to use <code>system_dfl_long_wq</code> instead of <code>system_long_wq</code> for long delayed work was accepted pending an improved commit message (<a href="thread/%253C20260430085412.96961-1-marco.crivellari%2540suse.com%253E.html">thread</a>).</li>
+<li><strong>nfs-utils throughput display</strong>: Tigran Mkrtchyan proposed an option to display throughput in MB/s (<a href="thread/%253C20260501205604.653238-1-tigran.mkrtchyan%2540desy.de%253E.html">thread</a>).</li>
+<li><strong>nsfs error code fix</strong>: Zhihao Cheng submitted a fix for wrong error codes returned by pidns ioctls (<a href="thread/%253C20260507111404.638608-1-chengzhihao1%2540huawei.com%253E.html">thread</a>).</li>
+</ul>
+<h2>Discussions this week</h2>
+<ul>
+<li><a href="thread/%253C20260427040517.828226-1-neilb%2540ownmail.net%253E.html">Re: [PATCH v3 04/19] VFS: use wait_var_event for waiting in d_alloc_parallel()</a></li>
+<li><a href="thread/%253C20260427040517.828226-5-neilb%2540ownmail.net%253E.html">Re: [PATCH v3 04/19] VFS: use wait_var_event for waiting in d_alloc_parallel()</a></li>
+<li><a href="thread/%253Cdcd371d3a95815a84ba7de52cef447b8%2540linux.ibm.com%253E.html">Re: [BUG] [powerpc] [next-20260216/17] nfsd: use-after-free in cache_check_rcu() triggered by sosreport on ppc64le</a></li>
+<li><a href="thread/%253C20260501-cache-uaf-fix-v1-0-a49928bf4817%2540oracle.com%253E.html">[PATCH 0/6] SUNRPC: Address remaining cache_check_rcu() UAF in cache content files</a></li>
+<li><a href="thread/%253C20260501-dontcache-v4-0-5d5e6dc71cb3%2540kernel.org%253E.html">[PATCH v4 0/4] mm: improve write performance with RWF_DONTCACHE</a></li>
+<li><a href="thread/%253C20260504-dontcache-v5-0-4103e58bb377%2540kernel.org%253E.html">[PATCH v5 0/2] mm: improve write performance with RWF_DONTCACHE</a></li>
+<li><a href="thread/%253C20260505-dontcache-v6-0-66463805dd6a%2540kernel.org%253E.html">[PATCH v6 0/2] mm: improve write performance with RWF_DONTCACHE</a></li>
+<li><a href="thread/%253C20260502-case-sensitivity-v13-0-aa853140311f%2540oracle.com%253E.html">[PATCH v13 00/15] Exposing case folding behavior</a></li>
+<li><a href="thread/%253C20260507-case-sensitivity-v14-0-e62cc8200435%2540oracle.com%253E.html">[PATCH v14 00/15] Exposing case folding behavior</a></li>
+<li><a href="thread/%253C20260502180201.27546-1-dai.ngo%2540oracle.com%253E.html">[PATCH 1/1] Subject: xfs: fix use of uninitialized imap in xfs_fs_map_blocks error path</a></li>
+<li><a href="thread/%253C20260502181031.32441-1-dai.ngo%2540oracle.com%253E.html">[PATCH 1/1] xfs: fix use of uninitialized imap in xfs_fs_map_blocks error path</a></li>
+<li><a href="thread/%253C20260502202542.111830-1-dai.ngo%2540oracle.com%253E.html">[PATCH v2 1/1] xfs: fix use of uninitialized imap in xfs_fs_map_blocks error path</a></li>
+<li><a href="thread/%253C20260430085412.96961-1-marco.crivellari%2540suse.com%253E.html">Re: [RFC PATCH] xprtrdma: Move long delayed work on system_dfl_long_wq</a></li>
+<li><a href="thread/%253C20260507130117.252825-1-marco.crivellari%2540suse.com%253E.html">[PATCH v2] xprtrdma: Move long delayed work on system_dfl_long_wq</a></li>
+<li><a href="thread/%253C45ca6e57.1a1cc.19dfc4104df.Coremail.guolingxing%2540supcon.com%253E.html">[BUG] NFSv4.1 client hang in nfs4_drain_slot_tbl under concurrent workload against Windows NFS server</a></li>
+<li><a href="thread/%253CCAPJSo4Xu8ZRmL8dbhW7PQVV0tpADKLOpfzUL-TgTCR1bgg2fEQ%2540mail.gmail.com%253E.html">Re: Re: [BUG] NFSv4.1 client hang in nfs4_drain_slot_tbl under concurrent workload against Windows NFS server</a></li>
+<li><a href="thread/%253C19b5fe04.1a5ac.19dffea136b.Coremail.guolingxing%2540supcon.com%253E.html">Re: Re: Re: [BUG] NFSv4.1 client hang in nfs4_drain_slot_tbl under concurrent workload against Windows NFS server</a></li>
+<li><a href="thread/%253Cfd4aaf4e-b1b7-4ca2-bc93-955c31fab317%2540grimberg.me%253E.html">Re: Breakage in ktls-utils with nfs keyring?</a></li>
+<li><a href="thread/%253C92a53963-1e4b-42eb-af81-6be9f63f9e43%2540app.fastmail.com%253E.html">[PATCH] tlshd: fix keyring cert retrieval</a></li>
+<li><a href="thread/%253C40e3d522-dfcf-4fc1-9c55-b5e81f1536d5%2540vastdata.com%253E.html">[RFC PATCH] Possible use-after-free bug in mTLS connect</a></li>
+<li><a href="thread/%253C20260504-sunrpc-tls-clnt-pin-v1-0-197f359c6072%2540oracle.com%253E.html">[PATCH 0/2] Fix a few memory bugs in RPC-with-TLS</a></li>
+<li><a href="thread/%253C20260505142038.52921-1-sagi%2540grimberg.me%253E.html">[PATCH] nfs.man: Document mtls mount parameters cert_serial and privkey_serial</a></li>
+<li><a href="thread/%253C20260505215535.68412-1-snitzer%2540kernel.org%253E.html">[RFC PATCH 0/2] svcrdma: avoid OOM due to unbounded sc_send_ctxts cache</a></li>
+<li><a href="thread/%253C20260506-svcrdma-next-v1-0-915fce8c4fbb%2540oracle.com%253E.html">[PATCH 0/2] svcrdma: Reduce svcrdma_wq contention on the Send completion path</a></li>
+<li><a href="thread/%253C20250428195022.24587-2-stephen.smalley.work%2540gmail.com%253E.html">Re: [PATCH ported/repost v2] security,fs,nfs,net: update security_inode_listsecurity() interface</a></li>
+<li><a href="thread/%253C20260422064447.358447-1-chengzhihao1%2540huawei.com%253E.html">Re: [PATCH] NFSv4: Fix state recovery deadlock when server misses grace period</a></li>
+<li><a href="thread/%253C20260501205604.653238-1-tigran.mkrtchyan%2540desy.de%253E.html">[PATCH] nfs-utils: add option to display throughput in MB/s</a></li>
+<li><a href="thread/%253C20260507111404.638608-1-chengzhihao1%2540huawei.com%253E.html">[PATCH] nsfs: fix wrong error code returned for pidns ioctls</a></li>
+<li><a href="thread/%253C2cb85a89-f896-4504-b1cf-e4494d344ffe%2540esat.kuleuven.be%253E.html">Re: NFS4ERR_SEQ_MISORDERED errors and NFS client very slow</a></li>
+<li><a href="thread/%253CaTN38kJjBftxnjm9%2540archie.me%253E.html">Re: [PATCH] dept: update documentation function names to match implementation</a></li>
+<li><a href="thread/%253Cm21pfqgzbq.fsf%2540gmail.com%253E.html">[DISCUSSION] Preventing ENOSPC/EDQUOT writeback errors on network filesystems</a></li>
+</ul>
+  </main>
+</body>
+</html>

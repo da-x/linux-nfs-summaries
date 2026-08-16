@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SUNRPC: Fix Use-After-Free in Cache Content Files via Deferred Release</title>
+  <meta name="description" content="This week, Chuck Lever submitted a six-patch series to address a persistent Use-After-Free (UAF) bug in the SUNRPC layer, specifically within the cache content files (/proc/net/rpc/&lt;cd&gt;/content). The issue was originally reported by Misbah…">
+  <meta property="og:title" content="SUNRPC: Fix Use-After-Free in Cache Content Files via Deferred Release">
+  <meta property="og:description" content="This week, Chuck Lever submitted a six-patch series to address a persistent Use-After-Free (UAF) bug in the SUNRPC layer, specifically within the cache content files (/proc/net/rpc/&lt;cd&gt;/content). The issue was originally reported by Misbah…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-07T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="SUNRPC: Fix Use-After-Free in Cache Content Files via Deferred Release">
+  <meta name="twitter:description" content="This week, Chuck Lever submitted a six-patch series to address a persistent Use-After-Free (UAF) bug in the SUNRPC layer, specifically within the cache content files (/proc/net/rpc/&lt;cd&gt;/content). The issue was originally reported by Misbah…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-07</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>SUNRPC: Fix Use-After-Free in Cache Content Files via Deferred Release</h1>
+<h2>Summary</h2>
+<p>This week, Chuck Lever submitted a six-patch series to address a persistent Use-After-Free (UAF) bug in the SUNRPC layer, specifically within the cache content files (<code>/proc/net/rpc/&lt;cd&gt;/content</code>). The issue was originally reported by Misbah Anjum on ppc64le and later reproduced on aarch64.</p>
+<h3>The Bug: Synchronous Teardown vs. RCU Readers</h3>
+<p>While previous fixes in v7.0 addressed UAFs in the NFSD export path (<code>e_show()</code>), a related fault remained in the generic cache show callback (<code>c_show()</code>). Lever explained that two bugs combined to cause the crash:</p>
+<ol>
+<li><strong>Missing Network Reference:</strong> The <code>/proc/net/rpc/.../content</code> open path took only a module reference, not a network namespace reference. Consequently, if a file descriptor remained open during a namespace exit, <code>cache_destroy_net()</code> would free the <code>cache_detail</code> and its hash table synchronously. Readers walking this freed memory encountered garbage pointers.</li>
+<li><strong>Premature Sub-object Cleanup:</strong> In caches like <code>ip_map</code>, sub-objects (e.g., <code>auth_domain</code>) were released via <code>path_put()</code> and <code>auth_domain_put()</code> <em>before</em> the RCU grace period ended. Although the final <code>kfree</code> was deferred, these functions performed synchronous teardown steps (unhashing dentries, clearing <code>d_inode</code>) that left data structures in a "half-dismantled" state while RCU readers were still traversing them.</li>
+</ol>
+<blockquote>
+<p>"The cache_head pointer is plain garbage... c_show() is the generic show callback used by /proc/net/rpc/&lt;cd&gt;/content for every per-net cache_detail."<br />
+— <a href="https://lore.kernel.org/linux-nfs/20260501-cache-uaf-fix-v1-0-a49928bf4817@oracle.com/">Chuck Lever</a></p>
+</blockquote>
+<h3>The Fix: Shared Infrastructure and Deferred Releases</h3>
+<p>Lever's series replaced narrow fixes with shared infrastructure covering all four <code>cache_detail</code> <code>.put</code> paths. Key changes included:</p>
+<ul>
+<li><strong>Shared Workqueue:</strong> A new <code>sunrpc_cache_wq</code> was introduced to handle deferred releases, replacing the NFSD-specific workqueue.</li>
+<li><strong>Deferred Cleanup:</strong> Patches converted <code>ip_map_put()</code> and <code>unix_gid_put()</code> to use a <code>queue_rcu_work()</code> pattern. This moves sleeping cleanup operations (like <code>path_put()</code>) into a callback that runs <em>after</em> the RCU grace period in process context, ensuring readers see consistent state.</li>
+<li><strong>Net Reference Holding:</strong> Patch 5 added <code>get_net(cd-&gt;net)</code> to the open helpers for cache files, preventing namespace teardown while files are open.</li>
+</ul>
+<blockquote>
+<p>"This series replaces the v1 narrow fixes with shared infrastructure that covers all four cache_detail .put paths and all three per-cache file types."<br />
+— <a href="https://lore.kernel.org/linux-nfs/20260501-cache-uaf-fix-v1-0-a49928bf4817@oracle.com/">Chuck Lever</a></p>
+</blockquote>
+<h3>Discussion and Verification</h3>
+<p>The series received quick positive feedback. Jeff Layton reviewed the code, stating:</p>
+<blockquote>
+<p>"The series looks sane."<br />
+— <a href="https://lore.kernel.org/linux-nfs/54d4357280a0c9caeaf5350affa0c685ffe90367.camel@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<p>Calum Mackay provided testing confirmation:</p>
+<blockquote>
+<p>"With these patches, testing shows no crashes, sosreport no longer hangs, no seq_file errors."<br />
+— <a href="https://lore.kernel.org/linux-nfs/daa6461b-d8d6-42ad-adac-ac0df58c3b6e@oracle.com/">Calum Mackay</a></p>
+</blockquote>
+<p>Lever subsequently pushed the series with these acknowledgments.</p>
+<h3>Technical Clarification: Why the UAF Occurred</h3>
+<p>Later in the week, yangerkun (Erkun) questioned why the UAF was triggered given that previous code used <code>call_rcu</code> for final frees:</p>
+<blockquote>
+<p>"I'm a little confused why this UAF can be trigged... The auth_domain_put function releases -&gt;name using call_rcu... All of this seems to prevent e_show from causing a UAF."<br />
+— <a href="https://lore.kernel.org/linux-nfs/c45779f6-fe6c-4037-bb1c-01cfbbaa8aac@huawei.com/">yangerkun</a></p>
+</blockquote>
+<p>Lever clarified that the issue wasn't the final <code>kfree</code>, but the synchronous dismantling performed by <code>path_put()</code> <em>before</em> the RCU callback:</p>
+<blockquote>
+<p>"The problem is the synchronous teardown inside path_put(), which runs before svc_export_put() ever reaches its own call_rcu()... An e_show() that's still inside its cache RCU read section walks into that half-dismantled state through seq_path(), and that's the NULL deref Misbah reported."<br />
+— <a href="https://lore.kernel.org/linux-nfs/76a10e49-54a6-4813-8b58-b7cd0820fdc6@app.fastmail.com/">Chuck Lever</a></p>
+</blockquote>
+<p>He emphasized that the new <code>queue_rcu_work()</code> pattern defers these sleeping operations entirely, closing the window for readers to encounter inconsistent state.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260501-cache-uaf-fix-v1-0-a49928bf4817@oracle.com/">2026-05-01 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 0/6] SUNRPC: Address remaining cache_check_rcu() UAF in cache content files</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260501-cache-uaf-fix-v1-1-a49928bf4817@oracle.com/">2026-05-01 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 1/6] SUNRPC: Move cache_initialize() declaration to sunrpc-private header</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260501-cache-uaf-fix-v1-2-a49928bf4817@oracle.com/">2026-05-01 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 2/6] SUNRPC: Provide a shared workqueue for cache release callbacks</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260501-cache-uaf-fix-v1-3-a49928bf4817@oracle.com/">2026-05-01 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 3/6] SUNRPC: Defer ip_map sub-object cleanup past RCU grace period</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260501-cache-uaf-fix-v1-4-a49928bf4817@oracle.com/">2026-05-01 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 4/6] SUNRPC: Use shared release pattern for the unix_gid cache</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260501-cache-uaf-fix-v1-5-a49928bf4817@oracle.com/">2026-05-01 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 5/6] SUNRPC: Hold cd-&gt;net for the lifetime of cache files</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260501-cache-uaf-fix-v1-6-a49928bf4817@oracle.com/">2026-05-01 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 6/6] NFSD: Convert nfsd_export_shutdown() to sunrpc_cache_destroy_net()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/54d4357280a0c9caeaf5350affa0c685ffe90367.camel@kernel.org/">2026-05-05 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 0/6] SUNRPC: Address remaining cache_check_rcu() UAF in cache content files</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/daa6461b-d8d6-42ad-adac-ac0df58c3b6e@oracle.com/">2026-05-05 Calum Mackay <a href="mailto:calum.mackay@oracle.com">calum.mackay@oracle.com</a> — Re: [PATCH 0/6] SUNRPC: Address remaining cache_check_rcu() UAF in cache content files</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/8d3fbb91-65c4-4d15-ac38-3e6372eb0ffa@kernel.org/">2026-05-05 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 0/6] SUNRPC: Address remaining cache_check_rcu() UAF in cache content files</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/c45779f6-fe6c-4037-bb1c-01cfbbaa8aac@huawei.com/">2026-05-07 yangerkun <a href="mailto:yangerkun@huawei.com">yangerkun@huawei.com</a> — Re: [PATCH 0/6] SUNRPC: Address remaining cache_check_rcu() UAF in cache content files</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/76a10e49-54a6-4813-8b58-b7cd0820fdc6@app.fastmail.com/">2026-05-07 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 0/6] SUNRPC: Address remaining cache_check_rcu() UAF in cache content files</a></li>
+</ul>
+  </main>
+</body>
+</html>

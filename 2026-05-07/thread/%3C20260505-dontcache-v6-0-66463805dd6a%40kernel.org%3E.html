@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>mm: Improve RWF_DONTCACHE write performance with targeted dirty tracking (v6)</title>
+  <meta name="description" content="Status: Patch series v6 posted, Reviewed-by obtained from Jan Kara. Type: Performance Improvement / Bug Fix (concurrency fixes in v6). Key Participants: Jeff Layton, Jan Kara.">
+  <meta property="og:title" content="mm: Improve RWF_DONTCACHE write performance with targeted dirty tracking (v6)">
+  <meta property="og:description" content="Status: Patch series v6 posted, Reviewed-by obtained from Jan Kara. Type: Performance Improvement / Bug Fix (concurrency fixes in v6). Key Participants: Jeff Layton, Jan Kara.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-07T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="mm: Improve RWF_DONTCACHE write performance with targeted dirty tracking (v6)">
+  <meta name="twitter:description" content="Status: Patch series v6 posted, Reviewed-by obtained from Jan Kara. Type: Performance Improvement / Bug Fix (concurrency fixes in v6). Key Participants: Jeff Layton, Jan Kara.">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-07</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>mm: Improve RWF_DONTCACHE write performance with targeted dirty tracking (v6)</h1>
+<h2>Summary</h2>
+<h1>mm: Improve RWF_DONTCACHE write performance with targeted dirty tracking (v6)</h1>
+<p><strong>Status:</strong> Patch series v6 posted, Reviewed-by obtained from Jan Kara.
+<strong>Type:</strong> Performance Improvement / Bug Fix (concurrency fixes in v6).
+<strong>Key Participants:</strong> Jeff Layton, Jan Kara.</p>
+<h2>Overview</h2>
+<p>Jeff Layton submitted version 6 of a two-patch series aimed at significantly improving write performance for <code>RWF_DONTCACHE</code> operations. This iteration addresses concurrency bugs discovered via the Sasiko static analysis tool after the v5 submission. The patches introduce per-bdi_writeback tracking for DONTCACHE dirty pages and replace inline writeback submission with a background flusher kick, drastically reducing tail latency and improving throughput parity with buffered I/O.</p>
+<h2>Key Technical Arguments &amp; Evolution</h2>
+<h3>1. Tracking DONTCACHE Dirty Pages (Patch 1/2)</h3>
+<p>The first patch introduces a <code>WB_DONTCACHE_DIRTY</code> counter per <code>bdi_writeback</code>. This allows the writeback subsystem to distinguish between standard dirty pages and those marked with the dropbehind flag (dirtied via <code>RWF_DONTCACHE</code>).</p>
+<ul>
+<li><strong>Concurrency Fixes:</strong> Layton noted that Sasiko identified bugs in previous versions. Key fixes in v6 include:
+<ul>
+<li>Using <code>atomic folio_test_clear_dropbehind()</code> in <code>__filemap_get_folio_mpol()</code> to prevent double-decrementing the counter by concurrent readers.</li>
+<li>Adding a <code>mapping_can_writeback()</code> guard before decrementing the counter to match the increment path logic.</li>
+</ul>
+</li>
+<li><strong>Review:</strong> Jan Kara approved this approach, stating:
+<blockquote>
+<p>"Yeah, good catch with the folio_test_clear_dropbehind(). Feel free to add: Reviewed-by: Jan Kara <a href="mailto:jack@suse.cz">jack@suse.cz</a>" <a href="https://lore.kernel.org/linux-nfs/zj7w24dm7qk64sp37ai7jvt54vyfftzmbvxwladwkoqhggi3d7@ivb4gkk5t6rj/">Reviewed-by added</a>.</p>
+</blockquote>
+</li>
+</ul>
+<h3>2. Kicking Writeback Flusher Instead of Inline Submission (Patch 2/2)</h3>
+<p>The second patch replaces the inline <code>filemap_flush_range()</code> call in <code>generic_write_sync()</code> with a mechanism that kicks the writeback flusher thread. This moves writeback submission off the writer's hot path.</p>
+<ul>
+<li><strong>Problem:</strong> Perf profiling showed that the performance bottleneck was not lock contention but the work of walking the page tree and submitting I/O inline, which inflated p99.9 latency from 23ms (buffered) to 93ms (dontcache).</li>
+<li><strong>Solution:</strong> A new <code>WB_start_dontcache</code> bit triggers the flusher to write back a proportional number of pages based on the <code>WB_DONTCACHE_DIRTY</code> counter. This preserves I/O batching while limiting the scope of expedited writeback to avoid flushing unrelated buffered data.</li>
+<li><strong>Concurrency Fixes:</strong>
+<ul>
+<li>Using <code>test_and_clear_bit</code> for <code>WB_start_dontcache</code> to prevent lost wakeups from concurrent writers.</li>
+<li>Moving <code>wb_wakeup()</code> outside the <code>unlocked_inode_to_wb_begin/end</code> section to avoid re-enabling interrupts while the <code>i_pages xa_lock</code> is held during cgroup writeback switches.</li>
+</ul>
+</li>
+<li><strong>Review:</strong> Jan Kara approved this patch as well:
+<blockquote>
+<p>"Looks good. Feel free to add: Reviewed-by: Jan Kara <a href="mailto:jack@suse.cz">jack@suse.cz</a>" <a href="https://lore.kernel.org/linux-nfs/yz5zorwpe5vunerb6wn4jv7sdumrkfe2jcvo6cnknk465kn4wa@g6fw43s7qb4a/">Reviewed-by added</a>.</p>
+</blockquote>
+</li>
+</ul>
+<h2>Performance Impact</h2>
+<p>Layton provided extensive benchmark results demonstrating significant improvements:</p>
+<ul>
+<li><strong>Single-stream throughput:</strong> Sequential write/dontcache improved by <strong>+201%</strong> (298 MB/s to 897 MB/s).</li>
+<li><strong>Tail Latency:</strong> p99.9 latency for sequential writes dropped from ~8.9 seconds to ~28ms (<strong>-99.7%</strong>).</li>
+<li><strong>Multi-writer Parity:</strong> In competing writer scenarios (dontcache vs. buffered), the previous version starved the dontcache writer 2:1. With per-bdi_writeback tracking, both writers now receive equal bandwidth.
+<blockquote>
+<p>"Previously the buffered writer starved the dontcache writer 2:1. With per-bdi_writeback tracking, both writers now receive equal bandwidth." <a href="https://lore.kernel.org/linux-nfs/20260505-dontcache-v6-2-66463805dd6a@kernel.org/">Layton</a></p>
+</blockquote>
+</li>
+<li><strong>Dirty Page Reduction:</strong> Peak dirty pages in a 32-file write test dropped from 1.8 GB to 213 MB (<strong>-88%</strong>).</li>
+</ul>
+<h2>Conclusion</h2>
+<p>The v6 series is now ready for inclusion, having addressed critical concurrency issues and received review from Jan Kara. The changes promise substantial performance gains for <code>RWF_DONTCACHE</code> workloads, particularly in reducing tail latency and ensuring fair bandwidth sharing with buffered I/O. Layton requested Christian Brauner to consider these patches for v7.2.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260505-dontcache-v6-0-66463805dd6a@kernel.org/">2026-05-05 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v6 0/2] mm: improve write performance with RWF_DONTCACHE</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260505-dontcache-v6-1-66463805dd6a@kernel.org/">2026-05-05 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v6 1/2] mm: track DONTCACHE dirty pages per bdi_writeback</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260505-dontcache-v6-2-66463805dd6a@kernel.org/">2026-05-05 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v6 2/2] mm: kick writeback flusher for IOCB_DONTCACHE with targeted dirty tracking</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/zj7w24dm7qk64sp37ai7jvt54vyfftzmbvxwladwkoqhggi3d7@ivb4gkk5t6rj/">2026-05-06 Jan Kara <a href="mailto:jack@suse.cz">jack@suse.cz</a> — Re: [PATCH v6 1/2] mm: track DONTCACHE dirty pages per bdi_writeback</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/yz5zorwpe5vunerb6wn4jv7sdumrkfe2jcvo6cnknk465kn4wa@g6fw43s7qb4a/">2026-05-06 Jan Kara <a href="mailto:jack@suse.cz">jack@suse.cz</a> — Re: [PATCH v6 2/2] mm: kick writeback flusher for IOCB_DONTCACHE with targeted dirty tracking</a></li>
+</ul>
+  </main>
+</body>
+</html>

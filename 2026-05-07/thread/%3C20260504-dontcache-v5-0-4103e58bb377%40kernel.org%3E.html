@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>mm: Improve RWF_DONTCACHE Write Performance (v5)</title>
+  <meta name="description" content="This week, Jeff Layton posted version 5 of a patch series aimed at significantly improving write performance for RWF_DONTCACHE (Dropbehind) I/O. This is a continuation of the v4 series posted earlier in the week, incorporating feedback…">
+  <meta property="og:title" content="mm: Improve RWF_DONTCACHE Write Performance (v5)">
+  <meta property="og:description" content="This week, Jeff Layton posted version 5 of a patch series aimed at significantly improving write performance for RWF_DONTCACHE (Dropbehind) I/O. This is a continuation of the v4 series posted earlier in the week, incorporating feedback…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-07T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="mm: Improve RWF_DONTCACHE Write Performance (v5)">
+  <meta name="twitter:description" content="This week, Jeff Layton posted version 5 of a patch series aimed at significantly improving write performance for RWF_DONTCACHE (Dropbehind) I/O. This is a continuation of the v4 series posted earlier in the week, incorporating feedback…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-07</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>mm: Improve RWF_DONTCACHE Write Performance (v5)</h1>
+<h2>Summary</h2>
+<h1>mm: Improve RWF_DONTCACHE Write Performance (v5)</h1>
+<h2>Summary</h2>
+<p>This week, Jeff Layton posted version 5 of a patch series aimed at significantly improving write performance for <code>RWF_DONTCACHE</code> (Dropbehind) I/O. This is a continuation of the v4 series posted earlier in the week, incorporating feedback from Jan Kara and Jens Axboe. The series represents a <strong>performance optimization</strong> rather than a bug fix or new feature, though it addresses severe tail latency issues that effectively acted as performance bugs for workloads using <code>RWF_DONTCACHE</code>.</p>
+<h3>Evolution from v4 to v5</h3>
+<p>The v4 series (<a href="https://lore.kernel.org/linux-nfs/20260501-dontcache-v4-0-5d5e6dc71cb3@kernel.org/">previously summarized</a>) received positive reviews but included two benchmarking patches that were deemed unsuitable for mainline inclusion. In v5, Jeff Layton streamlined the series:</p>
+<blockquote>
+<p>"I've also dropped the two patches that add the benchmarks that I was using for testing. I don't think they're appropriate for inclusion here, though we could consider cleaning them up and adding them to xfstests or something if there is interest." <a href="https://lore.kernel.org/linux-nfs/20260504-dontcache-v5-0-4103e58bb377@kernel.org/">As stated by Jeff Layton</a></p>
+</blockquote>
+<p>The primary technical change in v5 was an updated comment on <code>filemap_dontcache_kick_writeback()</code>, addressing Jan Kara's concern from the previous round:</p>
+<blockquote>
+<p>"This comment is a bit confusing as in fact we write arbitrary dirty pages. It is only the amount of pages that is influenced by WB_DONTCACHE_DIRTY..." <a href="https://lore.kernel.org/linux-nfs/oykxd436yv47u2yojrwrp3qdtzekq63hanezs6bwlovot6il2a@266nl5oqnnam/">As stated by Jan Kara in the v4 discussion</a></p>
+</blockquote>
+<p>Jeff Layton confirmed this adjustment:</p>
+<blockquote>
+<p>"The main difference in this version is an updated comment over filemap_dontcache_kick_writeback(), using the verbiage suggested by Jan." <a href="https://lore.kernel.org/linux-nfs/20260504-dontcache-v5-0-4103e58bb377@kernel.org/">As stated by Jeff Layton</a></p>
+</blockquote>
+<h3>Technical Arguments and Solution</h3>
+<p>The core problem addressed by this series is that the <code>IOCB_DONTCACHE</code> writeback path previously called <code>filemap_flush_range()</code> inline for every write, submitting writeback directly in the writer's context. This caused severe tail latency:</p>
+<blockquote>
+<p>"Perf lock contention profiling shows the performance problem is not lock contention but the writeback submission work itself — walking the page tree and submitting I/O blocks the writer for milliseconds, inflating p99.9 latency from 23ms (buffered) to 93ms (dontcache)." <a href="https://lore.kernel.org/linux-nfs/20260504-dontcache-v5-2-4103e58bb377@kernel.org/">As stated by Jeff Layton</a></p>
+</blockquote>
+<p>The solution involves two key patches:</p>
+<ol>
+<li>
+<p><strong>Patch 1/2</strong>: Introduces a per-bdi_writeback counter (<code>WB_DONTCACHE_DIRTY</code>) to track dirty pages with the dropbehind flag set. This allows the writeback system to know how many DONTCACHE pages are pending without flushing all dirty pages on the BDI.</p>
+</li>
+<li>
+<p><strong>Patch 2/2</strong>: Replaces the inline <code>filemap_flush_range()</code> call with a flusher kick that drains dirty pages in the background:</p>
+</li>
+</ol>
+<blockquote>
+<p>"Replace the inline filemap_flush_range() call with a flusher kick that drains dirty pages in the background. This moves writeback submission completely off the writer's hot path." <a href="https://lore.kernel.org/linux-nfs/20260504-dontcache-v5-2-4103e58bb377@kernel.org/">As stated by Jeff Layton</a></p>
+</blockquote>
+<p>The flusher uses a new <code>WB_start_dontcache</code> bit and writes back a number of pages proportional to the DONTCACHE dirty count, preserving I/O batching while limiting the scope of expedited writeback.</p>
+<h3>Performance Improvements</h3>
+<p>The benchmarks included in Patch 2/2 demonstrate dramatic improvements:</p>
+<ul>
+<li><strong>Single-stream sequential write throughput</strong>: +201% (298 MB/s → 897 MB/s)</li>
+<li><strong>Tail latency (p99)</strong>: -82% (135,266 μs → 23,986 μs)</li>
+<li><strong>Tail latency (p99.9)</strong>: -99.7% (8,925,479 μs → 28,443 μs)</li>
+<li><strong>Multi-writer throughput</strong>: Matches buffered I/O (4,532 MB/s vs 4,616 MB/s)</li>
+<li><strong>Peak dirty pages</strong>: -88% in 32-file concurrent writes (1.8 GB → 213 MB)</li>
+</ul>
+<p>Notably, the series also resolves fairness issues between buffered and DONTCACHE writers:</p>
+<blockquote>
+<p>"Previously the buffered writer starved the dontcache writer 2:1. With per-bdi_writeback tracking, both writers now receive equal bandwidth." <a href="https://lore.kernel.org/linux-nfs/20260504-dontcache-v5-2-4103e58bb377@kernel.org/">As stated by Jeff Layton</a></p>
+</blockquote>
+<h3>NFS Client Relevance</h3>
+<p>While the core changes are in the memory management and generic filesystem layers, this optimization is highly relevant to NFS clients utilizing <code>RWF_DONTCACHE</code> for improved performance characteristics. The NFS client can leverage <code>RWF_DONTCACHE</code> writes to achieve lower latency and higher throughput when appropriate, particularly for workloads that do not require immediate data persistence in the page cache.</p>
+<p>The series received Reviewed-by tags from both Jan Kara and Jens Axboe, indicating strong support from key maintainers. Jeff Layton requested consideration for inclusion in kernel v7.2:</p>
+<blockquote>
+<p>"Christian, please consider these for v7.2." <a href="https://lore.kernel.org/linux-nfs/20260504-dontcache-v5-0-4103e58bb377@kernel.org/">As stated by Jeff Layton</a></p>
+</blockquote>
+<h3>Conclusion</h3>
+<p>The v5 series represents a mature, well-reviewed performance enhancement for <code>RWF_DONTCACHE</code> writes. By moving writeback submission off the writer's hot path and introducing targeted dirty page tracking, the series eliminates severe tail latency issues and brings DONTCACHE throughput to parity with buffered I/O. With approvals from Jens Axboe and Jan Kara, the series is poised for integration into the mainline kernel.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260504-dontcache-v5-0-4103e58bb377@kernel.org/">2026-05-04 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v5 0/2] mm: improve write performance with RWF_DONTCACHE</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260504-dontcache-v5-1-4103e58bb377@kernel.org/">2026-05-04 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v5 1/2] mm: track DONTCACHE dirty pages per bdi_writeback</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260504-dontcache-v5-2-4103e58bb377@kernel.org/">2026-05-04 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v5 2/2] mm: kick writeback flusher for IOCB_DONTCACHE with targeted dirty tracking</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260504-dontcache-v5-0-4103e58bb377@kernel.org/">2026-05-04 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v5 0/2] mm: improve write performance with RWF_DONTCACHE</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260504-dontcache-v5-1-4103e58bb377@kernel.org/">2026-05-04 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v5 1/2] mm: track DONTCACHE dirty pages per bdi_writeback</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260504-dontcache-v5-2-4103e58bb377@kernel.org/">2026-05-04 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v5 2/2] mm: kick writeback flusher for IOCB_DONTCACHE with targeted dirty tracking</a></li>
+</ul>
+  </main>
+</body>
+</html>
