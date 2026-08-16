@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>sunrpc: Fix netlink GET_REQS hang by initializing cache request seqno at 1</title>
+  <meta name="description" content="This week, the Linux NFS community addressed a critical bug in the Sun RPC (sunrpc) subsystem that caused persistent hangs in mountd upcalls, particularly affecting NFSv4 export key (expkey) and file handle (nfsd.fh) cache entries. The fix…">
+  <meta property="og:title" content="sunrpc: Fix netlink GET_REQS hang by initializing cache request seqno at 1">
+  <meta property="og:description" content="This week, the Linux NFS community addressed a critical bug in the Sun RPC (sunrpc) subsystem that caused persistent hangs in mountd upcalls, particularly affecting NFSv4 export key (expkey) and file handle (nfsd.fh) cache entries. The fix…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-04-16T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="sunrpc: Fix netlink GET_REQS hang by initializing cache request seqno at 1">
+  <meta name="twitter:description" content="This week, the Linux NFS community addressed a critical bug in the Sun RPC (sunrpc) subsystem that caused persistent hangs in mountd upcalls, particularly affecting NFSv4 export key (expkey) and file handle (nfsd.fh) cache entries. The fix…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-04-16</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>sunrpc: Fix netlink GET_REQS hang by initializing cache request seqno at 1</h1>
+<h2>Summary</h2>
+<h2>Bug Fix: Resolving Persistent mountd Hangs via Cache Sequence Number Initialization</h2>
+<p>This week, the Linux NFS community addressed a critical bug in the Sun RPC (sunrpc) subsystem that caused persistent hangs in <code>mountd</code> upcalls, particularly affecting NFSv4 export key (<code>expkey</code>) and file handle (<code>nfsd.fh</code>) cache entries. The fix was proposed by Jeff Layton and applied by Chuck Lever to the <code>nfsd-testing</code> tree.</p>
+<h3>The Problem: Silent Skipping of Cache Requests</h3>
+<p>Jeff Layton identified a subtle initialization error in the sunrpc cache request handling logic. The issue stemmed from how sequence numbers (<code>seqno</code>) were assigned to new cache requests and subsequently filtered during netlink dumps.</p>
+<blockquote>
+<p>"sunrpc_cache_requests_snapshot() filters requests with crq-&gt;seqno &lt;= min_seqno. The min_seqno for the first netlink dump call is cb-&gt;args[0] which is 0. Since next_seqno was initialized to 0, the very first cache request got seqno=0 and was silently skipped by the snapshot (0 &lt;= 0 is true)." <a href="https://lore.kernel.org/linux-nfs/20260411-exportd-nl-v1-1-ca582b6d9434@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<p>This logic error had severe downstream consequences for NFS server operations:</p>
+<ol>
+<li><strong>Empty Snapshots:</strong> The netlink-based <code>GET_REQS</code> operation would return zero pending requests, even when a request was actually queued.</li>
+<li><strong>Blocked Resolution:</strong> Because <code>mountd</code> could not see the pending requests via netlink, it failed to resolve cache entries (specifically <code>expkey</code> and <code>nfsd.fh</code>).</li>
+<li><strong>Permanent Hangs:</strong> Entries remained in an unresolved <code>CACHE_PENDING</code> state, which blocked all further notifications for that entry. This resulted in "permanent NFS4ERR_DELAY hangs," effectively freezing NFS operations that depended on these cache lookups.</li>
+</ol>
+<p>Layton noted that he encountered this issue as a "persistent hang in mountd upcalls just after reboot," suggesting the bug manifests early in system initialization when the first cache requests are created.</p>
+<h3>The Fix</h3>
+<p>The solution was a minimal one-line change to <code>net/sunrpc/cache.c</code>. By initializing <code>next_seqno</code> to 1 instead of 0, all subsequent cache requests receive a sequence number greater than or equal to 1. This ensures they pass the snapshot filter when <code>min_seqno</code> is 0 (the default for the first dump).</p>
+<blockquote>
+<p>"Start next_seqno at 1 so all requests have seqno &gt;= 1 and pass the snapshot filter when min_seqno is 0." <a href="https://lore.kernel.org/linux-nfs/20260411-exportd-nl-v1-1-ca582b6d9434@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<p>Layton recommended that this fix be folded into the original patch that introduced the queue split, citing:</p>
+<blockquote>
+<p>"Fixes: facc4e3c8042 ("sunrpc: split cache_detail queue into request and reader lists")"</p>
+</blockquote>
+<h3>Conclusion</h3>
+<p>Chuck Lever accepted the patch without further discussion, applying it to the <code>nfsd-testing</code> tree. The commit was recorded as <code>2dd2484661eb</code>.</p>
+<blockquote>
+<p>"Applied to nfsd-testing, thanks!" <a href="https://lore.kernel.org/linux-nfs/177610106224.4271.14936503257520657746.b4-ty@oracle.com/">Chuck Lever</a></p>
+</blockquote>
+<p>This fix is significant for NFS server stability, particularly in environments where netlink-based cache management is used to coordinate between kernel-space NFS daemon components and user-space utilities like <code>mountd</code>. The bug had been present since the queue refactoring commit <code>facc4e3c8042</code>, making this an important regression fix for recent kernels.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260411-exportd-nl-v1-1-ca582b6d9434@kernel.org/">2026-04-11 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH] sunrpc: start cache request seqno at 1 to fix netlink GET_REQS</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177610106224.4271.14936503257520657746.b4-ty@oracle.com/">2026-04-13 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH] sunrpc: start cache request seqno at 1 to fix netlink GET_REQS</a></li>
+</ul>
+  </main>
+</body>
+</html>

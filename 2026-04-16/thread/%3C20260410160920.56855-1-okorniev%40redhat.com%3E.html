@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd: Fix mtime/ctime updates for CLONE/COPY with delegated attributes</title>
+  <meta name="description" content="A two-patch series submitted by Olga Kornievskaia addresses a regression in the NFS server (nfsd) where modification time (mtime) and change time (ctime) were not being updated correctly during CLONE and COPY operations when delegated…">
+  <meta property="og:title" content="nfsd: Fix mtime/ctime updates for CLONE/COPY with delegated attributes">
+  <meta property="og:description" content="A two-patch series submitted by Olga Kornievskaia addresses a regression in the NFS server (nfsd) where modification time (mtime) and change time (ctime) were not being updated correctly during CLONE and COPY operations when delegated…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-04-16T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd: Fix mtime/ctime updates for CLONE/COPY with delegated attributes">
+  <meta name="twitter:description" content="A two-patch series submitted by Olga Kornievskaia addresses a regression in the NFS server (nfsd) where modification time (mtime) and change time (ctime) were not being updated correctly during CLONE and COPY operations when delegated…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-04-16</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd: Fix mtime/ctime updates for CLONE/COPY with delegated attributes</h1>
+<h2>Summary</h2>
+<h2>NFS Server Bug Fix: Correcting Timestamp Updates for CLONE and COPY Operations</h2>
+<p>A two-patch series submitted by Olga Kornievskaia addresses a regression in the NFS server (nfsd) where modification time (<code>mtime</code>) and change time (<code>ctime</code>) were not being updated correctly during <code>CLONE</code> and <code>COPY</code> operations when delegated attributes were present. The patches were accepted and applied to the <code>nfsd-testing</code> tree by maintainer Chuck Lever.</p>
+<h3>The Problem: Delegated Attributes Masking Timestamps</h3>
+<p>The issue stems from how nfsd handles files with outstanding attribute delegations. When a client holds a delegation, the file is opened with the <code>NOCMTIME</code> flag. This prevents modifying operations from updating <code>mtime</code> and <code>ctime</code> on the server side to avoid getting out-of-sync with the client's delegated view of the metadata.</p>
+<p>However, this optimization created a bug for specific compound operations. As Olga Kornievskaia explained in the cover letter:</p>
+<blockquote>
+<p>"generic/407 is failing in presence of delegated attributes and this patch series explores the solution where the CLONE compound returns updated mtime/ctime in the GETATTR op in the compound."</p>
+</blockquote>
+<p>The core technical argument is that while general writes might defer timestamp updates to preserve delegation consistency, <code>CLONE</code> and <code>COPY</code> operations explicitly modify the destination file's content and should therefore update its timestamps. The server needs to reflect these changes in any subsequent <code>GETATTR</code> queries within the same compound operation.</p>
+<h3>Evolution of the Patch Series (v4)</h3>
+<p>This is the fourth version of the series, showing significant refinement from earlier iterations:</p>
+<ul>
+<li><strong>v3 changes</strong>: Consolidated synchronous and asynchronous COPY patches into a single patch. Additionally, <code>notify_change()</code> code was extracted from <code>nfsd4_finalize_deleg_timestamps</code> to be shared with <code>nfsd_update_cmtime_attr</code>, ensuring consistent error logging if the timestamp update fails.</li>
+<li><strong>v4 changes</strong>:
+<ul>
+<li>Patch 1: Moved <code>struct iattr</code> into <code>nfsd_update_cmtime_attr()</code>, which was relocated to <code>nfs4state.c</code>. It now accepts flags as a second argument, allowing for the addition of <code>ATTR_ATIME</code> when necessary.</li>
+<li>Patch 2: Removed a comment about <code>dput</code> in <code>nfsd4_do_async_copy()</code> and now tests for a set <code>nfsd4_copy-&gt;attr_update</code> flag. This flag is set if the file had <code>NOCMTIME</code> set on open and timestamps are subsequently modified.</li>
+</ul>
+</li>
+</ul>
+<h3>Technical Details of the Fix</h3>
+<p><strong>Patch 1/2: CLONE Operation</strong>
+The first patch addresses the <code>CLONE</code> operation. It ensures that when a clone occurs, the server updates its internal view of <code>mtime</code> and <code>ctime</code> for the destination file, even if a delegation is present. This allows the <code>GETATTR</code> operation in the same compound request to return accurate timestamps.</p>
+<blockquote>
+<p>"When delegated attributes are given on open, the file is opened with NOCMTIME and modifying operations do not update mtime/ctime as to not get out-of-sync with the client's delegated view. However, for CLONE operation, the server should update its view of mtime/ctime and reflect that in any GETATTR queries."</p>
+</blockquote>
+<p><strong>Patch 2/2: COPY Operation</strong>
+The second patch applies the same logic to the <code>COPY</code> operation, covering both synchronous and asynchronous copies. It introduces a tracking mechanism (<code>attr_update</code>) to determine if timestamp updates are required based on the presence of <code>NOCMTIME</code> at open time.</p>
+<h3>Conclusion and Application</h3>
+<p>Chuck Lever applied both patches to the <code>nfsd-testing</code> tree without further discussion:</p>
+<blockquote>
+<p>"Applied to nfsd-testing, thanks!"</p>
+</blockquote>
+<p>The fixes target a specific regression introduced by commit <code>e5e9b24ab8fa</code> ("nfsd: freeze c/mtime updates with outstanding WRITE_ATTRS delegation"), restoring correct behavior for NFSv4.1+ pNFS-like operations (CLONE/COPY) when delegations are active. This ensures that clients receive accurate metadata after these bulk data transfer operations, resolving failures in the generic/407 test suite.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260410160920.56855-1-okorniev@redhat.com/">2026-04-10 Olga Kornievskaia <a href="mailto:okorniev@redhat.com">okorniev@redhat.com</a> — [PATCH v4 0/2] nfsd update mtime/ctime on CLONE/COPY with delegated attritutes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260410160920.56855-2-okorniev@redhat.com/">2026-04-10 Olga Kornievskaia <a href="mailto:okorniev@redhat.com">okorniev@redhat.com</a> — [PATCH v4 1/2] nfsd: update mtime/ctime on CLONE in presense of delegated attributes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260410160920.56855-3-okorniev@redhat.com/">2026-04-10 Olga Kornievskaia <a href="mailto:okorniev@redhat.com">okorniev@redhat.com</a> — [PATCH v4 2/2] nfsd: update mtime/ctime on COPY in presence of delegated attributes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177585235184.1992986.5886959705627774468.b4-ty@b4/">2026-04-10 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v4 0/2] nfsd update mtime/ctime on CLONE/COPY with delegated attritutes</a></li>
+</ul>
+  </main>
+</body>
+</html>

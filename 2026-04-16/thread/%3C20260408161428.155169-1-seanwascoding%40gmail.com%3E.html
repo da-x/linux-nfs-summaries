@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS: RCU safety and tracing pointer fixes refined</title>
+  <meta name="description" content="This week, the discussion around Sean Chang&#39;s two-patch series to fix RCU safety and tracing pointer issues in the NFS client evolved significantly following review by Benjamin Coddington. The patches are classified as bug fixes addressing…">
+  <meta property="og:title" content="NFS: RCU safety and tracing pointer fixes refined">
+  <meta property="og:description" content="This week, the discussion around Sean Chang&#39;s two-patch series to fix RCU safety and tracing pointer issues in the NFS client evolved significantly following review by Benjamin Coddington. The patches are classified as bug fixes addressing…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-04-16T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS: RCU safety and tracing pointer fixes refined">
+  <meta name="twitter:description" content="This week, the discussion around Sean Chang&#39;s two-patch series to fix RCU safety and tracing pointer issues in the NFS client evolved significantly following review by Benjamin Coddington. The patches are classified as bug fixes addressing…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-04-16</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS: RCU safety and tracing pointer fixes refined</h1>
+<h2>Summary</h2>
+<h1>NFS: RCU Safety and Tracing Pointer Fixes Refined</h1>
+<h2>Overview</h2>
+<p>This week, the discussion around Sean Chang's two-patch series to fix RCU safety and tracing pointer issues in the NFS client evolved significantly following review by Benjamin Coddington. The patches are classified as <strong>bug fixes</strong> addressing Sparse static analysis warnings and potential concurrency hazards in <code>fs/nfs/super.c</code> and <code>fs/nfs/nfstrace.h</code>.</p>
+<p>Last week, Sean Chang submitted the initial v1 series <a href="https://lore.kernel.org/linux-nfs/20260408161428.155169-1-seanwascoding@gmail.com/">as described in prior summaries</a>. This week, Benjamin Coddington provided detailed feedback on both patches, and Sean responded with plans for a revised v2 series incorporating those suggestions.</p>
+<h2>Patch 1: RCU Safety in <code>nfs_compare_super_address</code></h2>
+<h3>Technical Context</h3>
+<p>The first patch addresses unsafe access to the <code>cl_xprt</code> pointer in <code>struct rpc_clnt</code>, which is marked as <code>__rcu</code>. The original code in <code>nfs_compare_super_address()</code> dereferenced this pointer without RCU protection, risking use-after-free bugs during concurrent transport switches.</p>
+<h3>Review and Evolution</h3>
+<p>Benjamin Coddington raised a nuanced concern about the null-pointer check proposed in the patch:</p>
+<blockquote>
+<p>"I'm not sure that's a great test, the rpc_xprt objects are refcounted. These might not be null but you could still race with a freeing path?" <a href="https://lore.kernel.org/linux-nfs/C9851FD8-FFFA-47DD-BAA7-F465F293295B@hammerspace.com/">Ben Coddington</a></p>
+</blockquote>
+<p>However, he also noted that the existing RCU section might already provide sufficient protection:</p>
+<blockquote>
+<p>"I think you might just be safe inside the RCU section here because rpc_switch_client_transport() uses synchronize_rcu() before xprt_put(old). I didn't audit all the freeing paths." <a href="https://lore.kernel.org/linux-nfs/C9851FD8-FFFA-47DD-BAA7-F465F293295B@hammerspace.com/">Ben Coddington</a></p>
+</blockquote>
+<p>Additionally, Ben suggested narrowing the RCU critical section:</p>
+<blockquote>
+<p>"Probably safe to drop the RCU protection scope after this point. No need to hold it over all the other checks.." <a href="https://lore.kernel.org/linux-nfs/C9851FD8-FFFA-47DD-BAA7-F465F293295B@hammerspace.com/">Ben Coddington</a></p>
+</blockquote>
+<h3>Sean's Response</h3>
+<p>Sean acknowledged the feedback and proposed a more robust approach for v2, adding an <code>XPRT_CONNECTED</code> state check to ensure the transport is logically active, not just memory-safe:</p>
+<blockquote>
+<p>"The XPRT_CONNECTED check ensures that the transport is not only memory-safe (via RCU) but also logically active. Since the RPC layer clears this bit before initiating the teardown of an rpc_xprt, this prevents accessing xprt_net on an object that is on the freeing path." <a href="https://lore.kernel.org/linux-nfs/CAAb=EJUfoq0dq=mSciyoBjTGWM05QKAHgRUZebq0pDh82pQ0gw@mail.gmail.com/">Sean Chang</a></p>
+</blockquote>
+<p>He also agreed to narrow the RCU scope:</p>
+<blockquote>
+<p>"I will move rcu_read_unlock() to immediately after the net_eq check in v2 to keep the critical section as small as possible." <a href="https://lore.kernel.org/linux-nfs/CAAb=EJUfoq0dq=mSciyoBjTGWM05QKAHgRUZebq0pDh82pQ0gw@mail.gmail.com/">Sean Chang</a></p>
+</blockquote>
+<h2>Patch 2: Tracing Pointer Safety in <code>nfs_page_class</code></h2>
+<h3>Technical Context</h3>
+<p>The second patch aimed to resolve a Sparse warning about dereferencing a <code>__private</code>-marked pointer in the <code>nfs_page_class</code> tracepoint by changing the field type from a pointer to <code>unsigned long</code>.</p>
+<h3>Review and Evolution</h3>
+<p>Benjamin Coddington pointed out a security concern with bypassing kernel pointer obfuscation:</p>
+<blockquote>
+<p>"Probably we don't want to bypass the %p formatting because some configurations use it to obfuscate kernel pointers." <a href="https://lore.kernel.org/linux-nfs/F701DA6B-3D88-4EF6-AD22-5B93B7809E6B@hammerspace.com/">Ben Coddington</a></p>
+</blockquote>
+<p>He further clarified that the <code>__private</code> annotation was likely incorrect in this context:</p>
+<blockquote>
+<p>"I think in this context the __private annotation is incorrect. We deref the nfs_page pointer only in TP_fast_assign() which runs at the call site, and the TP_printk only outputs the pointer value." <a href="https://lore.kernel.org/linux-nfs/F701DA6B-3D88-4EF6-AD22-5B93B7809E6B@hammerspace.com/">Ben Coddington</a></p>
+</blockquote>
+<h3>Sean's Response</h3>
+<p>Sean concurred and outlined his plan for v2:</p>
+<blockquote>
+<p>"I realize that using unsigned long results in printing the raw pointer address, which bypasses the intended %p formatting. You are right that the __private annotation is not appropriate here... I will rework the patch to remove __private and keep the pointer type with %p formatting." <a href="https://lore.kernel.org/linux-nfs/CAAb=EJWgCFvx6rz7tL3kEeEuKuv1D-nqvnzY1Ni7jjg4EUhYtA@mail.gmail.com/">Sean Chang</a></p>
+</blockquote>
+<h2>Final Conclusions</h2>
+<p>The discussion this week refined both patches significantly:</p>
+<ol>
+<li>
+<p><strong>RCU Safety Fix</strong>: The v2 patch will add an <code>XPRT_CONNECTED</code> state check for robustness against freeing paths and narrow the RCU critical section to only cover the network namespace comparison, improving both safety and performance.</p>
+</li>
+<li>
+<p><strong>Tracing Fix</strong>: Rather than changing the field type to <code>unsigned long</code>, the v2 patch will retain the pointer type with <code>%p</code> formatting and remove the incorrect <code>__private</code> annotation, preserving kernel pointer obfuscation features while satisfying Sparse.</p>
+</li>
+</ol>
+<p>Both patches remain bug fixes targeting correctness and static analysis compliance in the NFS client. A revised v2 series is expected shortly.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/C9851FD8-FFFA-47DD-BAA7-F465F293295B@hammerspace.com/">2026-04-10 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — Re: [PATCH v1 1/2] NFS: fix RCU safety in nfs_compare_super_address</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/F701DA6B-3D88-4EF6-AD22-5B93B7809E6B@hammerspace.com/">2026-04-10 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — Re: [PATCH v1 2/2] NFS: use unsigned long for req field in nfs_page_class</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAAb=EJWgCFvx6rz7tL3kEeEuKuv1D-nqvnzY1Ni7jjg4EUhYtA@mail.gmail.com/">2026-04-14 Sean Chang <a href="mailto:seanwascoding@gmail.com">seanwascoding@gmail.com</a> — Re: [PATCH v1 2/2] NFS: use unsigned long for req field in nfs_page_class</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAAb=EJUfoq0dq=mSciyoBjTGWM05QKAHgRUZebq0pDh82pQ0gw@mail.gmail.com/">2026-04-14 Sean Chang <a href="mailto:seanwascoding@gmail.com">seanwascoding@gmail.com</a> — Re: [PATCH v1 1/2] NFS: fix RCU safety in nfs_compare_super_address</a></li>
+</ul>
+  </main>
+</body>
+</html>

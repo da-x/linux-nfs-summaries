@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Help tracking down a possible race</title>
+  <meta name="description" content="This thread consists of a single message this week, an initial report from Nikolay Amiantov raising concerns about a potential race condition in the NFS client (and potentially any network filesystem). The discussion is centered on a…">
+  <meta property="og:title" content="Help tracking down a possible race">
+  <meta property="og:description" content="This thread consists of a single message this week, an initial report from Nikolay Amiantov raising concerns about a potential race condition in the NFS client (and potentially any network filesystem). The discussion is centered on a…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-04-16T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Help tracking down a possible race">
+  <meta name="twitter:description" content="This thread consists of a single message this week, an initial report from Nikolay Amiantov raising concerns about a potential race condition in the NFS client (and potentially any network filesystem). The discussion is centered on a…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-04-16</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Help tracking down a possible race</h1>
+<h2>Summary</h2>
+<h2>A Potential NFS Cache Race: Stale Zero-Fill Beyond EOF</h2>
+<p>This thread consists of a single message this week, an initial report from Nikolay Amiantov <a href="https://lore.kernel.org/linux-nfs/42bcb43b-5782-4353-b3f7-6e68d919f3c6@fmap.me/">raising concerns about a potential race condition</a> in the NFS client (and potentially any network filesystem). The discussion is centered on <strong>a possible bug fix</strong>, not a new feature or protocol change.</p>
+<h3>The Reported Race Condition</h3>
+<p>Amiantov, originally investigating a bug in JuiceFS (a FUSE-based distributed filesystem), distilled the issue down to a minimal reproducible example (MRE) that also manifests with NFS. He describes a scenario involving:</p>
+<ul>
+<li><strong>Host A</strong>: A writer appends to a file one byte at a time.</li>
+<li><strong>Host B</strong>: Simultaneously reads the file byte-by-byte (possibly from multiple threads/processes) while hammering the same file with <code>stat()</code> calls.</li>
+</ul>
+<p>The symptom: <em>"you may randomly read a zero byte instead of the byte you are expecting to read."</em></p>
+<h3>Technical Analysis</h3>
+<p>Amiantov traces the root cause to the interaction between page caching and inode size updates in <code>filemap_read()</code> (<code>mm/filemap.c</code>). He outlines the critical sequence:</p>
+<pre><code>do {
+    ...
+    error = filemap_get_pages(iocb, ...);  // (1) get cached folios
+    ...
+    isize = i_size_read(inode);            // (2) get file size
+    ...
+    // (3) copy from folio to user, capped at isize
+} while (...);
+</code></pre>
+<p>The core issue is that when a file grows remotely, the page cache before the old EOF contains zero-fill beyond the previous size. <em>"Those zeroes are valid while new size &lt;= old size (they are beyond EOF), but become stale once the new size is updated to reflect the remote growth: the remote host wrote real data there, but the local cache still has the old zero-fill."</em></p>
+<p>If the inode size is updated between steps (1) and (2) — for instance, via a <code>getattr</code> call discovering remote growth — <em>"the race happens; the old page gets capped at the new size, so the userspace reads zeroes where there should be actual data."</em></p>
+<h3>NFS-Specific Context</h3>
+<p>Amiantov notes that NFS already attempts to mitigate cache staleness:</p>
+<blockquote>
+<p>"NFS does stall the cache already — it sets NFS_INO_INVALID_DATA, then before we read invalidates the cache as needed. However the window between (1) and (2) is still there."</p>
+</blockquote>
+<p>He argues that the fundamental problem is architectural: <em>"there is no way to 'lock' the page and the inode size simultaneously, so the race cannot be fixed just by stalling the cache in getattr."</em></p>
+<h3>Scope and Significance</h3>
+<p>The author emphasizes that this issue is not unique to NFS: <em>"the race, as I understand it, is actually relevant to <em>any</em> network FS when updates may happen bypassing the cache layer."</em> He provides test repositories for both NFS (<a href="https://github.com/abbradar/nfs_stale_cache_test">nfs_stale_cache_test</a>) and FUSE (<a href="https://github.com/abbradar/fuse_growtest">fuse_growtest</a>) to reproduce the behavior.</p>
+<p>Amiantov concludes by noting the apparent lack of prior discussion: <em>"Apart from the patches introducing NFS_INO_INVALIDATING I can't find any prior discussion of this issue for FUSE-based, NFS, CIFS or any other network FS."</em> He invites the community to help <em>"denying or confirming my findings, or generally pointing me in the right direction."</em></p>
+<h3>Status</h3>
+<p>As of the end of this week's window, <strong>no replies have been received</strong>. The thread remains open for community feedback on whether this represents a genuine bug in NFS client cache coherency or a misunderstanding of the expected behavior.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/42bcb43b-5782-4353-b3f7-6e68d919f3c6@fmap.me/">2026-04-15 Nikolay Amiantov <a href="mailto:ab@fmap.me">ab@fmap.me</a> — Help tracking down a possible race</a></li>
+</ul>
+  </main>
+</body>
+</html>

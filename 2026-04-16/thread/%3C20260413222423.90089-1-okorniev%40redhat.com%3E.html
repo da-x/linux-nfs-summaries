@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS: v3 writeback error-loop fix submitted after maintainer ACK</title>
+  <meta name="description" content="This is a bug fix for the NFS client&#39;s page cache writeback subsystem, addressing infinite retry loops when the server returns ENOSPC errors during unstable writes.">
+  <meta property="og:title" content="NFS: v3 writeback error-loop fix submitted after maintainer ACK">
+  <meta property="og:description" content="This is a bug fix for the NFS client&#39;s page cache writeback subsystem, addressing infinite retry loops when the server returns ENOSPC errors during unstable writes.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-04-16T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS: v3 writeback error-loop fix submitted after maintainer ACK">
+  <meta name="twitter:description" content="This is a bug fix for the NFS client&#39;s page cache writeback subsystem, addressing infinite retry loops when the server returns ENOSPC errors during unstable writes.">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-04-16</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS: v3 writeback error-loop fix submitted after maintainer ACK</h1>
+<h2>Summary</h2>
+<h1>NFS: v3 writeback error-loop fix submitted after maintainer ACK</h1>
+<h2>Classification</h2>
+<p>This is a <strong>bug fix</strong> for the NFS client's page cache writeback subsystem, addressing infinite retry loops when the server returns <code>ENOSPC</code> errors during unstable writes.</p>
+<h2>Prior Context (Brief)</h2>
+<p>In March 2026, Olga Kornievskaia submitted an RFC and then v2 of her patch <em>"NFS: fix writeback in presence of errors"</em> targeting a bug discovered while running xfstest <code>generic/751</code>. The bug manifests as stuck writeback I/O under two specific failure patterns involving <code>ENOSPC</code> errors from the NFS server during unstable writes.</p>
+<p>Last week, maintainer Trond Myklebust reviewed v2 and gave it an ACK with one nitpick:</p>
+<blockquote>
+<p>"Can we please do something to avoid 2 calls to iov_iter_count() here?"</p>
+</blockquote>
+<p>He concluded:</p>
+<blockquote>
+<p>"Otherwise, the rest looks good to me."</p>
+</blockquote>
+<h2>This Week's Activity</h2>
+<p>On April 13, Olga Kornievskaia submitted <strong>v3</strong> of the patch <a href="https://lore.kernel.org/linux-nfs/20260413222423.90089-1-okorniev@redhat.com/">20260413222423.90089-1-okorniev@redhat.com</a>, addressing the maintainer's feedback. This is the only message in this thread for the current week; no further discussion occurred before the window closed.</p>
+<h3>The Bug: Two Failure Patterns</h3>
+<p>The patch description reiterates the two problematic patterns that cause writeback to loop indefinitely:</p>
+<p><strong>Pattern #1:</strong> Writeback I/O experiences <code>ENOSPC</code> at an offset smaller than the file size. For example:</p>
+<ul>
+<li>Write at offset 0, length 4096, unstable — OK</li>
+<li>Write at offset 8192, length 4096, unstable — OK</li>
+<li>Write at offset 12288, length 4096, unstable — ENOSPC</li>
+<li>Write at offset 4096, length 4096, unstable — ENOSPC</li>
+</ul>
+<p>The client sends a commit and receives a verifier different from the last successful write. It marks pages dirty and retries writeback, but again sends unstable writes, re-entering the same <code>ENOSPC</code> loop.</p>
+<p><strong>Pattern #2:</strong> An unstable write followed by a short write and then <code>ENOSPC</code>:</p>
+<ul>
+<li>Write at offset 0, length 4096, unstable — OK</li>
+<li>Write at offset 4096, length 4096, unstable — returns OK but count=100 (short write)</li>
+<li>Write at offset 4197, length 3996, stable — ENOSPC</li>
+</ul>
+<p>The same retry loop ensues.</p>
+<h3>The Fix: Synchronous Fallback via Persistent Context Flag</h3>
+<p>The patch proposes identifying these error conditions and marking requests to be performed <strong>synchronously</strong> instead of asynchronously. Kornievskaia explains the architectural evolution:</p>
+<blockquote>
+<p>"Previous solution tried to mark it in the nfs_page, however that's not persistent thus instead mark it in the nfs_open_context."</p>
+</blockquote>
+<p>Storing the synchronous-writeback flag in <code>nfs_open_context</code> (rather than the transient <code>nfs_page</code>) ensures the state persists across retries. The fix also extends to the LocalIO code path:</p>
+<blockquote>
+<p>"Furthermore, the same problem occurs during localio code path so recognize that IO needs to be done sync in that case as well."</p>
+</blockquote>
+<p>The patch touches four files:</p>
+<ul>
+<li><code>fs/nfs/localio.c</code> — 15 lines added/modified</li>
+<li><code>fs/nfs/pagelist.c</code> — 3 lines added</li>
+<li><code>fs/nfs/write.c</code> — 9 lines added</li>
+<li><code>include/linux/nfs_fs.h</code> — 1 line added</li>
+</ul>
+<p>Total: 27 insertions, 1 deletion.</p>
+<h3>v3 Changes</h3>
+<p>While the full diff was not included in this week's ingest, v3 follows directly from Myklebust's review of v2. The primary change expected is the elimination of the redundant <code>iov_iter_count()</code> calls flagged by the maintainer. No new objections or discussion arose this week, suggesting the fix is now in a merge-ready state.</p>
+<h2>Significance for NFS Client Development</h2>
+<ol>
+<li><strong>Reliability Improvement</strong>: This fix prevents application stalls and potential I/O deadlocks caused by infinite writeback loops under server-side <code>ENOSPC</code> conditions — a real-world scenario exposed by xfstest <code>generic/751</code>.</li>
+<li><strong>Architectural Soundness</strong>: The shift from transient <code>nfs_page</code> state to persistent <code>nfs_open_context</code> state represents a thoughtful design choice validated by the maintainer without objection.</li>
+<li><strong>LocalIO Coverage</strong>: By extending the fix to the LocalIO code path, the patch ensures consistent behavior across both traditional NFS and LocalIO writeback scenarios.</li>
+<li><strong>Test-Driven Development</strong>: The bug was discovered through automated testing (xfstest), exemplifying the value of systematic regression testing in kernel development.</li>
+</ol>
+<h2>Conclusion</h2>
+<p>This week saw the submission of v3 of Olga Kornievskaia's writeback error-loop fix, incorporating maintainer feedback from last week's review. With Trond Myklebust's prior ACK and no new objections this week, the patch appears poised for imminent merge into the Linux NFS client tree. The fix addresses a genuine reliability bug that could cause application stalls under server-side space exhaustion conditions.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260413222423.90089-1-okorniev@redhat.com/">2026-04-13 Olga Kornievskaia <a href="mailto:okorniev@redhat.com">okorniev@redhat.com</a> — [PATCH v3 1/1] NFS: fix writeback in presence of errors</a></li>
+</ul>
+  </main>
+</body>
+</html>

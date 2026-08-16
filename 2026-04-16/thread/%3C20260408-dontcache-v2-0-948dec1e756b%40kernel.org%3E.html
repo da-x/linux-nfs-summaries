@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DONTCACHE: Semantic Interpretation and Per-Inode Writeback Benchmarks</title>
+  <meta name="description" content="This week&#39;s discussion on the RWF_DONTCACHE writeback optimization thread continued with two key developments: a semantic clarification about what DONTCACHE guarantees, and extensive benchmark data comparing whole-BDI flusher wakeup…">
+  <meta property="og:title" content="DONTCACHE: Semantic Interpretation and Per-Inode Writeback Benchmarks">
+  <meta property="og:description" content="This week&#39;s discussion on the RWF_DONTCACHE writeback optimization thread continued with two key developments: a semantic clarification about what DONTCACHE guarantees, and extensive benchmark data comparing whole-BDI flusher wakeup…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-04-16T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="DONTCACHE: Semantic Interpretation and Per-Inode Writeback Benchmarks">
+  <meta name="twitter:description" content="This week&#39;s discussion on the RWF_DONTCACHE writeback optimization thread continued with two key developments: a semantic clarification about what DONTCACHE guarantees, and extensive benchmark data comparing whole-BDI flusher wakeup…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-04-16</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>DONTCACHE: Semantic Interpretation and Per-Inode Writeback Benchmarks</h1>
+<h2>Summary</h2>
+<h1>DONTCACHE: Semantic Interpretation and Per-Inode Writeback Benchmarks</h1>
+<h2>Overview</h2>
+<p>This week's discussion on the <code>RWF_DONTCACHE</code> writeback optimization thread continued with two key developments: a semantic clarification about what <code>DONTCACHE</code> guarantees, and extensive benchmark data comparing whole-BDI flusher wakeup against per-inode writeback approaches. The thread remains focused on <strong>performance optimization</strong> for existing <code>RWF_DONTCACHE</code> functionality in the mm/writeback subsystem, with implications for NFS server (NFSD) I/O modes.</p>
+<h2>Prior Context (Brief)</h2>
+<p>Last week, Jeff Layton submitted v2 of a three-patch series replacing inline <code>filemap_flush_range()</code> calls with <code>wakeup_flusher_threads_bdi()</code> to offload DONTCACHE writeback from the writer's hot path. Christoph Hellwig and Jan Kara raised concerns that kicking the entire BDI flusher could trigger excessive writeback of unrelated dirty pages. Hellwig proposed tracking DONTCACHE-specific folios with a new <code>WB_start_dontcache</code> bit, while Kara suggested marking inodes with "dropbehind" folios for prioritized writeback.</p>
+<h2>This Week's Discussion</h2>
+<h3>Semantic Interpretation of DONTCACHE Guarantees</h3>
+<p>Jan Kara and Jeff Layton debated the semantics of Hellwig's proposal to expedite writeback proportional to pending dontcache folios while still processing LRU inodes.</p>
+<p>Kara raised a concern about potential delays for mixed workloads:</p>
+<blockquote>
+<p>"So that may result in dontcache folios staying cached for quite some time if DONTCACHE and normal writes are mixed. But I agree over longer time it might just level out so maybe that's fine." <a href="https://lore.kernel.org/linux-nfs/quptbqj7jfparfhrxt45cassborouvwggeqkwbk3ixyt74crb6@e7ivbuu5qlox/">Jan Kara</a></p>
+</blockquote>
+<p>Layton responded with a clarifying interpretation of the DONTCACHE contract:</p>
+<blockquote>
+<p>"I think that's probably OK. In my interpretation, DONTCACHE on write just means 'don't cache this data beyond what's needed for writeback'. It doesn't provide any guarantees about when the writeback will be done." <a href="https://lore.kernel.org/linux-nfs/7f78f6ad39c3c66a207ae66e2be7edfb1421df06.camel@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<p>This semantic distinction is significant: if DONTCACHE merely means "eventually write back, don't retain in cache," then LRU-based ordering with expedited volume is acceptable. If it implies more immediate writeback guarantees, a more targeted approach would be necessary.</p>
+<h3>Per-Inode Writeback Benchmarks: The Batching Problem</h3>
+<p>The most substantial contribution this week came from Layton on April 16, who published detailed fio benchmark results comparing the <strong>whole-BDI flusher</strong> approach (current v2 proposal) against a <strong>per-inode writeback</strong> alternative he had drafted.</p>
+<p>Layton concluded that per-inode writeback should be abandoned:</p>
+<blockquote>
+<p>"I think we're probably better off not doing this because we lose some batching opportunities by trying to force out a single inode's pages rather than allowing the thread to do its thing." <a href="https://lore.kernel.org/linux-nfs/52b81c4d1fb2ad0e07b3b3b4dfbd3d36e8ee3e7d.camel@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<h4>Key Benchmark Findings</h4>
+<p><strong>Single-Client Workloads:</strong></p>
+<ul>
+<li>Sequential write: Essentially identical between whole-BDI (1450 MB/s) and per-inode (1438 MB/s)</li>
+<li>Random write: Per-inode regressed <strong>-21%</strong> (363 → 286 MB/s) with p99.9 latency worsening from 1.8ms to 16.7ms</li>
+</ul>
+<p><strong>Multi-Writer Workloads (Scenario A):</strong></p>
+<ul>
+<li>Aggregate throughput: Per-inode regressed <strong>-32%</strong> (1478 → 999 MB/s)</li>
+<li>p99.9 latency: Worsened by <strong>67%</strong> (46ms → 77ms)</li>
+</ul>
+<p><strong>Noisy Neighbor Scenarios:</strong></p>
+<ul>
+<li>Scenario D (mixed-mode writer + buffered readers): Essentially identical or slightly better for per-inode (+2% reader throughput, +19% better p99.9 latency)</li>
+</ul>
+<h4>Root Cause: Loss of I/O Batching</h4>
+<p>The analysis identified the core issue: <code>writeback_sb_inodes()</code> processes all dirty inodes in a single <code>blk_plug</code>'d pass, enabling efficient I/O merging. Per-inode <code>write_inode_now()</code> calls are processed serially, losing this batching benefit:</p>
+<blockquote>
+<p>"With whole-BDI, the flusher did one batched pass through all dirty inodes via writeback_sb_inodes(). With per-inode, each of 4 writers queues a separate work item processed serially by write_inode_now() — losing the batch I/O merging benefit." <a href="https://lore.kernel.org/linux-nfs/52b81c4d1fb2ad0e07b3b3b4dfbd3d36e8ee3e7d.camel@kernel.org/">Analysis included in</a></p>
+</blockquote>
+<h2>NFS Client Relevance</h2>
+<p>While this thread targets the core mm/writeback subsystem, it has direct implications for <strong>NFS server (NFSD)</strong> performance. The <code>RWF_DONTCACHE</code> mode is one of three I/O modes configurable via NFSD debugfs controls. Improving dontcache write performance benefits NFS workloads relying on this mode for low-latency, cache-bypassing writes. Layton's benchmark suite includes tests against an NFS server using fio's libnfs backend.</p>
+<h2>Final Conclusions</h2>
+<p>This week established two important conclusions:</p>
+<ol>
+<li>
+<p><strong>Semantic agreement</strong>: DONTCACHE is interpreted as "eventually write back, don't retain in cache" rather than guaranteeing immediate writeback. This relaxes the requirements for the flusher mechanism.</p>
+</li>
+<li>
+<p><strong>Per-inode writeback rejected</strong>: Extensive benchmark data demonstrates that per-inode writeback approaches lose critical I/O batching benefits, causing significant regressions in random write and multi-writer scenarios. The whole-BDI flusher approach remains preferable despite concerns about triggering excessive writeback of unrelated pages.</p>
+</li>
+</ol>
+<p>The discussion remains open on how to address Hellwig's concern about whole-BDI wakeup being too coarse-grained. No v3 patches were submitted this week, and the thread awaits further architectural direction.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/quptbqj7jfparfhrxt45cassborouvwggeqkwbk3ixyt74crb6@e7ivbuu5qlox/">2026-04-10 Jan Kara <a href="mailto:jack@suse.cz">jack@suse.cz</a> — Re: [PATCH v2 1/3] mm: kick writeback flusher instead of inline flush for IOCB_DONTCACHE</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/7f78f6ad39c3c66a207ae66e2be7edfb1421df06.camel@kernel.org/">2026-04-10 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v2 1/3] mm: kick writeback flusher instead of inline flush for IOCB_DONTCACHE</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/52b81c4d1fb2ad0e07b3b3b4dfbd3d36e8ee3e7d.camel@kernel.org/">2026-04-16 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v2 1/3] mm: kick writeback flusher instead of inline flush for IOCB_DONTCACHE</a></li>
+</ul>
+  </main>
+</body>
+</html>
