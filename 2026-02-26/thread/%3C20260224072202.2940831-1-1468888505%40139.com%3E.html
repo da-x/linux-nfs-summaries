@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>pNFS: Fix deadlock when returning delegation during open()</title>
+  <meta name="description" content="This week, the Linux NFS mailing list received a backport patch addressing a critical deadlock in the Parallel NFS (pNFS) client code. The issue, originally identified by Benjamin Coddington and resolved by Trond Myklebust, involves a…">
+  <meta property="og:title" content="pNFS: Fix deadlock when returning delegation during open()">
+  <meta property="og:description" content="This week, the Linux NFS mailing list received a backport patch addressing a critical deadlock in the Parallel NFS (pNFS) client code. The issue, originally identified by Benjamin Coddington and resolved by Trond Myklebust, involves a…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-02-26T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="pNFS: Fix deadlock when returning delegation during open()">
+  <meta name="twitter:description" content="This week, the Linux NFS mailing list received a backport patch addressing a critical deadlock in the Parallel NFS (pNFS) client code. The issue, originally identified by Benjamin Coddington and resolved by Trond Myklebust, involves a…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-02-26</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>pNFS: Fix deadlock when returning delegation during open()</h1>
+<h2>Summary</h2>
+<h1>pNFS: Fix a Deadlock When Returning a Delegation During open()</h1>
+<h2>Overview</h2>
+<p>This week, the Linux NFS mailing list received a backport patch addressing a critical deadlock in the Parallel NFS (pNFS) client code. The issue, originally identified by Benjamin Coddington and resolved by Trond Myklebust, involves a circular dependency between delegation returns and layout returns during file open operations.</p>
+<h2>The Bug: A Deadlock in pNFS Delegation Handling</h2>
+<p>The discussion centers on a hang reported by Benjamin Coddington (<a href="https://lore.kernel.org/linux-nfs/20260224072202.2940831-1-1468888505@139.com/">bcodding@hammerspace.com</a>), manifested as a kernel stack trace showing the system stuck in <code>pnfs_roc()</code> while attempting to return a delegation during an <code>open()</code> operation.</p>
+<p>The problematic call chain was:</p>
+<pre><code>nfs4_file_open -&gt; nfs4_atomic_open -&gt; _nfs4_do_open -&gt; ... 
+-&gt; nfs_inode_set_delegation -&gt; nfs_do_return_delegation 
+-&gt; nfs4_proc_delegreturn -&gt; _nfs4_proc_delegreturn -&gt; pnfs_roc [HANG]
+</code></pre>
+<p>As explained in the patch description:</p>
+<blockquote>
+<p>"The issue is that the delegreturn is being asked to wait for a layout return that cannot complete because a state recovery was initiated. The state recovery cannot complete until the open() finishes processing the delegations it was given."</p>
+</blockquote>
+<p>This creates a classic deadlock scenario:</p>
+<ol>
+<li>An <code>open()</code> operation receives a delegation from the server.</li>
+<li>To process this new delegation, the client must return any existing delegation via <code>nfs_do_return_delegation</code>.</li>
+<li>The delegation return path calls <code>pnfs_roc()</code> (Return On Close), which attempts to wait for outstanding layout returns to complete.</li>
+<li>However, a state recovery is in progress, blocking the layout return.</li>
+<li>The state recovery itself cannot complete until the <code>open()</code> finishes processing its delegations — but the <code>open()</code> is blocked waiting on the delegation return, which is blocked on the layout return.</li>
+</ol>
+<h2>The Fix</h2>
+<p>Trond Myklebust's solution, originally committed upstream as <code>857bf9056291a16785ae3be1d291026b2437fc48</code>, propagates existing flags that indicate a non-blocking call context down to <code>pnfs_roc()</code>. This allows the function to recognize when it should not block, breaking the circular wait.</p>
+<blockquote>
+<p>"The solution is to propagate the existing flags that indicate a non-blocking call to the function pnfs_roc(), so that it knows not to wait in this situation."</p>
+</blockquote>
+<p>The patch modifies three files:</p>
+<ul>
+<li><code>fs/nfs/nfs4proc.c</code>: Adjusts how delegation return calls are made.</li>
+<li><code>fs/nfs/pnfs.c</code>: Refactors <code>pnfs_roc()</code> and related functions to accept and respect non-blocking flags.</li>
+<li><code>fs/nfs/pnfs.h</code>: Updates function signatures accordingly.</li>
+</ul>
+<h2>Backport Context</h2>
+<p>Li hongliang submitted this as a backport to the 6.6.y stable tree, noting:</p>
+<blockquote>
+<p>"[ Upstream commit 857bf9056291a16785ae3be1d291026b2437fc48 ]"</p>
+<p>"[ Minor conflict resolved. ]"</p>
+</blockquote>
+<p>The original bug was introduced by commit <code>29ade5db1293</code> ("pNFS: Wait on outstanding layoutreturns to complete in pnfs_roc()"), which added the waiting behavior that ultimately caused the deadlock under certain conditions.</p>
+<h2>Significance</h2>
+<p>This fix is important for NFS client stability, particularly in environments using pNFS where delegation and layout management are active. Deadlocks in the NFS client can lead to hung processes or even system-wide hangs if critical filesystem operations are blocked. The fix ensures that delegation returns during open operations do not inadvertently block on layout returns when state recovery is in progress, maintaining forward progress in the NFS client state machine.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260224072202.2940831-1-1468888505@139.com/">2026-02-24 Li hongliang <a href="mailto:1468888505@139.com">1468888505@139.com</a> — [PATCH 6.6.y] pNFS: Fix a deadlock when returning a delegation during open()</a></li>
+</ul>
+  </main>
+</body>
+</html>

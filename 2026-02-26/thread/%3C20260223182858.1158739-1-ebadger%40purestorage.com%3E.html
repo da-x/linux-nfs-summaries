@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>xprtrdma: Fix Receive Queue Drain Hang on Early Exit Paths</title>
+  <meta name="description" content="Bug Fix – NFS Client / RPC over RDMA (xprtrdma) subsystem.">
+  <meta property="og:title" content="xprtrdma: Fix Receive Queue Drain Hang on Early Exit Paths">
+  <meta property="og:description" content="Bug Fix – NFS Client / RPC over RDMA (xprtrdma) subsystem.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-02-26T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="xprtrdma: Fix Receive Queue Drain Hang on Early Exit Paths">
+  <meta name="twitter:description" content="Bug Fix – NFS Client / RPC over RDMA (xprtrdma) subsystem.">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-02-26</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>xprtrdma: Fix Receive Queue Drain Hang on Early Exit Paths</h1>
+<h2>Summary</h2>
+<h1>xprtrdma: Fix Receive Queue Drain Hang on Early Exit Paths</h1>
+<h2>Classification</h2>
+<p><strong>Bug Fix</strong> – NFS Client / RPC over RDMA (xprtrdma) subsystem.</p>
+<h2>Summary</h2>
+<p>This week, Eric Badger (Pure Storage) submitted a critical bug fix for the <code>xprtrdma</code> subsystem that addresses a potential kernel hang during transport disconnection under memory pressure conditions. The patch was quickly reviewed and approved by Chuck Lever (Oracle).</p>
+<h3>The Problem: A Hung Task in <code>rpcrdma_xprt_drain()</code></h3>
+<p>Eric Badger identified a race condition in the receive queue management logic of the RPC over RDMA client. Specifically, when <code>rpcrdma_post_recvs()</code> fails to create a work request—potentially due to memory allocation failure—or exits early for other reasons, the counter <code>ep-&gt;re_receiving</code> was not being decremented.</p>
+<p>As Badger explained in his patch description:</p>
+<blockquote>
+<p>"In the event that rpcrdma_post_recvs() fails to create a work request (due to memory allocation failure, say) or otherwise exits early, we should decrement ep-&gt;re_receiving before returning. Otherwise we will hang in rpcrdma_xprt_drain() as re_receiving will never reach zero and the completion will never be triggered."</p>
+</blockquote>
+<p>This bug manifests on systems experiencing high memory pressure. The result is a kernel task stuck in an uninterruptible sleep state (D-state), waiting indefinitely for a completion that will never arrive. Badger provided a representative hung task trace showing <code>kworker</code> blocked for over 120 seconds:</p>
+<blockquote>
+<p>"On a system with high memory pressure, this can appear as the following hung task... INFO: task kworker/u385:17:8393 blocked for more than 122 seconds."</p>
+</blockquote>
+<p>The call trace highlights the blockage in <code>rpcrdma_xprt_disconnect</code>, which is called during the autoclose sequence of the transport.</p>
+<h3>The Fix and History</h3>
+<p>The patch modifies <code>net/sunrpc/xprtrdma/verbs.c</code> to ensure that <code>re_receiving</code> is decremented on all early exit paths within <code>rpcrdma_post_recvs()</code>. This ensures that the drain logic in <code>rpcrdma_xprt_drain()</code> can properly detect when all receive work requests have been completed or cancelled, allowing the transport disconnection to proceed.</p>
+<p>Badger noted that this issue was introduced by a previous change:</p>
+<blockquote>
+<p>"Fixes: 15788d1d1077 ("xprtrdma: Do not refresh Receive Queue while it is draining")"</p>
+</blockquote>
+<p>That prior commit attempted to prevent receive queue refreshes during drain, but inadvertently created a path where the counter could become inconsistent with the actual state of posted work requests.</p>
+<h3>Review and Acceptance</h3>
+<p>Chuck Lever, a primary maintainer of the NFS client subsystem, provided a swift review:</p>
+<blockquote>
+<p>"Reviewed-by: Chuck Lever <a href="mailto:chuck.lever@oracle.com">chuck.lever@oracle.com</a>"</p>
+</blockquote>
+<p>The quick turnaround suggests that the bug's impact and the fix's correctness were clear to the maintainers. This patch is important for NFS clients using RDMA transports in environments where memory pressure can cause allocation failures, preventing system hangs during transport cleanup.</p>
+<h2>Key Technical Arguments</h2>
+<ol>
+<li><strong>Counter Consistency</strong>: The core argument is that <code>ep-&gt;re_receiving</code> must accurately reflect the number of outstanding receive work requests. Any early exit from <code>rpcrdma_post_recvs()</code> that does not successfully post a work request must decrement this counter to maintain consistency.</li>
+<li><strong>Drain Logic Dependency</strong>: The <code>rpcrdma_xprt_drain()</code> function relies on <code>re_receiving</code> reaching zero to signal completion. If the counter is stuck above zero due to an unposted work request, the drain process hangs indefinitely.</li>
+<li><strong>Memory Pressure Trigger</strong>: The bug is particularly relevant under memory pressure, where allocation failures in <code>ib_post_recv</code> or similar functions are more likely, triggering the early exit paths that lacked the decrement.</li>
+</ol>
+<h2>Conclusion</h2>
+<p>This thread represents a straightforward but critical bug fix for the NFS client's RDMA transport layer. By ensuring proper counter management on error paths, the patch prevents kernel hangs during transport disconnection, improving the robustness of NFS over RDMA in resource-constrained environments. The fix was reviewed and accepted without controversy, highlighting the collaborative efficiency of the NFS development community.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260223182858.1158739-1-ebadger@purestorage.com/">2026-02-23 Eric Badger <a href="mailto:ebadger@purestorage.com">ebadger@purestorage.com</a> — [PATCH] xprtrdma: Decrement re_receiving on the early exit paths</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/6a05d2f9-78fc-4a10-ba0b-99370639bc4d@oracle.com/">2026-02-23 Chuck Lever <a href="mailto:chuck.lever@oracle.com">chuck.lever@oracle.com</a> — Re: [PATCH] xprtrdma: Decrement re_receiving on the early exit paths</a></li>
+</ul>
+  </main>
+</body>
+</html>

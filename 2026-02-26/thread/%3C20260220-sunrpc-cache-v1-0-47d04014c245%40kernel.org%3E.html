@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>sunrpc: Cache Infrastructure Scalability Improvements and Bug Fixes</title>
+  <meta name="description" content="This week, Jeff Layton introduced a three-patch series aimed at improving the scalability of the SUNRPC cache infrastructure, primarily to facilitate future work on retrofitting netlink upcalls. The patches were quickly applied by Chuck…">
+  <meta property="og:title" content="sunrpc: Cache Infrastructure Scalability Improvements and Bug Fixes">
+  <meta property="og:description" content="This week, Jeff Layton introduced a three-patch series aimed at improving the scalability of the SUNRPC cache infrastructure, primarily to facilitate future work on retrofitting netlink upcalls. The patches were quickly applied by Chuck…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-02-26T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="sunrpc: Cache Infrastructure Scalability Improvements and Bug Fixes">
+  <meta name="twitter:description" content="This week, Jeff Layton introduced a three-patch series aimed at improving the scalability of the SUNRPC cache infrastructure, primarily to facilitate future work on retrofitting netlink upcalls. The patches were quickly applied by Chuck…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-02-26</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>sunrpc: Cache Infrastructure Scalability Improvements and Bug Fixes</h1>
+<h2>Summary</h2>
+<h1>sunrpc: Cache Infrastructure Scalability Improvements and Bug Fixes</h1>
+<p>This week, Jeff Layton introduced a three-patch series aimed at improving the scalability of the SUNRPC cache infrastructure, primarily to facilitate future work on retrofitting netlink upcalls. The patches were quickly applied by Chuck Lever, but Neil Brown’s review uncovered two issues: unnecessary spinlock usage in the new code and a pre-existing bug in reader count handling that was exposed by the refactoring.</p>
+<h2>Discussion Evolution</h2>
+<h3>Initial Proposal</h3>
+<p>Jeff Layton <a href="https://lore.kernel.org/linux-nfs/20260220-sunrpc-cache-v1-0-47d04014c245@kernel.org/">introduced the series</a> on February 20, noting that the existing cache infrastructure relied on a global spinlock and waitqueue, which created contention across different cache instances (e.g., <code>auth.unix.ip</code> vs. <code>nfsd.fh</code>).</p>
+<p>The series consisted of:</p>
+<ol>
+<li>Converting <code>queue_lock</code> from a global spinlock to a per-<code>cache_detail</code> lock.</li>
+<li>Converting <code>queue_wait</code> from a global waitqueue to a per-<code>cache_detail</code> waitqueue.</li>
+<li>Splitting the single interleaved <code>cache_detail-&gt;queue</code> into two dedicated lists: one for cache requests and one for cache readers, using a sequence number mechanism to track reader positions.</li>
+</ol>
+<p>Layton stated:</p>
+<blockquote>
+<p>"I've been working on trying to retrofit a netlink upcall into the sunrpc cache infrastructure. While crawling over that code, I noticed that it relies on both a global spinlock and waitqueue."</p>
+</blockquote>
+<p>He requested consideration for the v7.1 kernel release.</p>
+<h3>Rapid Acceptance</h3>
+<p>Chuck Lever <a href="https://lore.kernel.org/linux-nfs/177161622290.3877966.16867844436002593841.b4-ty@oracle.com/">applied the series</a> to the <code>nfsd-testing</code> tree on the same day, acknowledging the cleanups and scalability benefits.</p>
+<h3>Review and Bug Discovery</h3>
+<p>Neil Brown <a href="https://lore.kernel.org/linux-nfs/177171367423.8396.10176251932730619714@noble.neil.brown.name/">reviewed Patch 3/3</a> on February 21, identifying two issues:</p>
+<ol>
+<li>
+<p><strong>Unnecessary Spinlocks</strong>: Brown noted that the new code retained spinlock acquisitions around operations that no longer required them due to the structural changes. He pointed out:</p>
+<blockquote>
+<p>"I don't think we need the spin_lock here any more."</p>
+</blockquote>
+</li>
+<li>
+<p><strong>Pre-existing Bug in Reader Counting</strong>: Brown observed that when decrementing the <code>-&gt;readers</code> count, the code failed to check if it reached zero and clear <code>CACHE_PENDING</code>, a pattern present elsewhere in the codebase. He remarked:</p>
+<blockquote>
+<p>"Hmm.. The other place where we decrement -&gt;readers we then check if it is zero and if CACHE_PENDING is clear - and do something. I suspect we should do that here. This bug (if I'm right and it is a bug) if there before you patch, but now might be a good time to fix it?"</p>
+</blockquote>
+</li>
+</ol>
+<h3>Resolution</h3>
+<p>Jeff Layton <a href="https://lore.kernel.org/linux-nfs/7c0e019cbf7371bdf47bd7a7c48df132fc5b87fd.camel@kernel.org/">acknowledged both points</a> on February 23, agreeing that the spinlock removals were valid and confirming the bug fix was necessary. He planned to release a v2 of the series:</p>
+<blockquote>
+<p>"Good catch. I'll add a patch to fix that preceding these patches, so it can go to stable (if we think that's worthwhile)... Thanks for the review! I'll send a v2 with the spinlock fixes and the above bugfix."</p>
+</blockquote>
+<h2>Key Technical Arguments</h2>
+<ul>
+<li><strong>Scalability</strong>: The primary motivation was reducing contention by eliminating global locks and waitqueues in the SUNRPC cache layer, which is critical for high-concurrency NFS client and server operations.</li>
+<li><strong>Code Simplification</strong>: Splitting the queue into request and reader lists simplified the logic for tracking reader positions using sequence numbers instead of list traversal.</li>
+<li><strong>Bug Fix</strong>: The identified bug involved improper handling of the <code>-&gt;readers</code> count, which could lead to stale cache entries not being cleaned up properly when the last reader detached.</li>
+</ul>
+<h2>Final Conclusions</h2>
+<p>The initial v1 series was applied but will be superseded by a v2 that addresses Neil Brown’s feedback. The v2 will include:</p>
+<ul>
+<li>Removal of unnecessary spinlock acquisitions in <code>cache_read</code>.</li>
+<li>A fix for the pre-existing bug where <code>CACHE_PENDING</code> was not cleared when the last reader detached, ensuring proper cache entry lifecycle management.</li>
+</ul>
+<p>This work represents an important step in modernizing the SUNRPC cache infrastructure, paving the way for netlink-based upcalls and improving overall NFS client/server scalability.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260220-sunrpc-cache-v1-0-47d04014c245@kernel.org/">2026-02-20 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 0/3] sunrpc: cache infrastructure scalability improvements</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260220-sunrpc-cache-v1-1-47d04014c245@kernel.org/">2026-02-20 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 1/3] sunrpc: convert queue_lock from global spinlock to per-cache_detail lock</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260220-sunrpc-cache-v1-2-47d04014c245@kernel.org/">2026-02-20 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 2/3] sunrpc: convert queue_wait from global to per-cache_detail waitqueue</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260220-sunrpc-cache-v1-3-47d04014c245@kernel.org/">2026-02-20 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 3/3] sunrpc: split cache_detail queue into request and reader lists</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177161622290.3877966.16867844436002593841.b4-ty@oracle.com/">2026-02-20 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 0/3] sunrpc: cache infrastructure scalability improvements</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177171367423.8396.10176251932730619714@noble.neil.brown.name/">2026-02-21 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH 3/3] sunrpc: split cache_detail queue into request and reader lists</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/7c0e019cbf7371bdf47bd7a7c48df132fc5b87fd.camel@kernel.org/">2026-02-23 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 3/3] sunrpc: split cache_detail queue into request and reader lists</a></li>
+</ul>
+  </main>
+</body>
+</html>

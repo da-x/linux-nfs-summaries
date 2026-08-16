@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD Buffer Page Management: v2 of Chuck Lever&#39;s SUNRPC page-array series posted</title>
+  <meta name="description" content="On Thursday, 2026-02-26, Oracle&#39;s Chuck Lever re-posted his six-patch series &quot;[PATCH v2 0/6] Optimize NFSD buffer page management&quot; Cover Letter to linux-nfs. This is the second iteration of a series that first appeared as an RFC earlier…">
+  <meta property="og:title" content="NFSD Buffer Page Management: v2 of Chuck Lever&#39;s SUNRPC page-array series posted">
+  <meta property="og:description" content="On Thursday, 2026-02-26, Oracle&#39;s Chuck Lever re-posted his six-patch series &quot;[PATCH v2 0/6] Optimize NFSD buffer page management&quot; Cover Letter to linux-nfs. This is the second iteration of a series that first appeared as an RFC earlier…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-02-26T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSD Buffer Page Management: v2 of Chuck Lever&#39;s SUNRPC page-array series posted">
+  <meta name="twitter:description" content="On Thursday, 2026-02-26, Oracle&#39;s Chuck Lever re-posted his six-patch series &quot;[PATCH v2 0/6] Optimize NFSD buffer page management&quot; Cover Letter to linux-nfs. This is the second iteration of a series that first appeared as an RFC earlier…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-02-26</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD Buffer Page Management: v2 of Chuck Lever's SUNRPC page-array series posted</h1>
+<h2>Summary</h2>
+<h1>NFSD Buffer Page Management: v2 Posted (SUNRPC server-side)</h1>
+<h2>What happened this week</h2>
+<p>On Thursday, 2026-02-26, Oracle's <strong>Chuck Lever</strong> re-posted his six-patch series <em>"[PATCH v2 0/6] Optimize NFSD buffer page management"</em> <a href="https://lore.kernel.org/linux-nfs/20260226144739.193129-1-cel@kernel.org/">Cover Letter</a> to linux-nfs. This is the second iteration of a series that first appeared as an RFC earlier this same week (2026-02-22), where it drew review comments from Neil Brown. No replies landed within this reporting window — the next substantive review activity (from Jeff Layton) came on 2026-03-10, outside the scope of this summary.</p>
+<h2>Classification: server-side optimization + latent bug hardening</h2>
+<p>Although this thread lives on the NFS list and touches client-visible behavior (large NFSv4 COMPOUNDs), the work is squarely in <strong>NFSD / SUNRPC server code</strong> (<code>net/sunrpc/svc.c</code>, <code>svc_xprt.c</code>, <code>svcsock.c</code>, <code>xprtrdma/*</code>). It combines:</p>
+<ul>
+<li>a <strong>protocol-capability fix</strong>: NFSD's buffer sizing must accommodate NFSv4 COMPOUNDs whose combined request+response footprint exceeds the maximum transport payload size;</li>
+<li>a <strong>performance optimization</strong>: stop scanning whole page arrays on every RPC; and</li>
+<li>several <strong>correctness/robustness fixes</strong> (tightened bounds checks, NULL-entry handling).</li>
+</ul>
+<h2>The two problems Lever sets out to solve</h2>
+<p>The cover letter frames the motivation crisply. First, the buffer-sizing problem:</p>
+<blockquote>
+<p>"NFSv3 operations have complementary Request and Response sizes... The sum of the two message sizes is never more than the maximum transport payload size. So NFSD could get away with maintaining a single array of pages, split between the RPC send and Receive buffer."</p>
+<p>"NFSv4 is not as cut and dried. An NFSv4 client may construct an NFSv4 COMPOUND that is arbitrarily complex, mixing operations that can have large Request size with operations that have a large Response size. The resulting server-side buffer size requirement can be larger than the maximum transport payload size."</p>
+</blockquote>
+<p>Second, the CPU-cost problem:</p>
+<blockquote>
+<p>"Due to the above, and because NFSD can now handle payload sizes considerably larger than 1MB, the number of array entries that alloc_bulk_pages() walks through to reset the rqst page arrays after each RPC completes has increased dramatically."</p>
+<p>"But we observe that the mean size of NFS requests remains smaller than a few pages... The CPU cost of walking these arrays is noticeable in 'perf' captures."</p>
+</blockquote>
+<h2>Patch-by-patch walkthrough</h2>
+<ol>
+<li>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260226144739.193129-2-cel@kernel.org/">Tighten bounds checking in svc_rqst_replace_page</a></strong> — A correctness fix that also paves the way for the architectural change. The reply-building path validated <code>rq_next_page</code> against the <em>entire</em> <code>rq_pages</code> array, but the true valid range is narrower:</p>
+<blockquote>
+<p>"The bounds check validates rq_next_page against the full rq_pages array, but the valid range for rq_next_page is [rq_respages, rq_page_end]. Use those bounds instead."</p>
+</blockquote>
+<p>Lever notes this is safe today only because both pointers index into <code>rq_pages</code>, and it "prepares for a subsequent change that separates the Reply page array from rq_pages."</p>
+</li>
+<li>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260226144739.193129-3-cel@kernel.org/">Allocate a separate Reply page array</a></strong> — The architectural centerpiece. Today <code>struct svc_rqst</code> uses one dynamic <code>rq_pages</code> array for both the incoming Call and outgoing Reply, with <code>rq_respages</code> as a sliding boundary pointer that each transport receive path must compute:</p>
+<blockquote>
+<p>"This boundary tracking is a source of confusion and bugs, and prevents an RPC transaction from having both a large Call and a large Reply simultaneously."</p>
+</blockquote>
+<p>The fix allocates <code>rq_respages</code> as its own array, "following the precedent set by rq_bvec (a separate dynamically-allocated array for I/O vectors)." Lever is candid about the cost — "Each svc_rqst now pins twice as many pages as before. For a server running 16 threads with a 1MB maximum payload, the additional cost is roughly 16MB of pinned memory" — and pre-empts alternatives:</p>
+<blockquote>
+<p>"We've considered several alternatives to maintaining a full second array. Each alternative reintroduces either boundary logic complexity or I/O-path allocation pressure."</p>
+</blockquote>
+</li>
+<li>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260226144739.193129-4-cel@kernel.org/">Handle NULL entries in svc_rqst_release_pages</a></strong> — A defensive fix for a state the next patches will create: after preserving <code>rq_next_page</code> (patch 4), the range <code>[rq_respages, rq_next_page)</code> "can contain NULL entries where pages have already been transferred to a send context." The release path is changed to iterate entry-by-entry, skipping NULLs.</p>
+</li>
+<li>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260226144739.193129-5-cel@kernel.org/">svcrdma: preserve rq_next_page in svc_rdma_save_io_pages</a></strong> — Removes a workaround. The RDMA send path used to reset <code>rq_next_page</code> back to <code>rq_respages</code>, "hiding the NULL region from svc_rqst_release_pages()." Now that NULLs are handled, dropping the reset preserves the invariant that <code>[rq_respages, rq_next_page)</code> "accurately describes how many response pages were consumed."</p>
+</li>
+<li>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260226144739.193129-6-cel@kernel.org/">Track consumed rq_pages entries</a></strong> — The first half of the CPU optimization. Two transport receive paths NULL out <code>rq_pages</code> entries (TCP multi-fragment reassembly via <code>svc_tcp_save_pages()</code>, and RDMA via <code>svc_rdma_clear_rqst_pages()</code>). A new <code>rq_pages_nfree</code> field records how many were nulled so <code>svc_alloc_arg()</code> "refill[s] only those entries rather than scanning the full rq_pages array... instead of the full ~259 slots (for 1MB messages)."</p>
+</li>
+<li>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260226144739.193129-7-cel@kernel.org/">Optimize rq_respages allocation in svc_alloc_arg</a></strong> — The second half: <code>svc_alloc_arg()</code> was calling <code>alloc_pages_bulk()</code> with the full <code>rq_maxpages</code> count "causing a full-array scan despite most slots holding valid pages." Since only <code>[rq_respages, rq_next_page)</code> contains NULLs after each RPC, the fill is now limited to that range.</p>
+</li>
+</ol>
+<h2>Evolution from RFC → v2 and open items</h2>
+<p>The v2 cover letter documents what changed since the RFC: "Clarify a number of comments based on review (NeilBrown)" and, notably, flags an unresolved point — "Possible NFSv3 waste is still open for discussion." That echoes Neil Brown's earlier concern that pinning twice as many pages is "complete waste" for NFSv3-only servers; Lever's v2 keeps the design but leans on the dynamic svc thread count facility to keep idle-server overhead minimal.</p>
+<h2>Status</h2>
+<p>As of the end of this week, the series is at <strong>v2 with no in-window review replies</strong>. The discussion is a server-side performance/correctness effort rather than a client bug fix; the nearest client-visible impact is that NFSD can now safely serve arbitrarily large NFSv4 COMPOUNDs. Watch for Jeff Layton's reviews (posted 2026-03-10, next week) and any resolution of the open NFSv3 memory-waste question.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260226144739.193129-1-cel@kernel.org/">2026-02-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 0/6] Optimize NFSD buffer page management</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260226144739.193129-2-cel@kernel.org/">2026-02-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 1/6] SUNRPC: Tighten bounds checking in svc_rqst_replace_page</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260226144739.193129-3-cel@kernel.org/">2026-02-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 2/6] SUNRPC: Allocate a separate Reply page array</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260226144739.193129-4-cel@kernel.org/">2026-02-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 3/6] SUNRPC: Handle NULL entries in svc_rqst_release_pages</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260226144739.193129-6-cel@kernel.org/">2026-02-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 5/6] SUNRPC: Track consumed rq_pages entries</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260226144739.193129-5-cel@kernel.org/">2026-02-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 4/6] svcrdma: preserve rq_next_page in svc_rdma_save_io_pages</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260226144739.193129-7-cel@kernel.org/">2026-02-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 6/6] SUNRPC: Optimize rq_respages allocation in svc_alloc_arg</a></li>
+</ul>
+  </main>
+</body>
+</html>

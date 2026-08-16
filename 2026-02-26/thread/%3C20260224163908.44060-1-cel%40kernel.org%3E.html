@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSv4 State Revocation on Unmount: Pivot to fsnotify</title>
+  <meta name="description" content="This week, Chuck Lever submitted version 3 of a patch series aimed at automating the revocation of NFSv4 state when an underlying filesystem is unmounted. The primary goal is to eliminate EBUSY errors during unmount operations caused by…">
+  <meta property="og:title" content="NFSv4 State Revocation on Unmount: Pivot to fsnotify">
+  <meta property="og:description" content="This week, Chuck Lever submitted version 3 of a patch series aimed at automating the revocation of NFSv4 state when an underlying filesystem is unmounted. The primary goal is to eliminate EBUSY errors during unmount operations caused by…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-02-26T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSv4 State Revocation on Unmount: Pivot to fsnotify">
+  <meta name="twitter:description" content="This week, Chuck Lever submitted version 3 of a patch series aimed at automating the revocation of NFSv4 state when an underlying filesystem is unmounted. The primary goal is to eliminate EBUSY errors during unmount operations caused by…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-02-26</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSv4 State Revocation on Unmount: Pivot to fsnotify</h1>
+<h2>Summary</h2>
+<h1>Automatic NFSv4 State Revocation on Filesystem Unmount: VFS Mechanism Debate</h1>
+<h2>Overview</h2>
+<p>This week, Chuck Lever submitted version 3 of a patch series aimed at automating the revocation of NFSv4 state when an underlying filesystem is unmounted. The primary goal is to eliminate <code>EBUSY</code> errors during unmount operations caused by client-held opens, locks, and delegations, thereby improving automation workflows for containerized NFS servers and orchestration systems.</p>
+<p>The discussion this week focused heavily on the <strong>VFS mechanism</strong> proposed in Patch 1/3: a new SRCU-based umount notifier chain. VFS maintainers raised significant concerns regarding namespace isolation and the proliferation of ad-hoc notifiers, leading to a pivot toward using existing <code>fsnotify</code> infrastructure instead.</p>
+<h2>Key Technical Arguments</h2>
+<h3>The Problem: Manual State Revocation</h3>
+<p>Chuck Lever highlighted that manual intervention via <code>/proc/fs/nfsd/unlock_fs</code> is "tedious, error-prone" and breaks automation. The series aims to automatically revoke opens, locks, delegations, and cancel async COPY operations upon unmount, sending <code>NFS4ERR_ADMIN_REVOKED</code> to clients <a href="https://lore.kernel.org/linux-nfs/20260224163908.44060-1-cel@kernel.org/">As mentioned by Chuck Lever</a>.</p>
+<h3>Concern 1: Namespace Isolation and Event Flooding</h3>
+<p>Al Viro and Christian Brauner identified a critical flaw in the proposed per-mount notifier chain: it does not adequately account for mount namespaces.</p>
+<blockquote>
+<p>"So anyone can force that just with unshare -U -m date? Creates a new namespace, populated by clones of all mounts you see... At that point all cloned mounts are released, each triggering your notifier chain..." <a href="https://lore.kernel.org/linux-nfs/20260224171424.GC1762976@ZenIV/">Al Viro</a></p>
+</blockquote>
+<p>Christian Brauner expanded on this, warning that common operations like systemd service spawns or container runtime starts could flood the system with notifications:</p>
+<blockquote>
+<p>"I'm pretty sure that is not what you want and that is defo not what the VFS should do..." <a href="https://lore.kernel.org/linux-nfs/20260226-alimente-kunst-fb9eae636deb@brauner/">Christian Brauner</a></p>
+</blockquote>
+<h3>Concern 2: Ad-hoc Notifiers vs. Unified Infrastructure</h3>
+<p>Brauner argued against adding another custom notification mechanism to the VFS, describing ad-hoc notifiers as "horrific." He proposed extending <code>fsnotify</code> to allow filesystems to register "internal watches" on mounts and superblocks:</p>
+<blockquote>
+<p>"Can we extend fsnotify so that it's possible for a filesystem to register 'internal watches' on relevant objects such as mounts and superblocks and get notified and execute blocking stuff if needed. Then we don't have to add another set of custom notification mechanisms but have it available in a single subsystem and uniformely available." <a href="https://lore.kernel.org/linux-nfs/20260226-alimente-kunst-fb9eae636deb@brauner/">Christian Brauner</a></p>
+</blockquote>
+<h3>The Proposed Solution: Leveraging fsnotify</h3>
+<p>Amir Goldstein and Jan Kara supported the <code>fsnotify</code> approach. Amir noted that <code>FS_UNMOUNT</code> events are already sent to inodes during unmount and suggested that NFSD could register for these events on the export root path:</p>
+<blockquote>
+<p>"I don't see a problem with nfsd registering for FS_UNMOUNT event on sb (once we add it). As a matter of fact, I think that nfsd can already add an inode mark on the export root path for FS_UNMOUNT event." <a href="https://lore.kernel.org/linux-nfs/CAOQ4uxhEpf1p3agEF7_HBrhUeKz1Fb_yKAQ0Pjo0zztTJfMoXA@mail.gmail.com/">Amir Goldstein</a></p>
+</blockquote>
+<p>Jan Kara confirmed this direction:</p>
+<blockquote>
+<p>"Yeah, then as Amir writes placing a mark with FS_UNMOUNT event on the export root path and handling the event in nfsd_file_fsnotify_handle_event() should do what you need?" <a href="https://lore.kernel.org/linux-nfs/jxyalrg3a2yjtjfmdylncg7fz63jstbq6pwhhqlaaxju5sk72f@55lb7mfucc5i/">Jan Kara</a></p>
+</blockquote>
+<h2>Evolution and Conclusion</h2>
+<p>Chuck Lever accepted the feedback, agreeing with Al Viro's namespace concerns and expressing willingness to adopt the mechanism preferred by VFS maintainers:</p>
+<blockquote>
+<p>"I agree with Al's earlier comment and have added some protection there for the next revision of the series... I'm happy to try whatever mechanism VFS maintainers are most comfortable with." <a href="https://lore.kernel.org/linux-nfs/1165a90b-acbf-4c0d-a7e3-3972eba0d35a@kernel.org/">Chuck Lever</a></p>
+</blockquote>
+<p><strong>Final Status:</strong> The discussion concluded with a consensus to replace the proposed SRCU umount notifier chain with an <code>fsnotify</code>-based solution using <code>FS_UNMOUNT</code> events on the export root inode. This avoids namespace flooding issues and aligns with existing VFS infrastructure. The NFSD-specific patches (2/3 and 3/3) regarding state revocation and file cache cleanup remain largely intact but will depend on the revised VFS hook in the next version of the series.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260224163908.44060-1-cel@kernel.org/">2026-02-24 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 0/3] Automatic NFSv4 state revocation on filesystem unmount</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260224163908.44060-2-cel@kernel.org/">2026-02-24 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 1/3] fs: add umount notifier chain for filesystem unmount notification</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260224163908.44060-3-cel@kernel.org/">2026-02-24 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 2/3] nfsd: revoke NFSv4 state when filesystem is unmounted</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260224163908.44060-4-cel@kernel.org/">2026-02-24 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 3/3] nfsd: close cached files on filesystem unmount</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260224171424.GC1762976@ZenIV/">2026-02-24 Al Viro <a href="mailto:viro@zeniv.linux.org.uk">viro@zeniv.linux.org.uk</a> — Re: [PATCH v3 0/3] Automatic NFSv4 state revocation on filesystem unmount</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260226-alimente-kunst-fb9eae636deb@brauner/">2026-02-26 Christian Brauner <a href="mailto:brauner@kernel.org">brauner@kernel.org</a> — Re: [PATCH v3 1/3] fs: add umount notifier chain for filesystem unmount notification</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxhEpf1p3agEF7_HBrhUeKz1Fb_yKAQ0Pjo0zztTJfMoXA@mail.gmail.com/">2026-02-26 Amir Goldstein <a href="mailto:amir73il@gmail.com">amir73il@gmail.com</a> — Re: [PATCH v3 1/3] fs: add umount notifier chain for filesystem unmount notification</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/1165a90b-acbf-4c0d-a7e3-3972eba0d35a@kernel.org/">2026-02-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v3 1/3] fs: add umount notifier chain for filesystem unmount notification</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/jxyalrg3a2yjtjfmdylncg7fz63jstbq6pwhhqlaaxju5sk72f@55lb7mfucc5i/">2026-02-26 Jan Kara <a href="mailto:jack@suse.cz">jack@suse.cz</a> — Re: [PATCH v3 1/3] fs: add umount notifier chain for filesystem unmount notification</a></li>
+</ul>
+  </main>
+</body>
+</html>

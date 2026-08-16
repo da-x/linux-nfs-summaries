@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS Server: Regression in nfsd_permission() Breaks File Locking</title>
+  <meta name="description" content="This thread reports a regression in the NFS server (nfsd) that causes file locking operations to fail with -ENOLCK (&quot;No locks available&quot;) on NFSv3 clients. The issue was discovered in production infrastructure and traced back to a specific…">
+  <meta property="og:title" content="NFS Server: Regression in nfsd_permission() Breaks File Locking">
+  <meta property="og:description" content="This thread reports a regression in the NFS server (nfsd) that causes file locking operations to fail with -ENOLCK (&quot;No locks available&quot;) on NFSv3 clients. The issue was discovered in production infrastructure and traced back to a specific…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-02-26T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS Server: Regression in nfsd_permission() Breaks File Locking">
+  <meta name="twitter:description" content="This thread reports a regression in the NFS server (nfsd) that causes file locking operations to fail with -ENOLCK (&quot;No locks available&quot;) on NFSv3 clients. The issue was discovered in production infrastructure and traced back to a specific…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-02-26</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS Server: Regression in nfsd_permission() Breaks File Locking</h1>
+<h2>Summary</h2>
+<h1>NFS Server: Regression in <code>nfsd_permission()</code> Breaks File Locking for NFSv3 Clients</h1>
+<h2>Classification: Bug Fix (NFS Server / nfsd Permission Checks)</h2>
+<h2>Summary</h2>
+<p>This thread reports a <strong>regression in the NFS server (<code>nfsd</code>)</strong> that causes file locking operations to fail with <code>-ENOLCK</code> ("No locks available") on NFSv3 clients. The issue was discovered in production infrastructure and traced back to a specific upstream commit that removed critical permission checks from <code>nfsd_permission()</code>.</p>
+<h2>Technical Context</h2>
+<h3>The Regression</h3>
+<p>Tj reported the issue <a href="https://lore.kernel.org/linux-nfs/c0f15088-3fc0-487a-9f24-cf89c158420d@proton.me/">on February 24</a>, identifying two commits as the source of the regression:</p>
+<blockquote>
+<p>"Upstream commit 4cc9b9f2bf4dfe13fe573 'nfsd: refine and rename NFSD_MAY_LOCK' and stable v6.12.54 commit 18744bc56b0ec (re)moves checks from fs/nfsd/vfs.c::nfsd_permission()."</p>
+</blockquote>
+<p>The removed checks caused NFS clients attempting to acquire file locks via <code>flock()</code> or <code>fcntl()</code> to receive <code>-ENOLCK</code> errors, effectively breaking file locking functionality over NFSv3 mounts.</p>
+<h3>Real-World Impact</h3>
+<p>The bug was discovered on the <strong>Debian openQA infrastructure</strong>, where worker hosts pass NFSv3-mounted ISO images to QEMU for virtual machine testing:</p>
+<blockquote>
+<p>"This was discovered on the Debian openQA infrastructure server when upgrading kernel from v6.12.48 to later v6.12.y where worker hosts (with any earlier or later kernel version) pass NFSv3 mounted ISO images to qemu-system-x86_64 and it reports: !!! : qemu-system-x86_64: -device scsi-cd,id=cd0-device,drive=cd0-overlay0,serial=cd0: Failed to get 'consistent read' lock: No locks available"</p>
+</blockquote>
+<p>QEMU requires "consistent read" locks on disk images to prevent corruption, and this regression broke that capability entirely.</p>
+<h3>Reproduction</h3>
+<p>Tj provided a clear reproducer using NFSv3 with NLM (Network Lock Manager) authentication:</p>
+<pre><code># Server exports:
+/srv/NAS/test fdff::/64(fsid=0,rw,no_root_squash,sync,no_subtree_check,auth_nlm)
+
+# Client mount:
+mount -t nfs [fdff::2]:/srv/NAS/test /srv/NAS/test -o proto=tcp6,ro,fsc,soft
+
+# Trigger:
+flock -e -w 4 /srv/NAS/test/debian-13.3.0-amd64-netinst.iso sleep 1
+flock: /srv/NAS/test/debian-13.3.0-amd64-netinst.iso: No locks available
+</code></pre>
+<p>A custom test program calling <code>fcntl()</code> with the same arguments QEMU uses also failed identically, confirming the issue is at the NFS server level rather than a client-side problem.</p>
+<h3>Proposed Fix</h3>
+<p>Tj identified a straightforward resolution:</p>
+<blockquote>
+<p>"Keeping the check in nfsd_permission() whilst also copying it to fs/nfsd/nfsfh.c::__fh_verify() resolves the issue."</p>
+</blockquote>
+<p>This suggests that the permission check removed from <code>nfsd_permission()</code> needs to be restored there and additionally duplicated in <code>__fh_verify()</code> to cover all code paths.</p>
+<h3>Call Trace Analysis</h3>
+<p>In a <a href="https://lore.kernel.org/linux-nfs/7945477d-f6f9-4311-9ef3-73a92f0e8ea2@proton.me/">follow-up message</a>, Tj added <code>dump_stack()</code> to <code>nfsd_permission()</code> and revealed the two call paths that trigger the issue:</p>
+<ol>
+<li><strong>NFSv4 path</strong>: <code>nfsd_permission</code> → <code>nfsd_access</code> → <code>nfsd4_proc_compound</code> → <code>nfsd_dispatch</code></li>
+<li><strong>NFSv3 path</strong>: <code>nfsd_permission</code> → <code>nfsd_access</code> → <code>nfsd3_proc_access</code> → <code>nfsd_dispatch</code></li>
+</ol>
+<p>Both paths flow through <code>nfsd_access</code>, confirming that the regression affects both NFSv3 and NFSv4 clients when they perform access/permission checks related to locking operations.</p>
+<h2>Evolution of Discussion</h2>
+<p>This week's activity was limited to Tj's initial report and follow-up with stack traces. The thread continued beyond this week (as seen in the full message list) with responses from Thorsten Leemhuis, Salvatore Bonaccorso, Olga Kornievskaia, Sasha Levin, NeilBrown, Jeff Layton, Chuck Lever, and Ben Hutchings — indicating that the NFS maintainers engaged with the report in subsequent weeks. The discussion eventually evolved into a patch series titled "[PATCH] lockd: fix TEST handling when not all permissions are available" by NeilBrown, suggesting the root cause analysis led to a fix in the <code>lockd</code> subsystem rather than simply reverting the original commit.</p>
+<h2>Key Technical Takeaway</h2>
+<p>This regression highlights the fragility of permission-check refactoring in the NFS server codebase. The removal of checks from <code>nfsd_permission()</code> during the "refine and rename NFSD_MAY_LOCK" commit inadvertently broke the locking infrastructure for NFS clients relying on NLM. The fact that both NFSv3 and NFSv4 paths are affected through the common <code>nfsd_access</code> function underscores how central permission checks are to the NFS server's locking protocol implementation.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/c0f15088-3fc0-487a-9f24-cf89c158420d@proton.me/">2026-02-24 Tj <a href="mailto:tj.iam.tj@proton.me">tj.iam.tj@proton.me</a> — Regression: Missing check in nfsd_permission() causes -ENOLCK No locks available</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/7945477d-f6f9-4311-9ef3-73a92f0e8ea2@proton.me/">2026-02-24 Tj <a href="mailto:tj.iam.tj@proton.me">tj.iam.tj@proton.me</a> — Re: Regression: Missing check in nfsd_permission() causes -ENOLCK No locks available</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/c0f15088-3fc0-487a-9f24-cf89c158420d@proton.me/">2026-02-24 Tj <a href="mailto:tj.iam.tj@proton.me">tj.iam.tj@proton.me</a> — Regression: Missing check in nfsd_permission() causes -ENOLCK No locks available</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/7945477d-f6f9-4311-9ef3-73a92f0e8ea2@proton.me/">2026-02-24 Tj <a href="mailto:tj.iam.tj@proton.me">tj.iam.tj@proton.me</a> — Re: Regression: Missing check in nfsd_permission() causes -ENOLCK No locks available</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Centralizing Directory Locking for Name Ops: VFS, NFSd, and OverlayFS Refactoring</title>
+  <meta name="description" content="Neil Brown submitted version 2 of a 15-patch series titled &quot;Further centralising of directory locking for name ops&quot; 00/15. This series is part of a broader initiative to refactor VFS locking mechanisms, aiming eventually to lock individual…">
+  <meta property="og:title" content="Centralizing Directory Locking for Name Ops: VFS, NFSd, and OverlayFS Refactoring">
+  <meta property="og:description" content="Neil Brown submitted version 2 of a 15-patch series titled &quot;Further centralising of directory locking for name ops&quot; 00/15. This series is part of a broader initiative to refactor VFS locking mechanisms, aiming eventually to lock individual…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-02-26T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Centralizing Directory Locking for Name Ops: VFS, NFSd, and OverlayFS Refactoring">
+  <meta name="twitter:description" content="Neil Brown submitted version 2 of a 15-patch series titled &quot;Further centralising of directory locking for name ops&quot; 00/15. This series is part of a broader initiative to refactor VFS locking mechanisms, aiming eventually to lock individual…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-02-26</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Centralizing Directory Locking for Name Ops: VFS, NFSd, and OverlayFS Refactoring</h1>
+<h2>Summary</h2>
+<h2>Overview</h2>
+<p>Neil Brown submitted version 2 of a 15-patch series titled <strong>"Further centralising of directory locking for name ops"</strong> <a href="https://lore.kernel.org/linux-nfs/20260223011210.3853517-1-neilb@ownmail.net/">00/15</a>. This series is part of a broader initiative to refactor VFS locking mechanisms, aiming eventually to lock individual names rather than entire directories during name operations. The immediate goal of this series is to consolidate all explicit directory locking (using <code>inode_lock()</code>, <code>lock_rename()</code>, etc.) into new centralized interfaces (<code>start_creating()</code>, <code>start_removing()</code>, etc.), thereby preparing the codebase for future locking rule changes.</p>
+<p>The series touches multiple subsystems, including VFS, procfs, libfs, AppArmor, SELinux, NFSd, cachefiles, and significantly, OverlayFS.</p>
+<h2>Key Technical Arguments and Evolution</h2>
+<h3>Centralization of Locking Interfaces</h3>
+<p>The core argument driving this series is the elimination of scattered explicit locking calls in favor of unified VFS helpers. Neil Brown noted that previous passes missed several locations where explicit locking remained <a href="https://lore.kernel.org/linux-nfs/20260223011210.3853517-1-neilb@ownmail.net/">00/15</a>.</p>
+<ul>
+<li><strong>NFSd Changes</strong>: Patch 07/15 switches <code>nfsd</code>'s <code>purge_old()</code> function to use <code>start_removing_noperm()</code> and <code>end_removing()</code> wrappers, removing explicit locking <a href="https://lore.kernel.org/linux-nfs/20260223011210.3853517-8-neilb@ownmail.net/">07/15</a>. This simplifies the NFS server code and aligns it with the new VFS patterns.</li>
+<li><strong>SELinux Fix</strong>: Chris Mason identified a bug in Patch 06/15 where <code>simple_start_creating()</code> returns <code>-EEXIST</code> instead of <code>ERR_PTR(-ENOMEM)</code>, potentially masking the actual error code. Paul Moore acknowledged this, stating:
+<blockquote>
+<p>"Good catch Chris, yes, please change this Neil and feel free to preserve my ACK." <a href="https://lore.kernel.org/linux-nfs/CAHC9VhSVjLNeTdxHmwYsGX75Z4FOAP+26=PjVdFxpmEkTrPvxA@mail.gmail.com/">Re: 06/15</a></p>
+</blockquote>
+</li>
+</ul>
+<h3>OverlayFS Locking and Race Condition Concerns</h3>
+<p>The most significant changes occur in OverlayFS (patches 09-14/15), where explicit locking is removed in favor of new lookup-and-lock interfaces.</p>
+<ul>
+<li>
+<p><strong>TOCTOU Debate</strong>: Chris Mason raised a concern regarding Patch 09/15 (<code>ovl: Simplify ovl_lookup_real_one()</code>), which removes <code>inode_lock_nested</code> during the lookup and validation phase. He flagged a potential Time-of-Check-Time-of-Use (TOCTOU) race:</p>
+<blockquote>
+<p>"The new lockless pattern creates a window where... A concurrent unlink/remove operation unhashes <code>this</code>... The function returns an unhashed dentry." <a href="https://lore.kernel.org/linux-nfs/20260223132027.4165509-1-clm@meta.com/">Re: 09/15</a></p>
+</blockquote>
+<p>Mason argued that the old code serialized with unhash operations, whereas the new pattern might miss a race where the dentry is unhashed but its <code>d_parent</code> pointer remains valid.</p>
+</li>
+<li>
+<p><strong>Resolution</strong>: Amir Goldstein countered this concern, explaining that the lock in the old code was on the overlayfs inode, not the underlying filesystem's inode. Therefore, the check of <code>real-&gt;d_parent</code> was never strictly protected against concurrent operations on the underlying fs:</p>
+<blockquote>
+<p>"The lock not taken on 'dir' which is the overlayfs inode and the checked 'real' dentry is on the underlying fs... it is a mere best effort sanity check, so I think there is no added risk here." <a href="https://lore.kernel.org/linux-nfs/CAOQ4uxirM8dW9rOw4SvGtfH-s0Eg9LGuFk1aZooMvEDc=2tbyA@mail.gmail.com/">Re: 09/15</a></p>
+</blockquote>
+<p>Neil Brown agreed with Amir's assessment, confirming that the validation is a point-in-time sanity check and does not require strict serialization for correctness in this context.</p>
+</li>
+</ul>
+<h3>Documentation and Cleanup</h3>
+<ul>
+<li>Patch 01/15 improves documentation for <code>try_lookup_noperm()</code> and related functions to clarify that they can return error pointers, not just NULL <a href="https://lore.kernel.org/linux-nfs/20260223011210.3853517-2-neilb@ownmail.net/">01/15</a>.</li>
+<li>Patch 15/15 unexports <code>lock_rename()</code>, <code>lock_rename_child()</code>, and <code>unlock_rename()</code> as they are now only used internally within <code>fs/namei.c</code> <a href="https://lore.kernel.org/linux-nfs/20260223011210.3853517-16-neilb@ownmail.net/">15/15</a>.</li>
+</ul>
+<h2>Final Conclusions</h2>
+<p>The discussion concluded with a consensus that the series is sound, with minor adjustments:</p>
+<ol>
+<li><strong>SELinux</strong>: Neil Brown agreed to fix the error code preservation issue in Patch 06/15 as requested by Paul Moore and Chris Mason.</li>
+<li><strong>OverlayFS</strong>: The concern regarding the TOCTOU race in Patch 09/15 was dismissed as a non-issue due to the nature of the sanity check and the scope of the locks involved. Amir Goldstein provided Reviewed-by tags for the OverlayFS patches <a href="https://lore.kernel.org/linux-nfs/CAOQ4uxjtedA8B1QZDddRtsSP0XgFZCuBTD1VGvN4wawRyoox=A@mail.gmail.com/">Re: 09/15</a>, <a href="https://lore.kernel.org/linux-nfs/CAOQ4uxibL=2Z0FZMz5wMAo=JMaJouOVo3p7t3Fi3FR59U5Tu=g@mail.gmail.com/">Re: 11/15</a>, and <a href="https://lore.kernel.org/linux-nfs/CAOQ4uxg0k2TMdmxoTL5-HW=5njZijX=FzMgWgVBa2GuHYV3-Zg@mail.gmail.com/">Re: 12/15</a>.</li>
+<li><strong>NFSd</strong>: The changes to NFSd were accepted without controversy, simplifying the recovery code path.</li>
+</ol>
+<p>Neil Brown indicated that this series is expected to land in <code>vfs/</code> shortly, paving the way for subsequent patches that will implement the actual locking rule changes (locking names instead of directories) in the next merge window <a href="https://lore.kernel.org/linux-nfs/20260223011210.3853517-1-neilb@ownmail.net/">00/15</a>.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260223011210.3853517-1-neilb@ownmail.net/">2026-02-23 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v2 00/15] Further centralising of directory locking for name ops.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260223011210.3853517-2-neilb@ownmail.net/">2026-02-23 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v2 01/15] VFS: note error returns is documentation for various lookup functions</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260223011210.3853517-3-neilb@ownmail.net/">2026-02-23 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v2 02/15] fs/proc: Don't lock root inode when creating "self" and "thread-self"</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260223011210.3853517-4-neilb@ownmail.net/">2026-02-23 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v2 03/15] VFS: move the start_dirop() kerndoc comment to before start_dirop()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260223011210.3853517-5-neilb@ownmail.net/">2026-02-23 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v2 04/15] libfs: change simple_done_creating() to use end_creating()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260223011210.3853517-6-neilb@ownmail.net/">2026-02-23 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v2 05/15] Apparmor: Use simple_start_creating() / simple_done_creating()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260223011210.3853517-7-neilb@ownmail.net/">2026-02-23 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v2 06/15] selinux: Use simple_start_creating() / simple_done_creating()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260223011210.3853517-8-neilb@ownmail.net/">2026-02-23 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v2 07/15] nfsd: switch purge_old() to use start_removing_noperm()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260223011210.3853517-9-neilb@ownmail.net/">2026-02-23 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v2 08/15] VFS: make lookup_one_qstr_excl() static.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260223011210.3853517-10-neilb@ownmail.net/">2026-02-23 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v2 09/15] ovl: Simplify ovl_lookup_real_one()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260223011210.3853517-11-neilb@ownmail.net/">2026-02-23 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v2 10/15] cachefiles: change cachefiles_bury_object to use start_renaming_dentry()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260223011210.3853517-12-neilb@ownmail.net/">2026-02-23 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v2 11/15] ovl: pass name buffer to ovl_start_creating_temp()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260223011210.3853517-13-neilb@ownmail.net/">2026-02-23 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v2 12/15] ovl: change ovl_create_real() to get a new lock when re-opening created file.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260223011210.3853517-14-neilb@ownmail.net/">2026-02-23 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v2 13/15] ovl: use is_subdir() for testing if one thing is a subdir of another</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260223011210.3853517-15-neilb@ownmail.net/">2026-02-23 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v2 14/15] ovl: remove ovl_lock_rename_workdir()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260223011210.3853517-16-neilb@ownmail.net/">2026-02-23 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v2 15/15] VFS: unexport lock_rename(), lock_rename_child(), unlock_rename()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxibL=2Z0FZMz5wMAo=JMaJouOVo3p7t3Fi3FR59U5Tu=g@mail.gmail.com/">2026-02-23 Amir Goldstein <a href="mailto:amir73il@gmail.com">amir73il@gmail.com</a> — Re: [PATCH v2 11/15] ovl: pass name buffer to ovl_start_creating_temp()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxg0k2TMdmxoTL5-HW=5njZijX=FzMgWgVBa2GuHYV3-Zg@mail.gmail.com/">2026-02-23 Amir Goldstein <a href="mailto:amir73il@gmail.com">amir73il@gmail.com</a> — Re: [PATCH v2 12/15] ovl: change ovl_create_real() to get a new lock when re-opening created file.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxjtedA8B1QZDddRtsSP0XgFZCuBTD1VGvN4wawRyoox=A@mail.gmail.com/">2026-02-23 Amir Goldstein <a href="mailto:amir73il@gmail.com">amir73il@gmail.com</a> — Re: [PATCH v2 09/15] ovl: Simplify ovl_lookup_real_one()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260223132027.4165509-1-clm@meta.com/">2026-02-23 Chris Mason <a href="mailto:clm@meta.com">clm@meta.com</a> — Re: [PATCH v2 09/15] ovl: Simplify ovl_lookup_real_one()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260223132424.105125-1-clm@meta.com/">2026-02-23 Chris Mason <a href="mailto:clm@meta.com">clm@meta.com</a> — Re: [PATCH v2 12/15] ovl: change ovl_create_real() to get a new lock when re-opening created file.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260223132533.136328-1-clm@meta.com/">2026-02-23 Chris Mason <a href="mailto:clm@meta.com">clm@meta.com</a> — Re: [PATCH v2 06/15] selinux: Use simple_start_creating() / simple_done_creating()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxirM8dW9rOw4SvGtfH-s0Eg9LGuFk1aZooMvEDc=2tbyA@mail.gmail.com/">2026-02-23 Amir Goldstein <a href="mailto:amir73il@gmail.com">amir73il@gmail.com</a> — Re: [PATCH v2 09/15] ovl: Simplify ovl_lookup_real_one()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260223135517.1229434-1-clm@meta.com/">2026-02-23 Chris Mason <a href="mailto:clm@meta.com">clm@meta.com</a> — Re: [PATCH v2 01/15] VFS: note error returns is documentation for various lookup functions</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAHC9VhSVjLNeTdxHmwYsGX75Z4FOAP+26=PjVdFxpmEkTrPvxA@mail.gmail.com/">2026-02-23 Paul Moore <a href="mailto:paul@paul-moore.com">paul@paul-moore.com</a> — Re: [PATCH v2 06/15] selinux: Use simple_start_creating() / simple_done_creating()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177188426768.8396.6205782771317375008@noble.neil.brown.name/">2026-02-23 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v2 01/15] VFS: note error returns is documentation for various lookup functions</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177188443018.8396.8813038272679664939@noble.neil.brown.name/">2026-02-23 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v2 06/15] selinux: Use simple_start_creating() / simple_done_creating()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177188530015.8396.7140929443922458208@noble.neil.brown.name/">2026-02-23 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v2 09/15] ovl: Simplify ovl_lookup_real_one()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177188581436.8396.15474182964858193799@noble.neil.brown.name/">2026-02-23 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v2 12/15] ovl: change ovl_create_real() to get a new lock when re-opening created file.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260224-granulat-joggen-cd082d178959@brauner/">2026-02-24 Christian Brauner <a href="mailto:brauner@kernel.org">brauner@kernel.org</a> — Re: [PATCH v2 12/15] ovl: change ovl_create_real() to get a new lock when re-opening created file.</a></li>
+</ul>
+  </main>
+</body>
+</html>

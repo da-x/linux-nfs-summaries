@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VFS Dentry Hashing Refactor: NFS Client Implications for d_splice_alias and atomic_open</title>
+  <meta name="description" content="This thread, originally initiated in August 2025, concerns a proposed VFS-level change to allow d_splice_alias() and d_add() to operate on hashed dentries — a prerequisite for NeilBrown&#39;s broader directory locking refactor. After a…">
+  <meta property="og:title" content="VFS Dentry Hashing Refactor: NFS Client Implications for d_splice_alias and atomic_open">
+  <meta property="og:description" content="This thread, originally initiated in August 2025, concerns a proposed VFS-level change to allow d_splice_alias() and d_add() to operate on hashed dentries — a prerequisite for NeilBrown&#39;s broader directory locking refactor. After a…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-02-26T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="VFS Dentry Hashing Refactor: NFS Client Implications for d_splice_alias and atomic_open">
+  <meta name="twitter:description" content="This thread, originally initiated in August 2025, concerns a proposed VFS-level change to allow d_splice_alias() and d_add() to operate on hashed dentries — a prerequisite for NeilBrown&#39;s broader directory locking refactor. After a…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-02-26</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>VFS Dentry Hashing Refactor: NFS Client Implications for d_splice_alias and atomic_open</h1>
+<h2>Summary</h2>
+<h1>VFS Dentry Hashing: NFS Client Implications in Directory Locking Refactor</h1>
+<h2>Overview</h2>
+<p>This thread, originally initiated in August 2025, concerns a proposed VFS-level change to allow <code>d_splice_alias()</code> and <code>d_add()</code> to operate on hashed dentries — a prerequisite for NeilBrown's broader directory locking refactor. After a six-month hiatus following Al Viro's initial review, Neil Brown revived the discussion this week with two messages on February 26, 2026, focusing specifically on how filesystems like NFS should handle dentry instantiation in <code>atomic_open</code> and <code>mkdir</code> contexts.</p>
+<p>This is primarily a <strong>protocol/VFS interface change</strong> with significant implications for NFS client development, rather than a discrete bug fix. The goal is to eliminate the need for filesystems to call <code>d_drop()</code> (unhashing) before invoking <code>d_splice_alias()</code>, which conflicts with proposed locking changes that require dentries to remain hashed during directory operations.</p>
+<h2>Background (Prior Weeks)</h2>
+<p>The original patch series ([PATCH 08/11] VFS: allow d_splice_alias() and d_add() to work on hashed dentries)[id://20250812235228.3072318-9-neil@brown.name] proposed modifying <code>d_splice_alias()</code> and <code>d_add()</code> to accept hashed dentries, removing explicit <code>d_drop()</code> calls from several filesystems including NFS (<code>fs/nfs/dir.c</code> and <code>fs/nfs/nfs4proc.c</code>).</p>
+<p>Al Viro responded with concerns about code clarity. He argued against making all callers of <code>d_splice_alias()</code> and <code>d_add()</code> ambiguous regarding hash state, stating:</p>
+<blockquote>
+<p>"The problem I have with that is the loss of information. That is to say, 'is it hashed here' is hard to deduce from code. I would rather add d_splice_alias_hashed() and d_add_hashed(), and then see what's going on in specific callers."</p>
+</blockquote>
+<p>Viro emphasized the need for upfront analysis:</p>
+<blockquote>
+<p>"I realize that it's no fun at all - in particular, I'd never been able to get ceph folks to explain what is and what is not possible there. I would really hate to have that expand by order of magnitude - in effect, you make <em>all</em> calls of d_splice_alias() and d_add() similar mysteries."</p>
+</blockquote>
+<h2>This Week's Activity (February 26, 2026)</h2>
+<p>After six months of silence, Neil Brown returned to the thread with renewed analysis. He noted:</p>
+<blockquote>
+<p>"I'm picking this up at last ... only 6 months later."</p>
+</blockquote>
+<h3>Key Technical Arguments</h3>
+<p><strong>1. The <code>atomic_open</code> Distinction</strong></p>
+<p>Neil identified that <code>atomic_open</code> is called in two distinct states:</p>
+<ul>
+<li>With a <code>d_in_lookup()</code> dentry (unhashed, still being looked up)</li>
+<li>With a negative hashed dentry (already in the hash table but without an inode)</li>
+</ul>
+<p>He observed that most filesystems providing <code>atomic_open</code> check for <code>d_in_lookup()</code> and perform a lookup to obtain a hashed dentry. However, three filesystems stand out as exceptions: <strong>ceph, smb/client, and NFS</strong>. These filesystems call <code>d_drop()</code> (conditionally for ceph, unconditionally for smb and nfs) and then invoke <code>d_splice_alias()</code>.</p>
+<p>Neil proposed a cleaner approach for these cases:</p>
+<blockquote>
+<p>"So I could change these to:</p>
+<pre><code> if (d_in_lookup(de))
+    d_splice_alias(de, inode);
+ else
+    d_instantiate(de, inode);
+```"
+</code></pre>
+</blockquote>
+<p>He also suggested enhancing <code>d_instantiate</code> to handle the <code>d_in_lookup()</code> case automatically:</p>
+<blockquote>
+<p>"Could we enhance d_instantiate to do d_splice_alias() in the case where the dentry is d_in_lookup()?"</p>
+</blockquote>
+<p><strong>2. The Directory Case (<code>mkdir</code>) Complication</strong></p>
+<p>In a follow-up message, Neil corrected his earlier assertion that there were no cases where <code>d_splice_alias()</code> is called with a directory inode and a hashed dentry:</p>
+<blockquote>
+<p>"There are of course... mkdir() is given a hashed negative dentry and may need to use d_splice_alias() if there is any chance the inode was accessible (e.g. by fhandle) before the splice can happen."</p>
+</blockquote>
+<p>This reveals a critical NFS-specific concern: file handles (<code>fhandle</code>) can make inodes accessible through alternative paths before the dentry splice occurs, necessitating careful handling.</p>
+<p>Neil outlined three distinct cases that generic "create object" code inside a filesystem must handle:</p>
+<ol>
+<li><strong><code>d_in_lookup()</code></strong> — use <code>d_splice_alias()</code></li>
+<li><strong>Otherwise if non-directory</strong> — use <code>d_instantiate()</code></li>
+<li><strong>Otherwise (directory)</strong> — use some new <code>d_add_or_obtain</code> (a name borrowed from NFS internals) which handles directories correctly</li>
+</ol>
+<p>He concluded with the core motivation:</p>
+<blockquote>
+<p>"Currently most d_drop() and use d_splice_alias() but I need to avoid the d_drop()."</p>
+</blockquote>
+<h2>Implications for NFS Client Development</h2>
+<p>This discussion is directly relevant to NFS client developers because:</p>
+<ol>
+<li><strong>NFS currently calls <code>d_drop()</code> unconditionally</strong> before <code>d_splice_alias()</code> in its <code>atomic_open</code> implementation, a pattern that must change under the proposed locking model.</li>
+<li><strong>The NFS-specific <code>d_add_or_obtain</code> semantics</strong> for directory creation may need to be elevated to a VFS-level interface or carefully adapted.</li>
+<li><strong>File handle accessibility</strong> is a unique concern for network filesystems like NFS, where inodes can be reached via multiple paths (e.g., through <code>open_by_handle_at</code>), making the race conditions around dentry splicing particularly important.</li>
+</ol>
+<h2>Final Conclusions</h2>
+<p>No definitive resolution was reached this week. The discussion remains open-ended, with Neil Brown proposing potential API simplifications (enhancing <code>d_instantiate</code> or introducing a new interface) while acknowledging the complexity introduced by directory creation scenarios. The key takeaway is that the NFS client's current pattern of unconditional <code>d_drop()</code> followed by <code>d_splice_alias()</code> must be replaced with state-aware logic distinguishing between <code>d_in_lookup()</code>, hashed non-directory, and hashed directory cases — all without calling <code>d_drop()</code>.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/177206761798.7472.8904569543245678825@noble.neil.brown.name/">2026-02-26 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH 08/11] VFS: allow d_splice_alias() and d_add() to work on hashed dentries.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177206964635.7472.10143856965392266372@noble.neil.brown.name/">2026-02-26 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH 08/11] VFS: allow d_splice_alias() and d_add() to work on hashed dentries.</a></li>
+</ul>
+  </main>
+</body>
+</html>

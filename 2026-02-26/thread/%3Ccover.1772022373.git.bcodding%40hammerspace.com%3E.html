@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>kNFSD Signed Filehandles: Hardening Against Guessing Attacks</title>
+  <meta name="description" content="This week, the Linux NFS server (kNFSD) received a significant security enhancement with the application of Benjamin Coddington&#39;s patch series &quot;kNFSD Signed Filehandles&quot; (v7). The series addresses a long-standing vulnerability where NFS…">
+  <meta property="og:title" content="kNFSD Signed Filehandles: Hardening Against Guessing Attacks">
+  <meta property="og:description" content="This week, the Linux NFS server (kNFSD) received a significant security enhancement with the application of Benjamin Coddington&#39;s patch series &quot;kNFSD Signed Filehandles&quot; (v7). The series addresses a long-standing vulnerability where NFS…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-02-26T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="kNFSD Signed Filehandles: Hardening Against Guessing Attacks">
+  <meta name="twitter:description" content="This week, the Linux NFS server (kNFSD) received a significant security enhancement with the application of Benjamin Coddington&#39;s patch series &quot;kNFSD Signed Filehandles&quot; (v7). The series addresses a long-standing vulnerability where NFS…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-02-26</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>kNFSD Signed Filehandles: Hardening Against Guessing Attacks</h1>
+<h2>Summary</h2>
+<h2>kNFSD Signed Filehandles: A New Defense Against Filehandle Guessing</h2>
+<p>This week, the Linux NFS server (kNFSD) received a significant security enhancement with the application of Benjamin Coddington's patch series <strong>"kNFSD Signed Filehandles"</strong> (v7). The series addresses a long-standing vulnerability where NFS clients could potentially bypass directory permissions by guessing filehandles.</p>
+<h3>The Problem: Well-Formed Filehandles Are Easy to Guess</h3>
+<p>As detailed in the cover letter <a href="https://lore.kernel.org/linux-nfs/cover.1772022373.git.bcodding@hammerspace.com/">by Benjamin Coddington</a>, filesystems generate filehandles through <code>encode_fh</code> operations. These handles are often "well-formed," consisting of predictable structures like inode numbers and generation numbers.</p>
+<blockquote>
+<p>"Filehandles are easy to guess because they are well-formed... You can simply insert inode numbers and iterate on the generation number. Eventually you'll be able to access the file using open_by_handle_at(2)."</p>
+</blockquote>
+<p>While local systems protect against this via <code>CAP_DAC_READ_SEARCH</code> for <code>open_by_handle_at(2)</code>, the NFS server cannot trust remote callers in the same way. Coddington noted that simple testing confirmed a generation number could be found within ~1200 minutes on a local system, estimating that network delay might only extend this to around 24 hours over genuine NFS calls.</p>
+<h3>The Solution: Signing Filehandles with SipHash</h3>
+<p>The proposed solution is to append an 8-byte Message Authentication Code (MAC) to filehandles using <strong>SipHash-2-4</strong>. This cryptographic signature ensures that a client cannot fabricate a valid filehandle without knowing the server's secret key.</p>
+<blockquote>
+<p>"We propose to sign filehandles by appending an 8-byte MAC which is the siphash of the filehandle from a key set from the nfs-utilities... The NFS server performs optional signing by possessing a key set from userspace and having the 'sign_fh' export option."</p>
+</blockquote>
+<h3>Key Technical Components</h3>
+<p>The three-patch series introduces the following changes:</p>
+<ol>
+<li>
+<p><strong>Key Management</strong>: A new netlink interface allows userspace (via <code>nfs-utils</code>) to set a 128-bit secret key for signing filehandles. This key persists across reboots, ensuring filehandles remain valid after server restarts. <a href="https://lore.kernel.org/linux-nfs/2fa9ee81cca11046ba123d991dcd36997d8abc50.1772022373.git.bcodding@hammerspace.com/">Patch 1/3</a> adds the <code>fh_key</code> attribute to the netlink spec and implements the storage in the network namespace.</p>
+</li>
+<li>
+<p><strong>Export Option</strong>: A new <code>sign_fh</code> export option is added <a href="https://lore.kernel.org/linux-nfs/1b3ba6ddb66cdcd2f63db2961f52894bfa3f1fd3.1772022373.git.bcodding@hammerspace.com/">in Patch 2/3</a>. When set, the server signals that filehandles for this export should be signed.</p>
+</li>
+<li>
+<p><strong>Signing and Verification</strong>: <a href="https://lore.kernel.org/linux-nfs/522524c4b87f7366f6c090c9eb677e88326440b7.1772022373.git.bcodding@hammerspace.com/">Patch 3/3</a> implements the actual signing logic in <code>fs/nfsd/nfsfh.c</code>.</p>
+<ul>
+<li>Outgoing filehandles are appended with the 8-byte SipHash MAC.</li>
+<li>Incoming filehandles are verified; if the MAC does not match, or if an unsigned filehandle is presented to a signed export, the server returns <code>NFS_STALE</code>.</li>
+</ul>
+</li>
+</ol>
+<h3>Evolution and Refinements</h3>
+<p>This v7 series represents the culmination of extensive review and refinement over several versions:</p>
+<ul>
+<li><strong>From Encryption to Signing</strong>: Early versions proposed encrypting filehandles, but Eric Biggers suggested signing instead, which is more appropriate for authentication without hiding the filehandle structure.</li>
+<li><strong>Endianness and Bug Fixes</strong>: Multiple rounds of feedback from Chuck Lever and others addressed endianness issues, <code>memcmp</code> usage, and error handling paths.</li>
+<li><strong>Interface Changes</strong>: The method for setting the key evolved from procfs to a netlink attribute, allowing for better integration with <code>rpc.nfsd</code>.</li>
+</ul>
+<h3>Conclusion</h3>
+<p>Chuck Lever applied the series to <code>nfsd-testing</code>, marking a successful conclusion to this development cycle.</p>
+<blockquote>
+<p>"Applied to nfsd-testing, thanks!" <a href="https://lore.kernel.org/linux-nfs/177203282074.180717.12140239799657635407.b4-ty@oracle.com/">Chuck Lever</a></p>
+</blockquote>
+<p>This feature provides a robust, opt-in mechanism for NFS server administrators to harden their exports against filehandle guessing attacks, significantly raising the bar for potential attackers while maintaining compatibility with existing clients (who will receive <code>STALE</code> errors if they attempt to use guessed handles on signed exports).</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/cover.1772022373.git.bcodding@hammerspace.com/">2026-02-25 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — [RESEND PATCH v7 0/3] kNFSD Signed Filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/2fa9ee81cca11046ba123d991dcd36997d8abc50.1772022373.git.bcodding@hammerspace.com/">2026-02-25 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — [PATCH v7 1/3] NFSD: Add a key for signing filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/1b3ba6ddb66cdcd2f63db2961f52894bfa3f1fd3.1772022373.git.bcodding@hammerspace.com/">2026-02-25 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — [PATCH v7 2/3] NFSD/export: Add sign_fh export option</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/522524c4b87f7366f6c090c9eb677e88326440b7.1772022373.git.bcodding@hammerspace.com/">2026-02-25 Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a> — [PATCH v7 3/3] NFSD: Sign filehandles</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177203282074.180717.12140239799657635407.b4-ty@oracle.com/">2026-02-25 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [RESEND PATCH v7 0/3] kNFSD Signed Filehandles</a></li>
+</ul>
+  </main>
+</body>
+</html>
