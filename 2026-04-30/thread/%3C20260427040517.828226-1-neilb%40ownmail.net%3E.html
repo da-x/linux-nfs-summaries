@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS/VFS: Preparing to Lift Lookup Out of Exclusive Directory Lock</title>
+  <meta name="description" content="Neil Brown submitted a 19-patch series (PATCH v3 00/19) aimed at improving concurrency for directory operations in the VFS and specifically for NFS and OverlayFS (ovl). The overarching goal is to move -&gt;lookup calls outside the exclusive…">
+  <meta property="og:title" content="NFS/VFS: Preparing to Lift Lookup Out of Exclusive Directory Lock">
+  <meta property="og:description" content="Neil Brown submitted a 19-patch series (PATCH v3 00/19) aimed at improving concurrency for directory operations in the VFS and specifically for NFS and OverlayFS (ovl). The overarching goal is to move -&gt;lookup calls outside the exclusive…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-04-30T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS/VFS: Preparing to Lift Lookup Out of Exclusive Directory Lock">
+  <meta name="twitter:description" content="Neil Brown submitted a 19-patch series (PATCH v3 00/19) aimed at improving concurrency for directory operations in the VFS and specifically for NFS and OverlayFS (ovl). The overarching goal is to move -&gt;lookup calls outside the exclusive…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-04-30</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS/VFS: Preparing to Lift Lookup Out of Exclusive Directory Lock</h1>
+<h2>Summary</h2>
+<h1>Prepare to Lift Lookup Out of Exclusive Lock for Directory Ops</h1>
+<p>Neil Brown submitted a 19-patch series (<a href="https://lore.kernel.org/linux-nfs/20260427040517.828226-1-neilb@ownmail.net/">PATCH v3 00/19</a>) aimed at improving concurrency for directory operations in the VFS and specifically for NFS and OverlayFS (ovl). The overarching goal is to move <code>-&gt;lookup</code> calls outside the exclusive inode lock (<code>i_rwsem</code>) on directories, allowing broader concurrency.</p>
+<h2>Key Technical Arguments and Evolution</h2>
+<h3>1. VFS Infrastructure Changes</h3>
+<p>The series introduces several new VFS primitives to support the locking changes:</p>
+<ul>
+<li><strong><code>d_splice_alias()</code> enhancements</strong>: Extended to handle hashed, unhashed, or in-lookup dentries (<a href="https://lore.kernel.org/linux-nfs/20260427040517.828226-3-neilb@ownmail.net/">PATCH 02/19</a>).</li>
+<li><strong><code>d_alloc_noblock()</code></strong>: A non-blocking variant of <code>d_alloc_parallel()</code> that returns <code>-EWOULDBLOCK</code> if a concurrent lookup is in progress (<a href="https://lore.kernel.org/linux-nfs/20260427040517.828226-6-neilb@ownmail.net/">PATCH 05/19</a>).</li>
+<li><strong><code>d_duplicate()</code></strong>: Creates an in-lookup dentry with the same name as an existing hashed dentry, preventing races during operations like silly-rename (<a href="https://lore.kernel.org/linux-nfs/20260427040517.828226-7-neilb@ownmail.net/">PATCH 06/19</a>).</li>
+<li><strong><code>LOOKUP_SHARED</code> flag</strong>: Indicates to <code>-&gt;lookup</code> handlers whether the parent directory is held with a shared or exclusive lock (<a href="https://lore.kernel.org/linux-nfs/20260427040517.828226-8-neilb@ownmail.net/">PATCH 07/19</a>).</li>
+<li><strong><code>wait_var_event</code> in <code>d_alloc_parallel()</code></strong>: Replaces the explicit waitqueue head parameter with <code>wait_var_event_spinlock()</code> using <code>dentry-&gt;d_lock</code> for synchronization (<a href="https://lore.kernel.org/linux-nfs/20260427040517.828226-5-neilb@ownmail.net/">PATCH 04/19</a>).</li>
+</ul>
+<h3>2. Discussion on <code>LOOKUP_SHARED</code> and Locking Semantics</h3>
+<p>Amir Goldstein expressed skepticism about Neil's claim that <code>-&gt;lookup</code> would <em>always</em> be called with a shared lock in the future:</p>
+<blockquote>
+<p>"Forgive me for being skeptical about the <em>always</em> part... I think it is more realistic to state that LOOKUP_SHARED is here to stay" [id://CAOQ4uxi8rqkbhK4=8N1ncfU1m6bjdHLbinSf=j3k0oVEaSa-wA@mail.gmail.com]</p>
+</blockquote>
+<p>Neil countered that all filesystems already support <code>-&gt;lookup</code> with a shared lock because simple lookups already provide only a shared lock:</p>
+<blockquote>
+<p>"All filesystems must support -&gt;lookup with a shared lock because it is already the case that with a simple lookup only a shared lock is provided... So I'm certain that it is safe from the filesystem's perspective to always call with only a shared lock" [id://177727962988.1474915.2841674553452335690@noble.neil.brown.name]</p>
+</blockquote>
+<p>Amir remained cautious, noting edge cases with FUSE servers that may rely on kernel-side serialization:</p>
+<blockquote>
+<p>"I will remain skeptical... think fuse servers (not under your control) which have grown to rely on the kernel to serialize atomic_open() on the directory" [id://CAOQ4uxiMUKHuGwpSkD=M4Z_QLxHn7Os9vaaWqAWd36HdfDRYuQ@mail.gmail.com]</p>
+</blockquote>
+<h3>3. API Design: <code>d_add_ci()</code> and Lock Dropping</h3>
+<p>Amir criticized the API choice in <a href="https://lore.kernel.org/linux-nfs/20260427040517.828226-9-neilb@ownmail.net/">PATCH 08/19</a>, which passed a boolean indicating shared/exclusive lock state to <code>d_add_ci()</code>:</p>
+<blockquote>
+<p>"I do not understand the choice of API. Seems better to pass the lookup flags and avoid exposing this very internal logic in the call sites..." [id://CAOQ4uxjj6iJNnwUqV+cRtqo4qRD4v-f-ct92=ofCZWPDATXM7g@mail.gmail.com]</p>
+</blockquote>
+<p>Neil agreed: "That is an excellent suggestion... I will definitely do that" [id://177727971181.1474915.16652480895948480305@noble.neil.brown.name].</p>
+<h3>4. Critical Bug in OverlayFS Patch</h3>
+<p>Amir Goldstein, assisted by AI review, identified a critical bug in <a href="https://lore.kernel.org/linux-nfs/20260427040517.828226-10-neilb@ownmail.net/">PATCH 09/19</a>:</p>
+<blockquote>
+<p>"The patch has a critical condition inversion (!d_unhashed vs d_unhashed) that would break impure readdir entirely and cause use-after-free corruption in the dcache. It also has a missing NULL check for d_alloc_name() failure" [id://CAOQ4uxidCcGpABkCtkn94i3U_u3OWK16zeAVDG2xuhh5e+ws9g@mail.gmail.com]</p>
+</blockquote>
+<p>This bug was corroborated by a syzbot crash report, which Neil attributed to the inverted test:</p>
+<blockquote>
+<p>"The inverted test on d_unhashed() in [PATCH v3 09/19]... could easily cause that to happen. So I believe this is now fixed" [id://177741819272.1474915.16232905294067712018@noble.neil.brown.name]</p>
+</blockquote>
+<h3>5. <code>d_alloc_parallel()</code> Waitqueue Refactoring</h3>
+<p>The most extensive technical debate centered on <a href="https://lore.kernel.org/linux-nfs/20260427040517.828226-5-neilb@ownmail.net/">PATCH 04/19</a>, which replaced the explicit waitqueue in <code>d_alloc_parallel()</code> with <code>wait_var_event</code>. Al Viro provided detailed feedback on optimizing the implementation, suggesting that <code>DCACHE_LOOKUP_WAITERS</code> should not be cleared and proposing a cleaner separation of wakeup logic:</p>
+<blockquote>
+<p>"In __d_lookup_unhash(): just don't return anything and lose the parts related to -&gt;d_wait... That yields the same semantics for flags as your variant does... and fs/dcache.c part is more straightforward that way" [id://20260429052626.GY3518998@ZenIV]</p>
+</blockquote>
+<p>Al Viro subsequently posted a complete alternative patch implementing his suggestions. Linus Torvalds reviewed it:</p>
+<blockquote>
+<p>"This looks like a clear improvement to me... But just looking at the patch I went 'Make it so'" [id://CAHk-=wgs8yAfaQYmeKWab7KES0jU46TvdBfQ3Q9+6+=E=vrx=w@mail.gmail.com]</p>
+</blockquote>
+<p>Neil acknowledged a bug in Al's proposed <code>__d_move()</code> handling, noting that the wrong dentry was being woken:</p>
+<blockquote>
+<p>"That code is wrong. It only makes sense to __d_wake_in_lookup_waiters() a dentry that we know was in-lookup, and in d_move, that is target... So we need __d_wake_in_lookup_waiters(target); in d_move" [id://177759308866.1474915.9708613530229799376@noble.neil.brown.name]</p>
+</blockquote>
+<h3>6. NFS Client-Specific Changes</h3>
+<p>The series includes seven patches targeting the NFS client (<a href="https://lore.kernel.org/linux-nfs/20260427040517.828226-14-neilb@ownmail.net/">PATCH 13-19/19</a>):</p>
+<ul>
+<li>Removal of <code>d_drop()/d_alloc_parallel()</code> from <code>nfs_atomic_open()</code> in favor of relying on <code>-&gt;d_revalidate</code> for exclusion.</li>
+<li>Use of <code>d_splice_alias()</code> in <code>nfs_link()</code> and atomic create paths, eliminating unsafe <code>d_drop()</code> calls before splice operations.</li>
+<li>Adoption of <code>d_alloc_noblock()</code> in <code>nfs_prime_dcache()</code> and silly-rename paths.</li>
+<li>Use of <code>d_duplicate()</code> for dentry duplication.</li>
+</ul>
+<p>Neil reported a testing issue at the end of the week:</p>
+<blockquote>
+<p>"Also my testing has hit a problem with some sort of deadlock in the nfs server (so accessing an XFS filesystem). They are trying to unlink a file and are waiting in d_alloc_parallel() under reconnect_path. This is running generic/467. So better hold off this patchset until I have that understood" [id://177759308866.1474915.9708613530229799376@noble.neil.brown.name]</p>
+</blockquote>
+<h3>7. Linus Torvalds on Incremental Merging</h3>
+<p>Linus encouraged breaking the series into smaller, independently mergable pieces:</p>
+<blockquote>
+<p>"when it comes to something as core and subtle as the dcache and filesystem integration, I'd personally be very happy to see this merged in small clear pieces... please take any cleanups in this series asap" [id://CAHk-=whXZz=-XnJdMGzM8BCwDkoqU0yDNKWyrpZSwXzchxsPUQ@mail.gmail.com]</p>
+</blockquote>
+<h2>Final Conclusions</h2>
+<ul>
+<li>The series is a <strong>protocol/locking change</strong> aimed at improving directory operation concurrency, not a bug fix or new feature in the traditional sense.</li>
+<li>Several API refinements were agreed upon (passing lookup flags instead of booleans, cleaner waitqueue handling).</li>
+<li>A critical bug in the OverlayFS patch was identified and fixed.</li>
+<li>Al Viro's refactored <code>d_alloc_parallel()</code> implementation received positive feedback from Linus but requires further testing.</li>
+<li>The series is <strong>on hold</strong> pending resolution of a deadlock observed during NFS client testing against an XFS server.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260427040517.828226-1-neilb@ownmail.net/">2026-04-27 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v3 00/19] Prepare to lift lookup out of exclusive lock for directory ops</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260427040517.828226-2-neilb@ownmail.net/">2026-04-27 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v3 01/19] VFS: fix various typos in documentation for start_creating start_removing etc</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260427040517.828226-3-neilb@ownmail.net/">2026-04-27 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v3 02/19] VFS: enhance d_splice_alias() to handle in-lookup dentries</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260427040517.828226-4-neilb@ownmail.net/">2026-04-27 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v3 03/19] VFS: allow d_alloc_name() to be used with -&gt;d_hash</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260427040517.828226-5-neilb@ownmail.net/">2026-04-27 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v3 04/19] VFS: use wait_var_event for waiting in d_alloc_parallel()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260427040517.828226-6-neilb@ownmail.net/">2026-04-27 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v3 05/19] VFS: introduce d_alloc_noblock()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260427040517.828226-7-neilb@ownmail.net/">2026-04-27 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v3 06/19] VFS: add d_duplicate()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260427040517.828226-8-neilb@ownmail.net/">2026-04-27 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v3 07/19] VFS: Add LOOKUP_SHARED flag.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260427040517.828226-9-neilb@ownmail.net/">2026-04-27 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v3 08/19] VFS/xfs/ntfs: drop parent lock across d_alloc_parallel() in d_add_ci()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260427040517.828226-10-neilb@ownmail.net/">2026-04-27 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v3 09/19] ovl: stop using lookup_one() in iterate_shared() handling.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260427040517.828226-11-neilb@ownmail.net/">2026-04-27 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v3 10/19] VFS/ovl: add d_alloc_noblock_return()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260427040517.828226-12-neilb@ownmail.net/">2026-04-27 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v3 11/19] efivarfs: use d_alloc_name()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260427040517.828226-13-neilb@ownmail.net/">2026-04-27 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v3 12/19] shmem: use d_duplicate()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260427040517.828226-14-neilb@ownmail.net/">2026-04-27 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v3 13/19] nfs: remove d_drop()/d_alloc_parallel() from nfs_atomic_open()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260427040517.828226-15-neilb@ownmail.net/">2026-04-27 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v3 14/19] nfs: use d_splice_alias() in nfs_link()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260427040517.828226-16-neilb@ownmail.net/">2026-04-27 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v3 15/19] nfs: don't d_drop() before d_splice_alias()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260427040517.828226-17-neilb@ownmail.net/">2026-04-27 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v3 16/19] nfs: don't d_drop() before d_splice_alias() in atomic_create.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260427040517.828226-18-neilb@ownmail.net/">2026-04-27 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v3 17/19] nfs: Use d_alloc_noblock() in nfs_prime_dcache()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260427040517.828226-19-neilb@ownmail.net/">2026-04-27 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v3 18/19] nfs: use d_alloc_noblock() in silly-rename</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260427040517.828226-20-neilb@ownmail.net/">2026-04-27 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v3 19/19] nfs: use d_duplicate()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxi8rqkbhK4=8N1ncfU1m6bjdHLbinSf=j3k0oVEaSa-wA@mail.gmail.com/">2026-04-27 Amir Goldstein <a href="mailto:amir73il@gmail.com">amir73il@gmail.com</a> — Re: [PATCH v3 07/19] VFS: Add LOOKUP_SHARED flag.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxjj6iJNnwUqV+cRtqo4qRD4v-f-ct92=ofCZWPDATXM7g@mail.gmail.com/">2026-04-27 Amir Goldstein <a href="mailto:amir73il@gmail.com">amir73il@gmail.com</a> — Re: [PATCH v3 08/19] VFS/xfs/ntfs: drop parent lock across d_alloc_parallel() in d_add_ci()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/69ef2169.a00a0220.316485.000b.GAE@google.com/">2026-04-27 syzbot ci <a href="mailto:syzbot+ci916c60bd3c422196@syzkaller.appspotmail.com">syzbot+ci916c60bd3c422196@syzkaller.appspotmail.com</a> — [syzbot ci] Re: Prepare to lift lookup out of exclusive lock for directory ops</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177727962988.1474915.2841674553452335690@noble.neil.brown.name/">2026-04-27 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v3 07/19] VFS: Add LOOKUP_SHARED flag.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177727971181.1474915.16652480895948480305@noble.neil.brown.name/">2026-04-27 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v3 08/19] VFS/xfs/ntfs: drop parent lock across d_alloc_parallel() in d_add_ci()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxiMUKHuGwpSkD=M4Z_QLxHn7Os9vaaWqAWd36HdfDRYuQ@mail.gmail.com/">2026-04-27 Amir Goldstein <a href="mailto:amir73il@gmail.com">amir73il@gmail.com</a> — Re: [PATCH v3 07/19] VFS: Add LOOKUP_SHARED flag.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxiZF0_dGtHY0x7T0oh=3jhDC7-THH_ANt-Ha5kfdRe4QQ@mail.gmail.com/">2026-04-27 Amir Goldstein <a href="mailto:amir73il@gmail.com">amir73il@gmail.com</a> — Re: [PATCH v3 10/19] VFS/ovl: add d_alloc_noblock_return()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxidCcGpABkCtkn94i3U_u3OWK16zeAVDG2xuhh5e+ws9g@mail.gmail.com/">2026-04-27 Amir Goldstein <a href="mailto:amir73il@gmail.com">amir73il@gmail.com</a> — Re: [PATCH v3 09/19] ovl: stop using lookup_one() in iterate_shared() handling.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177733387513.1474915.8575818212511266099@noble.neil.brown.name/">2026-04-27 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v3 07/19] VFS: Add LOOKUP_SHARED flag.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177733587210.1474915.5770075726707338974@noble.neil.brown.name/">2026-04-28 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v3 09/19] ovl: stop using lookup_one() in iterate_shared() handling.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177733649056.1474915.2313612194633470905@noble.neil.brown.name/">2026-04-28 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v3 10/19] VFS/ovl: add d_alloc_noblock_return()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260428021056.GT3518998@ZenIV/">2026-04-28 Al Viro <a href="mailto:viro@zeniv.linux.org.uk">viro@zeniv.linux.org.uk</a> — Re: [PATCH v3 03/19] VFS: allow d_alloc_name() to be used with -&gt;d_hash</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260428022245.GU3518998@ZenIV/">2026-04-28 Al Viro <a href="mailto:viro@zeniv.linux.org.uk">viro@zeniv.linux.org.uk</a> — Re: [PATCH v3 05/19] VFS: introduce d_alloc_noblock()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260428033738.GV3518998@ZenIV/">2026-04-28 Al Viro <a href="mailto:viro@zeniv.linux.org.uk">viro@zeniv.linux.org.uk</a> — Re: [PATCH v3 04/19] VFS: use wait_var_event for waiting in d_alloc_parallel()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260428043511.GW3518998@ZenIV/">2026-04-28 Al Viro <a href="mailto:viro@zeniv.linux.org.uk">viro@zeniv.linux.org.uk</a> — Re: [PATCH v3 10/19] VFS/ovl: add d_alloc_noblock_return()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177737511992.1474915.1952404144121931523@noble.neil.brown.name/">2026-04-28 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v3 04/19] VFS: use wait_var_event for waiting in d_alloc_parallel()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177737546960.1474915.10696166841821338403@noble.neil.brown.name/">2026-04-28 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v3 05/19] VFS: introduce d_alloc_noblock()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177737664116.1474915.2913290838767301303@noble.neil.brown.name/">2026-04-28 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v3 10/19] VFS/ovl: add d_alloc_noblock_return()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260428142225.GX3518998@ZenIV/">2026-04-28 Al Viro <a href="mailto:viro@zeniv.linux.org.uk">viro@zeniv.linux.org.uk</a> — Re: [PATCH v3 04/19] VFS: use wait_var_event for waiting in d_alloc_parallel()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAHk-=whXZz=-XnJdMGzM8BCwDkoqU0yDNKWyrpZSwXzchxsPUQ@mail.gmail.com/">2026-04-28 Linus Torvalds <a href="mailto:torvalds@linux-foundation.org">torvalds@linux-foundation.org</a> — Re: [PATCH v3 04/19] VFS: use wait_var_event for waiting in d_alloc_parallel()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177741819272.1474915.16232905294067712018@noble.neil.brown.name/">2026-04-28 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [syzbot ci] Re: Prepare to lift lookup out of exclusive lock for directory ops</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177741881482.1474915.12527082398060370192@noble.neil.brown.name/">2026-04-28 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v3 04/19] VFS: use wait_var_event for waiting in d_alloc_parallel()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177743069784.1474915.857167561824713821@noble.neil.brown.name/">2026-04-29 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> —  Re: [PATCH v3 03/19] VFS: allow d_alloc_name() to be used with -&gt;d_hash</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260429052626.GY3518998@ZenIV/">2026-04-29 Al Viro <a href="mailto:viro@zeniv.linux.org.uk">viro@zeniv.linux.org.uk</a> — Re: [PATCH v3 04/19] VFS: use wait_var_event for waiting in d_alloc_parallel()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260429170731.GZ3518998@ZenIV/">2026-04-29 Al Viro <a href="mailto:viro@zeniv.linux.org.uk">viro@zeniv.linux.org.uk</a> — Re: [PATCH v3 04/19] VFS: use wait_var_event for waiting in d_alloc_parallel()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAHk-=wgs8yAfaQYmeKWab7KES0jU46TvdBfQ3Q9+6+=E=vrx=w@mail.gmail.com/">2026-04-29 Linus Torvalds <a href="mailto:torvalds@linux-foundation.org">torvalds@linux-foundation.org</a> — Re: [PATCH v3 04/19] VFS: use wait_var_event for waiting in d_alloc_parallel()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177759308866.1474915.9708613530229799376@noble.neil.brown.name/">2026-04-30 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v3 04/19] VFS: use wait_var_event for waiting in d_alloc_parallel()</a></li>
+</ul>
+  </main>
+</body>
+</html>

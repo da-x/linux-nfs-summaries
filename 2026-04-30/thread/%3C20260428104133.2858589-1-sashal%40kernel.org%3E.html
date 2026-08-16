@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AUTOSEL Backports: NFS NLM Shutdown Race Fix and Writeback Livelock Repair</title>
+  <meta name="description" content="This thread consists of two AUTOSEL backport messages from Sasha Levin, delivering important bug fixes for the NFS client subsystem to stable kernel trees (7.0/6.6). Both patches address longstanding correctness issues in the NFS client:…">
+  <meta property="og:title" content="AUTOSEL Backports: NFS NLM Shutdown Race Fix and Writeback Livelock Repair">
+  <meta property="og:description" content="This thread consists of two AUTOSEL backport messages from Sasha Levin, delivering important bug fixes for the NFS client subsystem to stable kernel trees (7.0/6.6). Both patches address longstanding correctness issues in the NFS client:…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-04-30T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="AUTOSEL Backports: NFS NLM Shutdown Race Fix and Writeback Livelock Repair">
+  <meta name="twitter:description" content="This thread consists of two AUTOSEL backport messages from Sasha Levin, delivering important bug fixes for the NFS client subsystem to stable kernel trees (7.0/6.6). Both patches address longstanding correctness issues in the NFS client:…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-04-30</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>AUTOSEL Backports: NFS NLM Shutdown Race Fix and Writeback Livelock Repair</h1>
+<h2>Summary</h2>
+<h1>AUTOSEL Backports: NFS NLM Shutdown Race Fix and Writeback Livelock Repair</h1>
+<h2>Overview</h2>
+<p>This thread consists of two AUTOSEL backport messages from Sasha Levin, delivering important bug fixes for the NFS client subsystem to stable kernel trees (7.0/6.6). Both patches address longstanding correctness issues in the NFS client: one resolves a use-after-free race in the Network Lock Manager (NLM) shutdown path, and the other eliminates a writeback livelock triggered by server-side errors such as ENOSPC or commit verifier mismatches.</p>
+<h2>Patch 1: Safely Shut Down NLM Client RPC State</h2>
+<p><strong>Classification:</strong> Bug fix (race condition / use-after-free)</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260428104133.2858589-12-sashal@kernel.org/">Chuck Lever</a> introduced a new helper, <code>nlmclnt_shutdown_rpc_clnt()</code>, to safely shut down the NLM client's RPC state from the sysfs shutdown handler. The patch was reported and reviewed by <a href="https://lore.kernel.org/linux-nfs/20260428104133.2858589-12-sashal@kernel.org/">Jeff Layton</a>, a long-time NFS/lockd developer.</p>
+<h3>The Bug</h3>
+<p>A race condition existed between <code>shutdown_store()</code> (triggered when root writes to <code>/sys/fs/nfs/server-N/shutdown</code>) and <code>nlm_shutdown_hosts_net()</code> or the host release path during NFS unmount. Without synchronization, the following sequence could occur:</p>
+<blockquote>
+<p>"1. shutdown_store() reads server-&gt;nlm_host (non-NULL)
+2. nlm_shutdown_hosts_net() acquires nlm_host_mutex, calls rpc_shutdown_client(), sets h_rpcclnt to NULL, and potentially frees the host via nlm_gc_hosts()
+3. shutdown_store() dereferences the now-stale or freed host"</p>
+</blockquote>
+<p>This race was introduced in kernel v6.5 when the sysfs shutdown knob was enhanced to cancel existing RPC tasks. The failure mode is a <strong>use-after-free</strong> or <strong>NULL-pointer dereference</strong>, leading to a kernel oops.</p>
+<h3>The Fix</h3>
+<p>The patch introduces <code>nlmclnt_shutdown_rpc_clnt()</code> in <code>fs/lockd/host.c</code>, which acquires <code>nlm_host_mutex</code> before accessing <code>h_rpcclnt</code>. This synchronizes with both <code>nlm_shutdown_hosts_net()</code> and <code>nlmclnt_release_host()</code>, ensuring the RPC client pointer remains valid. The NFS sysfs code was updated to call this helper instead of directly dereferencing <code>server-&gt;nlm_host-&gt;h_rpcclnt</code>, and the include was switched from the internal <code>lockd.h</code> to the public <code>bind.h</code> header, improving API layering.</p>
+<blockquote>
+<p>"This change also improves API layering: NFS client code no longer needs to include the internal lockd header to access nlm_host fields."</p>
+</blockquote>
+<p>The fix is small (+32/-2 across 3 files), uses an existing mutex consistent with the rest of the lockd subsystem, and was reviewed by the domain expert. The bug has been latent since v6.5 (~2 years).</p>
+<h2>Patch 2: Fix Writeback Livelock in Presence of Errors</h2>
+<p><strong>Classification:</strong> Bug fix (livelock / infinite retry loop)</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260428104133.2858589-31-sashal@kernel.org/">Olga Kornievskaia</a> submitted a fix for a writeback livelock that can occur when the NFS server returns ENOSPC or when a commit receives a verifier different from the last successful write. The patch was signed off by NFS maintainer <a href="https://lore.kernel.org/linux-nfs/20260428104133.2858589-31-sashal@kernel.org/">Trond Myklebust</a>.</p>
+<h3>The Bug</h3>
+<p>Kornievskaia identified two failure patterns, both reproducible via <code>xfstest generic/751</code>:</p>
+<blockquote>
+<p>"Pattern#1: writeback IO experiences ENOSPC on an offset smaller than the filesize... client sends a commit and receives a verifier which is different from the last successful write. It marks pages dirty and writeback retries. But it again send writes unstable and gets into the same pattern, running into the ENOSPC error and sending a commit because writes were sent at unstable."</p>
+</blockquote>
+<blockquote>
+<p>"Pattern#2: an unstable write followed by a short write and ENOSPC... client send a commit and receives a verifier different from the last unstable write. The same behaviour is retried in a loop."</p>
+</blockquote>
+<p>In both cases, the NFS client enters an infinite retry loop: unstable writes fail, commits return mismatched verifiers, pages are re-marked dirty, and the cycle repeats indefinitely. This causes writeback to hang, <code>fsync()</code> to block forever, and eventually leads to system-wide writer throttling or OOM-class behavior.</p>
+<h3>The Fix</h3>
+<p>The patch introduces a new flag, <code>NFS_CONTEXT_WRITE_SYNC</code>, on the <code>nfs_open_context</code> structure. When certain error conditions are detected — short writes, ENOSPC during writeback, or commit verifier mismatches — this flag is set to force subsequent writes to use stable (<code>NFS_FILE_SYNC</code>) semantics instead of unstable writes. This breaks the retry loop because stable writes do not require a separate commit RPC, eliminating the verifier mismatch trigger.</p>
+<blockquote>
+<p>"Instead, this patch proposes to identify those conditions and mark requests to be done synchronously instead. Previous solution tried to mark it in the nfs_page, however that's not persistent thus instead mark it in the nfs_open_context."</p>
+</blockquote>
+<p>The fix also extends the same logic to the LocalIO code path (for loopback NFS-on-same-host scenarios), ensuring consistent behavior across both transport paths. The change touches 4 files with +27/-1 lines and affects hot write/commit completion paths, but only activates under error conditions.</p>
+<h2>Evolution of the Discussion</h2>
+<p>Both patches were delivered as AUTOSEL backports from upstream mainline commits, meaning they had already been merged into the development tree. No additional discussion occurred within this week's window — these are stable-tree nominations via Sasha Levin's automated backport tooling.</p>
+<p>The NLM shutdown fix evolved through four public revisions of Chuck Lever's "Clarify module API boundaries" series (v1–v4). Notably, v2 used a simpler NULL-check approach, but the author upgraded to full mutex serialization in v3 after recognizing a TOCTOU race window:</p>
+<blockquote>
+<p>"Serialize client-side NLM shutdown to avoid UAF and NPD."</p>
+</blockquote>
+<p>The writeback livelock fix also underwent significant redesign between v1 (which used a per-page <code>PG_SYNC</code> bit) and v2/v3 (which moved to the persistent per-open-context flag), demonstrating that the design space required careful consideration.</p>
+<h2>Final Conclusions</h2>
+<p>Both patches are <strong>important bug fixes</strong> for the NFS client:</p>
+<ol>
+<li>
+<p><strong>NLM Shutdown Race Fix</strong>: Closes a real use-after-free/NULL-pointer dereference in a root-gated sysfs path. The fix is small, well-reviewed by Jeff Layton (subsystem expert), and uses consistent locking semantics. The bug has existed since v6.5.</p>
+</li>
+<li>
+<p><strong>Writeback Livelock Fix</strong>: Eliminates an infinite retry loop that causes writeback to hang when servers return ENOSPC or commit verifier mismatches. Reproducible via standard xfstests, affects all current stable kernels (bug logic dates to 2012), and comes from the NFS maintainer directly.</p>
+</li>
+</ol>
+<p>Both fixes are appropriate for stable kernel trees and address real-world failure scenarios that can cause kernel crashes or system hangs for NFS users.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260428104133.2858589-12-sashal@kernel.org/">2026-04-28 Sasha Levin <a href="mailto:sashal@kernel.org">sashal@kernel.org</a> — [PATCH AUTOSEL 7.0-6.6] NFS: Use nlmclnt_shutdown_rpc_clnt() to safely shut down NLM</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260428104133.2858589-31-sashal@kernel.org/">2026-04-28 Sasha Levin <a href="mailto:sashal@kernel.org">sashal@kernel.org</a> — [PATCH AUTOSEL 7.0] NFS: fix writeback in presence of errors</a></li>
+</ul>
+  </main>
+</body>
+</html>

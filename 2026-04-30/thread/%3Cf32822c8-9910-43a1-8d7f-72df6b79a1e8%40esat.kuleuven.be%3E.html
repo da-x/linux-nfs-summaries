@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Report of NFS client processes stuck in D state under memory pressure</title>
+  <meta name="description" content="This thread consists of a single message this week, an initial bug report from Rik Theys at KU Leuven describing a serious issue where NFS client processes become stuck in uninterruptible sleep (D state), effectively hanging the NFS…">
+  <meta property="og:title" content="Report of NFS client processes stuck in D state under memory pressure">
+  <meta property="og:description" content="This thread consists of a single message this week, an initial bug report from Rik Theys at KU Leuven describing a serious issue where NFS client processes become stuck in uninterruptible sleep (D state), effectively hanging the NFS…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-04-30T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Report of NFS client processes stuck in D state under memory pressure">
+  <meta name="twitter:description" content="This thread consists of a single message this week, an initial bug report from Rik Theys at KU Leuven describing a serious issue where NFS client processes become stuck in uninterruptible sleep (D state), effectively hanging the NFS…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-04-30</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Report of NFS client processes stuck in D state under memory pressure</h1>
+<h2>Summary</h2>
+<h1>Processes in D State / Blocked Tasks: Open Bug Report</h1>
+<h2>Overview</h2>
+<p>This thread consists of a single message this week, an initial bug report from <strong>Rik Theys</strong> at KU Leuven describing a serious issue where NFS client processes become stuck in uninterruptible sleep (D state), effectively hanging the NFS client. No replies have been received as of the end of the reporting window.</p>
+<h2>Issue Classification</h2>
+<p>This is a <strong>bug report / troubleshooting request</strong>, not a proposed patch or feature. The discussion centers on diagnosing whether the hangs are caused by a kernel bug, a server-side issue, or resource exhaustion under memory pressure.</p>
+<h2>Key Technical Details</h2>
+<p>Rik Theys reported that "some of our numbercrunchers are periodically logging blocked tasks and the NFS client seems to (at least partially) hang" <a href="https://lore.kernel.org/linux-nfs/f32822c8-9910-43a1-8d7f-72df6b79a1e8@esat.kuleuven.be/">f32822c8-9910-43a1-8d7f-72df6b79a1e8@esat.kuleuven.be</a>. The environment involves:</p>
+<ul>
+<li><strong>Clients:</strong> Rocky 9 (kernel 6.18.20) and Rocky 8 (kernel 4.18.0-553.117.1.el8_10.x86_64)</li>
+<li><strong>Server:</strong> RHEL 10 running kernel 6.12.0-124.45.1.el10_1.x86_64</li>
+</ul>
+<p>The issue appears correlated with increased server utilization:</p>
+<blockquote>
+<p>"Most likely the reason we are seeing this come up now is that more users are starting to use the shared server and it frequently comes under high memory pressure."</p>
+</blockquote>
+<h3>Observed Symptoms</h3>
+<p>Multiple kernel <code>hung_task</code> warnings were logged, with processes blocked for over 120 seconds. The call traces reveal three distinct blocking patterns:</p>
+<ol>
+<li><strong>Writeback waits</strong> — Tasks blocked in <code>folio_wait_writeback</code> → <code>nfs_write_begin</code> → <code>nfs_file_write</code>, indicating pages stuck in writeback that never complete.</li>
+<li><strong>Inode lookup waits</strong> — Tasks blocked in <code>__wait_on_freeing_inode</code> during <code>nfs_fhget</code> / <code>_nfs4_open_and_get_state</code>, suggesting an inode is being freed but not yet released.</li>
+<li><strong>RPC execution hangs</strong> — Processes waiting in <code>rpc_wait_bit_killable</code> within the SUNRPC layer, particularly during <code>nfs4_proc_access</code> permission checks.</li>
+</ol>
+<p>Additional stacks showed page faults stuck in <code>filemap_fault</code> and autofs mounts waiting in <code>autofs_mount_wait</code>.</p>
+<p>Rik noted:</p>
+<blockquote>
+<p>"When I look at the output of <code>ps -e -o state,pid,user,cmd,wchan | grep ^D</code>, it seems most of these blocked processes are waiting in <code>rpc_wait_bit_killable</code>, some in <code>folio_wait_bit_common</code> and a few in <code>autofs_wait</code>."</p>
+</blockquote>
+<h3>Rocky 8 Observations</h3>
+<p>On the older Rocky 8 system, git processes were blocked during file flush/close operations:</p>
+<pre><code>wait_on_page_writeback → __filemap_fdatawait_range → nfs_wb_all → nfs4_file_flush → filp_close
+</code></pre>
+<p>This suggests that writeback completion is stalled, preventing file close operations from returning.</p>
+<h3>Server Status</h3>
+<p>The server itself shows no obvious issues:</p>
+<blockquote>
+<p>"The server seems to be fine: there's no high load, no indications of a network issue and the disks are not saturated."</p>
+</blockquote>
+<h2>Context with Prior Reports</h2>
+<p>This report comes from the same reporter who recently experienced <code>NFS4ERR_SEQ_MISORDERED</code> errors on the same RHEL 10 server infrastructure (summarized in a separate thread). That issue was traced to a server-side bug in SEQUENCE replay handling, fixed in RHEL 10.2 kernels. It is unclear whether this new D-state hang is related or a distinct problem.</p>
+<h2>Open Questions</h2>
+<p>Rik Theys asked:</p>
+<blockquote>
+<p>"What could cause these processes to end up in this state? Is there some deadlock due to memory pressure? Which information could be more useful to further debug this and/or make the system recover?"</p>
+</blockquote>
+<p>As of the end of this reporting week, no replies have been posted. The thread remains open for community diagnosis.</p>
+<h2>Summary</h2>
+<ul>
+<li><strong>Type:</strong> Bug report / troubleshooting request</li>
+<li><strong>Symptom:</strong> NFS client processes stuck in D state (uninterruptible sleep), causing apparent hangs</li>
+<li><strong>Affected kernels:</strong> 6.18.20 (Rocky 9) and 4.18.0-553 (Rocky 8) clients against RHEL 10 server</li>
+<li><strong>Suspected trigger:</strong> High memory pressure on the NFS server under increased concurrent usage</li>
+<li><strong>Status:</strong> Awaiting community response; no replies received this week</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/f32822c8-9910-43a1-8d7f-72df6b79a1e8@esat.kuleuven.be/">2026-04-24 Rik Theys <a href="mailto:Rik.Theys@esat.kuleuven.be">Rik.Theys@esat.kuleuven.be</a> — processes in D state / blocked tasks</a></li>
+</ul>
+  </main>
+</body>
+</html>

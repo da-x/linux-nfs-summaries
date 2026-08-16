@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSv4.1/pNFS: Fix LAYOUTCOMMIT Retry Loop on OLD_STATEID</title>
+  <meta name="description" content="This thread documents a bug fix for the NFS client&#39;s Parallel NFS (pNFS) implementation, specifically addressing an unbounded retry loop in LAYOUTCOMMIT operations when encountering stale state IDs. The discussion also clarifies submission…">
+  <meta property="og:title" content="NFSv4.1/pNFS: Fix LAYOUTCOMMIT Retry Loop on OLD_STATEID">
+  <meta property="og:description" content="This thread documents a bug fix for the NFS client&#39;s Parallel NFS (pNFS) implementation, specifically addressing an unbounded retry loop in LAYOUTCOMMIT operations when encountering stale state IDs. The discussion also clarifies submission…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-04-30T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSv4.1/pNFS: Fix LAYOUTCOMMIT Retry Loop on OLD_STATEID">
+  <meta name="twitter:description" content="This thread documents a bug fix for the NFS client&#39;s Parallel NFS (pNFS) implementation, specifically addressing an unbounded retry loop in LAYOUTCOMMIT operations when encountering stale state IDs. The discussion also clarifies submission…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-04-30</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSv4.1/pNFS: Fix LAYOUTCOMMIT Retry Loop on OLD_STATEID</h1>
+<h2>Summary</h2>
+<p>This thread documents a bug fix for the NFS client's Parallel NFS (pNFS) implementation, specifically addressing an unbounded retry loop in <code>LAYOUTCOMMIT</code> operations when encountering stale state IDs. The discussion also clarifies submission procedures for the linux-nfs mailing list.</p>
+<h3>Technical Issue: Unbounded LAYOUTCOMMIT Retries</h3>
+<p>Lei Yin submitted a patch to resolve a critical issue where the NFS client could enter an infinite retry loop during pNFS layout commit operations.</p>
+<blockquote>
+<p>"Without refreshing data-&gt;args.stateid, LAYOUTCOMMIT can keep retrying with the same stale stateid after OLD_STATEID, resulting in an unbounded retry loop." <a href="https://lore.kernel.org/linux-nfs/tencent_BF5118C8B480E6BFEF401CC2B287682FC905@qq.com/">Lei Yin</a></p>
+</blockquote>
+<p>The bug manifests when the server returns <code>-NFS4ERR_OLD_STATEID</code>, indicating that the state ID used in the request is no longer valid. The existing code path did not handle this error appropriately in <code>nfs4_layoutcommit_done()</code>, leading to repeated attempts with the same invalid state ID. This could cause affected files to become unresponsive, effectively hanging I/O operations on those files.</p>
+<h3>Reproduction and Impact</h3>
+<p>Lei Yin provided detailed reproduction steps, noting that the issue was observed on NFSv4.2:</p>
+<blockquote>
+<p>"The most reliable way I found to reproduce it is: 1. Run a workload with relatively high concurrent I/O on the client. 2. Kill the client-side I/O process with kill -9 while those I/Os are still in flight." <a href="https://lore.kernel.org/linux-nfs/tencent_C198D1548F26ACCF529CC312888839694E05@qq.com/">Lei Yin</a></p>
+</blockquote>
+<p>The developer explained that using <code>kill -9</code> significantly increases the likelihood of hitting the stale state ID window, though the issue can occasionally occur under heavy concurrency and stress testing even without forced process termination. The core problem is that:</p>
+<blockquote>
+<p>"because LAYOUTCOMMIT does not recover from OLD_STATEID here, the RPC can loop indefinitely with the stale stateid; once this happens, operations on the corresponding file may stop making progress." <a href="https://lore.kernel.org/linux-nfs/tencent_C198D1548F26ACCF529CC312888839694E05@qq.com/">Lei Yin</a></p>
+</blockquote>
+<h3>Proposed Fix</h3>
+<p>The patch introduces proper error handling by:</p>
+<ol>
+<li>Calling <code>nfs4_layout_refresh_old_stateid()</code> to refresh the layout state ID when <code>-NFS4ERR_OLD_STATEID</code> is received.</li>
+<li>Updating the layout state ID in the inode layout header after a successful refresh.</li>
+<li>Restarting the RPC operation only after the state ID has been successfully refreshed.</li>
+</ol>
+<p>This ensures that subsequent <code>LAYOUTCOMMIT</code> attempts use a valid state ID, breaking the infinite retry cycle.</p>
+<h3>Submission Clarification</h3>
+<p>Lei Yin initially expressed confusion about the patch being marked as "Not Applicable" in Patchwork:</p>
+<blockquote>
+<p>"Could you please let me know whether the Not Applicable status means: 1. an equivalent fix is already present in the target tree, 2. the patch was sent against the wrong tree or branch, or 3. there is some issue with the problem analysis or the proposed fix?" <a href="https://lore.kernel.org/linux-nfs/tencent_C198D1548F26ACCF529CC312888839694E05@qq.com/">Lei Yin</a></p>
+</blockquote>
+<p>Chuck Lever clarified that this was a procedural matter rather than a technical rejection:</p>
+<blockquote>
+<p>"The linux-nfs patchworks is for NFSD only. 'Not Applicable' means the patch is not an NFSD patch." <a href="https://lore.kernel.org/linux-nfs/4bae2fbf-68d3-4585-8d2f-9b7081b619fe@app.fastmail.com/">Chuck Lever</a></p>
+</blockquote>
+<p>This distinction highlights that the linux-nfs Patchwork instance tracks server-side (NFSD) patches, while client-side fixes like this one follow a different submission and review workflow.</p>
+<h3>Conclusion</h3>
+<p>This thread presents an important bug fix for NFS client development, addressing a potential denial-of-service condition in pNFS implementations where stale state IDs could cause indefinite retry loops. The fix ensures proper state ID refresh mechanisms are employed when the server indicates that a state ID is obsolete, thereby maintaining I/O progress and system stability under concurrent load conditions.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/tencent_BF5118C8B480E6BFEF401CC2B287682FC905@qq.com/">2026-04-24 Lei Yin <a href="mailto:cybeyond@foxmail.com">cybeyond@foxmail.com</a> — [PATCH v2] NFSv4.1/pNFS: fix LAYOUTCOMMIT retry loop on OLD_STATEID</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/tencent_C198D1548F26ACCF529CC312888839694E05@qq.com/">2026-04-27 Lei Yin <a href="mailto:cybeyond@foxmail.com">cybeyond@foxmail.com</a> — Question about "Not Applicable" status for [PATCH v2] NFSv4.1/pNFS: fix LAYOUTCOMMIT retry loop on OLD_STATEID</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/4bae2fbf-68d3-4585-8d2f-9b7081b619fe@app.fastmail.com/">2026-04-27 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: Question about "Not Applicable" status for [PATCH v2] NFSv4.1/pNFS: fix LAYOUTCOMMIT retry loop on OLD_STATEID</a></li>
+</ul>
+  </main>
+</body>
+</html>

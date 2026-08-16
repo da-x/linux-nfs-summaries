@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSv4 Client Regression Fix: mkdir EEXIST after NFS4ERR_DELAY</title>
+  <meta name="description" content="This thread addresses a critical regression in the Linux NFSv4 client where mkdir(2) syscalls occasionally return -EEXIST to userspace even though the directory was successfully created on the server. The issue affects both NFSv4.0 and…">
+  <meta property="og:title" content="NFSv4 Client Regression Fix: mkdir EEXIST after NFS4ERR_DELAY">
+  <meta property="og:description" content="This thread addresses a critical regression in the Linux NFSv4 client where mkdir(2) syscalls occasionally return -EEXIST to userspace even though the directory was successfully created on the server. The issue affects both NFSv4.0 and…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-04-30T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSv4 Client Regression Fix: mkdir EEXIST after NFS4ERR_DELAY">
+  <meta name="twitter:description" content="This thread addresses a critical regression in the Linux NFSv4 client where mkdir(2) syscalls occasionally return -EEXIST to userspace even though the directory was successfully created on the server. The issue affects both NFSv4.0 and…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-04-30</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSv4 Client Regression Fix: mkdir EEXIST after NFS4ERR_DELAY</h1>
+<h2>Summary</h2>
+<h1>NFSv4 Client Regression: <code>mkdir</code> Returns EEXIST After DELAY-Then-Success</h1>
+<h2>Overview</h2>
+<p>This thread addresses a critical regression in the Linux NFSv4 client where <code>mkdir(2)</code> syscalls occasionally return <code>-EEXIST</code> to userspace even though the directory was successfully created on the server. The issue affects both NFSv4.0 and NFSv4.2 mounts against an in-kernel Linux nfsd, reproducing reliably under load or after mount idleness.</p>
+<h2>Bug Classification</h2>
+<p><strong>Type:</strong> Bug Fix (Regression)<br />
+<strong>Component:</strong> NFS Client (<code>fs/nfs/nfs4proc.c</code>)<br />
+<strong>Root Cause Commit:</strong> <code>dd862da61e91</code> ("nfs: fix incorrect handling of large-number NFS errors in nfs4_do_mkdir()")</p>
+<h2>Technical Analysis</h2>
+<h3>Symptom and Reproduction</h3>
+<p>Igor Raits reported that an occasional <code>mkdir(2)</code> returns <code>-EEXIST</code>, yet the directory exists on disk. The issue is reproducible with a simple loop creating random-named directories:</p>
+<blockquote>
+<p>"Symptom: an occasional mkdir(2) on an NFSv4 mount returns -EEXIST, but the directory it was supposed to create is actually present afterwards."<br />
+— <a href="https://lore.kernel.org/linux-nfs/CA+9S74hSp_tJu2Ffe2BPNC2T25gfkhgjjDkdgSsF5c2rnJq_wA@mail.gmail.com/">Igor Raits</a></p>
+</blockquote>
+<p>Packet captures revealed a three-RPC sequence for a single <code>mkdir</code> syscall:</p>
+<ol>
+<li>Client sends CREATE → Server returns <code>NFS4ERR_DELAY</code></li>
+<li>Client retries CREATE → Server returns <code>NFS4_OK</code> (directory created)</li>
+<li>Client sends another CREATE → Server returns <code>NFS4ERR_EXIST</code></li>
+</ol>
+<p>The client then incorrectly surfaces the final <code>EXIST</code> error to userspace, despite having already received a successful response in step 2.</p>
+<h3>Root Cause</h3>
+<p>The regression was introduced by commit <code>dd862da61e91</code>, which refactored <code>nfs4_proc_mkdir()</code> to return the error code separately from the dentry pointer. The change added an <code>if (err)</code> guard around the call to <code>nfs4_handle_exception()</code>:</p>
+<pre><code class="language-c">do {
+    alias = _nfs4_proc_mkdir(dir, dentry, sattr, label, &amp;err);
+    trace_nfs4_mkdir(dir, &amp;dentry-&gt;d_name, err);
+    if (err)
+        alias = ERR_PTR(nfs4_handle_exception(NFS_SERVER(dir),
+                                              err, &amp;exception));
+} while (exception.retry);
+</code></pre>
+<p>Igor Raits identified the flaw:</p>
+<blockquote>
+<p>"If I'm reading this right, on a successful retry (err == 0) nfs4_handle_exception() is skipped, so exception.retry stays at the value it had after the previous DELAY iteration (which is 1). The loop then runs once more, sends another CREATE for the same name, and that one legitimately gets NFS4ERR_EXIST."<br />
+— <a href="https://lore.kernel.org/linux-nfs/CA+9S74hSp_tJu2Ffe2BPNC2T25gfkhgjjDkdgSsF5c2rnJq_wA@mail.gmail.com/">Igor Raits</a></p>
+</blockquote>
+<p>Other similar loops in the same file (e.g., <code>nfs4_proc_symlink</code>) call <code>nfs4_handle_exception()</code> unconditionally, which correctly resets <code>exception.retry</code> to 0 on success and exits the loop.</p>
+<h3>Resolution</h3>
+<p>Igor Raits proposed a patch that removes the <code>if (err)</code> guard, ensuring <code>nfs4_handle_exception()</code> is always called:</p>
+<blockquote>
+<p>"FTR I have applied following patch and it seems to fix our issue."<br />
+— <a href="https://lore.kernel.org/linux-nfs/CA+9S74i=TJBJjFWy1-LDqMLf1hmj5kcqNi-Yb5k79-mX1yCrLQ@mail.gmail.com/">Igor Raits</a></p>
+</blockquote>
+<p>NeilBrown, the maintainer who authored the original problematic commit, confirmed the diagnosis:</p>
+<blockquote>
+<p>"Oh dear, that was careless of me. We <em>always</em> need to call nfs4_handle_exception()."<br />
+— <a href="https://lore.kernel.org/linux-nfs/177745671692.1474915.5018486129724109553@noble.neil.brown.name/">NeilBrown</a></p>
+</blockquote>
+<p>He offered to either accept a properly formatted patch from Igor or prepare it himself, providing a <code>Reviewed-by</code> tag:</p>
+<blockquote>
+<p>"That is exactly the patch I was thinking of when I saw your first email. If you would like to create a properly formatted patch for submission, please add Reviewed-by: NeilBrown <a href="mailto:neil@brown.name">neil@brown.name</a>. If you don't want to, I can do it for you."<br />
+— <a href="https://lore.kernel.org/linux-nfs/177745671692.1474915.5018486129724109553@noble.neil.brown.name/">NeilBrown</a></p>
+</blockquote>
+<h2>Conclusion</h2>
+<p>This thread demonstrates a rapid and effective resolution of an NFS client regression. The bug was identified through careful packet capture analysis and code review, with the reporter providing both a detailed reproducer and a working fix. The maintainer acknowledged the error in the original commit and endorsed the proposed solution. The fix ensures that <code>nfs4_handle_exception()</code> is called unconditionally in the <code>mkdir</code> retry loop, preventing spurious <code>-EEXIST</code> errors after successful retries following <code>NFS4ERR_DELAY</code>.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/CA+9S74hSp_tJu2Ffe2BPNC2T25gfkhgjjDkdgSsF5c2rnJq_wA@mail.gmail.com/">2026-04-29 Igor Raits <a href="mailto:igor@gooddata.com">igor@gooddata.com</a> — REGRESSION: NFSv4: mkdir returns EEXIST after NFS4ERR_DELAY-then-success;</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CA+9S74i=TJBJjFWy1-LDqMLf1hmj5kcqNi-Yb5k79-mX1yCrLQ@mail.gmail.com/">2026-04-29 Igor Raits <a href="mailto:igor@gooddata.com">igor@gooddata.com</a> — Re: REGRESSION: NFSv4: mkdir returns EEXIST after NFS4ERR_DELAY-then-success;</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177745671692.1474915.5018486129724109553@noble.neil.brown.name/">2026-04-29 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> —  Re: REGRESSION: NFSv4: mkdir returns EEXIST after NFS4ERR_DELAY-then-success;</a></li>
+</ul>
+  </main>
+</body>
+</html>

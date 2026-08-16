@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>mm: Improve RWF_DONTCACHE write performance via background flusher kick</title>
+  <meta name="description" content="This week, Jeff Layton posted v3 of a patch series titled &quot;[PATCH v3 0/4] mm: improve write performance with RWF_DONTCACHE&quot; cover letter. The series aims to address high latency and poor throughput associated with RWF_DONTCACHE writes,…">
+  <meta property="og:title" content="mm: Improve RWF_DONTCACHE write performance via background flusher kick">
+  <meta property="og:description" content="This week, Jeff Layton posted v3 of a patch series titled &quot;[PATCH v3 0/4] mm: improve write performance with RWF_DONTCACHE&quot; cover letter. The series aims to address high latency and poor throughput associated with RWF_DONTCACHE writes,…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-04-30T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="mm: Improve RWF_DONTCACHE write performance via background flusher kick">
+  <meta name="twitter:description" content="This week, Jeff Layton posted v3 of a patch series titled &quot;[PATCH v3 0/4] mm: improve write performance with RWF_DONTCACHE&quot; cover letter. The series aims to address high latency and poor throughput associated with RWF_DONTCACHE writes,…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-04-30</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>mm: Improve RWF_DONTCACHE write performance via background flusher kick</h1>
+<h2>Summary</h2>
+<h1>mm: Improve RWF_DONTCACHE Write Performance with Background Flushers</h1>
+<p>This week, Jeff Layton posted <strong>v3</strong> of a patch series titled "[PATCH v3 0/4] mm: improve write performance with RWF_DONTCACHE" <a href="https://lore.kernel.org/linux-nfs/20260426-dontcache-v3-0-79eb37da9547@kernel.org/">cover letter</a>. The series aims to address high latency and poor throughput associated with <code>RWF_DONTCACHE</code> writes, particularly in NFS server (NFSD) workloads.</p>
+<h2>Technical Context: New Feature / Performance Optimization</h2>
+<p>The discussion centers on optimizing the <code>IOCB_DONTCACHE</code> writeback path. Previously, <code>generic_write_sync()</code> called <code>filemap_flush_range()</code> inline for every DONTCACHE write, submitting I/O in the writer's context. This caused significant latency spikes (p99.9 latency inflated from 23ms to 93ms) due to the work of walking page trees and submitting I/O blocking the writer.</p>
+<p>The v3 series implements a scheme suggested by Jan Kara and Christoph Hellwig: instead of inline writeback, the writer kicks the background flusher thread to perform writeback proportional to the amount written.</p>
+<h3>Key Patches</h3>
+<ol>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260426-dontcache-v3-1-79eb37da9547@kernel.org/">PATCH 1/4</a></strong>: Adds <code>NR_DONTCACHE_DIRTY</code>, a per-node page counter tracking dirty pages with the dropbehind flag (dirtied via <code>RWF_DONTCACHE</code>). This allows the VM to track DONTCACHE-specific dirty pressure.</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260426-dontcache-v3-2-79eb37da9547@kernel.org/">PATCH 2/4</a></strong>: Replaces inline <code>filemap_flush_range()</code> with a flusher kick (<code>WB_start_dontcache</code>). The flusher drains dirty pages in the background, targeting an amount proportional to the DONTCACHE writes. This moves writeback submission off the hot path.</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260426-dontcache-v3-3-79eb37da9547@kernel.org/">PATCH 3/4 &amp; 4/4</a></strong>: Adds two benchmark suites (<code>nfsd-io-bench</code> and <code>dontcache-bench</code>) to demonstrate performance improvements. Layton noted these were largely AI-generated ("AI slop") and may not be suitable for long-term inclusion in the tree.</li>
+</ol>
+<h2>Performance Results</h2>
+<p>Layton provided extensive benchmarks showing significant improvements, especially for NFS:</p>
+<ul>
+<li><strong>Local XFS (NVMe)</strong>: Multi-writer DONTCACHE throughput improved by <strong>+27.2%</strong>, matching buffered I/O performance. p99.9 latency dropped by <strong>~73%</strong>.</li>
+<li><strong>NFSv3 (NFSD)</strong>: Improvements were even more dramatic. Multi-writer DONTCACHE throughput improved by <strong>+398.3%</strong> (nearly 5x), effectively matching buffered I/O levels. Single-client sequential p99.9 latency dropped by <strong>76.9%</strong>.</li>
+</ul>
+<blockquote>
+<p>"The NFS results show even larger improvements than the local benchmarks. Multi-writer dontcache throughput improves nearly 5x, matching buffered I/O." — <a href="https://lore.kernel.org/linux-nfs/20260426-dontcache-v3-2-79eb37da9547@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<h2>Discussion and Review</h2>
+<h3>Andrew Morton's Concerns</h3>
+<p>Andrew Morton questioned whether deferring writeback could lead to a buildup of dirty, unreclaimable pagecache. Layton clarified that while pagecache remains dirty until the flusher acts, traditional VM limits (<code>balance_dirty_pages()</code>) will eventually throttle writers if the flusher cannot keep up. He noted:</p>
+<blockquote>
+<p>"In the test runs I did, the peak pagecache with DONTCACHE writes was higher than with the unpatched version but still considerably less than with normal buffered I/O." — <a href="https://lore.kernel.org/linux-nfs/2a2d77bb3caf096781b1a4a6000a1c1318d52840.camel@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<p>Morton also raised concerns about the maintainability of the AI-generated benchmark scripts, comparing it to "shipping the .s file without giving us the .c file." Layton agreed the benchmarks might be excluded from the final merge, serving only as demonstration tools.</p>
+<h3>Matthew Wilcox and Ritesh Harjani: Noisy Neighbor Tests</h3>
+<p>Matthew Wilcox pointed out that the "noisy neighbor" benchmark (DONTCACHE writer + buffered readers) showed a <strong>45.9% drop</strong> in reader throughput. He suggested this wasn't a true "noisy neighbor" test, which should involve competing writers.</p>
+<blockquote>
+<p>"hm. This wasn't what I thought of when I thought of 'noisy neighbour'. I'd have process A doing DONTCACHE writes to file A and process B doing normal buffered writes to file B." — <a href="https://lore.kernel.org/linux-nfs/ae55M8xBIVYZXPFN@casper.infradead.org/">Matthew Wilcox</a></p>
+</blockquote>
+<p>Ritesh Harjani echoed this, asking for tests involving parallel buffered and DONTCACHE writers to ensure the new mechanism doesn't regress performance in mixed-workload scenarios. He also questioned why DONTCACHE didn't show significant benefits over buffered I/O in single-client local tests, suggesting it shines more when page cache pressure is high (file size &gt; RAM).</p>
+<p>Layton acknowledged these points, agreeing to recreate benchmarks that mirror Jens Axboe's original DONTCACHE use cases and test mixed writer scenarios.</p>
+<h3>Jan Kara: Per-BDI vs. Per-Node Counters</h3>
+<p>Jan Kara raised a technical concern regarding the <code>NR_DONTCACHE_DIRTY</code> counter being per-node rather than per-BDI (backing device info). He argued that splitting node-level stats among cgroups could underestimate writeback needs if DONTCACHE and normal writes come from different cgroups.</p>
+<blockquote>
+<p>"So I think the stat should be a per bdi_writeback one (instead of a per node one) which would avoid the need to split the value to wb here." — <a href="https://lore.kernel.org/linux-nfs/7567kwydg2x7lp77xloxk5hjaar3k2xvbqqaro3k4hu4fncww5@yo2rmkrxlhkv/">Jan Kara</a></p>
+</blockquote>
+<h3>Syzbot Report</h3>
+<p>Syzbot reported a <code>WARNING in __mod_memcg_lruvec_state</code> ("missing stat item 21") when testing the series. This indicates a potential issue with how the new <code>NR_DONTCACHE_DIRTY</code> counter interacts with memory cgroup LRU statistics, requiring further investigation by Layton.</p>
+<h2>Conclusion</h2>
+<p>The v3 series demonstrates significant performance gains for <code>RWF_DONTCACHE</code>, particularly in NFS multi-writer scenarios, by moving writeback submission to background flushers. However, reviewers have identified several areas needing attention:</p>
+<ol>
+<li><strong>Counter Granularity</strong>: Jan Kara suggests moving the DONTCACHE dirty counter from per-node to per-BDI.</li>
+<li><strong>Mixed Workloads</strong>: Ritesh Harjani and Matthew Wilcox request more rigorous testing of mixed buffered/DONTCACHE writer scenarios.</li>
+<li><strong>Syzbot Warning</strong>: A memory cgroup stat warning needs resolution.</li>
+<li><strong>Benchmark Maintenance</strong>: The AI-generated benchmarks are likely to be dropped from the tree.</li>
+</ol>
+<p>Layton agreed to address these points, including recreating specific benchmarks and refining the counter implementation before LSF/MM.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260426-dontcache-v3-0-79eb37da9547@kernel.org/">2026-04-26 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3 0/4] mm: improve write performance with RWF_DONTCACHE</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260426-dontcache-v3-1-79eb37da9547@kernel.org/">2026-04-26 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3 1/4] mm: add NR_DONTCACHE_DIRTY node page counter</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260426-dontcache-v3-2-79eb37da9547@kernel.org/">2026-04-26 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3 2/4] mm: kick writeback flusher for IOCB_DONTCACHE with targeted dirty tracking</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260426-dontcache-v3-3-79eb37da9547@kernel.org/">2026-04-26 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3 3/4] testing: add nfsd-io-bench NFS server benchmark suite</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260426-dontcache-v3-4-79eb37da9547@kernel.org/">2026-04-26 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3 4/4] testing: add dontcache-bench local filesystem benchmark suite</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260426052854.8372fb9d4c616f16a8aa0a0f@linux-foundation.org/">2026-04-26 Andrew Morton <a href="mailto:akpm@linux-foundation.org">akpm@linux-foundation.org</a> — Re: [PATCH v3 2/4] mm: kick writeback flusher for IOCB_DONTCACHE with targeted dirty tracking</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260426053455.4c06140446976964e6fbb8ab@linux-foundation.org/">2026-04-26 Andrew Morton <a href="mailto:akpm@linux-foundation.org">akpm@linux-foundation.org</a> — Re: [PATCH v3 3/4] testing: add nfsd-io-bench NFS server benchmark suite</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/2a2d77bb3caf096781b1a4a6000a1c1318d52840.camel@kernel.org/">2026-04-26 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v3 2/4] mm: kick writeback flusher for IOCB_DONTCACHE with targeted dirty tracking</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/a1e784d7006fe5d4331d41a0638be117ac67fb21.camel@kernel.org/">2026-04-26 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v3 3/4] testing: add nfsd-io-bench NFS server benchmark suite</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/c40b691f76e6d397b889b4ee27e43490320660f1.camel@kernel.org/">2026-04-26 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v3 2/4] mm: kick writeback flusher for IOCB_DONTCACHE with targeted dirty tracking</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/69ee6140.170a0220.11de9.0011.GAE@google.com/">2026-04-26 syzbot ci <a href="mailto:syzbot+ciecac32dcb1f4d0d7@syzkaller.appspotmail.com">syzbot+ciecac32dcb1f4d0d7@syzkaller.appspotmail.com</a> — [syzbot ci] Re: mm: improve write performance with RWF_DONTCACHE</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ae55M8xBIVYZXPFN@casper.infradead.org/">2026-04-26 Matthew Wilcox <a href="mailto:willy@infradead.org">willy@infradead.org</a> — Re: [PATCH v3 2/4] mm: kick writeback flusher for IOCB_DONTCACHE with targeted dirty tracking</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/qzo1s6a4.ritesh.list@gmail.com/">2026-04-26 Ritesh Harjani (IBM) <a href="mailto:ritesh.list@gmail.com">ritesh.list@gmail.com</a> — Re: [PATCH v3 2/4] mm: kick writeback flusher for IOCB_DONTCACHE with targeted dirty tracking</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/mryps2fs.ritesh.list@gmail.com/">2026-04-27 Ritesh Harjani (IBM) <a href="mailto:ritesh.list@gmail.com">ritesh.list@gmail.com</a> — Re: [PATCH v3 3/4] testing: add nfsd-io-bench NFS server benchmark suite</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/bb418f9a7bfcabc3070b412c745c5b6456d592b9.camel@kernel.org/">2026-04-27 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v3 2/4] mm: kick writeback flusher for IOCB_DONTCACHE with targeted dirty tracking</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ca981318a1d114c5d0e4f428e32f429e187d4ed2.camel@kernel.org/">2026-04-27 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v3 2/4] mm: kick writeback flusher for IOCB_DONTCACHE with targeted dirty tracking</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/7567kwydg2x7lp77xloxk5hjaar3k2xvbqqaro3k4hu4fncww5@yo2rmkrxlhkv/">2026-04-27 Jan Kara <a href="mailto:jack@suse.cz">jack@suse.cz</a> — Re: [PATCH v3 2/4] mm: kick writeback flusher for IOCB_DONTCACHE with targeted dirty tracking</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/jytsrnn1.ritesh.list@gmail.com/">2026-04-27 Ritesh Harjani (IBM) <a href="mailto:ritesh.list@gmail.com">ritesh.list@gmail.com</a> — Re: [PATCH v3 2/4] mm: kick writeback flusher for IOCB_DONTCACHE with targeted dirty tracking</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/7a5bfc91266c4432e0b21eb98e2e1087936cb657.camel@kernel.org/">2026-04-28 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v3 2/4] mm: kick writeback flusher for IOCB_DONTCACHE with targeted dirty tracking</a></li>
+</ul>
+  </main>
+</body>
+</html>

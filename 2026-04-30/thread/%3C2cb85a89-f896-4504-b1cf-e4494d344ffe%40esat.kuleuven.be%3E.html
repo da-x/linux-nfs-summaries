@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Diagnosis of NFS4ERR_SEQ_MISORDERED errors on RHEL10 servers</title>
+  <meta name="description" content="This thread addresses a critical performance regression reported by Rik Theys, where a Rocky 8 Linux client (kernel 7.0.2) experienced extremely slow NFS operations when connecting to a RHEL10 server. The root cause was identified as a bug…">
+  <meta property="og:title" content="Diagnosis of NFS4ERR_SEQ_MISORDERED errors on RHEL10 servers">
+  <meta property="og:description" content="This thread addresses a critical performance regression reported by Rik Theys, where a Rocky 8 Linux client (kernel 7.0.2) experienced extremely slow NFS operations when connecting to a RHEL10 server. The root cause was identified as a bug…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-04-30T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Diagnosis of NFS4ERR_SEQ_MISORDERED errors on RHEL10 servers">
+  <meta name="twitter:description" content="This thread addresses a critical performance regression reported by Rik Theys, where a Rocky 8 Linux client (kernel 7.0.2) experienced extremely slow NFS operations when connecting to a RHEL10 server. The root cause was identified as a bug…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-04-30</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Diagnosis of NFS4ERR_SEQ_MISORDERED errors on RHEL10 servers</h1>
+<h2>Summary</h2>
+<h1>NFS4ERR_SEQ_MISORDERED Errors and NFS Client Very Slow</h1>
+<h2>Overview</h2>
+<p>This thread addresses a critical performance regression reported by Rik Theys, where a Rocky 8 Linux client (kernel 7.0.2) experienced extremely slow NFS operations when connecting to a RHEL10 server. The root cause was identified as a bug in the RHEL10 NFS server's handling of SEQUENCE replay, leading to <code>NFS4ERR_SEQ_MISORDERED</code> errors.</p>
+<h2>Key Technical Arguments and Evolution</h2>
+<h3>Initial Report</h3>
+<p>Rik Theys reported that cloning git repositories was "extremely slow" despite no saturation on the server side. Network captures revealed frequent <code>NFS4ERR_SEQ_MISORDERED</code> (10063) responses from the server. He asked:</p>
+<blockquote>
+<p>"What could be the cause of these mismatches? Is this always a client issue, or can this be caused by the server?"</p>
+</blockquote>
+<h3>Expert Analysis</h3>
+<p>Benjamin Coddington initially suggested the error might indicate a client-side bug or network issues such as packet duplication:</p>
+<blockquote>
+<p>"This is something you shouldn't normally see and probably indicates a bug or serious problem... I'd also check to make sure your underlying network isn't doing something totally nuts like duplicating packets."</p>
+</blockquote>
+<p>Rick Macklem provided a detailed explanation of the NFSv4.1/4.2 SEQUENCE operation protocol, clarifying that <code>NFS4ERR_SEQ_MISORDERED</code> is returned by the server when the sequence ID in a request does not match the expected value (same or +1) for a given session and slot. He noted:</p>
+<blockquote>
+<p>"If this happens, the server is behaving correctly, afaik. Then, is this a client bug or a client feature? That is more difficult to answer... I'd say it's probably a bug if neither 'intr' nor 'soft' options are on the mount."</p>
+</blockquote>
+<h3>Root Cause Identification</h3>
+<p>Rik Theys analyzed his packet capture and observed that while slot 0 sequenced correctly, other slots repeatedly used sequence ID <code>0x00000001</code>, often appearing exactly three times with the same slot ID. This pattern suggested the client was resetting its view of the slot table state.</p>
+<p>Olga Kornievskaia identified the specific server-side bug responsible. She pointed to a patch by NeilBrown (commit <code>1cff14b7fc7f31363c39d0269563ce75c714f7ae</code>) titled <strong>"nfsd: ensure SEQUENCE replay sends a valid reply."</strong></p>
+<p>The bug occurred because the server's replay cache logic encoded the SEQUENCE reply <em>before</em> filling in the correct reply fields. This resulted in an incorrect <code>maxslots</code> value being sent to the client, causing it to believe the slot table had shrunk and discard its knowledge of current sequence numbers for higher slots. When the client later used those slots, the server rejected them with <code>NFS4ERR_SEQ_MISORDERED</code>.</p>
+<blockquote>
+<p>"The incorrect maxslots value, in particular, can cause the client to think the slot table has been reduced in size so it can discard its knowledge of current sequence number of the later slots, though the server has not discarded those slots."</p>
+</blockquote>
+<h3>Conclusion and Fix</h3>
+<p>Olga confirmed that this bug affects all slots except slot 0:</p>
+<blockquote>
+<p>"If I recall correctly, slotid=0 was not affected but all other slots were... Then at some point when client starts using slots other then slot 0 it ends in this SEQ_MISORDERED state."</p>
+</blockquote>
+<p>The fix is included in the RHEL10.2 release and CentOS kernels <code>6.12.0-201</code> and later. Rik Theys was advised to upgrade the server kernel or wait for the RHEL10.2 update to resolve the performance issues.</p>
+<h2>Summary of Impact</h2>
+<ul>
+<li><strong>Issue:</strong> Server-side bug in NFSv4.1/4.2 SEQUENCE replay logic.</li>
+<li><strong>Symptom:</strong> <code>NFS4ERR_SEQ_MISORDERED</code> errors, severe client performance degradation.</li>
+<li><strong>Fix:</strong> Kernel patch correcting the order of SEQUENCE reply encoding during replay.</li>
+<li><strong>Status:</strong> Fixed in upstream Linux and RHEL10.2/CentOS 6.12.0-201+.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/2cb85a89-f896-4504-b1cf-e4494d344ffe@esat.kuleuven.be/">2026-04-30 Rik Theys <a href="mailto:Rik.Theys@esat.kuleuven.be">Rik.Theys@esat.kuleuven.be</a> — NFS4ERR_SEQ_MISORDERED errors and NFS client very slow</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CB5BA5C0-15AA-49D0-96B9-2017F6617903@hammerspace.com/">2026-04-30 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — Re: NFS4ERR_SEQ_MISORDERED errors and NFS client very slow</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/cf6fd710-e11b-425b-949a-d5acb509eec7@esat.kuleuven.be/">2026-04-30 Rik Theys <a href="mailto:Rik.Theys@esat.kuleuven.be">Rik.Theys@esat.kuleuven.be</a> — Re: NFS4ERR_SEQ_MISORDERED errors and NFS client very slow</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAM5tNy44_s=4thbohL=mX8rdF7gwNyqLPGKBiO9ncd-0Aw+s8g@mail.gmail.com/">2026-04-30 Rick Macklem <a href="mailto:rick.macklem@gmail.com">rick.macklem@gmail.com</a> — Re: NFS4ERR_SEQ_MISORDERED errors and NFS client very slow</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAM5tNy6j0JhZ8yM1T_bT3pddBi21Q3JN-qnsMN8K5mn7KQdeiw@mail.gmail.com/">2026-04-30 Rick Macklem <a href="mailto:rick.macklem@gmail.com">rick.macklem@gmail.com</a> — Re: NFS4ERR_SEQ_MISORDERED errors and NFS client very slow</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAM5tNy6rbQE-QDGD9-YffYn0Z+MsaCNOOpHAetnBKbW7Pn0_dw@mail.gmail.com/">2026-04-30 Rick Macklem <a href="mailto:rick.macklem@gmail.com">rick.macklem@gmail.com</a> — Re: NFS4ERR_SEQ_MISORDERED errors and NFS client very slow</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/58dc67a1-49a4-41ab-97ba-5a4f295cde1f@esat.kuleuven.be/">2026-04-30 Rik Theys <a href="mailto:Rik.Theys@esat.kuleuven.be">Rik.Theys@esat.kuleuven.be</a> — Re: NFS4ERR_SEQ_MISORDERED errors and NFS client very slow</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/3bee225b-3a3f-47a0-a38e-ce08196595ab@esat.kuleuven.be/">2026-04-30 Rik Theys <a href="mailto:Rik.Theys@esat.kuleuven.be">Rik.Theys@esat.kuleuven.be</a> — Re: NFS4ERR_SEQ_MISORDERED errors and NFS client very slow</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAM5tNy63vtAAh1DsBFgPMiXDZReUCimR8nii=WFiAUv8LsJctQ@mail.gmail.com/">2026-04-30 Rick Macklem <a href="mailto:rick.macklem@gmail.com">rick.macklem@gmail.com</a> — Re: NFS4ERR_SEQ_MISORDERED errors and NFS client very slow</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAM5tNy75wkmkHXMhmu0c4ANroXX6Q-Tt5GjS-D7T9FOhRnpmLg@mail.gmail.com/">2026-04-30 Rick Macklem <a href="mailto:rick.macklem@gmail.com">rick.macklem@gmail.com</a> — Re: NFS4ERR_SEQ_MISORDERED errors and NFS client very slow</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/fe5d8251-f92d-4732-a19a-bf92c4ea0cb9@esat.kuleuven.be/">2026-04-30 Rik Theys <a href="mailto:Rik.Theys@esat.kuleuven.be">Rik.Theys@esat.kuleuven.be</a> — Re: NFS4ERR_SEQ_MISORDERED errors and NFS client very slow</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAN-5tyGhC8q=iB_H6JaFZpwpWAqEz5NObVrzZ8m=3OzgLgJnpw@mail.gmail.com/">2026-04-30 Olga Kornievskaia <a href="mailto:aglo@umich.edu">aglo@umich.edu</a> — Re: NFS4ERR_SEQ_MISORDERED errors and NFS client very slow</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/baa0afef-f004-4ee4-945c-8992c05e7d2a@esat.kuleuven.be/">2026-04-30 Rik Theys <a href="mailto:Rik.Theys@esat.kuleuven.be">Rik.Theys@esat.kuleuven.be</a> — Re: NFS4ERR_SEQ_MISORDERED errors and NFS client very slow</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAN-5tyEec5qG7uC0UOHKY0WSsRRE30VtOjDoOX87z89X7UAiWw@mail.gmail.com/">2026-04-30 Olga Kornievskaia <a href="mailto:aglo@umich.edu">aglo@umich.edu</a> — Re: NFS4ERR_SEQ_MISORDERED errors and NFS client very slow</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>lockd: Fix TEST Lock Handling for Read-Only File Descriptors</title>
+  <meta name="description" content="This week, Chuck Lever submitted v3 of a bug-fix patch on behalf of Neil Brown to correct a long-standing but recently exposed defect in the NFS lock daemon (lockd) concerning how TEST lock requests are handled when only read-only access…">
+  <meta property="og:title" content="lockd: Fix TEST Lock Handling for Read-Only File Descriptors">
+  <meta property="og:description" content="This week, Chuck Lever submitted v3 of a bug-fix patch on behalf of Neil Brown to correct a long-standing but recently exposed defect in the NFS lock daemon (lockd) concerning how TEST lock requests are handled when only read-only access…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-04-30T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="lockd: Fix TEST Lock Handling for Read-Only File Descriptors">
+  <meta name="twitter:description" content="This week, Chuck Lever submitted v3 of a bug-fix patch on behalf of Neil Brown to correct a long-standing but recently exposed defect in the NFS lock daemon (lockd) concerning how TEST lock requests are handled when only read-only access…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-04-30</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>lockd: Fix TEST Lock Handling for Read-Only File Descriptors</h1>
+<h2>Summary</h2>
+<h1>lockd: Fix TEST Lock Handling for Read-Only File Descriptors</h1>
+<h2>Summary</h2>
+<p>This week, Chuck Lever submitted <strong>v3 of a bug-fix patch</strong> on behalf of Neil Brown to correct a long-standing but recently exposed defect in the NFS lock daemon (<code>lockd</code>) concerning how <code>TEST</code> lock requests are handled when only read-only access is available to a file. The fix addresses a regression triggered by a recent change in NFSD permission checking, and resolves practical problems for users running virtual machines via QEMU with read-only filesystem images over NFS.</p>
+<h2>Classification</h2>
+<p>This is a <strong>bug fix</strong> targeting the NFS server-side lock daemon (<code>lockd</code>), with direct implications for NFS client workloads that perform lock queries on read-only file descriptors.</p>
+<h2>Background: The Exposed Regression</h2>
+<p>The patch's cover letter explains that <code>lockd</code> has historically treated <code>F_GETLK</code> (lock test/query) requests similarly to <code>F_SETLK</code> (lock set) requests — requiring write access to query an <code>F_WRLCK</code> lock and read access to query an <code>F_RDLCK</code> lock. However, POSIX semantics allow <code>F_GETLK</code> to operate with either read or write access:</p>
+<blockquote>
+<p>"The F_GETLK fcntl can work with either read access or write access or both. It can query F_RDLCK and F_WRLCK locks in either case." <a href="https://lore.kernel.org/linux-nfs/20260428194744.2360735-1-cel@kernel.org/">Neil Brown</a></p>
+</blockquote>
+<p>This incorrect behavior had been <strong>hidden for years</strong> because the NFS server (<code>nfsd</code>) previously ignored the access mode requested by <code>lockd</code> and required only <code>READ</code> access for all locking operations. The bug was exposed by a recent commit:</p>
+<blockquote>
+<p>"The commit mentioned in Fixes: below changed nfsd_permission() to NOT override the access request for LOCK requests and this exposed the bug that we are now fixing." <a href="https://lore.kernel.org/linux-nfs/20260428194744.2360735-1-cel@kernel.org/">Neil Brown</a></p>
+</blockquote>
+<p>The offending commit, <code>4cc9b9f2bf4d</code> ("nfsd: refine and rename NFSD_MAY_LOCK"), was part of the broader NFSD infrastructure cleanup discussed in <a href="https://lore.kernel.org/linux-nfs/20260401144059.160746-1-hch@lst.de/">related threads this week</a>.</p>
+<h2>Practical Impact</h2>
+<p>The real-world consequence is that applications like QEMU, which access read-only filesystem images (e.g., ISO files) over NFS and query lock status, would fail when attempting to test for write locks:</p>
+<blockquote>
+<p>"This is wrong and can cause problems - e.g. when qemu accesses a read-only (e.g. iso) filesystem image over NFS (though why it queries if it can get a write lock - I don't know. But it does, and this works with local filesystems)." <a href="https://lore.kernel.org/linux-nfs/20260428194744.2360735-1-cel@kernel.org/">Neil Brown</a></p>
+</blockquote>
+<p>The issue was reported via Debian bug <a href="https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=1128861">#1128861</a> by user Tj.</p>
+<h2>Technical Approach</h2>
+<p>The patch modifies five files in <code>fs/lockd/</code> to decouple the access mode used for <code>TEST</code> requests from the lock type being queried:</p>
+<ol>
+<li><strong><code>nlm_do_fopen()</code></strong> now accepts <code>O_RDWR</code> as a mode, succeeding if either <code>O_RDONLY</code> or <code>O_WRONLY</code> can be opened.</li>
+<li><strong><code>nlm_lookup_file()</code></strong> accepts an explicit mode argument from callers instead of deducing it based on lock type.</li>
+<li><strong><code>nlm4svc_retrieve_args()</code> and <code>nlmsvc_retrieve_args()</code></strong> detect <code>TEST</code> requests and pass <code>O_RDWR</code> to <code>nlm_lookup_file()</code>, while preserving the previous behavior for non-TEST requests (e.g., <code>GRANT</code>, <code>UNLOCK</code>).</li>
+<li><strong><code>nlmsvc_testlock()</code></strong> uses the file descriptor already stored in <code>lock-&gt;fl.c.flc_file</code> rather than recalculating the mode.</li>
+</ol>
+<p>Brown notes that this incorrect behavior has existed "at least since git history began," underscoring how deeply embedded the bug was in the codebase.</p>
+<h2>Known Limitation</h2>
+<p>The patch deliberately does not address a related issue with <code>flock(LOCK_EX)</code> on read-only file descriptors:</p>
+<blockquote>
+<p>"The flock(.., LOCK_EX) call is permitted on a read-only file descriptor. Linux NFS maps this to NLM locking as whole-file byte-range locks. nfsd will see this as though it were fcntl( F_SETLK (F_WRLCK)) and will now require write access, which it might not be able to get. It is not clear if this is a problem in practice, or what the best solution might be. So no attempt is made to address it." <a href="https://lore.kernel.org/linux-nfs/20260428194744.2360735-1-cel@kernel.org/">Neil Brown</a></p>
+</blockquote>
+<p>This caveat leaves open the possibility of follow-up work if <code>flock(LOCK_EX)</code> on read-only NFS files becomes a reported issue.</p>
+<h2>Evolution and Status</h2>
+<p>This is <strong>v3</strong> of the patch, with changes since v2 including:</p>
+<ul>
+<li>Rebase on <code>nfsd-testing</code> (v7.1-rc1+)</li>
+<li>Proper handling of "drop reply" scenarios</li>
+</ul>
+<p>The patch carries a <strong>Reviewed-by</strong> tag from Jeff Layton, indicating peer validation. As of this week's window close, no further discussion or merge confirmation was posted to the list. The single message in this thread is <a href="https://lore.kernel.org/linux-nfs/20260428194744.2360735-1-cel@kernel.org/">Chuck Lever's submission</a> on April 28.</p>
+<h2>Significance for NFS Client Development</h2>
+<p>For NFS client developers, this fix ensures that lock query operations (<code>F_GETLK</code>) behave consistently with local filesystem semantics when accessing read-only files over NFS. This is particularly relevant for:</p>
+<ul>
+<li><strong>Virtualization workloads</strong>: QEMU and similar hypervisors accessing disk images over NFS will no longer encounter spurious lock test failures on read-only exports.</li>
+<li><strong>Application compatibility</strong>: Any client application that queries write locks on read-only file descriptors — a pattern that works on local filesystems — will now function correctly over NFS as well.</li>
+</ul>
+<p>The fix restores parity between NFS and local filesystem behavior for lock testing, closing a gap introduced by the NFSD permission refinement work.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260428194744.2360735-1-cel@kernel.org/">2026-04-28 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3] lockd: fix TEST handling when not all permissions are available.</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSv4: Fix -EEXIST on mkdir after NFS4ERR_DELAY retry</title>
+  <meta name="description" content="This week, Igor Raits submitted a targeted bug fix for the NFSv4 client addressing a subtle but impactful regression in exception-state management during mkdir(2) retries. The patch was reviewed by NeilBrown and marked for stable backport.">
+  <meta property="og:title" content="NFSv4: Fix -EEXIST on mkdir after NFS4ERR_DELAY retry">
+  <meta property="og:description" content="This week, Igor Raits submitted a targeted bug fix for the NFSv4 client addressing a subtle but impactful regression in exception-state management during mkdir(2) retries. The patch was reviewed by NeilBrown and marked for stable backport.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-04-30T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSv4: Fix -EEXIST on mkdir after NFS4ERR_DELAY retry">
+  <meta name="twitter:description" content="This week, Igor Raits submitted a targeted bug fix for the NFSv4 client addressing a subtle but impactful regression in exception-state management during mkdir(2) retries. The patch was reviewed by NeilBrown and marked for stable backport.">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-04-30</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSv4: Fix -EEXIST on mkdir after NFS4ERR_DELAY retry</h1>
+<h2>Summary</h2>
+<h2>Bug Fix: Spurious <code>-EEXIST</code> from <code>mkdir(2)</code> After Successful Retry</h2>
+<p>This week, Igor Raits submitted a targeted bug fix for the NFSv4 client addressing a subtle but impactful regression in exception-state management during <code>mkdir(2)</code> retries. The patch was reviewed by NeilBrown and marked for stable backport.</p>
+<h3>The Problem</h3>
+<p>When an NFSv4 server returns <code>NFS4ERR_DELAY</code> for a CREATE operation (issued by <code>mkdir(2)</code>), the Linux NFS client correctly waits and retries. However, after the retry succeeds—creating the directory on the server—userspace can still receive <code>-EEXIST</code>, even though the directory was just created successfully. This manifests as intermittent failures under high-concurrency workloads.</p>
+<p>Raits provided a concrete reproducer targeting an in-kernel Linux nfsd, which works under both NFSv4.0 and NFSv4.2:</p>
+<pre><code class="language-bash">N=2000000; base=/var/gdc/export
+for ((i=1; i&lt;=N; i++)); do
+    d=$base/$(openssl rand -hex 8)
+    mkdir "$d" 2&gt;/dev/null || echo "$(date +%T) failed loop=$i $d"
+    rmdir "$d" 2&gt;/dev/null
+done
+</code></pre>
+<p>Failures cluster at the cadence of server-side auth/export cache refresh, which triggers <code>NFS4ERR_DELAY</code> from nfsd.</p>
+<h3>Root Cause Analysis</h3>
+<p>Raits traced the issue to a wire-level sequence where three CREATE RPCs originate from a single <code>mkdir(2)</code> call:</p>
+<blockquote>
+<p>"client -&gt; server  CREATE name=...  -&gt; NFS4ERR_DELAY<br />
+~100 ms later<br />
+client -&gt; server  CREATE name=...  -&gt; NFS4_OK         (dir created)<br />
+~80 us later<br />
+client -&gt; server  CREATE name=...  -&gt; NFS4ERR_EXIST   (correct)"</p>
+</blockquote>
+<p>The third CREATE should never have been issued. The root cause was identified in commit <code>dd862da61e91</code> ("nfs: fix incorrect handling of large-number NFS errors in nfs4_do_mkdir()"), which introduced a conditional gate around <code>nfs4_handle_exception()</code>. Raits explained:</p>
+<blockquote>
+<p>"Since commit dd862da61e91, nfs4_handle_exception() is called only when _nfs4_proc_mkdir() returned an error. That gate breaks retry-state hygiene: nfs4_do_handle_exception() resets exception.{delay,recovering,retry} to 0 on entry, so calling it on success is what previously cleared the retry flag set by the preceding NFS4ERR_DELAY iteration."</p>
+</blockquote>
+<p>With the conditional in place, <code>exception.retry</code> remains at 1 after a successful retry. The do-while loop in <code>nfs4_proc_mkdir()</code> executes one additional iteration, sending another CREATE for an already-created name, which correctly returns <code>NFS4ERR_EXIST</code> — but this is then surfaced as <code>-EEXIST</code> to userspace.</p>
+<h3>The Fix</h3>
+<p>The patch drops the conditional and calls <code>nfs4_handle_exception()</code> unconditionally after each iteration of the do-while loop, matching the pattern used by every other similar operation in <code>fs/nfs/nfs4proc.c</code> (e.g., <code>nfs4_proc_symlink()</code>, <code>nfs4_proc_link()</code>). As Raits noted:</p>
+<blockquote>
+<p>"Drop the conditional and call nfs4_handle_exception() unconditionally, matching every other do-while in fs/nfs/nfs4proc.c. The dentry/status separation introduced by that commit is preserved."</p>
+</blockquote>
+<p>The fix changes only 5 lines in <code>fs/nfs/nfs4proc.c</code> (2 insertions, 3 deletions), making it a minimal and surgical correction.</p>
+<h3>Credits and Context</h3>
+<ul>
+<li><strong>Reported-and-tested-by:</strong> Jan Čípa <a href="mailto:jan.cipa@gooddata.com">jan.cipa@gooddata.com</a></li>
+<li><strong>Reviewed-by:</strong> NeilBrown <a href="mailto:neil@brown.name">neil@brown.name</a></li>
+<li><strong>Cc:</strong> stable@vger.kernel.org</li>
+</ul>
+<p>The patch closes the upstream bug report at <a href="https://lore.kernel.org/linux-nfs/CA+9S74hSp_tJu2Ffe2BPNC2T25gfkhgjjDkdgSsF5c2rnJq_wA@mail.gmail.com//">lore.kernel.org</a> and fixes the regression introduced by <code>dd862da61e91</code>.</p>
+<h3>Conclusion</h3>
+<p>This is a classic example of how well-intentioned error-handling refactors can inadvertently break retry-state hygiene in complex protocol clients. The NFSv4 client's do-while retry loops depend on consistent exception-state cleanup after every iteration — success or failure. Restoring the unconditional call to <code>nfs4_handle_exception()</code> aligns <code>nfs4_proc_mkdir()</code> with the established pattern across the rest of the NFSv4 procedure implementations. Given its stable-tagging and minimal scope, this fix is expected to be merged promptly and backported to affected stable kernels.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260429104938.1776671-1-igor.raits@gmail.com/">2026-04-29 Igor Raits <a href="mailto:igor.raits@gmail.com">igor.raits@gmail.com</a> — [PATCH] NFSv4: clear exception state on successful mkdir retry</a></li>
+</ul>
+  </main>
+</body>
+</html>

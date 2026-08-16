@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>xprtrdma: Move long delayed work to system_dfl_long_wq for better scheduler placement</title>
+  <meta name="description" content="This week, Marco Crivellari (SUSE) proposed an RFC patch for the NFS/RDMA transport layer (xprtrdma) to improve how long-running delayed work items are scheduled. The change swaps the use of system_long_wq for the newer system_dfl_long_wq,…">
+  <meta property="og:title" content="xprtrdma: Move long delayed work to system_dfl_long_wq for better scheduler placement">
+  <meta property="og:description" content="This week, Marco Crivellari (SUSE) proposed an RFC patch for the NFS/RDMA transport layer (xprtrdma) to improve how long-running delayed work items are scheduled. The change swaps the use of system_long_wq for the newer system_dfl_long_wq,…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-04-30T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="xprtrdma: Move long delayed work to system_dfl_long_wq for better scheduler placement">
+  <meta name="twitter:description" content="This week, Marco Crivellari (SUSE) proposed an RFC patch for the NFS/RDMA transport layer (xprtrdma) to improve how long-running delayed work items are scheduled. The change swaps the use of system_long_wq for the newer system_dfl_long_wq,…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-04-30</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>xprtrdma: Move long delayed work to system_dfl_long_wq for better scheduler placement</h1>
+<h2>Summary</h2>
+<p>This week, Marco Crivellari (SUSE) proposed an RFC patch for the NFS/RDMA transport layer (<code>xprtrdma</code>) to improve how long-running delayed work items are scheduled. The change swaps the use of <code>system_long_wq</code> for the newer <code>system_dfl_long_wq</code>, aiming to leverage scheduler task placement optimizations rather than relying on per-CPU workqueues with random timer firing locations.</p>
+<h3>Technical Context and Proposal</h3>
+<p>The patch addresses a subtle inefficiency in how <code>xprtrdma</code> enqueues long delayed work. Currently, the code uses <code>queue_delayed_work()</code> with <code>system_long_wq</code>. As Marco Crivellari explained in his initial post <a href="https://lore.kernel.org/linux-nfs/20260430085412.96961-1-marco.crivellari@suse.com/">here</a>, this mechanism results in the work being queued on whichever CPU happens to fire the global timer:</p>
+<blockquote>
+<p>"The consequence of all of this is that the work can run anywhere, depending on where the timer fired."</p>
+</blockquote>
+<p>Crivellari noted that a new unbound workqueue, <code>system_dfl_long_wq</code>, was recently added specifically for long-running works to benefit from better scheduler decisions. His patch simply swaps the workqueue identifier in <code>net/sunrpc/xprtrdma/transport.c</code>.</p>
+<h3>Discussion Evolution: Clarifying Motivation</h3>
+<p>Chuck Lever (Oracle), a key maintainer of the NFS client stack, initially found the commit message confusing. He pointed out that "running anywhere" could be interpreted as a feature rather than a bug, and asked for clearer motivation regarding housekeeping CPUs or isolated systems <a href="https://lore.kernel.org/linux-nfs/8d1eff7b-3712-4039-87d6-028a4118e210@app.fastmail.com/">here</a>:</p>
+<blockquote>
+<p>"Without a sentence saying 'and that anywhere includes isolated CPUs, which we don't want,' the reader is left to fill in the gap."</p>
+</blockquote>
+<p>Frederic Weisbecker (SUSE Labs), who has deep expertise in workqueues and timers, clarified that the issue wasn't about isolated CPUs per se, but about scheduler efficiency. He explained that global timers do not fire on isolated CPUs, so the current code already respects isolation masks. However, the <em>placement</em> of the work item is suboptimal because it's bound to a random CPU rather than being allowed to migrate for performance and power benefits <a href="https://lore.kernel.org/linux-nfs/afNguCraI6AvmZrR@localhost.localdomain/">here</a>:</p>
+<blockquote>
+<p>"The consequence of all of this is that the work can run on any housekeeping CPU, irrespective of the scheduler that knows better about the best task placement, which would apply if the work were to be queued on an unbound workqueue."</p>
+</blockquote>
+<p>Chuck Lever pressed for clarity on whether this was a bug fix or an optimization <a href="https://lore.kernel.org/linux-nfs/1e220a70-4318-49de-aaac-332c0a1cfab4@app.fastmail.com/">here</a>:</p>
+<blockquote>
+<p>"Does the patch address a bug (work isn't getting rescheduled at all) or is it merely a minor optimization for certain platforms? What's the user-visible issue that will be improved with this change?"</p>
+</blockquote>
+<h3>Final Conclusions</h3>
+<p>Frederic Weisbecker confirmed that this is <strong>not a bug fix</strong>, but rather an optimization for power and performance, aligning with broader kernel efforts to remove <code>system_long_wq</code> in favor of unbound workqueues where locality isn't required <a href="https://lore.kernel.org/linux-nfs/afNvZKtiQPLbi-3F@localhost.localdomain/">here</a>:</p>
+<blockquote>
+<p>"It's not a bug, it's an optimization power-wise and performance-wise... Long works have no reason to stick to a single CPU. If they are converted to be unbound, the scheduler can move them to relevant targets to optimize performances and power consumption."</p>
+</blockquote>
+<p>He also highlighted a logical inconsistency in the current approach:</p>
+<blockquote>
+<p>"Using queue_delayed_work() with a bound workqueue doesn't make any sense since the target is completely random."</p>
+</blockquote>
+<p>Chuck Lever acknowledged this explanation, stating he had no technical objections to the code change but emphasized that the commit message should clearly reflect this rationale <a href="https://lore.kernel.org/linux-nfs/4edf7abf-8f48-4433-98f0-2ed2d97a32f5@app.fastmail.com/">here</a>:</p>
+<blockquote>
+<p>"The light dawns (for me). That's what I'd like to see in the commit message."</p>
+</blockquote>
+<h3>Summary for NFS Client Development</h3>
+<p>This discussion highlights a shift in kernel workqueue best practices, impacting NFS client subsystems like <code>xprtrdma</code>. Developers should be aware that:</p>
+<ol>
+<li><strong><code>system_long_wq</code> is being phased out</strong> for cases where CPU locality is not critical.</li>
+<li><strong><code>system_dfl_long_wq</code></strong> is the preferred workqueue for long-running tasks to allow the scheduler to optimize placement for power and performance.</li>
+<li><strong>Commit messages</strong> must clearly distinguish between bug fixes (functional correctness) and optimizations (performance/power), especially when the behavioral change is subtle.</li>
+</ol>
+<p>The patch itself is a minor one-line change in <code>transport.c</code>, but it represents an important alignment with modern kernel scheduling infrastructure.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260430085412.96961-1-marco.crivellari@suse.com/">2026-04-30 Marco Crivellari <a href="mailto:marco.crivellari@suse.com">marco.crivellari@suse.com</a> — [RFC PATCH] xprtrdma: Move long delayed work on system_dfl_long_wq</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/8d1eff7b-3712-4039-87d6-028a4118e210@app.fastmail.com/">2026-04-30 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [RFC PATCH] xprtrdma: Move long delayed work on system_dfl_long_wq</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/afNguCraI6AvmZrR@localhost.localdomain/">2026-04-30 Frederic Weisbecker <a href="mailto:frederic@kernel.org">frederic@kernel.org</a> — Re: [RFC PATCH] xprtrdma: Move long delayed work on system_dfl_long_wq</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/1e220a70-4318-49de-aaac-332c0a1cfab4@app.fastmail.com/">2026-04-30 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [RFC PATCH] xprtrdma: Move long delayed work on system_dfl_long_wq</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/afNvZKtiQPLbi-3F@localhost.localdomain/">2026-04-30 Frederic Weisbecker <a href="mailto:frederic@kernel.org">frederic@kernel.org</a> — Re: [RFC PATCH] xprtrdma: Move long delayed work on system_dfl_long_wq</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/4edf7abf-8f48-4433-98f0-2ed2d97a32f5@app.fastmail.com/">2026-04-30 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [RFC PATCH] xprtrdma: Move long delayed work on system_dfl_long_wq</a></li>
+</ul>
+  </main>
+</body>
+</html>
