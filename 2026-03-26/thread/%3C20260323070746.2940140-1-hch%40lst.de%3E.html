@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Support for Multiple Block Devices in pNFS Block-Style Layouts</title>
+  <meta name="description" content="This week, Christoph Hellwig submitted a seven-patch series titled &quot;support multiple block devices per file system for block-style layouts&quot; to extend the NFS server&#39;s (nfsd) ability to export multiple block devices via pNFS block-style…">
+  <meta property="og:title" content="Support for Multiple Block Devices in pNFS Block-Style Layouts">
+  <meta property="og:description" content="This week, Christoph Hellwig submitted a seven-patch series titled &quot;support multiple block devices per file system for block-style layouts&quot; to extend the NFS server&#39;s (nfsd) ability to export multiple block devices via pNFS block-style…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-03-26T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Support for Multiple Block Devices in pNFS Block-Style Layouts">
+  <meta name="twitter:description" content="This week, Christoph Hellwig submitted a seven-patch series titled &quot;support multiple block devices per file system for block-style layouts&quot; to extend the NFS server&#39;s (nfsd) ability to export multiple block devices via pNFS block-style…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-03-26</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Support for Multiple Block Devices in pNFS Block-Style Layouts</h1>
+<h2>Summary</h2>
+<h2>Overview</h2>
+<p>This week, Christoph Hellwig submitted a seven-patch series titled <strong>"support multiple block devices per file system for block-style layouts"</strong> to extend the NFS server's (nfsd) ability to export multiple block devices via pNFS block-style layouts. The primary motivation is to enable support for the XFS Real-Time (RT) device, allowing clients to access RT extents directly through pNFS.</p>
+<p>The series refactors the <code>exportfs</code> interface to split layout-based block device operations into a separate structure (<code>exportfs_block_ops</code>) and updates nfsd to handle multiple device IDs and indices. The final patch implements this support in XFS, enabling layout grants on the RT device.</p>
+<h2>Key Technical Arguments and Bug Fixes</h2>
+<p>The series faced rigorous review from Chuck Lever, who identified three significant issues: a potential NULL pointer dereference, a critical fencing logic error, and a timestamp regression.</p>
+<h3>1. NULL Pointer Dereference in Layout Setup</h3>
+<p>Chuck Lever pointed out that the refactoring in <strong><a href="https://lore.kernel.org/linux-nfs/20260323070746.2940140-2-hch@lst.de/">PATCH 1/7</a></strong> introduced a potential crash for non-XFS filesystems. He noted:</p>
+<blockquote>
+<p>"block_ops itself is NULL for any filesystem that does not provide block layout support (everything other than XFS today). When an admin exports such a filesystem with pNFS enabled... svc_export_parse() calls nfsd4_setup_layout_type(), and bops-&gt;get_uuid dereferences a NULL pointer."</p>
+</blockquote>
+<p>He suggested adding a null check: <code>if (bops &amp;&amp; bops-&gt;get_uuid &amp;&amp; ...)</code>. Christoph Hellwig acknowledged the issue in his response on March 26, stating:</p>
+<blockquote>
+<p>"Yes, I'll fix it up." <a href="https://lore.kernel.org/linux-nfs/20260326053359.GA23157@lst.de/">Response</a></p>
+</blockquote>
+<h3>2. Critical Fencing Logic Error</h3>
+<p>The most significant technical debate centered on <strong><a href="https://lore.kernel.org/linux-nfs/20260323070746.2940140-6-hch@lst.de/">PATCH 5/7</a></strong>, which adds support for <code>GETDEVICEINFO</code> for multiple devices. Chuck Lever identified a severe flaw in the fence client path (<code>nfsd4_scsi_fence_client</code>).</p>
+<p>He explained that when a layout is granted on the RT device (device index 1), Persistent Reservation (PR) registration occurs on the RT block device. However, the fencing code incorrectly targets the data device:</p>
+<blockquote>
+<p>"This always gets the data device. For an RT inode whose layout was granted with dev_idx=1, PR registration happened on the RT bdev... but the preempt here fires against the data bdev."</p>
+</blockquote>
+<p>Chuck detailed a concrete path to a kernel oops or security vulnerability:</p>
+<ol>
+<li>An XFS filesystem has a SATA data device (no <code>pr_ops</code>) and an NVMe RT device (with <code>pr_ops</code>).</li>
+<li>The server enables LAYOUT_SCSI because the RT device supports it.</li>
+<li>A client accesses an RT inode, registering PR on the RT device.</li>
+<li>Upon recall failure, <code>nfsd4_scsi_fence_client</code> attempts to fence the data device.</li>
+<li>Since the data device lacks <code>pr_ops</code>, this results in a NULL pointer dereference (kernel oops).</li>
+</ol>
+<p>Even if both devices support PR, Chuck noted that fencing the wrong device leaves the RT device unfenced, compromising data integrity. He argued that fixing this requires threading the device index through to the fence path:</p>
+<blockquote>
+<p>"The difficulty is that fence_client receives a nfs4_layout_stateid and nfsd_file, neither of which carries the dev_idx that was encoded in the device ID at layout grant time... So the fix isn't just a one-liner — it requires threading the device index (or the bdev) through to the fence path."</p>
+</blockquote>
+<p>Christoph Hellwig disagreed with the scope of the fix, arguing that fencing should be broader:</p>
+<blockquote>
+<p>"This is bollocks. A fence happens when the client fails to respond, so we need to fence access to all devices for it. Which means we just need to track which devices it got access to. I'll look into it." <a href="https://lore.kernel.org/linux-nfs/20260326053828.GC23157@lst.de/">Response</a></p>
+</blockquote>
+<p>This indicates a planned redesign of the fencing mechanism to track all accessed devices per client rather than just fixing the index for the current layout.</p>
+<h3>3. Mtime Regression in LAYOUTCOMMIT</h3>
+<p>In <strong><a href="https://lore.kernel.org/linux-nfs/20260323070746.2940140-3-hch@lst.de/">PATCH 2/7</a></strong>, Christoph removed <code>struct iattr</code> from the <code>-&gt;commit_blocks</code> callback, passing only the new size. Chuck Lever identified that this broke the handling of <code>loca_time_modify</code> in LAYOUTCOMMIT:</p>
+<blockquote>
+<p>"After this change is applied, nfsd4_block_commit_blocks continues to compute lcp-&gt;lc_mtime (honoring UTIME_NOW etc.) but never passes it to the underlying filesystem... This change introduces a regression against RFC 8881 Section 18.42 (LAYOUTCOMMIT's loca_time_modify is ignored)."</p>
+</blockquote>
+<p>Christoph clarified that this behavior was not new to the patch but highlighted the need for a separate fix:</p>
+<blockquote>
+<p>"That's not new in this patch. For the is_mgtime() case, which applies to XFS, setattr_copy always sets mtime to the current time when ATTR_MTIME is passed. We'd need to move ATTR_MTIME_SET to set a specific time." <a href="https://lore.kernel.org/linux-nfs/20260326053653.GB23157@lst.de/">Response</a></p>
+</blockquote>
+<h2>Conclusion</h2>
+<p>The discussion highlights the complexity of extending pNFS block layouts to multi-device filesystems like XFS with RT devices. While the series provides a clean architectural foundation for multiple device exports, it exposed critical edge cases in error handling (fencing) and interface cleanup (mtimes). Christoph Hellwig has agreed to address the NULL pointer dereference immediately and is investigating a broader solution for the fencing logic that tracks all accessed devices per client. The mtime issue remains a known regression requiring a follow-up fix using <code>ATTR_MTIME_SET</code>.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260323070746.2940140-1-hch@lst.de/">2026-03-23 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — support multiple block devices per file system for block-style layouts</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260323070746.2940140-2-hch@lst.de/">2026-03-23 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 1/7] exportfs: split out the ops for layout-based block device access</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260323070746.2940140-3-hch@lst.de/">2026-03-23 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 2/7] exportfs: don't pass struct iattr to -&gt;commit_blocks</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260323070746.2940140-4-hch@lst.de/">2026-03-23 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 3/7] exportfs,nfsd: rework checking for layout-based block device access support</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260323070746.2940140-5-hch@lst.de/">2026-03-23 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 4/7] nfsd: support multiple pNFS device IDs</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260323070746.2940140-6-hch@lst.de/">2026-03-23 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 5/7] nfsd/blocklayout: support GETDEVICEINFO for multiple devices</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260323070746.2940140-7-hch@lst.de/">2026-03-23 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 6/7] exportfs: return a device index from -&gt;map_blocks</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260323070746.2940140-8-hch@lst.de/">2026-03-23 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 7/7] xfs: support layout-based block device access on the RT device</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/1fbdc5d9-d95c-4d1a-816e-028ffd1231b0@app.fastmail.com/">2026-03-23 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 1/7] exportfs: split out the ops for layout-based block device access</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/736ddc8a-7a28-4900-b3c1-0368cad24085@app.fastmail.com/">2026-03-23 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 5/7] nfsd/blocklayout: support GETDEVICEINFO for multiple devices</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/81da6f4c-7523-496d-b8ed-8e78f4f83ea4@app.fastmail.com/">2026-03-23 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 2/7] exportfs: don't pass struct iattr to -&gt;commit_blocks</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260326053359.GA23157@lst.de/">2026-03-26 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: [PATCH 1/7] exportfs: split out the ops for layout-based block device access</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260326053653.GB23157@lst.de/">2026-03-26 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: [PATCH 2/7] exportfs: don't pass struct iattr to -&gt;commit_blocks</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260326053828.GC23157@lst.de/">2026-03-26 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: [PATCH 5/7] nfsd/blocklayout: support GETDEVICEINFO for multiple devices</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/5ff9bc59-f579-4b7a-bc7a-eef411b8e31e@kernel.org/">2026-03-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 5/7] nfsd/blocklayout: support GETDEVICEINFO for multiple devices</a></li>
+</ul>
+  </main>
+</body>
+</html>

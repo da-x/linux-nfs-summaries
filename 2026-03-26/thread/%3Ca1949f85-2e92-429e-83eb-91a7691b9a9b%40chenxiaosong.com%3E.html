@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>netfs: Cleanup Semantics Debate on netfs_writeback_single() Failure Path</title>
+  <meta name="description" content="This thread continues the review of David Howells&#39; ongoing netfslib refactoring, specifically Patch 17/17 of the RFC series titled &quot;[RFC PATCH 17/17] netfs: Combine prepare and issue ops and grab the buffers on request&quot;. This week&#39;s…">
+  <meta property="og:title" content="netfs: Cleanup Semantics Debate on netfs_writeback_single() Failure Path">
+  <meta property="og:description" content="This thread continues the review of David Howells&#39; ongoing netfslib refactoring, specifically Patch 17/17 of the RFC series titled &quot;[RFC PATCH 17/17] netfs: Combine prepare and issue ops and grab the buffers on request&quot;. This week&#39;s…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-03-26T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="netfs: Cleanup Semantics Debate on netfs_writeback_single() Failure Path">
+  <meta name="twitter:description" content="This thread continues the review of David Howells&#39; ongoing netfslib refactoring, specifically Patch 17/17 of the RFC series titled &quot;[RFC PATCH 17/17] netfs: Combine prepare and issue ops and grab the buffers on request&quot;. This week&#39;s…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-03-26</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>netfs: Cleanup Semantics Debate on netfs_writeback_single() Failure Path</h1>
+<h2>Summary</h2>
+<h1>netfs: Cleanup Semantics Debate on <code>netfs_writeback_single()</code> Failure Path</h1>
+<h2>Summary</h2>
+<p>This thread continues the review of David Howells' ongoing <code>netfslib</code> refactoring, specifically Patch 17/17 of the RFC series titled "[RFC PATCH 17/17] netfs: Combine prepare and issue ops and grab the buffers on request". This week's activity focused on a narrow but critical question regarding reference counting and cleanup semantics in the writeback failure path.</p>
+<p>This discussion is part of a broader multi-week review process where ChenXiaoSong and Paulo Alcantara identified significant memory management bugs—including a Use-After-Free (UAF) condition—in Howells' <code>netfs-next</code> branch. As noted in prior summaries, Alcantara warned:</p>
+<blockquote>
+<p>"The above is still broken as it would cause an UAF on @subreq as we're putting it with netfs_put_subrequest() and then dereferencing it afterwards." — <a href="https://lore.kernel.org/linux-nfs/63655684a778145167a549b4a6251ccf@manguebit.org/">Paulo Alcantara</a></p>
+</blockquote>
+<p>Alcantara advised waiting for the next patchset, suggesting that architectural changes might resolve these issues. ChenXiaoSong also raised a concern about incorrect cleanup semantics in <code>netfs_writeback_single()</code>, questioning whether <code>netfs_put_failed_request()</code> should be called instead of <code>netfs_put_request()</code> on the failure path.</p>
+<h3>This Week's Activity: The Cleanup Function Debate</h3>
+<p>On March 24, ChenXiaoSong revisited the cleanup question originally raised in his earlier message <a href="https://lore.kernel.org/linux-nfs/a1949f85-2e92-429e-83eb-91a7691b9a9b@chenxiaosong.com/">a1949f85-2e92-429e-83eb-91a7691b9a9b@chenxiaosong.com</a>. David Howells responded, downplaying the distinction between the two functions:</p>
+<blockquote>
+<p>"It doesn't matter exactly, as the only difference really is whether it gets bumped over to a workqueue, but it's probably better to avoid that if we can." — <a href="https://lore.kernel.org/linux-nfs/3597849.1774336571@warthog.procyon.org.uk/">David Howells</a></p>
+</blockquote>
+<p>ChenXiaoSong pushed back with a more detailed technical explanation, clarifying the reference counting semantics:</p>
+<blockquote>
+<p>"<code>netfs_put_request()</code> only decrements the reference count by one, while <code>netfs_put_failed_request()</code> (refcount == 2) immediately frees the request by calling <code>netfs_free_request()</code>." — <a href="https://lore.kernel.org/linux-nfs/c456a6ce-c883-4631-a5c7-5d2255205546@chenxiaosong.com/">ChenXiaoSong</a></p>
+</blockquote>
+<p>He further explained the lifecycle of the request object:</p>
+<blockquote>
+<p>"Since the <code>refcount == 2</code> after <code>netfs_create_write_req() -&gt; netfs_alloc_request()</code>, on the failure path, calling <code>netfs_put_request()</code> will not free the request." — <a href="https://lore.kernel.org/linux-nfs/c456a6ce-c883-4631-a5c7-5d2255205546@chenxiaosong.com/">ChenXiaoSong</a></p>
+</blockquote>
+<h3>Key Technical Arguments</h3>
+<p>The core of the debate centers on reference counting correctness in <code>netfs_writeback_single()</code>:</p>
+<ol>
+<li>
+<p><strong>Howells' Position</strong>: The distinction between <code>netfs_put_request()</code> and <code>netfs_put_failed_request()</code> is minor, affecting only whether cleanup is deferred to a workqueue or performed immediately. He suggests avoiding the workqueue overhead if possible but does not consider it a correctness issue.</p>
+</li>
+<li>
+<p><strong>ChenXiaoSong's Position</strong>: The choice of cleanup function has semantic implications for reference counting. After <code>netfs_create_write_req()</code> calls <code>netfs_alloc_request()</code>, the request object has a reference count of 2. Calling <code>netfs_put_request()</code> (which decrements by one) would leave the request with a refcount of 1, preventing immediate freeing. In contrast, <code>netfs_put_failed_request()</code> is designed to handle the failure case by calling <code>netfs_free_request()</code> directly when the refcount reaches the expected threshold.</p>
+</li>
+</ol>
+<h3>Classification</h3>
+<p>This discussion concerns a <strong>bug fix / correctness issue</strong> within the broader context of a major <code>netfslib</code> refactoring. The changes affect all network filesystems (including NFS) that leverage <code>netfslib</code> for writeback operations.</p>
+<h3>Context: Broader Refactoring Effort</h3>
+<p>It is worth noting that later this week, on March 26, Howells submitted a formal 26-patch series superseding the original RFC. This new series incorporates numerous bug fixes and architectural changes, including the resolution of the FIEMAP controversy and several critical memory management bugs identified during the review process. The cleanup semantics discussed in this thread may have been addressed in that updated patchset, though no explicit confirmation was provided in this week's window.</p>
+<h3>Conclusion</h3>
+<p>This brief exchange highlights the meticulous attention to reference counting required in asynchronous I/O paths. While Howells initially downplayed the distinction between the two cleanup functions, ChenXiaoSong's detailed explanation underscores the importance of correct semantics for preventing memory leaks or premature freeing. NFS client developers should monitor the formal 26-patch submission for how this issue was ultimately resolved, as incorrect cleanup in <code>netfs_writeback_single()</code> could lead to resource leaks or stability issues in production environments.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/3597849.1774336571@warthog.procyon.org.uk/">2026-03-24 David Howells <a href="mailto:dhowells@redhat.com">dhowells@redhat.com</a> — Re: [RFC PATCH 17/17] netfs: Combine prepare and issue ops and grab the buffers on request</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/c456a6ce-c883-4631-a5c7-5d2255205546@chenxiaosong.com/">2026-03-24 ChenXiaoSong <a href="mailto:chenxiaosong@chenxiaosong.com">chenxiaosong@chenxiaosong.com</a> — Re: [RFC PATCH 17/17] netfs: Combine prepare and issue ops and grab the buffers on request</a></li>
+</ul>
+  </main>
+</body>
+</html>

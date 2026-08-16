@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSv4.1 Client Hang in OPEN Reclaim Path Due to Stale StateIDs on Kernel 5.15</title>
+  <meta name="description" content="This week, a new bug report thread was opened by Wei Guo from UCloud regarding an NFSv4.1 client hang observed on Linux kernel 5.15 (Ubuntu 22.04). The discussion is classified as a bug fix investigation — specifically targeting a…">
+  <meta property="og:title" content="NFSv4.1 Client Hang in OPEN Reclaim Path Due to Stale StateIDs on Kernel 5.15">
+  <meta property="og:description" content="This week, a new bug report thread was opened by Wei Guo from UCloud regarding an NFSv4.1 client hang observed on Linux kernel 5.15 (Ubuntu 22.04). The discussion is classified as a bug fix investigation — specifically targeting a…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-03-26T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSv4.1 Client Hang in OPEN Reclaim Path Due to Stale StateIDs on Kernel 5.15">
+  <meta name="twitter:description" content="This week, a new bug report thread was opened by Wei Guo from UCloud regarding an NFSv4.1 client hang observed on Linux kernel 5.15 (Ubuntu 22.04). The discussion is classified as a bug fix investigation — specifically targeting a…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-03-26</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSv4.1 Client Hang in OPEN Reclaim Path Due to Stale StateIDs on Kernel 5.15</h1>
+<h2>Summary</h2>
+<h1>NFSv4.1 Client Hang in OPEN Reclaim Path on Kernel 5.15</h1>
+<h2>Overview</h2>
+<p>This week, a new bug report thread was opened by Wei Guo from UCloud regarding an NFSv4.1 client hang observed on Linux kernel 5.15 (Ubuntu 22.04). The discussion is classified as a <strong>bug fix</strong> investigation — specifically targeting a deadlock-like condition in the NFS client's state recovery path. No replies from maintainers or other developers were received during this window; the thread consists solely of two messages from the reporter.</p>
+<h2>The Problem: Stuck State Manager During OPEN Reclaim</h2>
+<p>The issue manifests when the NFS server returns <code>NFS4ERR_EXPIRED</code>, triggering the client to enter state recovery. However, the reclaim process fails to complete, leaving the state manager thread permanently stuck. The observed kernel stack trace is:</p>
+<pre><code>rpc_wait_bit_killable
+__rpc_wait_for_completion_task
+nfs4_run_open_task
+nfs4_open_recover_helper
+nfs4_open_recover
+nfs4_do_open_expired
+nfs40_open_expired
+__nfs4_reclaim_open_state
+nfs4_reclaim_open_state
+nfs4_do_reclaim
+nfs4_state_manager
+</code></pre>
+<p><a href="https://lore.kernel.org/linux-nfs/538B06AD-0307-4BD4-8E44-16BF6BAD7B4E@ucloud.cn/">As described by the reporter</a>:</p>
+<blockquote>
+<p>"The issue starts when the server returns NFS4ERR_EXPIRED. The client appears to enter recovery, but the reclaim process does not complete."</p>
+</blockquote>
+<p>Key observations from the initial report include:</p>
+<ul>
+<li><strong>~30 million RPC calls</strong> have been issued, yet retransmissions are extremely low (only 94), suggesting the problem is <strong>not caused by network loss or server unresponsiveness</strong>.</li>
+<li>The server continues to return <code>NFS4ERR_EXPIRED</code> throughout.</li>
+<li>IO operations continue but repeatedly fail.</li>
+<li>Network connectivity appears stable and the NFS server shows no signs of restart or failover.</li>
+</ul>
+<h2>Lease Renewal Anomaly in NFSv4.1</h2>
+<p>A particularly notable aspect of this bug is that the client continues to send RENEW/SEQUENCE traffic — which in NFSv4.1 should implicitly renew the lease — yet the client still encounters <code>NFS4ERR_EXPIRED</code>. This raises the question of whether lease renewal is effectively occurring despite the apparent activity.</p>
+<p>The reporter posed three critical questions:</p>
+<blockquote>
+<ol>
+<li>Under what conditions might a client still hit NFS4ERR_EXPIRED despite ongoing SEQUENCE activity and a seemingly healthy server/network?</li>
+<li>Could there be scenarios where RPC completion, session slot handling, or sequence handling prevents the lease from being properly renewed?</li>
+<li>Is this behavior something that has been observed before in the NFSv4.1 recovery or session handling paths, particularly in 5.15?</li>
+</ol>
+</blockquote>
+<h2>Updated Finding: Stale StateIDs and Sequence IDs</h2>
+<p>In a follow-up message <a href="https://lore.kernel.org/linux-nfs/D54322C3-58CA-459A-A195-CE4511225ECB@ucloud.cn/">posted shortly after</a>, the reporter provided additional server-side diagnostics:</p>
+<blockquote>
+<p>"Server-side logs indicate that the client is sending stale stateids / sequence IDs, and the server responds with NFS4ERR_OLD_STATEID."</p>
+<p>"This suggests that the client state may not be properly updated after previous operations."</p>
+</blockquote>
+<p>This finding significantly narrows the root cause hypothesis: the client's internal state tracking (stateids and/or sequence counters) appears to have diverged from the server's view, causing the server to reject reclaim attempts with <code>NFS4ERR_OLD_STATEID</code>. This would explain why the OPEN reclaim loop never completes — each attempt is rejected due to stale state references, and the client remains stuck in <code>rpc_wait_bit_killable</code> waiting for RPC completion that can never succeed.</p>
+<h2>Current Status</h2>
+<p>As of the end of this reporting window, <strong>no responses from NFS maintainers or other developers have been received</strong>. The thread remains open with no proposed patches or workarounds. The reporter also asked:</p>
+<blockquote>
+<p>"If there are any known fixes or relevant patches in newer kernels (e.g., 5.19 or 6.x), we would also be very interested to learn about them."</p>
+</blockquote>
+<p>This question has not yet been addressed.</p>
+<h2>Significance for NFS Client Development</h2>
+<p>This bug report highlights a subtle but serious class of issues in the NFSv4.1 client's state recovery machinery:</p>
+<ol>
+<li><strong>State divergence between client and server</strong>: When the client's cached stateids or sequence IDs become stale, the reclaim path can enter an infinite loop where every OPEN attempt is rejected by the server.</li>
+<li><strong>Lease renewal vs. state consistency</strong>: Even when SEQUENCE operations appear to be flowing normally, underlying state inconsistencies can still cause <code>NFS4ERR_EXPIRED</code> and subsequent recovery failures.</li>
+<li><strong>Kernel version impact</strong>: The issue was reported on kernel 5.15 (an LTS release widely used in production), raising concerns about whether similar bugs exist in other supported kernels or have been addressed in newer versions.</li>
+</ol>
+<p>Further investigation by the NFS maintainer team will be needed to determine whether this is a regression, a latent bug in the reclaim logic, or an interaction with specific server implementations.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/538B06AD-0307-4BD4-8E44-16BF6BAD7B4E@ucloud.cn/">2026-03-25 user <a href="mailto:wei.guo@ucloud.cn">wei.guo@ucloud.cn</a> — [BUG] NFSv4.1 client hang in OPEN reclaim path (rpc_wait_bit_killable) on 5.15</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/D54322C3-58CA-459A-A195-CE4511225ECB@ucloud.cn/">2026-03-25 user <a href="mailto:wei.guo@ucloud.cn">wei.guo@ucloud.cn</a> — Re: [BUG] NFSv4.1 client hang in OPEN reclaim path (rpc_wait_bit_killable) on 5.15</a></li>
+</ul>
+  </main>
+</body>
+</html>

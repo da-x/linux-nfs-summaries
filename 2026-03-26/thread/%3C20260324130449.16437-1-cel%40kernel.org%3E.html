@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>sunrpc: Avoid no-op transport enqueues to improve NFS server performance</title>
+  <meta name="description" content="Chuck Lever submitted a three-patch series this week targeting the SunRPC service thread scheduler, aiming to eliminate wasted work caused by &quot;no-op&quot; transport enqueues. The changes are focused on the NFS server-side RPC transport layer…">
+  <meta property="og:title" content="sunrpc: Avoid no-op transport enqueues to improve NFS server performance">
+  <meta property="og:description" content="Chuck Lever submitted a three-patch series this week targeting the SunRPC service thread scheduler, aiming to eliminate wasted work caused by &quot;no-op&quot; transport enqueues. The changes are focused on the NFS server-side RPC transport layer…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-03-26T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="sunrpc: Avoid no-op transport enqueues to improve NFS server performance">
+  <meta name="twitter:description" content="Chuck Lever submitted a three-patch series this week targeting the SunRPC service thread scheduler, aiming to eliminate wasted work caused by &quot;no-op&quot; transport enqueues. The changes are focused on the NFS server-side RPC transport layer…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-03-26</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>sunrpc: Avoid no-op transport enqueues to improve NFS server performance</h1>
+<h2>Summary</h2>
+<p>Chuck Lever submitted a three-patch series this week targeting the SunRPC service thread scheduler, aiming to eliminate wasted work caused by "no-op" transport enqueues. The changes are focused on the NFS server-side RPC transport layer (<code>net/sunrpc/svc_xprt.c</code>) and represent an optimization effort rather than a bug fix or new feature.</p>
+<h3>Technical Context and Problem Statement</h3>
+<p>The core issue identified by Lever is that <code>svc_xprt_enqueue()</code> is called frequently in scenarios where no actual work can be scheduled, causing the system to execute unnecessary memory barriers, flag reads, and tracepoints.</p>
+<p>In his cover letter <a href="https://lore.kernel.org/linux-nfs/20260324130449.16437-1-cel@kernel.org/">PATCH 0/3</a>, Lever states:</p>
+<blockquote>
+<p>"Reduce the amount of wasted work the svc thread scheduler has to do when no work can be scheduled... I've also measured a slight uptick in IOPS and data throughput as well as a drop in 50th percentile latency for simple workloads on fast storage."</p>
+</blockquote>
+<h3>Patch Breakdown</h3>
+<p><strong>Patch 1: Skip enqueue when no work is pending</strong>
+<a href="https://lore.kernel.org/linux-nfs/20260324130449.16437-2-cel@kernel.org/">PATCH 1/3</a> addresses calls from <code>svc_reserve()</code> and <code>svc_xprt_release_slot()</code>. Lever notes that trace data from a 256KB NFSv3 WRITE workload over RDMA showed:</p>
+<blockquote>
+<p>"11.2 svc_xprt_enqueue() calls per RPC. Of these, 6.9 per RPC lack XPT_DATA and exit svc_xprt_ready() immediately after executing the smp_rmb(), READ_ONCE(), and tracepoint."</p>
+</blockquote>
+<p>The patch introduces a helper <code>svc_xprt_resource_released()</code> that checks for <code>XPT_DATA | XPT_DEFERRED</code> flags before enqueuing. It also upgrades <code>smp_wmb()</code> barriers to <code>smp_mb()</code> to ensure visibility of concurrent flag sets.</p>
+<p><strong>Patch 2: Skip enqueue in svc_xprt_received when idle</strong>
+<a href="https://lore.kernel.org/linux-nfs/20260324130449.16437-3-cel@kernel.org/">PATCH 2/3</a> targets <code>svc_xprt_received()</code>, which unconditionally calls <code>svc_xprt_enqueue()</code> after clearing the <code>XPT_BUSY</code> flag. Lever highlights significant inefficiency here:</p>
+<blockquote>
+<p>"Trace data from a 256KB NFSv3 workload over RDMA shows 85% of svc_xprt_received() invocations reach svc_xprt_enqueue() with no pending work flags."</p>
+</blockquote>
+<p>The patch adds a pre-check for work flags between clearing <code>XPT_BUSY</code> and calling the enqueue function.</p>
+<p><strong>Patch 3: Skip enqueue when transport is busy</strong>
+<a href="https://lore.kernel.org/linux-nfs/20260324130449.16437-4-cel@kernel.org/">PATCH 3/3</a> handles cases where <code>svc_xprt_resource_released()</code> is called while the transport is still marked as <code>BUSY</code> (e.g., during RPC processing when <code>svc_reserve_auth()</code> reduces the reservation counter). Lever notes:</p>
+<blockquote>
+<p>"Trace data from a 256KB NFSv3 WRITE workload over TCP shows this pattern generates roughly 195,000 wasted enqueue calls -- approximately one per RPC -- each paying the full svc_xprt_ready() cost for no benefit."</p>
+</blockquote>
+<p>The patch adds a <code>BUSY</code> check to prevent these redundant enqueues, relying on the fact that the thread holding <code>XPT_BUSY</code> will call <code>svc_xprt_received()</code> upon completion.</p>
+<h3>Community Response</h3>
+<p>Jeff Layton provided rapid review and approval for all three patches on the same day they were submitted:</p>
+<ul>
+<li>For <a href="https://lore.kernel.org/linux-nfs/c2a1a3b3d07a1f773e8f3c5a8ba48d81129ecb14.camel@kernel.org/">PATCH 1/3</a>: "Reviewed-by: Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a>"</li>
+<li>For <a href="https://lore.kernel.org/linux-nfs/2cc13ec847b6366197103c8e5d02a709eeb57dd4.camel@kernel.org/">PATCH 2/3</a>: "Reviewed-by: Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a>"</li>
+<li>For <a href="https://lore.kernel.org/linux-nfs/294ffcf440317af6cc6198196e7687fe0af66c14.camel@kernel.org/">PATCH 3/3</a>: "Reviewed-by: Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a>"</li>
+</ul>
+<h3>Conclusion</h3>
+<p>This series represents a targeted performance optimization for the NFS server's RPC transport layer. By avoiding unnecessary enqueue operations when no work is pending, when the transport is idle, or when it is busy, the patches reduce CPU overhead and improve latency metrics. With Jeff Layton's reviews, the series is well-positioned for inclusion in the mainline kernel.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260324130449.16437-1-cel@kernel.org/">2026-03-24 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 0/3] Avoid no-op transport enqueues</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260324130449.16437-3-cel@kernel.org/">2026-03-24 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 2/3] sunrpc: skip svc_xprt_enqueue in svc_xprt_received when idle</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260324130449.16437-2-cel@kernel.org/">2026-03-24 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 1/3] sunrpc: skip svc_xprt_enqueue when no work is pending</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260324130449.16437-4-cel@kernel.org/">2026-03-24 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 3/3] sunrpc: skip svc_xprt_enqueue when transport is busy</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/c2a1a3b3d07a1f773e8f3c5a8ba48d81129ecb14.camel@kernel.org/">2026-03-24 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 1/3] sunrpc: skip svc_xprt_enqueue when no work is pending</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/2cc13ec847b6366197103c8e5d02a709eeb57dd4.camel@kernel.org/">2026-03-24 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 2/3] sunrpc: skip svc_xprt_enqueue in svc_xprt_received when idle</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/294ffcf440317af6cc6198196e7687fe0af66c14.camel@kernel.org/">2026-03-24 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 3/3] sunrpc: skip svc_xprt_enqueue when transport is busy</a></li>
+</ul>
+  </main>
+</body>
+</html>

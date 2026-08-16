@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Making NFS Writeback Waits Killable to Prevent Unkillable D-State Processes</title>
+  <meta name="description" content="Type: Bug fix / Kernel infrastructure change (generic writeback path with NFS-specific implications)">
+  <meta property="og:title" content="Making NFS Writeback Waits Killable to Prevent Unkillable D-State Processes">
+  <meta property="og:description" content="Type: Bug fix / Kernel infrastructure change (generic writeback path with NFS-specific implications)">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-03-26T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Making NFS Writeback Waits Killable to Prevent Unkillable D-State Processes">
+  <meta name="twitter:description" content="Type: Bug fix / Kernel infrastructure change (generic writeback path with NFS-specific implications)">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-03-26</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Making NFS Writeback Waits Killable to Prevent Unkillable D-State Processes</h1>
+<h2>Summary</h2>
+<h1>Making NFS Writeback Waits Killable: A Critical Fix for Unkillable D-State Processes</h1>
+<p><strong>Type:</strong> Bug fix / Kernel infrastructure change (generic writeback path with NFS-specific implications)</p>
+<h2>Overview</h2>
+<p>This week saw an important RFC discussion on a long-standing problem in the Linux NFS client: processes with dirty NFS pages becoming stuck in uninterruptible sleep (D-state) when their jobs are cancelled, effectively requiring a node reboot to recover. Rushil Patel of GSA Capital proposed a fix that touches the generic mm/filemap writeback path, and received detailed feedback from Matthew Wilcox, the maintainer of the page cache subsystem.</p>
+<h2>The Problem</h2>
+<p>Rushil Patel described a production issue encountered on Slurm compute nodes using NFSv4.1 mounts to NetApp filers:</p>
+<blockquote>
+<p>"When a job is cancelled, processes with dirty NFS pages get stuck in D-state inside folio_wait_bit_common() because __filemap_fdatawait_range() uses folio_wait_writeback(), which is TASK_UNINTERRUPTIBLE. If the filer is slow to respond these processes are unkillable - we've found the only recovery in practice is rebooting the node."</p>
+</blockquote>
+<p>The root cause is that <code>__filemap_fdatawait_range()</code> waits for writeback completion using <code>folio_wait_writeback()</code>, which operates with <code>TASK_UNINTERRUPTIBLE</code> sleep state. This means SIGKILL cannot interrupt the wait, leaving processes permanently stuck if the NFS server is slow or unresponsive.</p>
+<h2>The Proposed Fix</h2>
+<p>Patel's RFC patch proposes two key changes:</p>
+<ol>
+<li>
+<p><strong>Switch to killable waits:</strong> Replace <code>folio_wait_writeback()</code> with <code>folio_wait_writeback_killable()</code> in <code>__filemap_fdatawait_range()</code>, allowing SIGKILL to interrupt the wait. Writeback continues on the server side; the client simply stops waiting for the acknowledgement.</p>
+</li>
+<li>
+<p><strong>Handle re-entry during process exit:</strong> A critical subtlety arises when a killed process re-enters the writeback path during <code>do_exit()</code>. Patel identified a five-step failure scenario:</p>
+<blockquote>
+<p>"1. SIGKILL wakes the killable wait, signal is consumed by get_signal()"<br />
+"2. do_exit() -&gt; exit_signals() sets PF_EXITING"<br />
+"3. do_exit() -&gt; exit_files() -&gt; nfs4_file_flush() -&gt; nfs_wb_all() re-enters __filemap_fdatawait_range()"<br />
+"4. wants_signal() checks PF_EXITING <em>before</em> the SIGKILL special case (kernel/signal.c:951 vs 954), so it returns false"<br />
+"5. No signal can wake the second wait -&gt; stuck in D-state again"</p>
+</blockquote>
+</li>
+</ol>
+<p>To address this, Patel added a <code>PF_EXITING</code> check to avoid re-entering the wait entirely, citing precedent in <code>mm/oom_kill.c</code>, <code>mm/memcontrol.c</code>, <code>block/blk-ioc.c</code>, and <code>io_uring/</code>.</p>
+<h2>Matthew Wilcox's Feedback</h2>
+<p>Matthew Wilcox expressed strong sympathy for the problem, noting it was similar to one he encountered when introducing the <code>TASK_KILLABLE</code> infrastructure in 2007:</p>
+<blockquote>
+<p>"It was something similar which led to me introducing the TASK_KILLABLE infrastructure back in 2007. My problem was read-only though, and while I had an initial attempt to also handle write workloads, it didn't work and I didn't have a personal need for it, so I abandoned it. Now you have a real need, so let's make it work."</p>
+</blockquote>
+<p>However, Wilcox raised concerns about the placement of the <code>PF_EXITING</code> check:</p>
+<blockquote>
+<p>"I'm not entirely comfortable with the location of the check. I feel that __filemap_fdatawait_range() is a bit too low level for a check of PF_EXITING. I could see there being other places which really do want to wait, even in the presence of an exiting task."</p>
+</blockquote>
+<p>Wilcox suggested an alternative approach: suppressing the call from <code>nfs_wb_all()</code> itself by using <code>filemap_fdatawrite()</code> (which initiates writeback without waiting) instead of <code>filemap_write_and_wait()</code> when the process is exiting:</p>
+<pre><code class="language-c">-	ret = filemap_write_and_wait(inode-&gt;i_mapping);
++	if (current-&gt;flags &amp; PF_EXITING)
++		ret = filemap_fdatawrite(inode-&gt;i_mapping);
++	else
++		ret = filemap_write_and_wait(inode-&gt;i_mapping);
+</code></pre>
+<p>Wilcox also noted a concern about the subsequent <code>nfs_commit_inode(inode, FLUSH_SYNC)</code> call in <code>nfs_wb_all()</code>, which he inferred would also wait for the server. However, he acknowledged that Patel's testing showed the approach works:</p>
+<blockquote>
+<p>"but if your testing shows that it works, I must be mistaken about that."</p>
+</blockquote>
+<h2>Key Technical Considerations</h2>
+<ul>
+<li>
+<p><strong>Error reporting:</strong> Patel argued that all six callers of <code>__filemap_fdatawait_range()</code> detect errors independently via <code>errseq_t</code> / <code>filemap_check_errors()</code>, so the early return doesn't suppress error reporting. Wilcox was cautious: "I'm not entirely sure it doesn't suppress error reporting. But I think I see what you're trying to say, and I think the change of behaviour is one that was never guaranteed anyway."</p>
+</li>
+<li>
+<p><strong>NFS consistency model:</strong> Wilcox noted that NFS has a close-to-open consistency model and other filesystems don't perform this flush-on-close behavior. He concluded:</p>
+</li>
+</ul>
+<blockquote>
+<p>"I believe we can break this guarantee in this case as it's not an orderly close but an involuntary termination of the process."</p>
+</blockquote>
+<h2>Current Status</h2>
+<p>The discussion remains at the RFC stage. Wilcox added NFS maintainers to the thread for their opinions, and Patel demonstrated flexibility on the approach, having considered alternatives but seeking guidance on whether modifying <code>mm/filemap.c</code> was the right place for the fix or if a different approach would be preferred. The patch was tested with <code>iptables DROP</code> on port 2049 to simulate server unresponsiveness, confirming that the killable-only revision still gets stuck on re-entry while the <code>PF_EXITING</code> + killable combination allows clean termination.</p>
+<h2>Significance for NFS Client Development</h2>
+<p>This fix addresses a critical operational issue where NFS client nodes become effectively bricked when jobs are cancelled during active writeback to an unresponsive server. The ability to cleanly kill such processes without rebooting has significant implications for HPC environments using Slurm and similar job schedulers with NFS-backed storage.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/acQ0YRLM_SxYfjfI@casper.infradead.org/">2026-03-25 Matthew Wilcox <a href="mailto:willy@infradead.org">willy@infradead.org</a> — Re: [RFC PATCH 0/1] mm/filemap: make writeback wait killable in __filemap_fdatawait_range()</a></li>
+</ul>
+  </main>
+</body>
+</html>

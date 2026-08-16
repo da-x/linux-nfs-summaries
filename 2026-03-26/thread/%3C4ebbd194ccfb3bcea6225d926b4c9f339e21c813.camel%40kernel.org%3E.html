@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Benchmarking nfsd IOModes: DONTCACHE_LAZY Proposal and Testing Critique</title>
+  <meta name="description" content="This week, Jeff Layton published a detailed benchmarking analysis of the new NFS server (nfsd) input/output modes (iomodes), highlighting significant performance issues with the existing RWF_DONTCACHE implementation for streaming write…">
+  <meta property="og:title" content="Benchmarking nfsd IOModes: DONTCACHE_LAZY Proposal and Testing Critique">
+  <meta property="og:description" content="This week, Jeff Layton published a detailed benchmarking analysis of the new NFS server (nfsd) input/output modes (iomodes), highlighting significant performance issues with the existing RWF_DONTCACHE implementation for streaming write…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-03-26T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Benchmarking nfsd IOModes: DONTCACHE_LAZY Proposal and Testing Critique">
+  <meta name="twitter:description" content="This week, Jeff Layton published a detailed benchmarking analysis of the new NFS server (nfsd) input/output modes (iomodes), highlighting significant performance issues with the existing RWF_DONTCACHE implementation for streaming write…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-03-26</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Benchmarking nfsd IOModes: DONTCACHE_LAZY Proposal and Testing Critique</h1>
+<h2>Summary</h2>
+<h1>Benchmarking nfsd IOModes: DONTCACHE_LAZY Proposal and Testing Critique</h1>
+<p>This week, Jeff Layton published a detailed benchmarking analysis of the new NFS server (<code>nfsd</code>) input/output modes (iomodes), highlighting significant performance issues with the existing <code>RWF_DONTCACHE</code> implementation for streaming write workloads. In response, he proposed an experimental optimization called <code>DONTCACHE_LAZY</code>. The discussion attracted commentary from Chuck Lever and Mike Snitzer, who questioned both the AI-assisted analysis and the validity of the benchmarking methodology relative to high-performance server environments.</p>
+<h2>Key Technical Arguments</h2>
+<h3>Performance Collapse with RWF_DONTCACHE</h3>
+<p>Jeff Layton reported that <code>RWF_DONTCACHE</code> performs "absolutely terrible" for streaming write workloads. The core issue identified is severe serialization under concurrent writers:</p>
+<blockquote>
+<p>"IOCB_DONTCACHE flushes all dirty pages on every write via filemap_flush_range() with nr_to_write=LONG_MAX. Under concurrent writers, this creates severe serialization: every writer contends on the writeback submission path, leading to catastrophic throughput collapse (~1 GB/s vs ~10 GB/s for buffered) and multi-second tail latency." <a href="https://lore.kernel.org/linux-nfs/4ebbd194ccfb3bcea6225d926b4c9f339e21c813.camel@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<h3>Proposal: DONTCACHE_LAZY</h3>
+<p>To address this, Layton introduced an experimental patch adding <code>IOCB_DONTCACHE_LAZY</code> (and the user-visible <code>RWF_DONTCACHE_LAZY</code>). This mode employs two mechanisms to mitigate contention while maintaining dropbehind semantics:</p>
+<ol>
+<li><strong>Skip-if-busy:</strong> Checks if writeback is already in progress (<code>mapping_tagged(PAGECACHE_TAG_WRITEBACK)</code>). If so, the flush is skipped entirely.</li>
+<li><strong>Proportional cap:</strong> Caps <code>nr_to_write</code> to the number of pages just written, preventing full-file flushes that starve concurrent readers.</li>
+</ol>
+<p>Layton noted that while this experimental mode outperforms others in his tests, the long-term goal is likely to merge these optimizations into the standard <code>DONTCACHE</code> mode rather than maintaining a separate iomode indefinitely:</p>
+<blockquote>
+<p>"I doubt we'll want a new iomode long-term. What we'll probably want to do is modify DONTCACHE to work like DONTCACHE_LAZY." <a href="https://lore.kernel.org/linux-nfs/4ebbd194ccfb3bcea6225d926b4c9f339e21c813.camel@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<h3>Critique of AI Analysis and Splice Reads</h3>
+<p>Chuck Lever questioned an assertion in the accompanying AI-generated analysis (by "Claude") that suggested disabling splice reads was beneficial. Lever stated:</p>
+<blockquote>
+<p>"My own benchmarking in that area has shown that splice read is always a win over not using splice." <a href="https://lore.kernel.org/linux-nfs/d453add6-ed23-4d61-af95-d80133b0e456@oracle.com/">Chuck Lever</a></p>
+</blockquote>
+<p>Layton quickly corrected this, admitting it was an error in the AI's writeup:</p>
+<blockquote>
+<p>"Good catch. That turns out to be a mistake in Claude's writeup... I (and it) have no idea why it would recommend disabling them, when the testing all left them enabled for buffered reads." <a href="https://lore.kernel.org/linux-nfs/33582a86daf135336f6bc0d5260d8de0501abadd.camel@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<p>Mike Snitzer clarified that the confusion likely stemmed from the mutual exclusion between <code>splice_read</code> and both <code>NFSD_IO_DONTCACHE</code> and <code>NFSD_IO_DIRECT</code>, meaning splice reads are implicitly disabled when testing these modes.</p>
+<h3>Critique of Benchmarking Methodology</h3>
+<p>Mike Snitzer raised significant concerns about whether Layton's tests were sufficient to expose the Memory Management (MM) bottlenecks that differentiate buffered IO from O_DIRECT in high-performance scenarios. He contrasted Layton's results with Jon Flynn's earlier testing, which achieved 72 GB/s using RDMA and multiple NVMe drives:</p>
+<blockquote>
+<p>"Your bandwidth for 1MB sequential IO of 793 MB/s for O_DIRECT and 4,952 MB/s for buffered and dontcache is considerably less than the 72 GB/s offered in Jon's testbed. Your testing isn't exposing the bottlenecks (contention) of the MM subsystem for buffered IO... not yet put my finger on <em>why</em> that is." <a href="https://lore.kernel.org/linux-nfs/acWbrlvt_dUB9X3R@kernel.org/">Mike Snitzer</a></p>
+</blockquote>
+<p>Snitzer argued that because the tests did not saturate the backend storage or trigger severe MM contention, the comparison with O_DIRECT was not fully representative of high-end server capabilities. However, he conceded on the core issue:</p>
+<blockquote>
+<p>"Putting that aside, yes DONTCACHE as-is really isn't helpful.. your lazy variant seems much more useful." <a href="https://lore.kernel.org/linux-nfs/acWbrlvt_dUB9X3R@kernel.org/">Mike Snitzer</a></p>
+</blockquote>
+<h2>Evolution and Conclusions</h2>
+<p>The discussion evolved from a performance report into a critique of both the benchmarking scale and the reliability of AI-assisted analysis in kernel development.</p>
+<ol>
+<li><strong>Bug Fix/Optimization Focus:</strong> The thread confirms that <code>RWF_DONTCACHE</code> has serious scalability issues for concurrent streaming writes due to aggressive flushing behavior.</li>
+<li><strong>Proposed Solution:</strong> The <code>DONTCACHE_LAZY</code> approach, which rate-limits writeback and skips flushes when writeback is already active, is viewed as a promising direction. Layton intends to eventually merge these behaviors into the standard <code>DONTCACHE</code> implementation.</li>
+<li><strong>Testing Standards:</strong> Snitzer's comments highlight the need for benchmarking that can drive enough load to expose MM subsystem bottlenecks, particularly when comparing buffered IO variants against O_DIRECT in high-throughput NFS server environments.</li>
+</ol>
+<p>The consensus is that while the current <code>DONTCACHE</code> implementation requires improvement, the lazy variant represents a meaningful step forward for NFS client and server performance in streaming write scenarios.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/4ebbd194ccfb3bcea6225d926b4c9f339e21c813.camel@kernel.org/">2026-03-26 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — A comparison of the new nfsd iomodes (and an experimental one)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/d453add6-ed23-4d61-af95-d80133b0e456@oracle.com/">2026-03-26 Chuck Lever <a href="mailto:chuck.lever@oracle.com">chuck.lever@oracle.com</a> — Re: A comparison of the new nfsd iomodes (and an experimental one)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/33582a86daf135336f6bc0d5260d8de0501abadd.camel@kernel.org/">2026-03-26 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: A comparison of the new nfsd iomodes (and an experimental one)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/acWbrlvt_dUB9X3R@kernel.org/">2026-03-26 Mike Snitzer <a href="mailto:snitzer@kernel.org">snitzer@kernel.org</a> — Re: A comparison of the new nfsd iomodes (and an experimental one)</a></li>
+</ul>
+  </main>
+</body>
+</html>

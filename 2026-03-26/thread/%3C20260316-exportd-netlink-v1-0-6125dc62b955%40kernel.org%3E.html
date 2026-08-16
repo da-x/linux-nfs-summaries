@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Netlink upcall review: dump continuation bug, YAML policy masks, and dead code cleanup</title>
+  <meta name="description" content="This discussion is part of an ongoing new feature / protocol interface change effort to replace /proc-based cache upcalls with generic netlink interfaces in the NFS server (nfsd) and SunRPC subsystem. The three messages this week focus on…">
+  <meta property="og:title" content="Netlink upcall review: dump continuation bug, YAML policy masks, and dead code cleanup">
+  <meta property="og:description" content="This discussion is part of an ongoing new feature / protocol interface change effort to replace /proc-based cache upcalls with generic netlink interfaces in the NFS server (nfsd) and SunRPC subsystem. The three messages this week focus on…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-03-26T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Netlink upcall review: dump continuation bug, YAML policy masks, and dead code cleanup">
+  <meta name="twitter:description" content="This discussion is part of an ongoing new feature / protocol interface change effort to replace /proc-based cache upcalls with generic netlink interfaces in the NFS server (nfsd) and SunRPC subsystem. The three messages this week focus on…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-03-26</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Netlink upcall review: dump continuation bug, YAML policy masks, and dead code cleanup</h1>
+<h2>Summary</h2>
+<h1>Netlink Upcalls for mountd/exportd — Review Continues on Dump Bugs and Protocol Design</h1>
+<h2>Classification</h2>
+<p>This discussion is part of an ongoing <strong>new feature / protocol interface change</strong> effort to replace <code>/proc</code>-based cache upcalls with generic netlink interfaces in the NFS server (<code>nfsd</code>) and SunRPC subsystem. The three messages this week focus on detailed code review of patches 09/14 and 10/14 from Jeff Layton's v1 series, identifying a potential infinite-loop bug and several protocol design concerns.</p>
+<h2>Context</h2>
+<p>Last week (ending 2026-03-19), Chuck Lever initiated a thorough review of the 14-patch v1 series, raising concerns about TOCTOU races in cache snapshotting and spurious notifications. On March 25, Jeff Layton submitted <a href="https://lore.kernel.org/linux-nfs/20260325-exportd-netlink-v2-0-067df016ea95@kernel.org/">v2 of the series</a>, addressing those concerns including proper netlink dump continuation support. However, Chuck Lever's review messages this week were still referencing the v1 patches against his <code>nfsd-testing</code> branch, and Jeff Layton's responses on March 23 confirmed he was working on incorporating the feedback.</p>
+<h2>Key Technical Arguments This Week</h2>
+<h3>1. Infinite Retry Bug in GID Cache Dump Handler</h3>
+<p>On March 20, Chuck Lever identified a critical bug in Patch 09/14 (the <code>auth.unix.gid</code> cache netlink upcall):</p>
+<blockquote>
+<p>"sunrpc_nl_unix_gid_get_reqs_dumpit() packs its reply entries into a single netlink message. The default SKB size is ~8 KiB, and each entry encodes to ~24 bytes, so the buffer fills at roughly 340 entries. When nla_put fails, the function returns -ENOBUFS but never sets <code>cb-&gt;args[0] = 1;</code> causing the netlink subsystem to retry indefinitely. A big NFS server can easily exceed 340 pending GID cache entries." — <a href="https://lore.kernel.org/linux-nfs/47cd2355-04b1-4719-8d91-421d2a9fbcd3@oracle.com/">Chuck Lever</a></p>
+</blockquote>
+<p>He proposed implementing proper netlink dump continuation:</p>
+<blockquote>
+<p>"Should we implement proper netlink dump continuation: snapshot once then emit entries across multiple dumpit calls using a cursor in cb-&gt;args?" — <a href="https://lore.kernel.org/linux-nfs/47cd2355-04b1-4719-8d91-421d2a9fbcd3@oracle.com/">Chuck Lever</a></p>
+</blockquote>
+<p>This is a significant reliability concern for production NFS servers with large GID caches. The v2 series (submitted March 25) addressed this by implementing proper dump continuation support in all downcalls, as noted in the v2 cover letter.</p>
+<h3>2. Dead Code and Deferred Attribute Sets</h3>
+<p>In his review of Patch 10/14 (the <code>svc_export</code> netlink spec), Chuck Lever noted that he was able to apply only through this patch cleanly to <code>nfsd-testing</code>:</p>
+<blockquote>
+<p>"This is the last patch in this series that applied cleanly to the current nfsd-testing branch, so I'm stopping with this one." — <a href="https://lore.kernel.org/linux-nfs/9f91bda8-b39f-4bc1-a53d-dffb63ca47ed@oracle.com/">Chuck Lever</a></p>
+</blockquote>
+<p>He flagged two pieces of dead code introduced in this patch:</p>
+<blockquote>
+<p>"The svc-export-req attribute set isn't used in this patch; perhaps its introduction should be deferred to a patch where it is used. NFSD_CMD_CACHE_NOTIFY looks like the same: dead code for now." — <a href="https://lore.kernel.org/linux-nfs/9f91bda8-b39f-4bc1-a53d-dffb63ca47ed@oracle.com/">Chuck Lever</a></p>
+</blockquote>
+<p>Jeff Layton agreed on March 23:</p>
+<blockquote>
+<p>"Ok. I'll see about moving those bits." — <a href="https://lore.kernel.org/linux-nfs/f5d48ab675f4cf41df18c66d1e94d7d709d119a1.camel@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<h3>3. Raw Hex Masks in NLA Policy Definitions</h3>
+<p>Chuck Lever raised a maintainability concern about the netlink attribute policy masks:</p>
+<blockquote>
+<p>"0x3ffff and 0x7 in the NLA policy masks correspond to NFSEXP_ALLFLAGS and NFSEXP_XPRTSEC_ALL from include/uapi/linux/nfsd/export.h, but the policy uses raw hex. Adding a new export flag requires updating three independent locations with no compile-time check. Using the named constants directly in the policy would make the link more explicit." — <a href="https://lore.kernel.org/linux-nfs/9f91bda8-b39f-4bc1-a53d-dffb63ca47ed@oracle.com/">Chuck Lever</a></p>
+</blockquote>
+<p>Jeff Layton explained that these values are auto-generated by the <code>ynl</code> (Yet Another Netlink) code generation tool from the YAML specification:</p>
+<blockquote>
+<p>"These are generated by ynl from the provided flags in the spec. I'm not sure there is much we can do here. ynl just has no idea that those constants exist. All it cares about is filtering out flags that it doesn't understand." — <a href="https://lore.kernel.org/linux-nfs/f5d48ab675f4cf41df18c66d1e94d7d709d119a1.camel@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<p>He acknowledged the concern remains valid:</p>
+<blockquote>
+<p>"Ease of adding new flags is a valid concern though. That's one of the main reasons for doing this. I'll think about this some more." — <a href="https://lore.kernel.org/linux-nfs/f5d48ab675f4cf41df18c66d1e94d7d709d119a1.camel@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<p>This tension between code generation automation and maintainability is a recurring theme in netlink protocol development.</p>
+<h3>4. Request for Netlink Protocol Expert Review</h3>
+<p>Chuck Lever recommended expanding the reviewer base:</p>
+<blockquote>
+<p>"Recommend you add Jakub to the cc: for the series for closer human inspection of the YAML / netlink protocol aspects." — <a href="https://lore.kernel.org/linux-nfs/9f91bda8-b39f-4bc1-a53d-dffb63ca47ed@oracle.com/">Chuck Lever</a></p>
+</blockquote>
+<p>Jeff Layton confirmed he would do so in the next posting:</p>
+<blockquote>
+<p>"I'll do that on the next posting." — <a href="https://lore.kernel.org/linux-nfs/f5d48ab675f4cf41df18c66d1e94d7d709d119a1.camel@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<h2>Evolution and Conclusions</h2>
+<p>This week's discussion represents the middle phase of a multi-week review process. The key outcomes are:</p>
+<ol>
+<li>
+<p><strong>Bug identified and fixed</strong>: The infinite retry bug in the GID cache dump handler was identified by Chuck Lever and subsequently addressed in the v2 series through proper netlink dump continuation support.</p>
+</li>
+<li>
+<p><strong>Dead code cleanup agreed upon</strong>: Both parties agreed that unused attribute sets and commands should be deferred to patches where they are actually used, improving patch clarity.</p>
+</li>
+<li>
+<p><strong>Policy mask maintainability remains open</strong>: The tension between auto-generated code and explicit constant references has no immediate resolution; Jeff Layton indicated he would continue thinking about the problem.</p>
+</li>
+<li>
+<p><strong>Reviewer expansion planned</strong>: Jakub Kicinski (netlink subsystem maintainer) will be added to the CC list for future postings to ensure proper protocol-level scrutiny.</p>
+</li>
+</ol>
+<p>Jeff Layton concluded:</p>
+<blockquote>
+<p>"Thanks for all the review so far! I'm working on addressing your other comments too." — <a href="https://lore.kernel.org/linux-nfs/f5d48ab675f4cf41df18c66d1e94d7d709d119a1.camel@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<p>The v2 series, submitted March 25, incorporated several of these fixes including proper dump continuation and reduced <code>genlmsg_new</code> sizes for notify requests. The discussion is ongoing as the series awaits broader review from netlink protocol experts.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/47cd2355-04b1-4719-8d91-421d2a9fbcd3@oracle.com/">2026-03-20 Chuck Lever <a href="mailto:chuck.lever@oracle.com">chuck.lever@oracle.com</a> — Re: [PATCH 09/14] sunrpc: add netlink upcall for the auth.unix.gid cache</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/9f91bda8-b39f-4bc1-a53d-dffb63ca47ed@oracle.com/">2026-03-20 Chuck Lever <a href="mailto:chuck.lever@oracle.com">chuck.lever@oracle.com</a> — Re: [PATCH 10/14] nfsd: add new netlink spec for svc_export upcall</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/f5d48ab675f4cf41df18c66d1e94d7d709d119a1.camel@kernel.org/">2026-03-23 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 10/14] nfsd: add new netlink spec for svc_export upcall</a></li>
+</ul>
+  </main>
+</body>
+</html>
