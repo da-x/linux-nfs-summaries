@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Netlink upcalls for mountd/exportd caches</title>
+  <meta name="description" content="This week, Jeff Layton introduced a 14-patch series replacing the antiquated /proc-based interfaces used by mountd and exportd for sunrpc cache upcalls with a new generic netlink interface. The series affects both the sunrpc module (for…">
+  <meta property="og:title" content="Netlink upcalls for mountd/exportd caches">
+  <meta property="og:description" content="This week, Jeff Layton introduced a 14-patch series replacing the antiquated /proc-based interfaces used by mountd and exportd for sunrpc cache upcalls with a new generic netlink interface. The series affects both the sunrpc module (for…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-03-19T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Netlink upcalls for mountd/exportd caches">
+  <meta name="twitter:description" content="This week, Jeff Layton introduced a 14-patch series replacing the antiquated /proc-based interfaces used by mountd and exportd for sunrpc cache upcalls with a new generic netlink interface. The series affects both the sunrpc module (for…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-03-19</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Netlink upcalls for mountd/exportd caches</h1>
+<h2>Summary</h2>
+<h2>Netlink-Based Upcalls for NFS Daemon Caches</h2>
+<p>This week, Jeff Layton introduced a 14-patch series <a href="https://lore.kernel.org/linux-nfs/20260316-exportd-netlink-v1-0-6125dc62b955@kernel.org/">replacing the antiquated /proc-based interfaces</a> used by <code>mountd</code> and <code>exportd</code> for sunrpc cache upcalls with a new generic netlink interface. The series affects both the <code>sunrpc</code> module (for <code>auth.unix.ip</code> and <code>auth.unix.gid</code> caches) and <code>nfsd</code> (for <code>svc_export</code> and <code>nfsd.fh</code> caches).</p>
+<h3>Technical Overview</h3>
+<p>The core design adds a <code>cache_notify</code> callback to <code>struct cache_detail</code>. When a cache miss occurs, the kernel sends a netlink multicast notification to userspace. Userspace then fetches the outstanding <code>cache_request</code> entries via a dumpit handler and responds with the resolved data over netlink. The series also introduces <code>SUNRPC_CMD_CACHE_FLUSH</code> and <code>NFSD_CMD_CACHE_FLUSH</code> commands to allow userspace to flush caches without writing to <code>/proc</code>.</p>
+<h3>Review Discussion</h3>
+<p>Chuck Lever provided detailed review comments on March 19, focusing on concurrency semantics and code organization.</p>
+<h4>TOCTOU Race in Cache Snapshotting</h4>
+<p>Chuck identified a potential Time-Of-Check-Time-Of-Use (TOCTOU) issue in the helper functions added to count and snapshot pending requests:</p>
+<blockquote>
+<p>"This API architecture introduces a TOCTOU, since as soon as the queue_lock is dropped, the count can immediately become stale." <a href="https://lore.kernel.org/linux-nfs/0908b7ac-658f-491b-89be-f5a1d97e991e@oracle.com/">Chuck Lever</a></p>
+</blockquote>
+<p>He noted that the dumpit handlers perform a one-shot snapshot: they count requests, allocate buffers, and then snapshot. If new requests are added between these steps, they are silently truncated. Since the handlers signal completion after a single pass, these entries would be lost.</p>
+<p>Jeff Layton clarified that this is not a data loss issue in practice because userspace receives an independent netlink notification for each queued request:</p>
+<blockquote>
+<p>"Userland will receive a separate notify request whenever a cache_request is queued... select() will return the notify descriptor again on the next pass and mountd will pick up the remaining entries at that point." <a href="https://lore.kernel.org/linux-nfs/579b0239abbbb0b95d619e6b400bb919fedab60d.camel@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<p>Chuck accepted this explanation but recommended documenting the expected retry behavior in the code:</p>
+<blockquote>
+<p>"Makes sense. But perhaps should be documented somewhere; the 'retry' loop is not obvious from the source code introduced here." <a href="https://lore.kernel.org/linux-nfs/163efbf2-5e1a-4dde-b6c8-787c9b68e878@oracle.com/">Chuck Lever</a></p>
+</blockquote>
+<h4>Spurious Notifications</h4>
+<p>On Patch 05, Chuck pointed out that <code>cache_notify</code> is called even when the upcall fails with <code>-EAGAIN</code>, indicating another thread already cleared the <code>CACHE_PENDING</code> bit. This results in a notification for an entry that is no longer pending:</p>
+<blockquote>
+<p>"Calling cache_notify in this case sends a netlink notification for an entry that is no longer pending... a possible fix might be: <code>if (ret != -EAGAIN &amp;&amp; detail-&gt;cache_notify)</code>" <a href="https://lore.kernel.org/linux-nfs/da7312d0-b31b-4a62-afbc-ce0e656c5134@oracle.com/">Chuck Lever</a></p>
+</blockquote>
+<h4>Code Organization and Unrelated Hunks</h4>
+<p>Chuck raised minor concerns about premature includes in Patch 05 and the placement of <code>sunrpc_cache_notify()</code> in Patch 07. More significantly, he noticed an unrelated hunk in <code>fs/nfsd/netlink.c</code> within Patch 07:</p>
+<blockquote>
+<p>"This hunk is clearly not related to adding 'a generic netlink family for cache upcalls'. Should I apply it instead to the appropriate FH-signing patch?" <a href="https://lore.kernel.org/linux-nfs/0fb26335-058a-464f-ab9f-c109658d4358@oracle.com/">Chuck Lever</a></p>
+</blockquote>
+<p>Jeff attributed the change to an update in the <code>ynl</code> code generation tool, but Chuck confirmed the tool had not changed. He traced the anomaly to a previous patch ("NFSD: Add a key for signing filehandles") and applied the fix separately to his <code>nfsd-testing</code> branch:</p>
+<blockquote>
+<p>"I think 'NFSD: Add a key for signing filehandles' introduced this anomaly, so I've gone back to that patch and re-ran the tool... I applied it and pushed it to nfsd-testing." <a href="https://lore.kernel.org/linux-nfs/42fa1201-eb78-41c2-b059-d34df26483ff@oracle.com/">Chuck Lever</a></p>
+</blockquote>
+<h3>Conclusion</h3>
+<p>The series represents a significant modernization of the NFS server's user-space communication interfaces, removing dependencies on <code>/proc</code> and enabling easier extension for new export options. The review highlighted important concurrency considerations in the snapshotting mechanism, which were resolved through an explanation of the userspace retry protocol. Minor code organization issues and an unrelated hunk were addressed separately by the maintainer.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260316-exportd-netlink-v1-0-6125dc62b955@kernel.org/">2026-03-16 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 00/14] nfsd/sunrpc: add support for netlink upcalls for mountd/exportd</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260316-exportd-netlink-v1-1-6125dc62b955@kernel.org/">2026-03-16 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 01/14] nfsd: move struct nfsd_genl_rqstp to nfsctl.c</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260316-exportd-netlink-v1-2-6125dc62b955@kernel.org/">2026-03-16 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 02/14] sunrpc: rename sunrpc_cache_pipe_upcall() to sunrpc_cache_upcall()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260316-exportd-netlink-v1-3-6125dc62b955@kernel.org/">2026-03-16 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 03/14] sunrpc: rename sunrpc_cache_pipe_upcall_timeout()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260316-exportd-netlink-v1-4-6125dc62b955@kernel.org/">2026-03-16 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 04/14] sunrpc: rename cache_pipe_upcall() to cache_do_upcall()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260316-exportd-netlink-v1-5-6125dc62b955@kernel.org/">2026-03-16 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 05/14] sunrpc: add a cache_notify callback</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260316-exportd-netlink-v1-6-6125dc62b955@kernel.org/">2026-03-16 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 06/14] sunrpc: add helpers to count and snapshot pending cache requests</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260316-exportd-netlink-v1-7-6125dc62b955@kernel.org/">2026-03-16 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 07/14] sunrpc: add a generic netlink family for cache upcalls</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260316-exportd-netlink-v1-8-6125dc62b955@kernel.org/">2026-03-16 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 08/14] sunrpc: add netlink upcall for the auth.unix.ip cache</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260316-exportd-netlink-v1-9-6125dc62b955@kernel.org/">2026-03-16 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 09/14] sunrpc: add netlink upcall for the auth.unix.gid cache</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260316-exportd-netlink-v1-10-6125dc62b955@kernel.org/">2026-03-16 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 10/14] nfsd: add new netlink spec for svc_export upcall</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260316-exportd-netlink-v1-11-6125dc62b955@kernel.org/">2026-03-16 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 11/14] nfsd: add netlink upcall for the svc_export cache</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260316-exportd-netlink-v1-12-6125dc62b955@kernel.org/">2026-03-16 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 12/14] nfsd: add netlink upcall for the nfsd.fh cache</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260316-exportd-netlink-v1-13-6125dc62b955@kernel.org/">2026-03-16 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 13/14] sunrpc: add SUNRPC_CMD_CACHE_FLUSH netlink command</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260316-exportd-netlink-v1-14-6125dc62b955@kernel.org/">2026-03-16 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 14/14] nfsd: add NFSD_CMD_CACHE_FLUSH netlink command</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ceec5140-f6d6-492a-b891-e1a578ff6144@oracle.com/">2026-03-19 Chuck Lever <a href="mailto:chuck.lever@oracle.com">chuck.lever@oracle.com</a> — Re: [PATCH 04/14] sunrpc: rename cache_pipe_upcall() to cache_do_upcall()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/da7312d0-b31b-4a62-afbc-ce0e656c5134@oracle.com/">2026-03-19 Chuck Lever <a href="mailto:chuck.lever@oracle.com">chuck.lever@oracle.com</a> — Re: [PATCH 05/14] sunrpc: add a cache_notify callback</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/0908b7ac-658f-491b-89be-f5a1d97e991e@oracle.com/">2026-03-19 Chuck Lever <a href="mailto:chuck.lever@oracle.com">chuck.lever@oracle.com</a> — Re: [PATCH 06/14] sunrpc: add helpers to count and snapshot pending cache requests</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/579b0239abbbb0b95d619e6b400bb919fedab60d.camel@kernel.org/">2026-03-19 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 06/14] sunrpc: add helpers to count and snapshot pending cache requests</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/e527b377-028f-4074-850f-5ec97c5048e6@oracle.com/">2026-03-19 Chuck Lever <a href="mailto:chuck.lever@oracle.com">chuck.lever@oracle.com</a> — Re: [PATCH 07/14] sunrpc: add a generic netlink family for cache upcalls</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/163efbf2-5e1a-4dde-b6c8-787c9b68e878@oracle.com/">2026-03-19 Chuck Lever <a href="mailto:chuck.lever@oracle.com">chuck.lever@oracle.com</a> — Re: [PATCH 06/14] sunrpc: add helpers to count and snapshot pending cache requests</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/0fb26335-058a-464f-ab9f-c109658d4358@oracle.com/">2026-03-19 Chuck Lever <a href="mailto:chuck.lever@oracle.com">chuck.lever@oracle.com</a> — Re: [PATCH 07/14] sunrpc: add a generic netlink family for cache upcalls</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/c314bb03ebcde4ed58c856a91d895570bd37f05e.camel@kernel.org/">2026-03-19 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 07/14] sunrpc: add a generic netlink family for cache upcalls</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/d1cc129a-fb8a-469e-a7c0-16209df0ebde@oracle.com/">2026-03-19 Chuck Lever <a href="mailto:chuck.lever@oracle.com">chuck.lever@oracle.com</a> — Re: [PATCH 07/14] sunrpc: add a generic netlink family for cache upcalls</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/42fa1201-eb78-41c2-b059-d34df26483ff@oracle.com/">2026-03-19 Chuck Lever <a href="mailto:chuck.lever@oracle.com">chuck.lever@oracle.com</a> — Re: [PATCH 07/14] sunrpc: add a generic netlink family for cache upcalls</a></li>
+</ul>
+  </main>
+</body>
+</html>

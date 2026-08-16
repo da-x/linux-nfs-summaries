@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS Client Regressions and Fixes: EIO with Large rsize, Infinite Writeback Loop, Delegation Bugs, and NFSD Netlink Modernization</title>
+  <meta name="description" content="A significant regression was reported by Debian affecting the Linux NFS client against Dell EMC Isilion/OneFS servers. Commit 2b092175f5e3 (&quot;NFS: Fix inheritance of the block sizes when automounting&quot;) exposed a semantic mismatch: the Linux…">
+  <meta property="og:title" content="NFS Client Regressions and Fixes: EIO with Large rsize, Infinite Writeback Loop, Delegation Bugs, and NFSD Netlink Modernization">
+  <meta property="og:description" content="A significant regression was reported by Debian affecting the Linux NFS client against Dell EMC Isilion/OneFS servers. Commit 2b092175f5e3 (&quot;NFS: Fix inheritance of the block sizes when automounting&quot;) exposed a semantic mismatch: the Linux…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-03-19T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS Client Regressions and Fixes: EIO with Large rsize, Infinite Writeback Loop, Delegation Bugs, and NFSD Netlink Modernization">
+  <meta name="twitter:description" content="A significant regression was reported by Debian affecting the Linux NFS client against Dell EMC Isilion/OneFS servers. Commit 2b092175f5e3 (&quot;NFS: Fix inheritance of the block sizes when automounting&quot;) exposed a semantic mismatch: the Linux…">
+  <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../index.html">Summaries</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS Client Regressions and Fixes: EIO with Large rsize, Infinite Writeback Loop, Delegation Bugs, and NFSD Netlink Modernization</h1>
+<p><em>Week ending 2026-03-19</em></p>
+<h2>Critical NFS Client Bugs</h2>
+<h3>Regression: Large rsize/wsize (1 MB) Causes EIO on Dell EMC OneFS</h3>
+<p>A significant regression was reported by Debian affecting the Linux NFS client against Dell EMC Isilion/OneFS servers. Commit <code>2b092175f5e3</code> ("NFS: Fix inheritance of the block sizes when automounting") exposed a semantic mismatch: the Linux client uses <code>maxread</code>/<code>maxwrite</code> to size WRITE payloads, but OneFS interprets these as total compound packet limits rather than payload-only. When 1 MB writes are issued, the full SEQUENCE+PUTFH+WRITE+GETATTR compound exceeds the server's <code>max_request_size</code>, resulting in <code>NFS4ERR_REQ_TOO_BIG</code> and EIO on the client.</p>
+<p>Jeff Layton argued the client should defensively clamp write sizes or at least warn about mismatches, while Trond Myklebust maintained that servers are responsible for advertising consistent limits and adding client-side sanity checks for every vendor would be an undue burden. No fix was agreed upon this week; the issue is tracked via Debian bug #1128834. (<a href="thread/%253C177349021750.3039212.10211295677877269201%2540eldamar.lan%253E.html">thread</a>)</p>
+<h3>Infinite Loop in <code>nfs_writepages</code> After State Recovery Failure</h3>
+<p>Huawei's Li Lingfeng reported a critical bug where <code>nfs_writepages</code> enters an infinite loop after a server restart and state recovery failure. When the server returns <code>ESTALE</code>, <code>EROFS</code>, or <code>EIO</code> during open-state reclamation, the file's open context is marked bad (<code>NFS_CONTEXT_BAD</code>). Subsequently, <code>nfs_page_create</code> returns <code>-EBADF</code>, but <code>nfs_writepages</code> does not treat this as a fatal error and retries forever, preventing the superblock lock from being released and causing mount operations to hang. A proposed workaround treats <code>-EBADF</code> as fatal; the report awaits maintainer review. (<a href="thread/%253C64fecc88-6b11-4fdf-a26f-271c4445be1a%2540huawei.com%253E.html">thread</a>)</p>
+<h3>Soft Mount Ineffective with <code>NFS_CS_NO_RETRANS_TIMEOUT</code></h3>
+<p>Zhangjian from Huawei demonstrated that the <code>soft</code> mount option is ineffective when the TCP connection remains in <code>ESTABLISHED</code> state but the server never responds. The <code>NFS_CS_NO_RETRANS_TIMEOUT</code> flag suppresses retransmission timeouts regardless of mount options, causing operations like <code>OPEN</code> to hang indefinitely while waiting for a sequence ID. Trond Myklebust refused client-side workarounds: "We do not ever 'fix' broken servers by hacking the client." (<a href="thread/%253Cff8debe9-6877-4cf7-ba29-fc98eae0ffa0%2540huawei.com%253E.html">thread</a>)</p>
+<h2>Important NFS Client Bug Fixes</h2>
+<h3>Delegated Attribute Fixes for v7.1</h3>
+<p>Jeff Layton's two-patch series fixing delegated attribute handling was validated by Olga Kornievskaia (xfstests generic/221 and generic/728 now pass). The patches address: (1) <code>utimensat()</code> not triggering ctime updates via RPC when cached locally under delegation, and (2) <code>removexattr</code> not fetching updated attributes post-operation. Anna Schumaker requested <code>Fixes:</code> tags before merging. (<a href="thread/%253C20260305-nfs-7-1-v1-0-e2200f69e543%2540kernel.org%253E.html">thread</a>)</p>
+<h3>Fix <code>drop_nlink</code> During REMOVE with Delegations</h3>
+<p>Roberto Bergantinos Corpas submitted a fix for a regression in commit <code>bd4928ec799b</code>. When a file with <code>nlink=1</code> and an active delegation is removed, the delegation return advances <code>gencount</code>, which the previous logic misinterpreted as evidence that an inflight RPC had already reflected the removal — causing it to skip the link-count drop. This broke <code>inotify</code> <code>FS_DELETE_SELF</code> notifications (LTP/inotify04 failure). The patch forces <code>drop_nlink</code> when a delegation exists before REMOVE. (<a href="thread/%253C20260319113106.17308-1-rbergant%2540redhat.com%253E.html">thread</a>)</p>
+<h3>pNFS FlexFiles: OOB Read Fix</h3>
+<p>Jenny Guanni Qu submitted a security hardening patch validating that <code>ds_versions_cnt</code> is non-zero during LAYOUTGET response parsing. A zero value from a malicious server causes <code>kcalloc(0, ...)</code> to return <code>ZERO_SIZE_PTR</code>, leading to an out-of-bounds read at address <code>0x10</code>. Reported by Vidoc Security; confirmed via KASAN. (<a href="thread/%253C20260313224207.4065796-1-qguanni%2540gmail.com%253E.html">thread</a>)</p>
+<h3>SUNRPC Sysfs Race Fix Backported to 5.15.y</h3>
+<p>Robert Garcia backported NeilBrown's fix for a race condition where <code>-&gt;sock</code> can be set to NULL asynchronously during sysfs reads, causing kernel oopses. The fix ensures <code>-&gt;recv_mutex</code> is held during transport attribute reads. (<a href="thread/%253C20260318075551.1668418-1-rob_garcia%2540163.com%253E.html">thread</a>)</p>
+<h2>NFSD and Server-Side Activity</h2>
+<h3>Second Round of NFSD Fixes Merged for v7.0-rc</h3>
+<p>Chuck Lever's pull request merged four critical fixes: a SunRPC cache_request leak, a heap overflow in the NFSv4.0 LOCK replay cache (security-critical), a network namespace reference lifetime fix for <code>/proc/fs/nfs/exports</code>, and deferred sub-object cleanup in export "put" callbacks. All marked for expedient stable backports. (<a href="thread/%253C20260318211447.1808-1-cel%2540kernel.org%253E.html">thread</a>)</p>
+<h3>NFSD Lock Regression: F_GETLK Fix Direction Agreed</h3>
+<p>After weeks of debate, Jeff Layton endorsed Neil Brown's reframed analysis: the <code>-ENOLCK</code> regression on read-only files was caused by NFSD incorrectly requiring write access for <code>F_GETLK</code> (a lock query), not <code>F_SETLK</code> (lock acquisition). Local filesystems already permit <code>F_GETLK</code> without write access. Layton traced the issue potentially back to a 2021 commit, suggesting it had been latent for years. (<a href="thread/%253Cc0f15088-3fc0-487a-9f24-cf89c158420d%2540proton.me%253E.html">thread</a>)</p>
+<h3>Netlink Modernization: Upcalls and State Revocation</h3>
+<p>Two major netlink initiatives advanced this week:</p>
+<ul>
+<li>
+<p><strong>Netlink upcalls for mountd/exportd</strong> (Jeff Layton, 14 patches): Replaces <code>/proc</code>-based cache upcalls with generic netlink for <code>auth.unix.ip</code>, <code>auth.unix.gid</code>, <code>svc_export</code>, and <code>nfsd.fh</code> caches. Chuck Lever reviewed concurrency semantics around snapshotting pending requests. (<a href="thread/%253C20260316-exportd-netlink-v1-0-6125dc62b955%2540kernel.org%253E.html">thread</a>)</p>
+</li>
+<li>
+<p><strong>Automatic NFSv4 state revocation on unmount</strong> (Chuck Lever, v4 6 patches): Introduces <code>NFSD_CMD_UNLOCK</code> netlink command with IP, filesystem, and export scopes. Jeff Layton raised concerns about hardlinked files across exports and API design (single vs. multiple commands). Chuck committed to linking NFSv4 state to exports in v5. (<a href="thread/%253C20260318-umount-kills-nfsv4-state-v4-0-56aad44ab982%2540oracle.com%253E.html">thread</a>)</p>
+</li>
+</ul>
+<h3>RDMA: MR Pool Exhaustion Fix for NFS over RDMA</h3>
+<p>Chuck Lever's series fixed Memory Region pool exhaustion under write-intensive workloads causing connection resets. Patches 1–2 (fallback to direct SGE posting and bvec path fix) were accepted into the RDMA tree for -rc. Patches 3–4 (folio batch release helper and contiguous page optimization) are pending for the next merge window. (<a href="thread/%253C20260313194201.5818-1-cel%2540kernel.org%253E.html">thread</a>)</p>
+<h2>Major Trends and Ongoing Debates</h2>
+<h3>Increasing Default <code>max_block_size</code> to 4 MB</h3>
+<p>Cedric Blancher proposed raising the NFSv4 server default from 1 MB to 4 MB. Chuck Lever called for data-driven validation. Roland Mainz (ms-nfs41-client/Windows) confirmed 4 MB works with performance gains; Rick Macklem (FreeBSD) noted limited support; Anna Schumaker reported Linux client testing passed with code changes needed for &gt;1 MB sizes. (<a href="thread/%253CCALXu0UdOR8mVr%253D8pwNP95FnOsOk1w1A2%253DDcayKk3YnDfS%252BPzUA%2540mail.gmail.com%253E.html">thread</a>)</p>
+<h3>VFS Directory Locking RFC (Neil Brown, 53 patches)</h3>
+<p>The second week of Neil Brown's RFC to lift lookup out of exclusive directory locks saw filesystem adaptations for AFS, SMB/CIFS, cephfs, ext4, and others. Amir Goldstein identified overlayfs-specific issues with readdir cache protection; Jan Kara flagged ext4 fast-commit tracking concerns. Al Viro's ACK remains the critical path. (<a href="thread/%253C20260312214330.3885211-1-neilb%2540ownmail.net%253E.html">thread</a>)</p>
+<h3>nfs-utils 2.8.7 Released</h3>
+<p>Steve Dickson announced nfs-utils 2.8.7, fixing the <code>nfsrahead</code> regression from 2.8.6 that caused 10-second delays for non-NFS devices and cascading <code>blktests</code> failures. He also noted an upcoming 2.9.1 release will disable NFSv4.0 by default on the server, aligning with kernel client defaults in 7.0 kernels. (<a href="thread/%253C4d11b9d7-7b49-4a1e-8c26-29ecb2fefe2f%2540redhat.com%253E.html">thread</a>)</p>
+<h3>Code Cleanup</h3>
+<p>Sean Chang's series removed redundant <code>IS_ENABLED(CONFIG_SUNRPC_DEBUG)</code> guards and refactored <code>nfs_errorf</code> macros to the standard <code>do-while(0)</code> pattern, receiving Reviewed-by from Andy Shevchenko. (<a href="thread/%253C20260319141846.78222-1-seanwascoding%2540gmail.com%253E.html">thread</a>)</p>
+<h2>Discussions this week</h2>
+<ul>
+<li><a href="thread/%253C20260312214330.3885211-1-neilb%2540ownmail.net%253E.html">Re: [PATCH RFC 00/53] lift lookup out of exclive lock for dir ops</a></li>
+<li><a href="thread/%253C20260310-b4-is_err_or_null-v1-0-bd63b656022d%2540avm.de%253E.html">Re: [PATCH 02/61] btrfs: Prefer IS_ERR_OR_NULL over manual NULL check</a></li>
+<li><a href="thread/%253C20251205071855.72743-1-byungchul%2540sk.com%253E.html">Re: [PATCH v18 00/42] DEPT(DEPendency Tracker)</a></li>
+<li><a href="thread/%253C20260307140726.70219-1-dorjoychy111%2540gmail.com%253E.html">Re: [PATCH v5 0/4] OPENAT2_REGULAR flag support for openat2</a></li>
+<li><a href="thread/%253C20260310-work-kernel-exit-v2-0-30711759d87b%2540kernel.org%253E.html">Re: [PATCH v2 1/2] kthread: remove kthread_exit()</a></li>
+<li><a href="thread/%253C177349021750.3039212.10211295677877269201%2540eldamar.lan%253E.html">[regression] Large rsize/wsize (1MB) causes EIO after 2b092175f5e3 ("NFS: Fix inheritance of the block sizes when automounting")</a></li>
+<li><a href="thread/%253Cc0f15088-3fc0-487a-9f24-cf89c158420d%2540proton.me%253E.html">Re: Regression: Missing check in nfsd_permission() causes -ENOLCK No locks available</a></li>
+<li><a href="thread/%253C64fecc88-6b11-4fdf-a26f-271c4445be1a%2540huawei.com%253E.html">[BUG]nfs_writepages may loop forever with -EBADF after state recovery failure</a></li>
+<li><a href="thread/%253Cff8debe9-6877-4cf7-ba29-fc98eae0ffa0%2540huawei.com%253E.html">Re: [Question]nfs: should nfs timeout even with NFS_CS_NO_RETRANS_TIMEOUT ?</a></li>
+<li><a href="thread/%253CCALXu0UdOR8mVr%253D8pwNP95FnOsOk1w1A2%253DDcayKk3YnDfS%252BPzUA%2540mail.gmail.com%253E.html">Increase default NFSv4 server size "max_block_size" to 4MB</a></li>
+<li><a href="thread/%253C20260303140725.86260-1-seanwascoding%2540gmail.com%253E.html">Re: [PATCH v2] sunrpc: simplify dprintk() macros and cleanup redundant debug guards</a></li>
+<li><a href="thread/%253C20260319141846.78222-1-seanwascoding%2540gmail.com%253E.html">[PATCH v3 0/3] sunrpc/nfs: cleanup redundant debug checks and refactor macros</a></li>
+<li><a href="thread/%253C20260305-nfs-7-1-v1-0-e2200f69e543%2540kernel.org%253E.html">Re: [PATCH 0/2] nfs: delegated attribute fixes</a></li>
+<li><a href="thread/%253C20260313224207.4065796-1-qguanni%2540gmail.com%253E.html">[PATCH] pnfs/flexfiles: validate ds_versions_cnt is non-zero</a></li>
+<li><a href="thread/%253C20260319113106.17308-1-rbergant%2540redhat.com%253E.html">[PATCH] nfs: force drop_nlink if we have a delegation during REMOVE</a></li>
+<li><a href="thread/%253C20260312120720.27899-1-dmantipov%2540yandex.ru%253E.html">Re: [PATCH] nfsd: simplify nfsd4_interssc_connect()</a></li>
+<li><a href="thread/%253C20251119005119.5147-1-cel%2540kernel.org%253E.html">Re: pynfs tests for set-acl-on-file/dir/dev creation time? Re: [PATCH v1] NFSD: NFSv4 file creation neglects setting ACL</a></li>
+<li><a href="thread/%253C20260313001428.2599438-1-dai.ngo%2540oracle.com%253E.html">[PATCH v6 1/1] NFSD: move accumulated callback ops to per-net namespace</a></li>
+<li><a href="thread/%253C20260313163148.281676-1-cel%2540kernel.org%253E.html">[PATCH v7 1/2] NFSD: use per-operation statidx for callback procedures</a></li>
+<li><a href="thread/%253C20260312134008.7387-3-cel%2540kernel.org%253E.html">Re: [PATCH v2 2/2] svcrdma: Use contiguous pages for RDMA Read sink buffers</a></li>
+<li><a href="thread/%253C20260313194201.5818-1-cel%2540kernel.org%253E.html">[PATCH v3 0/4] RDMA/rw: Fix MR pool exhaustion in bvec RDMA READ path</a></li>
+<li><a href="thread/%253C20260319133610.2556826-1-cel%2540kernel.org%253E.html">[PATCH v4] svcrdma: Use contiguous pages for RDMA Read sink buffers</a></li>
+<li><a href="thread/%253C20260318-umount-kills-nfsv4-state-v4-0-56aad44ab982%2540oracle.com%253E.html">[PATCH v4 0/6] Automatic NFSv4 state revocation on filesystem unmount</a></li>
+<li><a href="thread/%253C20260316-exportd-netlink-v1-0-6125dc62b955%2540kernel.org%253E.html">[PATCH 00/14] nfsd/sunrpc: add support for netlink upcalls for mountd/exportd</a></li>
+<li><a href="thread/%253C20260316-exportd-netlink-v1-0-9a408a0b389d%2540kernel.org%253E.html">[PATCH nfs-utils 00/17] exportfs/exportd/mountd: allow them to use netlink for up/downcalls</a></li>
+<li><a href="thread/%253C20260316182516.153940-1-joseph.salisbury%2540oracle.com%253E.html">[PATCH] nfsd: fix comment typo in nfs3xdr</a></li>
+<li><a href="thread/%253C20260316182845.155269-1-joseph.salisbury%2540oracle.com%253E.html">[PATCH] nfsd: fix comment typo in nfsxdr</a></li>
+<li><a href="thread/%253C20260318222105.3031225-1-rdunlap%2540infradead.org%253E.html">[PATCH] NFSD: Docs: clean up pnfs server timeout docs</a></li>
+<li><a href="thread/%253C20260318075551.1668418-1-rob_garcia%2540163.com%253E.html">[PATCH 5.15.y] SUNRPC: lock against -&gt;sock changing during sysfs read</a></li>
+<li><a href="thread/%253C20260318081059.1864218-1-rob_garcia%2540163.com%253E.html">[PATCH 5.15.y] SUNRPC: lock against -&gt;sock changing during sysfs read</a></li>
+<li><a href="thread/%253C20260318211447.1808-1-cel%2540kernel.org%253E.html">[GIT PULL] Second round of NFSD fixes for v7.0-rc</a></li>
+<li><a href="thread/%253C4d11b9d7-7b49-4a1e-8c26-29ecb2fefe2f%2540redhat.com%253E.html">ANNOUNCE: nfs-utils-2.8.7 released.</a></li>
+<li><a href="thread/%253CCA%252B1jF5pnVrOOum0%253Dt_Yf3QFmhRdFZOmWtRs0iZ%252B3Z2xt18EELw%2540mail.gmail.com%253E.html">How to add Linux users/groups with whitespaces in the name, so NFSv4 and SAMBA can use them?</a></li>
+<li><a href="thread/%253CCAKAoaQ%253DCJ-VyKmJjnZEghJ4mAYKoDUszbw0TsGYbMPCSLQH9wg%2540mail.gmail.com%253E.html">Fwd: [Ms-nfs41-client-devel] [Announcement] NFSv4.2/NFSv4.1 filesystem client Windows driver binaries for Windows 10/11+WindowsServer 2019/2022/2025 for testing, 2026-03-14 ...</a></li>
+</ul>
+  </main>
+</body>
+</html>

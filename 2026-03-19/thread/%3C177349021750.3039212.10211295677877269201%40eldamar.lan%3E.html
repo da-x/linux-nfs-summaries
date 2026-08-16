@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS Client Regression: Large rsize/wsize (1MB) Causes EIO with Dell EMC OneFS Servers</title>
+  <meta name="description" content="Bug fix / regression analysis. This thread addresses a client-side regression introduced by commit 2b092175f5e3 (&quot;NFS: Fix inheritance of the block sizes when automounting&quot;), which exposed an interoperability issue between the Linux NFS…">
+  <meta property="og:title" content="NFS Client Regression: Large rsize/wsize (1MB) Causes EIO with Dell EMC OneFS Servers">
+  <meta property="og:description" content="Bug fix / regression analysis. This thread addresses a client-side regression introduced by commit 2b092175f5e3 (&quot;NFS: Fix inheritance of the block sizes when automounting&quot;), which exposed an interoperability issue between the Linux NFS…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-03-19T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS Client Regression: Large rsize/wsize (1MB) Causes EIO with Dell EMC OneFS Servers">
+  <meta name="twitter:description" content="Bug fix / regression analysis. This thread addresses a client-side regression introduced by commit 2b092175f5e3 (&quot;NFS: Fix inheritance of the block sizes when automounting&quot;), which exposed an interoperability issue between the Linux NFS…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-03-19</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS Client Regression: Large rsize/wsize (1MB) Causes EIO with Dell EMC OneFS Servers</h1>
+<h2>Summary</h2>
+<h1>NFS Client Regression: Large rsize/wsize (1MB) Causes EIO with Dell EMC OneFS Servers</h1>
+<h2>Classification</h2>
+<p><strong>Bug fix / regression analysis.</strong> This thread addresses a client-side regression introduced by commit <code>2b092175f5e3</code> ("NFS: Fix inheritance of the block sizes when automounting"), which exposed an interoperability issue between the Linux NFS client and Dell EMC Isilion/OneFS servers when using large read/write sizes (1 MB).</p>
+<h2>Summary</h2>
+<p>Salvatore Bonaccorso <a href="https://lore.kernel.org/linux-nfs/177349021750.3039212.10211295677877269201@eldamar.lan/">opened the discussion</a> on behalf of Debian, reporting that users experienced I/O errors (EIO) on NFS client writes after upgrading to kernels containing commit <code>2b092175f5e3</code> and its stable backports. The regression manifested specifically when the NFS server was a Dell EMC Isilion (OneFS) system with large <code>rsize</code>/<code>wsize</code> values (1 MB).</p>
+<p>The root cause, as identified by affected user Valentin SAMIR in correspondence with Dell support, is a semantic mismatch between how the Linux client and Dell's OneFS interpret NFSv4 size limits:</p>
+<blockquote>
+<p>"The kernel treats the max size as the nfs payload max size whereas OneFs treat the max size as the overall compound packet max size (everything related to NFS in the call). Hence when OneFS receives a call with a payload of 1M, the overall NFS packet is slightly bigger and it returns an NFS4ERR_REQ_TOO_BIG."</p>
+</blockquote>
+<p>In other words, the Linux client uses the <code>maxread</code>/<code>maxwrite</code> attributes returned by the server to determine how large a READ/WRITE payload to send, but does not cross-check this against the server's <code>max_request_size</code>. When the compound request (SEQUENCE + PUTFH + WRITE + GETATTR) exceeds <code>max_request_size</code>, OneFS rejects it with <code>NFS4ERR_REQ_TOO_BIG</code>, which manifests as EIO on the client.</p>
+<h2>Evolution of the Discussion</h2>
+<h3>Trond Myklebust's Initial Position</h3>
+<p>Linux NFS client maintainer Trond Myklebust <a href="https://lore.kernel.org/linux-nfs/0f9572e731939f365f6708f58b258bee89d6245a.camel@kernel.org/">responded</a> by explaining the current client behavior:</p>
+<blockquote>
+<p>"The Linux NFS client uses the 'maxread' and 'maxwrite' attributes (see RFC8881 Sections 5.8.2.20. and 5.8.2.21.) to decide how big a payload to request/send to the server in a READ/WRITE COMPOUND."</p>
+</blockquote>
+<p>He noted that the client assumes no conflict between <code>maxread</code>/<code>maxwrite</code> and <code>max_request_size</code> because both values originate from the server:</p>
+<blockquote>
+<p>"It won't cross check with the max request size, because it assumes that since both values derive from the server, there will be no conflict between them."</p>
+</blockquote>
+<h3>Aurélien Couderc's Suggestion</h3>
+<p>Aurélien Couderc <a href="https://lore.kernel.org/linux-nfs/CA+1jF5p57oj4Jhkqy_MYqKpijmjSVU+1WeV+DH2waEszg5rwhQ@mail.gmail.com/">questioned</a> whether the client should enforce bounds:</p>
+<blockquote>
+<p>"So maxread and/or maxwrite MUST NOT be larger than the clients maximum RPC size?"</p>
+</blockquote>
+<p>He proposed adding defensive logging:</p>
+<blockquote>
+<p>"Maybe add an assert()-like warning to syslog if there is a mismatch?"</p>
+</blockquote>
+<h3>Jeff Layton's Counter-Argument</h3>
+<p>Jeff Layton <a href="https://lore.kernel.org/linux-nfs/73c3a6a03fbe30a4f4b05c7fe58b3dceda87c45b.camel@kernel.org/">pushed back</a> against Trond's interpretation, arguing that the client <em>is</em> responsible for respecting <code>max_request_size</code>:</p>
+<blockquote>
+<p>"Servers use the max_request_size to properly size their receive buffers, and the client is responsible for adhering to that value. I don't think you can stick a bunch of operations in a request compound and then put a huge WRITE at the end that blows out max_request_size, and expect the server to be OK with that."</p>
+</blockquote>
+<p>Layton suggested a practical mitigation:</p>
+<blockquote>
+<p>"ISTM the client should clamp the length down to something shorter that allows the request to fit. Maybe drop the last folio and force another request? Performance would suck but it would work."</p>
+</blockquote>
+<p>However, he also acknowledged that the server-side behavior was flawed:</p>
+<blockquote>
+<p>"All that said, the server in this case isn't sizing max_request_size with enough overhead for the client to actually achieve a full 1M write, which is just dumb. Dell should fix that."</p>
+</blockquote>
+<h3>Trond Myklebust's Final Position</h3>
+<p>Trond <a href="https://lore.kernel.org/linux-nfs/46a87e31656d23d6246d170955ec2d633bfe63ea.camel@kernel.org/">reiterated</a> his stance, clarifying that the compound request structure is minimal (SEQUENCE, PUTFH, WRITE, GETATTR) and emphasizing server-side responsibility:</p>
+<blockquote>
+<p>"We're not putting 'a bunch of operations' before the WRITE. There's a SEQUENCE, PUTFH, WRITE and GETATTR."</p>
+</blockquote>
+<blockquote>
+<p>"The point is, we expect the value of maxwrite to be set to a reasonable value w.r.t. max_request_size so that the client doesn't have to sanity check everybody and their dog's server."</p>
+</blockquote>
+<h2>Key Technical Arguments</h2>
+<ol>
+<li>
+<p><strong>Client-side assumption</strong>: The Linux NFS client trusts that <code>maxread</code>/<code>maxwrite</code> values returned by the server are already consistent with <code>max_request_size</code>. It does not perform a cross-check or clamp operations.</p>
+</li>
+<li>
+<p><strong>Server-side obligation</strong>: Per NFSv4 semantics, servers should set <code>max_request_size</code> large enough to accommodate the compound overhead plus the maximum payload indicated by <code>maxread</code>/<code>maxwrite</code>. Dell's OneFS appears to treat these values as total packet size rather than payload-only, creating a conflict.</p>
+</li>
+<li>
+<p><strong>Proposed client hardening</strong>: Layton and Couderc suggested the client could defensively clamp write sizes or emit warnings when a mismatch is detected, improving robustness against non-conformant servers.</p>
+</li>
+<li>
+<p><strong>Maintainer position</strong>: Trond Myklebust maintains that adding client-side sanity checks for every server's configuration would be an undue burden, arguing instead that the server should provide consistent values.</p>
+</li>
+</ol>
+<h2>Final Conclusions</h2>
+<p>The thread did not conclude with a definitive patch or resolution this week. The key takeaways are:</p>
+<ul>
+<li><strong>The regression is real</strong>: Commit <code>2b092175f5e3</code> exposed a pre-existing interoperability gap between the Linux NFS client and Dell EMC OneFS servers when using large I/O sizes.</li>
+<li><strong>Dual responsibility</strong>: Both sides have valid arguments — the server should advertise consistent size limits, but the client could be more defensive in clamping or warning about mismatches.</li>
+<li><strong>No immediate fix landed</strong>: The discussion remains open, with Trond Myklebust leaning toward a server-side fix from Dell, while Jeff Layton and others advocate for additional client-side robustness.</li>
+</ul>
+<p>This issue is being tracked via Debian bug <a href="https://bugs.debian.org/1128834">#1128834</a> and the Linux kernel regressions tracker.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/177349021750.3039212.10211295677877269201@eldamar.lan/">2026-03-14 Salvatore Bonaccorso <a href="mailto:carnil@debian.org">carnil@debian.org</a> — [regression] Large rsize/wsize (1MB) causes EIO after 2b092175f5e3 ("NFS: Fix inheritance of the block sizes when automounting")</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/0f9572e731939f365f6708f58b258bee89d6245a.camel@kernel.org/">2026-03-14 Trond Myklebust <a href="mailto:trondmy@kernel.org">trondmy@kernel.org</a> — Re: [regression] Large rsize/wsize (1MB) causes EIO after 2b092175f5e3 ("NFS: Fix inheritance of the block sizes when automounting")</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CA+1jF5p57oj4Jhkqy_MYqKpijmjSVU+1WeV+DH2waEszg5rwhQ@mail.gmail.com/">2026-03-15 Aurélien Couderc <a href="mailto:aurelien.couderc2002@gmail.com">aurelien.couderc2002@gmail.com</a> — Re: [regression] Large rsize/wsize (1MB) causes EIO after 2b092175f5e3 ("NFS: Fix inheritance of the block sizes when automounting")</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/73c3a6a03fbe30a4f4b05c7fe58b3dceda87c45b.camel@kernel.org/">2026-03-15 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [regression] Large rsize/wsize (1MB) causes EIO after 2b092175f5e3 ("NFS: Fix inheritance of the block sizes when automounting")</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/46a87e31656d23d6246d170955ec2d633bfe63ea.camel@kernel.org/">2026-03-15 Trond Myklebust <a href="mailto:trondmy@kernel.org">trondmy@kernel.org</a> — Re: [regression] Large rsize/wsize (1MB) causes EIO after 2b092175f5e3 ("NFS: Fix inheritance of the block sizes when automounting")</a></li>
+</ul>
+  </main>
+</body>
+</html>

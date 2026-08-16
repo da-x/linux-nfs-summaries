@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Automatic NFSv4 State Revocation via Netlink</title>
+  <meta name="description" content="This week, Chuck Lever submitted version 4 of a six-patch series titled [PATCH v4 0/6] Automatic NFSv4 state revocation on filesystem unmount [id://20260318-umount-kills-nfsv4-state-v4-0-56aad44ab982@oracle.com]. The series addresses a…">
+  <meta property="og:title" content="Automatic NFSv4 State Revocation via Netlink">
+  <meta property="og:description" content="This week, Chuck Lever submitted version 4 of a six-patch series titled [PATCH v4 0/6] Automatic NFSv4 state revocation on filesystem unmount [id://20260318-umount-kills-nfsv4-state-v4-0-56aad44ab982@oracle.com]. The series addresses a…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-03-19T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Automatic NFSv4 State Revocation via Netlink">
+  <meta name="twitter:description" content="This week, Chuck Lever submitted version 4 of a six-patch series titled [PATCH v4 0/6] Automatic NFSv4 state revocation on filesystem unmount [id://20260318-umount-kills-nfsv4-state-v4-0-56aad44ab982@oracle.com]. The series addresses a…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-03-19</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Automatic NFSv4 State Revocation via Netlink</h1>
+<h2>Summary</h2>
+<p>This week, Chuck Lever submitted version 4 of a six-patch series titled <strong>[PATCH v4 0/6] Automatic NFSv4 state revocation on filesystem unmount</strong> [id://20260318-umount-kills-nfsv4-state-v4-0-56aad44ab982@oracle.com]. The series addresses a persistent operational pain point: when an NFS server exports a filesystem with active client state (opens, locks, delegations), unmounting the underlying filesystem fails with <code>EBUSY</code>. While the existing <code>/proc/fs/nfsd/unlock_fs</code> interface can force revocation, it operates at superblock granularity and lacks extensibility.</p>
+<h3>Key Technical Arguments and Evolution</h3>
+<p><strong>1. Transition from Procfs to Netlink</strong>
+The series replaces previous VFS-based approaches with a new netlink command, <code>NFSD_CMD_UNLOCK</code>. This allows for typed, validated attributes and supports multiple scopes. The initial implementation includes:</p>
+<ul>
+<li><strong>IP Scope</strong>: A netlink equivalent of <code>write_unlock_ip</code>, releasing NLM locks for a specific client address.</li>
+<li><strong>Filesystem Scope</strong>: A netlink equivalent of <code>write_unlock_fs</code>, accepting a path string to revoke NFSv4 state, NLM locks, async COPY operations, and cached file handles.</li>
+</ul>
+<p><strong>2. Export-Scoped Revocation</strong>
+A significant enhancement in v4 is the refinement of the "filesystem" scope to operate at <strong>export granularity</strong> rather than superblock granularity. As Chuck Lever explained, when multiple exports share a filesystem, only state referencing files under the specified export root should be affected. The implementation walks all dentry aliases of each inode to ensure hard-linked files outside the export are not incorrectly matched [id://20260318-umount-kills-nfsv4-state-v4-5-56aad44ab982@oracle.com].</p>
+<p><strong>3. API Design Debate: Single Command vs. Multiple Commands</strong>
+Jeff Layton raised a structural concern regarding the netlink interface design. He questioned whether a single command with a "type" attribute was optimal, suggesting that different scopes require different attributes and would be easier to validate if implemented as distinct commands:</p>
+<blockquote>
+<p>"I wonder if we'd be better served with different commands instead of passing a type value to a single command? Different types are going to require different attributes, and it'll be easier to validate those if they use different commands." [id://33d42b3de7a2c7cd61bdd01bae04a2e082755f95.camel@kernel.org]</p>
+</blockquote>
+<p>Chuck Lever acknowledged this, noting that while he initially followed the philosophy of the <code>THREADS</code> command, the YAML/netlink infrastructure struggles with divergent argument sets:</p>
+<blockquote>
+<p>"I don't think it would be difficult to break UNLOCK into three separate unlock netlink commands." [id://9ea5b835-5e91-458c-9929-c1df7e6df25d@kernel.org]</p>
+</blockquote>
+<p><strong>4. The Hardlink Across Exports Bug/Concern</strong>
+The most significant technical critique came from Jeff Layton regarding the export-scoped revocation logic. He highlighted a scenario where two exports (<code>/export/foo</code> and <code>/export/bar</code>) reside on the same superblock, and a file is hardlinked between them. If state is acquired via both paths, revoking state for one export might incorrectly revoke state for the other if the check relies solely on dentry aliases:</p>
+<blockquote>
+<p>"Ouch the hardlinked thing makes this hard to reason about... Won't client foo's state end up being revoked too in that case?" [id://f582806fcf3c6d6f7416c24c55462fc502cb0ab0.camel@kernel.org]</p>
+</blockquote>
+<p>Layton suggested tracking the specific export in the stateid structure (e.g., an <code>st_export</code> field) to ensure precise revocation. While he conceded that hardlinks across exports are rare, he emphasized maintainability:</p>
+<blockquote>
+<p>"OTOH, hardlinks are rare so maybe this isn't worth fretting over." [id://c42d3896eb47aa3bb766f29776fd0aac2a1eb07d.camel@kernel.org]</p>
+</blockquote>
+<h3>Final Conclusions</h3>
+<p>Chuck Lever agreed that the current approach was difficult to reason about and committed to addressing the export-tracking issue in the next version:</p>
+<blockquote>
+<p>"Probably rare, but the point is the current approach is difficult to reason about, thus will be hard to maintain. For v5, I'll try linking NFSv4 state to exports." [id://2ef59bf1-c4f7-4818-9f47-16d056edcb8b@kernel.org]</p>
+</blockquote>
+<p>Jeff Layton provided <code>Reviewed-by</code> tags for the refactoring patches ([id://7288d90cf67a4a8b3473b0118f3ce844e3538a3b.camel@kernel.org], [id://e1c465a1010b702ff41af23caef6177ff88aa4e8.camel@kernel.org]) and noted that the userland support in <code>nfs-utils</code> would integrate well with this netlink interface. The discussion concluded with a clear path forward for v5: refine export-scoping to handle hardlinks correctly and potentially split the netlink commands for better API clarity.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260318-umount-kills-nfsv4-state-v4-0-56aad44ab982@oracle.com/">2026-03-18 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v4 0/6] Automatic NFSv4 state revocation on filesystem unmount</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260318-umount-kills-nfsv4-state-v4-1-56aad44ab982@oracle.com/">2026-03-18 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v4 1/6] NFSD: Extract revoke_one_stid() utility function</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260318-umount-kills-nfsv4-state-v4-2-56aad44ab982@oracle.com/">2026-03-18 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v4 2/6] NFSD: Add NFSD_CMD_UNLOCK netlink command with ip scope</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260318-umount-kills-nfsv4-state-v4-3-56aad44ab982@oracle.com/">2026-03-18 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v4 3/6] NFSD: Add filesystem scope to NFSD_CMD_UNLOCK</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260318-umount-kills-nfsv4-state-v4-5-56aad44ab982@oracle.com/">2026-03-18 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v4 5/6] NFSD: Add export-scoped state revocation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260318-umount-kills-nfsv4-state-v4-4-56aad44ab982@oracle.com/">2026-03-18 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v4 4/6] NFSD: Refactor find_one_sb_stid() into find_next_sb_stid()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260318-umount-kills-nfsv4-state-v4-6-56aad44ab982@oracle.com/">2026-03-18 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v4 6/6] NFSD: Add nfsd_file_close_export() for file cache cleanup</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/7288d90cf67a4a8b3473b0118f3ce844e3538a3b.camel@kernel.org/">2026-03-18 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v4 1/6] NFSD: Extract revoke_one_stid() utility function</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/5addf0525656d06d57851a996ed6b127a6870585.camel@kernel.org/">2026-03-18 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v4 0/6] Automatic NFSv4 state revocation on filesystem unmount</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/33d42b3de7a2c7cd61bdd01bae04a2e082755f95.camel@kernel.org/">2026-03-18 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v4 2/6] NFSD: Add NFSD_CMD_UNLOCK netlink command with ip scope</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/a055f411bd7d90d26cbb68b70561f3b698f9d608.camel@kernel.org/">2026-03-18 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v4 3/6] NFSD: Add filesystem scope to NFSD_CMD_UNLOCK</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/e1c465a1010b702ff41af23caef6177ff88aa4e8.camel@kernel.org/">2026-03-18 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v4 4/6] NFSD: Refactor find_one_sb_stid() into find_next_sb_stid()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/9ea5b835-5e91-458c-9929-c1df7e6df25d@kernel.org/">2026-03-18 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v4 2/6] NFSD: Add NFSD_CMD_UNLOCK netlink command with ip scope</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/f582806fcf3c6d6f7416c24c55462fc502cb0ab0.camel@kernel.org/">2026-03-18 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v4 5/6] NFSD: Add export-scoped state revocation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/202c9697-82cd-409a-8c5c-ea56a3830a8a@kernel.org/">2026-03-18 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v4 5/6] NFSD: Add export-scoped state revocation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/c42d3896eb47aa3bb766f29776fd0aac2a1eb07d.camel@kernel.org/">2026-03-18 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v4 5/6] NFSD: Add export-scoped state revocation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/2ef59bf1-c4f7-4818-9f47-16d056edcb8b@kernel.org/">2026-03-18 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v4 5/6] NFSD: Add export-scoped state revocation</a></li>
+</ul>
+  </main>
+</body>
+</html>

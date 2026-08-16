@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS writepages infinite loop on -EBADF after state recovery failure</title>
+  <meta name="description" content="Type: Bug fix (infinite loop in NFS client writeback path)">
+  <meta property="og:title" content="NFS writepages infinite loop on -EBADF after state recovery failure">
+  <meta property="og:description" content="Type: Bug fix (infinite loop in NFS client writeback path)">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-03-19T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS writepages infinite loop on -EBADF after state recovery failure">
+  <meta name="twitter:description" content="Type: Bug fix (infinite loop in NFS client writeback path)">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-03-19</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS writepages infinite loop on -EBADF after state recovery failure</h1>
+<h2>Summary</h2>
+<h2>Bug Report: NFS <code>nfs_writepages</code> Infinite Loop After State Recovery Failure</h2>
+<p><strong>Type:</strong> Bug fix (infinite loop in NFS client writeback path)</p>
+<h3>Overview</h3>
+<p>Li Lingfeng of Huawei reported a critical bug in the NFS client where <code>nfs_writepages</code> enters an infinite loop after a server restart and state recovery failure, causing mount operations to hang indefinitely <a href="https://lore.kernel.org/linux-nfs/64fecc88-6b11-4fdf-a26f-271c4445be1a@huawei.com/">As described by Li Lingfeng</a>.</p>
+<h3>Problem Description</h3>
+<p>The bug manifests when the NFS server is restarted and the client's state manager attempts to reclaim open files. If the server returns errors such as <code>EROFS</code>, <code>EIO</code>, or <code>ESTALE</code> during reclamation, the affected file's state is marked as bad via <code>nfs4_state_mark_open_context_bad</code>. The reporter explained:</p>
+<blockquote>
+<p>"When the NFS server is restarted, the client's state manager attempts to reclaim open files. If the server returns errors such as EROFS, EIO, or ESTALE during reclamation, the affected file's state is marked as bad (via nfs4_state_mark_open_context_bad)."</p>
+</blockquote>
+<p>Subsequently, when the kernel writeback worker (<code>wb_workfn</code>) tries to flush dirty pages for that inode, <code>nfs_writepages</code> enters an infinite loop. The root cause is that <code>nfs_page_create</code> returns <code>-EBADF</code> for the bad open context, but <code>nfs_writepages</code> does not treat <code>-EBADF</code> as a fatal error:</p>
+<blockquote>
+<p>"nfs_writepages retries the loop as long as the error is not fatal according to nfs_error_is_fatal(). Since -EBADF is not considered fatal, it keeps retrying forever."</p>
+</blockquote>
+<p>This prevents the superblock lock from being released, causing any concurrent mount operation to hang.</p>
+<h3>Call Chain Analysis</h3>
+<p>The reporter provided a detailed call chain showing how the bug propagates:</p>
+<ol>
+<li>
+<p><strong>State recovery path:</strong> <code>nfs4_do_reclaim</code> → <code>nfs4_reclaim_open_state</code> → <code>__nfs4_reclaim_open_state</code> (gets <code>-ESTALE</code>) → <code>nfs4_state_mark_recovery_failed</code> → <code>nfs4_state_mark_open_context_bad</code> → sets the <code>NFS_CONTEXT_BAD</code> bit.</p>
+</li>
+<li>
+<p><strong>Writeback path:</strong> <code>wb_workfn</code> → <code>wb_do_writeback</code> → <code>writeback_sb_inodes</code> → <code>__writeback_single_inode</code> → <code>do_writepages</code> → <code>nfs_writepages</code> (loops here) → <code>write_cache_pages</code> → <code>nfs_writepages_callback</code> → <code>nfs_do_writepage</code> → <code>nfs_page_async_flush</code> → <code>nfs_create_subreq</code> → <code>nfs_page_create</code> (returns <code>-EBADF</code>).</p>
+</li>
+</ol>
+<h3>Reproduction Steps</h3>
+<p>The reporter provided a reliable reproducer on Linux 7.0-rc4:</p>
+<ol>
+<li>Set up an NFS server with an export containing test data.</li>
+<li>On the client, mount the export and run a Python script that opens a file, writes ~1GB of dirty pages, and keeps the file descriptor open.</li>
+<li>Restart the server and wipe the underlying filesystem to force <code>ESTALE</code> errors during state recovery.</li>
+</ol>
+<h3>Temporary Workaround</h3>
+<p>The reporter proposed a patch that treats <code>-EBADF</code> as a fatal error in <code>nfs_writepages</code>, thereby breaking the infinite loop. This workaround was described as:</p>
+<blockquote>
+<p>"We have applied the following patch to break the loop by treating -EBADF as fatal in nfs_writepages"</p>
+</blockquote>
+<h3>Current Status</h3>
+<p>As of this week (ending 2026-03-19), this thread contains only the initial bug report with no replies from maintainers or other developers. The discussion remains open, awaiting review and potential integration of the proposed fix into the mainline NFS client code.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/64fecc88-6b11-4fdf-a26f-271c4445be1a@huawei.com/">2026-03-17 Li Lingfeng <a href="mailto:lilingfeng3@huawei.com">lilingfeng3@huawei.com</a> — [BUG]nfs_writepages may loop forever with -EBADF after state recovery failure</a></li>
+</ul>
+  </main>
+</body>
+</html>
