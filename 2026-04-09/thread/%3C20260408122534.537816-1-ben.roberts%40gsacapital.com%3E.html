@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>pNFS: Deadlock fix in pnfs_send_layoutreturn withdrawn after review</title>
+  <meta name="description" content="This thread concerns a bug fix proposed by Ben Roberts of GSA Capital to address a recurring deadlock in the Parallel NFS (pNFS) client&#39;s layout return path. The patch, submitted as v2 on April 8, was ultimately withdrawn after maintainer…">
+  <meta property="og:title" content="pNFS: Deadlock fix in pnfs_send_layoutreturn withdrawn after review">
+  <meta property="og:description" content="This thread concerns a bug fix proposed by Ben Roberts of GSA Capital to address a recurring deadlock in the Parallel NFS (pNFS) client&#39;s layout return path. The patch, submitted as v2 on April 8, was ultimately withdrawn after maintainer…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-04-09T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="pNFS: Deadlock fix in pnfs_send_layoutreturn withdrawn after review">
+  <meta name="twitter:description" content="This thread concerns a bug fix proposed by Ben Roberts of GSA Capital to address a recurring deadlock in the Parallel NFS (pNFS) client&#39;s layout return path. The patch, submitted as v2 on April 8, was ultimately withdrawn after maintainer…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-04-09</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>pNFS: Deadlock fix in pnfs_send_layoutreturn withdrawn after review</h1>
+<h2>Summary</h2>
+<h1>pNFS: Deadlock in <code>pnfs_send_layoutreturn</code> — Patch Withdrawn After Review</h1>
+<h2>Overview</h2>
+<p>This thread concerns a <strong>bug fix</strong> proposed by Ben Roberts of GSA Capital to address a recurring deadlock in the Parallel NFS (pNFS) client's layout return path. The patch, submitted as v2 on April 8, was ultimately withdrawn after maintainer review raised concerns about its correctness against upstream code.</p>
+<h2>The Reported Problem</h2>
+<p>Ben Roberts reported that his HPC cluster, running Red Hat Enterprise Linux 9 kernel <code>5.14.0-611.9.1.el9.x86_64</code>, experienced regular deadlocks within <a href="https://lore.kernel.org/linux-nfs/20260408122534.537816-1-ben.roberts@gsacapital.com/"><code>pnfs_send_layoutreturn()</code></a>, causing userspace processes to become stuck in uninterruptible sleep and requiring reboots:</p>
+<blockquote>
+<p>"On a HPC cluster running 5.14.0-611.9.1.el9.x86_64, regular deadlocks were seen within pnfs_send_layoutreturn leading to userspace processes stuck in uninterruptible sleep, ultimately requiring reboots to clear."</p>
+</blockquote>
+<p>The proposed fix was a single-line change: clearing the <code>NFS_LAYOUT_RETURN_REQUESTED</code> flag in the memory allocation failure path of <code>pnfs_send_layoutreturn()</code> before calling <code>pnfs_put_layout_hdr()</code>. Roberts noted that this patch had been running in production for over three months without recurrence.</p>
+<h2>Maintainer Pushback</h2>
+<p>Benjamin Coddington, responding on April 10 (just outside the weekly window), questioned whether the issue was reproduced on a recent upstream kernel:</p>
+<blockquote>
+<p>"Did you reproduce and diagnose this problem on a recent upstream kernel version? If not, you probably want to report the issue to your Red Hat support channel directly instead of sending fixes upstream because the maintainers will want to see patches and fixes against the upstream code."</p>
+</blockquote>
+<h2>Revised Analysis and Race Condition Theory</h2>
+<p>Unable to reproduce the issue on newer kernels without risking production systems, Roberts refined his theory. He ruled out a single-process recursive deadlock and instead proposed an <strong>inter-process race condition</strong>:</p>
+<blockquote>
+<p>"Revised theory for why this patch helps is that the deadlock is subject to an inter-process race, where one process suffers a memory allocation failure, causing a second process to become a victim of bad state, leading to an unserviceable RPC request. The timing appears to be very sensitive and hard to reproduce on demand."</p>
+</blockquote>
+<p>He provided a detailed LLM-assisted analysis describing how Thread A's allocation failure would wake Thread B via <code>pnfs_clear_layoutreturn_waitbit()</code>, but fail to clear the <code>NFS_LAYOUT_RETURN_REQUESTED</code> flag, causing Thread B to initiate an RPC on corrupted layout state. Roberts included a stack trace showing processes deadlocked in <code>rpc_wait_bit_killable()</code> during NFS superblock teardown.</p>
+<h2>Technical Rebuttal</h2>
+<p>Coddington countered that the analysis did not hold for upstream code:</p>
+<blockquote>
+<p>"The kzalloc failure is definitely a rarely-used/tested path, so its possible there's an issue there no one has seen yet, but from what I can see it looks like every call to pnfs_send_layoutreturn() first calls pnfs_prepare_layoutreturn(), which already clears NFS_LAYOUT_RETURN_REQUESTED. I don't see how you can end up with another process seeing the flag."</p>
+</blockquote>
+<p>Coddington also noted that Roberts' systems lacked a significant body of upstream pNFS work from June 2024, and again recommended engaging Red Hat support.</p>
+<h2>Patch Withdrawn</h2>
+<p>Roberts accepted the feedback and withdrew the patch:</p>
+<blockquote>
+<p>"Understood, thank you for the feedback here. I withdraw the patch request and will take this back to the drawing board. Likely removing the patch from local systems and looking to capture more useful diagnostics if/when the problem reoccurs."</p>
+</blockquote>
+<p>He also noted that most of the referenced upstream changes were already present in the EL9 kernel source, with only partial application of one patch.</p>
+<h2>Final Word from Trond Myklebust</h2>
+<p>NFS maintainer Trond Myklebust added a technical note, revealing he had initially applied the patch but then reconsidered:</p>
+<blockquote>
+<p>"I had first applied this patch, however when looking more closely, it seems that it will also be defeated by the loop in pnfs_clear_layoutreturn_info() that checks if there are any layouts that need returning, and resets NFS_LAYOUT_RETURN_REQUESTED."</p>
+</blockquote>
+<h2>Conclusion</h2>
+<p>The patch was <strong>not accepted</strong>. The discussion highlights the challenges of diagnosing race conditions in production environments running older kernel versions, and underscores the importance of validating fixes against upstream code. The root cause of Roberts' deadlocks remains unresolved, with plans to gather more diagnostics on the affected systems.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260408122534.537816-1-ben.roberts@gsacapital.com/">2026-04-08 Ben Roberts <a href="mailto:ben.roberts@gsacapital.com">ben.roberts@gsacapital.com</a> — [PATCH v2] pNFS: deadlock in pnfs_send_layoutreturn</a></li>
+</ul>
+  </main>
+</body>
+</html>

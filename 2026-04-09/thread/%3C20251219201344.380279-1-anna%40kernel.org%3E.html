@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Al Viro Reviews NFS Directory Delegation Verifier Race Conditions and Dentry Subtleties</title>
+  <meta name="description" content="Type: Bug fix review — potential use-after-free and locking correctness issues in the NFS client&#39;s directory delegation verifier code.">
+  <meta property="og:title" content="Al Viro Reviews NFS Directory Delegation Verifier Race Conditions and Dentry Subtleties">
+  <meta property="og:description" content="Type: Bug fix review — potential use-after-free and locking correctness issues in the NFS client&#39;s directory delegation verifier code.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-04-09T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Al Viro Reviews NFS Directory Delegation Verifier Race Conditions and Dentry Subtleties">
+  <meta name="twitter:description" content="Type: Bug fix review — potential use-after-free and locking correctness issues in the NFS client&#39;s directory delegation verifier code.">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-04-09</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Al Viro Reviews NFS Directory Delegation Verifier Race Conditions and Dentry Subtleties</h1>
+<h2>Summary</h2>
+<h1>Al Viro Reviews NFS Directory Delegation Verifier Race Conditions and Dentry Subtleties</h1>
+<h2>Summary</h2>
+<p><strong>Type:</strong> Bug fix review — potential use-after-free and locking correctness issues in the NFS client's directory delegation verifier code.</p>
+<h2>Background (Prior Weeks)</h2>
+<p>This thread originated from Anna Schumaker's December 19 patch <a href="https://lore.kernel.org/linux-nfs/20251219201344.380279-1-anna@kernel.org/">Fix directory delegation verifier checks</a>, which aimed to optimize directory delegation verifier handling. Christoph Hellwig reported that the patch caused kernel Oops crashes during delegation benchmarking and <code>generic/633</code> xfstests runs. Over the following weeks (summarized in January 2026), Trond Myklebust iterated through multiple fixes addressing state recovery crashes for directory delegations, with Christoph testing each iteration. The final fix from January blocked state recovery for non-regular file delegations at two crash sites, resolving <code>generic/633</code> — though Anna noted the issue may persist under NFS v4.2.</p>
+<h2>This Week's Discussion (April 4–5, 2026)</h2>
+<p>VFS maintainer Al Viro re-engaged with the thread, reviewing Trond Myklebust's December 31 patch (<code>nfs_clear_verifier_directory</code>) and raising three distinct concerns about locking correctness and code semantics.</p>
+<h3>Concern 1: Potential Use-After-Free on Inode Iteration</h3>
+<p>In his first message [id://20260404183247.GA2798238@ZenIV], Viro questioned the safety of iterating over dentries in <code>nfs_clear_verifier_directory()</code>:</p>
+<blockquote>
+<p>"What's to stop the inode from being freed right under you? You are <em>not</em> guaranteed to be holding rcu_read_lock(), unless I'm missing something in the call chain, so... what's going on here?"</p>
+</blockquote>
+<p>Viro added <code>fsdevel</code> to the CC list, signaling that this review had broader VFS implications beyond just NFS. The concern centers on whether the inode being iterated could be freed concurrently while the verifier-clearing code walks its dentry list — a classic use-after-free scenario if RCU read-side protection is absent.</p>
+<h3>Concern 2: Purpose of Directory Cursors</h3>
+<p>In a follow-up [id://20260404190735.GS3836593@ZenIV], Viro raised an additional question about the presence of cursors on NFS directories:</p>
+<blockquote>
+<p>"While we are at it, what are cursors doing on NFS directories? AFAICS, you are not using simple_dir_operations there or anything that would call dcache_dir_open(), for that matter. Confused..."</p>
+</blockquote>
+<p>This suggests Viro was puzzled by why the verifier-clearing code manipulates directory cursor state, given that NFS does not use <code>simple_dir_operations</code> or the standard <code>dcache_dir_open()</code> infrastructure that typically manages such cursors.</p>
+<h3>Concern 3: Dentry Lifetime Guarantees in <code>nfs_clear_verifier_file()</code></h3>
+<p>In his third and most detailed message [id://20260405023953.GU3836593@ZenIV], Viro provided a technical analysis of the dentry lifetime guarantees in <code>nfs_clear_verifier_file()</code>, noting that it does not need to check for a NULL parent directory:</p>
+<blockquote>
+<p>"Incidentally, nfs_clear_verifier_file() doesn't need to bother with checking for NULL dir - alias is found in -&gt;i_dentry of inode with -&gt;i_lock held, which means it can't have progressed through __dentry_kill() to dropping the reference to parent. So holding alias-&gt;d_lock (which stabilizes -&gt;d_parent) is enough - -&gt;d_parent is still pinned by alias and it can't have become negative."</p>
+</blockquote>
+<p>Viro emphasized the critical distinction between this case and <code>nfs_set_verifier_locked()</code>:</p>
+<blockquote>
+<p>""Can't have progressed through __dentry_kill()" is critical here - that's the difference from nfs_set_verifier_locked() case."</p>
+</blockquote>
+<p>He closed with a broader admonition to the NFS development community:</p>
+<blockquote>
+<p>"Folks, this stuff can get seriously subtle; <em>please</em> ask around on fsdevel if you are doing something non-trivial with it."</p>
+</blockquote>
+<h2>Key Technical Arguments and Conclusions</h2>
+<ol>
+<li>
+<p><strong>Use-After-Free Risk:</strong> Viro identified a potential race condition in <code>nfs_clear_verifier_directory()</code> where an inode could be freed during dentry iteration without RCU protection. This remains unresolved at week's end — no response from Trond or other NFS developers was observed within the window.</p>
+</li>
+<li>
+<p><strong>Cursor Semantics Question:</strong> The purpose of directory cursor manipulation in NFS verifier code is unclear, given that NFS does not use the standard VFS directory operations that would exercise cursors. This may indicate dead code or a misunderstanding of the dcache infrastructure.</p>
+</li>
+<li>
+<p><strong>Dentry Lifetime Analysis:</strong> Viro clarified that <code>nfs_clear_verifier_file()</code> has stronger lifetime guarantees than previously assumed due to the <code>-&gt;i_lock</code> preventing progression through <code>__dentry_kill()</code>. This is a correctness insight that could simplify the code.</p>
+</li>
+<li>
+<p><strong>Broader VFS Engagement:</strong> By adding <code>fsdevel</code> to the CC list and urging NFS developers to consult the broader filesystem community, Viro signaled that directory delegation verifier code involves subtle VFS internals that warrant wider review.</p>
+</li>
+</ol>
+<h2>Open Questions</h2>
+<ul>
+<li>Whether <code>nfs_clear_verifier_directory()</code> requires additional RCU or reference-counting protection against inode freeing.</li>
+<li>Whether directory cursor manipulation in NFS verifier code serves any functional purpose.</li>
+<li>How the dentry lifetime analysis applies to other verifier-related code paths.</li>
+</ul>
+<p>No responses from Trond Myklebust, Anna Schumaker, or Christoph Hellwig were observed within this week's window. The thread remains open pending further discussion.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260404183247.GA2798238@ZenIV/">2026-04-04 Al Viro <a href="mailto:viro@zeniv.linux.org.uk">viro@zeniv.linux.org.uk</a> — Re: [PATCH] NFS: Fix directory delegation verifier checks</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260404190735.GS3836593@ZenIV/">2026-04-04 Al Viro <a href="mailto:viro@zeniv.linux.org.uk">viro@zeniv.linux.org.uk</a> — Re: [PATCH] NFS: Fix directory delegation verifier checks</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260405023953.GU3836593@ZenIV/">2026-04-05 Al Viro <a href="mailto:viro@zeniv.linux.org.uk">viro@zeniv.linux.org.uk</a> — Re: [PATCH] NFS: Fix directory delegation verifier checks</a></li>
+</ul>
+  </main>
+</body>
+</html>

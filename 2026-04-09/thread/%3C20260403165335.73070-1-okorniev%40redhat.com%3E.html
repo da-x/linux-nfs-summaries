@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd: Fix mtime/ctime updates on CLONE/COPY with delegated attributes</title>
+  <meta name="description" content="This thread concerns a bug fix in the NFS server (nfsd) related to timestamp updates during CLONE and COPY operations when delegated attributes are present. The issue stems from a previous commit (e5e9b24ab8fa) that froze c/mtime updates…">
+  <meta property="og:title" content="nfsd: Fix mtime/ctime updates on CLONE/COPY with delegated attributes">
+  <meta property="og:description" content="This thread concerns a bug fix in the NFS server (nfsd) related to timestamp updates during CLONE and COPY operations when delegated attributes are present. The issue stems from a previous commit (e5e9b24ab8fa) that froze c/mtime updates…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-04-09T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd: Fix mtime/ctime updates on CLONE/COPY with delegated attributes">
+  <meta name="twitter:description" content="This thread concerns a bug fix in the NFS server (nfsd) related to timestamp updates during CLONE and COPY operations when delegated attributes are present. The issue stems from a previous commit (e5e9b24ab8fa) that froze c/mtime updates…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-04-09</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd: Fix mtime/ctime updates on CLONE/COPY with delegated attributes</h1>
+<h2>Summary</h2>
+<h1>nfsd: Correcting mtime/ctime Updates on CLONE/COPY with Delegated Attributes</h1>
+<h2>Overview</h2>
+<p>This thread concerns a <strong>bug fix</strong> in the NFS server (<code>nfsd</code>) related to timestamp updates during <code>CLONE</code> and <code>COPY</code> operations when delegated attributes are present. The issue stems from a previous commit (<a href="https://lore.kernel.org/linux-nfs/e5e9b24ab8fa/">e5e9b24ab8fa</a>) that froze c/mtime updates when a <code>WRITE_ATTRS</code> delegation was outstanding, causing the server to open files with <code>FMODE_NOCMTIME</code>. While this prevents out-of-sync states with client-delegated views for standard writes, it inadvertently suppressed timestamp updates for server-side copy operations.</p>
+<h2>Key Technical Arguments</h2>
+<h3>The Problem</h3>
+<p>Olga Kornievskaia introduced the patch <a href="https://lore.kernel.org/linux-nfs/20260403165335.73070-1-okorniev@redhat.com/">on April 3</a>, explaining:</p>
+<blockquote>
+<p>"When delegated attributes are given on open the file is opened with NOCMTIME and modifying operations do not update mtime/ctime as to not get out-of-sync with the client's delegated view. However, for operations CLONE/COPY server should update its view of mtime/ctime and reflect that in any GETATTR queries."</p>
+</blockquote>
+<p>Her initial approach temporarily cleared <code>FMODE_NOCMTIME</code> during the copy operation and restored it afterward.</p>
+<h3>Race Conditions Identified</h3>
+<p>Jeff Layton immediately flagged a concurrency concern <a href="https://lore.kernel.org/linux-nfs/63fbd05720af891a2f7339be78fea2460beda7a8.camel@kernel.org/">in his response</a>:</p>
+<blockquote>
+<p>"This seems simple enough, but there is some raciness involved if other calls are running concurrently with the COPY/CLONE. You might end up reenabling FMODE_NOCMTIME before a second COPY/CLONE finishes."</p>
+</blockquote>
+<p>He proposed an alternative:</p>
+<blockquote>
+<p>"A simpler idea might be to just do a notify_change() for ATTR_MTIME after each COPY or CLONE operation done on a file with FMODE_NOCMTIME set. That should set the timestamp to something pretty close to whatever the last write() would have set it to, but without having to monkey with the fmode."</p>
+</blockquote>
+<p>Chuck Lever identified a separate but related flaw specific to <strong>async copies</strong> <a href="https://lore.kernel.org/linux-nfs/d9281142-57c1-4a0d-98b7-1cea19b39cb2@app.fastmail.com/">on April 4</a>:</p>
+<blockquote>
+<p>"For async copies, does this restore FMODE_NOCMTIME before the kthread performs the actual data transfer? The async path creates a kthread then falls through to the out: label. The restore runs here, before the kthread calls nfsd4_do_copy(). By the time the kthread runs... FMODE_NOCMTIME has already been restored, and the timestamp update that this patch intends to enable will not take effect for async copies."</p>
+</blockquote>
+<blockquote>
+<p>"This is probably a variant of the race that Jeff already called out."</p>
+</blockquote>
+<h3>Resolution Direction</h3>
+<p>Olga Kornievskaia acknowledged both concerns <a href="https://lore.kernel.org/linux-nfs/CAN-5tyE7yW=27HObj+cfHW-6HJsiGx=m6JbAcfEw+fTA2HXgsA@mail.gmail.com/">on April 6</a> and adopted Jeff's <code>notify_change()</code> approach:</p>
+<blockquote>
+<p>"Thanks Jeff and Chuck. I've changed the code to use the notify_change() but before I send out I have a question regarding where you think this notify_change () should take place in case of a copy (specifically thinking about async copy vs sync copy)."</p>
+</blockquote>
+<p>She asked whether the timestamp update should occur at the completion of the COPY compound request or upon actual data transfer completion for async copies.</p>
+<p>Jeff Layton provided the final guidance <a href="https://lore.kernel.org/linux-nfs/0c134e9a9670a30d858b7f28da5b92420fd0ac8f.camel@kernel.org/">on April 6</a>:</p>
+<blockquote>
+<p>"I think you want to do it when the copy completes. If that's sync copy then you'd stamp it before you send the COPY reply. For async copy, I think you'd want to do it before sending a CB_OFFLOAD."</p>
+</blockquote>
+<h2>Evolution and Conclusion</h2>
+<p>The discussion evolved from Olga's initial patch—manipulating <code>FMODE_NOCMTIME</code> directly—to a consensus on using <code>notify_change()</code> for timestamp updates, avoiding fmode manipulation entirely. This approach eliminates the race conditions identified by both Jeff Layton and Chuck Lever.</p>
+<p><strong>Final conclusions:</strong></p>
+<ol>
+<li>The original approach of toggling <code>FMODE_NOCMTIME</code> was rejected due to concurrency races.</li>
+<li>The <code>notify_change()</code> mechanism is preferred for updating mtime/ctime on COPY/CLONE operations.</li>
+<li>For <strong>synchronous copies</strong>, the timestamp should be updated before sending the COPY reply.</li>
+<li>For <strong>asynchronous copies</strong>, the timestamp should be updated before sending the <code>CB_OFFLOAD</code> callback to the client.</li>
+</ol>
+<p>Olga Kornievskaia indicated she would send an updated patch incorporating these changes, but no v2 was posted within this week's window. The thread remains open pending the revised submission.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260403165335.73070-1-okorniev@redhat.com/">2026-04-03 Olga Kornievskaia <a href="mailto:okorniev@redhat.com">okorniev@redhat.com</a> — [PATCH 1/1] nfsd: update mtime/ctime on CLONE and COPY in presence of delegated attributes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/63fbd05720af891a2f7339be78fea2460beda7a8.camel@kernel.org/">2026-04-03 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 1/1] nfsd: update mtime/ctime on CLONE and COPY in presence of delegated attributes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/d9281142-57c1-4a0d-98b7-1cea19b39cb2@app.fastmail.com/">2026-04-04 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 1/1] nfsd: update mtime/ctime on CLONE and COPY in presence of delegated attributes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAN-5tyE7yW=27HObj+cfHW-6HJsiGx=m6JbAcfEw+fTA2HXgsA@mail.gmail.com/">2026-04-06 Olga Kornievskaia <a href="mailto:aglo@umich.edu">aglo@umich.edu</a> — Re: [PATCH 1/1] nfsd: update mtime/ctime on CLONE and COPY in presence of delegated attributes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/0c134e9a9670a30d858b7f28da5b92420fd0ac8f.camel@kernel.org/">2026-04-06 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 1/1] nfsd: update mtime/ctime on CLONE and COPY in presence of delegated attributes</a></li>
+</ul>
+  </main>
+</body>
+</html>

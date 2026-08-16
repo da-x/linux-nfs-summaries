@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>mm: Improve RWF_DONTCACHE Write Performance via Flusher Thread Offload</title>
+  <meta name="description" content="This week, Jeff Layton submitted v2 of a three-patch series aimed at improving write performance for RWF_DONTCACHE I/O in the Linux kernel&#39;s memory management subsystem. The discussion centers on a critical performance regression observed…">
+  <meta property="og:title" content="mm: Improve RWF_DONTCACHE Write Performance via Flusher Thread Offload">
+  <meta property="og:description" content="This week, Jeff Layton submitted v2 of a three-patch series aimed at improving write performance for RWF_DONTCACHE I/O in the Linux kernel&#39;s memory management subsystem. The discussion centers on a critical performance regression observed…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-04-09T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="mm: Improve RWF_DONTCACHE Write Performance via Flusher Thread Offload">
+  <meta name="twitter:description" content="This week, Jeff Layton submitted v2 of a three-patch series aimed at improving write performance for RWF_DONTCACHE I/O in the Linux kernel&#39;s memory management subsystem. The discussion centers on a critical performance regression observed…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-04-09</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>mm: Improve RWF_DONTCACHE Write Performance via Flusher Thread Offload</h1>
+<h2>Summary</h2>
+<h2>Overview</h2>
+<p>This week, Jeff Layton submitted <strong>v2 of a three-patch series</strong> aimed at improving write performance for <code>RWF_DONTCACHE</code> I/O in the Linux kernel's memory management subsystem. The discussion centers on a critical performance regression observed when NFS server (NFSD) or local filesystems use the "dontcache" I/O mode, and explores architectural changes to offload writeback from the writer's hot path.</p>
+<p><strong>Classification:</strong> This is a <strong>performance optimization / bug fix</strong> for existing functionality (<code>RWF_DONTCACHE</code>), not a new feature or protocol change. The patches modify core VFS/writeback behavior with implications for NFS client/server I/O patterns.</p>
+<h2>Background: The DONTCACHE Problem</h2>
+<p>The <code>RWF_DONTCACHE</code> flag (exposed via <code>IOCB_DONTCACHE</code>) allows applications and subsystems like NFSD to perform writes that should be flushed from the page cache immediately, without lingering in memory. Recently, NFSD gained debugfs controls to select between buffered, dontcache, and direct I/O modes.</p>
+<p>Jeff Layton benchmarked these modes and discovered that <code>RWF_DONTCACHE</code> performed poorly under write-heavy workloads:</p>
+<blockquote>
+<p>"one thing that really stood out was how badly RWF_DONTCACHE performed with write-heavy workloads. This turned out to be the case on a local xfs with io_uring as well as with nfsd." <a href="https://lore.kernel.org/linux-nfs/20260408-dontcache-v2-0-948dec1e756b@kernel.org/">As noted in the cover letter</a></p>
+</blockquote>
+<p>The root cause was identified: <code>generic_write_sync()</code> called <code>filemap_flush_range()</code> inline on every write, blocking the writer for milliseconds while walking the page tree and submitting I/O. This inflated p99.9 latency from <strong>23ms (buffered) to 93ms (dontcache)</strong>.</p>
+<h2>Patch v2: Kick the Flusher Thread Instead of Inline Flush</h2>
+<p>The key technical change in <a href="https://lore.kernel.org/linux-nfs/20260408-dontcache-v2-1-948dec1e756b@kernel.org/">Patch 1/3</a> replaces the inline <code>filemap_flush_range()</code> call with a <code>wakeup_flusher_threads_bdi()</code> invocation. This kicks the BDI's background flusher thread to drain dirty pages asynchronously, moving writeback submission entirely off the writer's hot path:</p>
+<blockquote>
+<p>"This moves writeback submission completely off the writer's hot path. The flusher thread handles writeback asynchronously, naturally coalescing and rate-limiting I/O without any explicit skip-if-busy or dirty pressure checks." <a href="https://lore.kernel.org/linux-nfs/20260408-dontcache-v2-1-948dec1e756b@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<p>Patches 2/3 and 3/3 add benchmark suites (<code>nfsd-io-bench</code> and <code>dontcache-bench</code>) to document the testing methodology, though Layton noted these are not intended for merge.</p>
+<h2>Evolution of the Discussion</h2>
+<h3>Abandoning Per-Inode Writeback</h3>
+<p>In v1, an alternative approach using <code>writeback_single_inode()</code> was considered to isolate DONTCACHE writeback to specific inodes. However, Layton reported significant regressions with that approach:</p>
+<blockquote>
+<p>"The per-inode approach is neutral-to-slightly-better for the production scenario (Scenario D), but regresses on multi-writer and random write workloads. The core issue is loss of I/O batching — writeback_sb_inodes() processes all dirty inodes in one blk_plug'd pass, while per-inode write_inode_now() calls are processed one at a time." <a href="https://lore.kernel.org/linux-nfs/c2351220336d0ad99396a331bad34c6177bf354e.camel@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<p>Specific regressions included:</p>
+<ul>
+<li><strong>Random write throughput:</strong> -21% (363 → 286 MB/s)</li>
+<li><strong>Multi-writer aggregate throughput:</strong> -32% (1478 → 999 MB/s)</li>
+<li><strong>Multi-writer p99.9 latency:</strong> worsened by 67% (46ms → 77ms)</li>
+</ul>
+<p>Layton concluded: <strong>"I think v2 is probably the best approach, on balance."</strong></p>
+<h3>Christoph Hellwig's Concerns: Scope of Writeback</h3>
+<p>Christoph Hellwig raised a fundamental architectural concern: kicking the entire BDI flusher for every DONTCACHE write could trigger excessive writeback of unrelated dirty pages. He explained the mechanism:</p>
+<blockquote>
+<p>"wakeup_flusher_threads_bdi ends up calling wb_start_writeback eventually, which sets WB_start_all... The flusher thread then through wb_check_start_all does a WB_SYNC_NONE writeback based on get_nr_dirty_pages. Which seems wrong - we don't want to do a huge writeback every time some DONTCACHE write finished." <a href="https://lore.kernel.org/linux-nfs/adc-Q1iDWHD5yxHH@infradead.org/">Christoph Hellwig</a></p>
+</blockquote>
+<p>Hellwig proposed a more targeted approach:</p>
+<blockquote>
+<p>"So I think you'll want a new WB_start_dontcache bit, a new get_nr_dontcache_pages() helper on a new node counter, etc." <a href="https://lore.kernel.org/linux-nfs/adc-Q1iDWHD5yxHH@infradead.org/">Christoph Hellwig</a></p>
+</blockquote>
+<h3>Jan Kara's Workload Regression Scenario</h3>
+<p>Jan Kara validated Hellwig's concern with a concrete regression scenario:</p>
+<blockquote>
+<p>"I can certainly construct a workload where this behavior will lead to big regressions in performance - for example one process creating say 1G temporary file and deleting it shortly after creation + one process doing small DONTCACHE writes. Before this change only DONTCACHE writes will make it to the disk and temporary file will only be in the page cache, after this change you pay for allocating, writing back, and deleting the temporary file." <a href="https://lore.kernel.org/linux-nfs/gpcc6t5unsoepakjdffsmnmd5duuvijxwdochd753ttix75h7l@nahwzi4qfdcq/">Jan Kara</a></p>
+</blockquote>
+<p>Kara suggested marking inodes with "dropbehind" folios and having the flusher prioritize only those:</p>
+<blockquote>
+<p>"Maybe we could mark inodes which have folios with dropbehind set and make flush worker only write such inodes?" <a href="https://lore.kernel.org/linux-nfs/gpcc6t5unsoepakjdffsmnmd5duuvijxwdochd753ttix75h7l@nahwzi4qfdcq/">Jan Kara</a></p>
+</blockquote>
+<p>Hellwig refined this idea:</p>
+<blockquote>
+<p>"I'd only expedite writing by the number of pending dontcache folios. It would still write the least recently dirtied inodes." <a href="https://lore.kernel.org/linux-nfs/ade14lOI1CDiraar@infradead.org/">Christoph Hellwig</a></p>
+</blockquote>
+<h3>API Naming Concerns</h3>
+<p>Ritesh Harjani noted that the new <code>filemap_dontcache_kick_writeback()</code> function name is misleading, as it triggers whole-BDI writeback rather than inode-specific writeback:</p>
+<blockquote>
+<p>"This api gives a wrong sense that we are kicking writeback to write dirty pages which belongs to only this inode's address space mapping. But instead we are starting wb for everything on the respective bdi." <a href="https://lore.kernel.org/linux-nfs/tstklxm7.ritesh.list@gmail.com/">Ritesh Harjani</a></p>
+</blockquote>
+<p>Hellwig agreed but preferred not to expose <code>wakeup_flusher_threads_bdi()</code> directly:</p>
+<blockquote>
+<p>"I'd rather not expose that to wide with the extra reason arguments that's not otherwise exposed outside the core writeback code." <a href="https://lore.kernel.org/linux-nfs/adc-h4bhUFGqbejN@infradead.org/">Christoph Hellwig</a></p>
+</blockquote>
+<h3>Benchmark Data Quality</h3>
+<p>Hellwig also questioned the benchmark methodology, noting unexpected results:</p>
+<blockquote>
+<p>"How does O_DIRECT manage to create almost the same peak dirty as buffered? Similarly even this patched dontcache should be lower, which feels odd." <a href="https://lore.kernel.org/linux-nfs/addBkBKySJUb8MB4@infradead.org/">Christoph Hellwig</a></p>
+</blockquote>
+<p>He requested that benchmark results be included directly in patches rather than external links, which "tend to get stale very easily."</p>
+<h2>NFS Client/Server Relevance</h2>
+<p>While this thread targets the core mm/writeback subsystem, it has direct implications for <strong>NFS server (NFSD) performance</strong>. The <code>RWF_DONTCACHE</code> mode is one of three I/O modes now configurable via NFSD debugfs controls. Improving dontcache write performance directly benefits NFS workloads that rely on this mode for low-latency, cache-bypassing writes. Layton's benchmark suite includes tests against an NFS server on localhost using fio's libnfs backend, demonstrating the NFS-relevant testing context.</p>
+<h2>Final Status and Next Steps</h2>
+<p>The discussion concluded without a resolved v3 direction. Key open items:</p>
+<ol>
+<li><strong>Architecture:</strong> Hellwig and Kara agree that whole-BDI flusher wakeup is too coarse-grained. A more targeted approach tracking DONTCACHE-specific folios/inodes is needed, but the exact mechanism remains undecided.</li>
+<li><strong>Review:</strong> Jens Axboe (block layer maintainer) has not yet weighed in, and Hellwig noted: <strong>"We also haven't heard from Jens at all, whom I'd really like to look over this."</strong> <a href="https://lore.kernel.org/linux-nfs/addB-eRg5cXzZhHG@infradead.org/">Christoph Hellwig</a></li>
+<li><strong>Timeline:</strong> Layton suggested targeting v7.2, and Hellwig confirmed there is no rush if that is the goal.</li>
+</ol>
+<p>The thread ends with significant technical consensus on the <em>problem</em> (inline flusher contention hurts DONTCACHE writes) but unresolved debate on the <em>solution</em> (whole-BDI wakeup vs. targeted inode/folio tracking).</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260408-dontcache-v2-0-948dec1e756b@kernel.org/">2026-04-08 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v2 0/3] mm: improve write performance with RWF_DONTCACHE</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260408-dontcache-v2-1-948dec1e756b@kernel.org/">2026-04-08 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v2 1/3] mm: kick writeback flusher instead of inline flush for IOCB_DONTCACHE</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260408-dontcache-v2-2-948dec1e756b@kernel.org/">2026-04-08 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v2 2/3] testing: add nfsd-io-bench NFS server benchmark suite</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260408-dontcache-v2-3-948dec1e756b@kernel.org/">2026-04-08 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v2 3/3] testing: add dontcache-bench local filesystem benchmark suite</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/c2351220336d0ad99396a331bad34c6177bf354e.camel@kernel.org/">2026-04-08 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v2 0/3] mm: improve write performance with RWF_DONTCACHE</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/tstklxm7.ritesh.list@gmail.com/">2026-04-09 Ritesh Harjani (IBM) <a href="mailto:ritesh.list@gmail.com">ritesh.list@gmail.com</a> — Re: [PATCH v2 1/3] mm: kick writeback flusher instead of inline flush for IOCB_DONTCACHE</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/adc-Q1iDWHD5yxHH@infradead.org/">2026-04-09 Christoph Hellwig <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [PATCH v2 1/3] mm: kick writeback flusher instead of inline flush for IOCB_DONTCACHE</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/adc-h4bhUFGqbejN@infradead.org/">2026-04-09 Christoph Hellwig <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [PATCH v2 1/3] mm: kick writeback flusher instead of inline flush for IOCB_DONTCACHE</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/addBkBKySJUb8MB4@infradead.org/">2026-04-09 Christoph Hellwig <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [PATCH v2 0/3] mm: improve write performance with RWF_DONTCACHE</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/addB-eRg5cXzZhHG@infradead.org/">2026-04-09 Christoph Hellwig <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [PATCH v2 0/3] mm: improve write performance with RWF_DONTCACHE</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/gpcc6t5unsoepakjdffsmnmd5duuvijxwdochd753ttix75h7l@nahwzi4qfdcq/">2026-04-09 Jan Kara <a href="mailto:jack@suse.cz">jack@suse.cz</a> — Re: [PATCH v2 1/3] mm: kick writeback flusher instead of inline flush for IOCB_DONTCACHE</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ade14lOI1CDiraar@infradead.org/">2026-04-09 Christoph Hellwig <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [PATCH v2 1/3] mm: kick writeback flusher instead of inline flush for IOCB_DONTCACHE</a></li>
+</ul>
+  </main>
+</body>
+</html>

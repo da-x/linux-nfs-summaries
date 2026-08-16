@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS Server: Fixing False Positives in Delegation File Change Detection</title>
+  <meta name="description" content="This week, Scott Mayhew submitted [PATCH v2] nfsd: fix file change detection in CB_GETATTR [id://20260404005405.1565136-1-smayhew@redhat.com], addressing a bug in the NFS server&#39;s handling of write delegations. The discussion, involving…">
+  <meta property="og:title" content="NFS Server: Fixing False Positives in Delegation File Change Detection">
+  <meta property="og:description" content="This week, Scott Mayhew submitted [PATCH v2] nfsd: fix file change detection in CB_GETATTR [id://20260404005405.1565136-1-smayhew@redhat.com], addressing a bug in the NFS server&#39;s handling of write delegations. The discussion, involving…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-04-09T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS Server: Fixing False Positives in Delegation File Change Detection">
+  <meta name="twitter:description" content="This week, Scott Mayhew submitted [PATCH v2] nfsd: fix file change detection in CB_GETATTR [id://20260404005405.1565136-1-smayhew@redhat.com], addressing a bug in the NFS server&#39;s handling of write delegations. The discussion, involving…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-04-09</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS Server: Fixing False Positives in Delegation File Change Detection</h1>
+<h2>Summary</h2>
+<h2>Overview</h2>
+<p>This week, Scott Mayhew submitted <strong>[PATCH v2] nfsd: fix file change detection in CB_GETATTR</strong> [id://20260404005405.1565136-1-smayhew@redhat.com], addressing a bug in the NFS server's handling of write delegations. The discussion, involving maintainers Chuck Lever and Jeff Layton, focused on correcting non-compliant behavior regarding file change detection, optimizing stack usage, and debating the reliability of current attributes for detecting unflushed client data.</p>
+<h2>The Bug: Cached vs. Current File Size</h2>
+<p>The core issue lies in how <code>nfsd</code> determines if a client holding a delegation has modified a file. When the server issues a <code>CB_GETATTR</code> callback to a delegating client, it expects the client to report its current view of the file attributes.</p>
+<p>Scott Mayhew highlighted that the existing implementation compared the file size reported by the client against a <strong>cached</strong> value stored in the delegation record (<code>ncf_cur_fsize</code>). This violated RFC 8881, Section 10.4.3. As Scott explained:</p>
+<blockquote>
+<p>"RFC 8881, section 10.4.3 doesn't say anything about caching the file size in the delegation record... What section 10.4.3 of RFC 8881 does say is that the server should compare the <em>current</em> file size with size reported by the client holding the delegation in the CB_GETATTR reply."</p>
+</blockquote>
+<p>The consequence of this bug was significant: if a client flushed its modifications to the server and then received a <code>CB_GETATTR</code>, the server would incorrectly believe the client still held modified data (because the cached size differed from the current size). This triggered unnecessary updates to metadata timestamps (<code>mtime</code>, <code>ctime</code>) even when no further changes were made.</p>
+<h2>Technical Evolution of the Patch</h2>
+<h3>Stack Depth Concerns</h3>
+<p>Scott's v2 patch introduced a call to <code>vfs_getattr()</code> within <code>nfsd4_deleg_getattr_conflict()</code> to retrieve the current file size accurately. Chuck Lever raised concerns about the API design and stack depth, noting:</p>
+<blockquote>
+<p>"Passing the kstat struct in saves some stack just as I suggested, but it is an ugly API... did you happen to measure how deep it gets after this patch is applied?"</p>
+</blockquote>
+<p>Scott provided detailed stack tracing data using <code>bpftrace</code>, showing a maximum stack depth of approximately 1792 bytes when traversing through SELinux hooks (<code>avc_lookup</code>) during the <code>vfs_getattr</code> call [id://adLellU5iadfbYdX@smayhew-thinkpadp1gen4i.remote.csb].</p>
+<h3>Optimization: <code>i_size_read</code> vs. <code>vfs_getattr</code></h3>
+<p>In response to the stack depth and complexity, Chuck Lever proposed a lighter-weight alternative. Since the client holds an exclusive write delegation, the file size should be stable and visible in the inode's memory representation without a full VFS getattr call.</p>
+<blockquote>
+<p>"Since the new code only needs the file's size, perhaps you can get away with <code>if (i_size_read(inode) != ncf-&gt;ncf_cb_fsize)</code>... Then there's no longer a need for a struct kstat at all." [id://fb00b2d1-e7be-4567-a077-9ec26a938a5c@app.fastmail.com]</p>
+</blockquote>
+<p>Scott agreed to this optimization, confirming he would send a v3 patch using <code>i_size_read</code> [id://adPrbw7adrsXGWVq@aion].</p>
+<h2>Debate on Change Detection Reliability</h2>
+<p>Jeff Layton raised broader concerns about the reliability of using file size and change attributes to detect unflushed data. He noted that size is not a reliable indicator for fixed-size files (e.g., VM images) and suggested checking <code>mtime</code> or extending the protocol.</p>
+<blockquote>
+<p>"I hate relying on the size for this, since it's not a reliable indicator of change... In fact, I wonder if this ought to be looking at the mtime too." [id://e812ca8b2caaf2cafaf94b7b5be487346fe07285.camel@kernel.org]</p>
+</blockquote>
+<p>Scott defended the current approach, emphasizing that the patch's primary goal was strict RFC compliance regarding the <em>source</em> of the comparison (current vs. cached), not necessarily inventing new detection heuristics. He argued that checking <code>mtime</code> might encroach on "delegated timestamps" territory and that the existing change attribute mechanism already handles unflushed writes:</p>
+<blockquote>
+<p>"If an application calls write() but not fsync(), close(), etc... the dirty pages/folios will be tracked on the nfs_inode and the client will send the elevated change attribute in the CB_GETATTR reply. What am I missing?" [id://adQwSTW7ABXvrovQ@aion]</p>
+</blockquote>
+<p>Jeff acknowledged the point about <code>mtime</code> crossing into delegated timestamps but remained skeptical that the change attribute alone is a "reliable indicator that there is still buffered write data on the client" [id://67a54e834a2625d0c31b19e22088d135f89c50b7.camel@kernel.org]. He floated the idea of a spec extension:</p>
+<blockquote>
+<p>"Should we be looking at extending the spec? Maybe we should add a 'I have outstanding buffered data' attribute that the client could send to the server in a CB_GETATTR?" [id://ca6076eba9248c39f8b95bed66cec5d907aa0ab7.camel@kernel.org]</p>
+</blockquote>
+<h2>Conclusion</h2>
+<p>The thread concluded with consensus on the immediate bug fix: <strong>v3 of the patch will use <code>i_size_read()</code></strong> to compare the current inode size against the client-reported size, adhering to RFC 8881 while avoiding stack depth issues. The broader discussion about the sufficiency of the change attribute for detecting unflushed data and potential future spec extensions remains an open topic for further consideration.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260404005405.1565136-1-smayhew@redhat.com/">2026-04-04 Scott Mayhew <a href="mailto:smayhew@redhat.com">smayhew@redhat.com</a> — [PATCH v2] nfsd: fix file change detection in CB_GETATTR</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/e03d3523-06e1-4414-b185-d349e7edbe54@app.fastmail.com/">2026-04-04 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v2] nfsd: fix file change detection in CB_GETATTR</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/adLellU5iadfbYdX@smayhew-thinkpadp1gen4i.remote.csb/">2026-04-05 Scott Mayhew <a href="mailto:smayhew@redhat.com">smayhew@redhat.com</a> — Re: [PATCH v2] nfsd: fix file change detection in CB_GETATTR</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/fb00b2d1-e7be-4567-a077-9ec26a938a5c@app.fastmail.com/">2026-04-06 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v2] nfsd: fix file change detection in CB_GETATTR</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/e812ca8b2caaf2cafaf94b7b5be487346fe07285.camel@kernel.org/">2026-04-06 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v2] nfsd: fix file change detection in CB_GETATTR</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/adPrbw7adrsXGWVq@aion/">2026-04-06 Scott Mayhew <a href="mailto:smayhew@redhat.com">smayhew@redhat.com</a> — Re: [PATCH v2] nfsd: fix file change detection in CB_GETATTR</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/adPxsOl98imcKXeC@aion/">2026-04-06 Scott Mayhew <a href="mailto:smayhew@redhat.com">smayhew@redhat.com</a> — Re: [PATCH v2] nfsd: fix file change detection in CB_GETATTR</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/67a54e834a2625d0c31b19e22088d135f89c50b7.camel@kernel.org/">2026-04-06 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v2] nfsd: fix file change detection in CB_GETATTR</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ca6076eba9248c39f8b95bed66cec5d907aa0ab7.camel@kernel.org/">2026-04-06 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v2] nfsd: fix file change detection in CB_GETATTR</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/adQwSTW7ABXvrovQ@aion/">2026-04-06 Scott Mayhew <a href="mailto:smayhew@redhat.com">smayhew@redhat.com</a> — Re: [PATCH v2] nfsd: fix file change detection in CB_GETATTR</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSv4.1: Session Size Limits Applied to Clone Path (Bug Fix)</title>
+  <meta name="description" content="Bug fix. This thread delivers a concrete patch addressing a regression in the Linux NFS client&#39;s automount clone path, where session size limits were not being enforced for submounts.">
+  <meta property="og:title" content="NFSv4.1: Session Size Limits Applied to Clone Path (Bug Fix)">
+  <meta property="og:description" content="Bug fix. This thread delivers a concrete patch addressing a regression in the Linux NFS client&#39;s automount clone path, where session size limits were not being enforced for submounts.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-04-09T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSv4.1: Session Size Limits Applied to Clone Path (Bug Fix)">
+  <meta name="twitter:description" content="Bug fix. This thread delivers a concrete patch addressing a regression in the Linux NFS client&#39;s automount clone path, where session size limits were not being enforced for submounts.">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-04-09</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSv4.1: Session Size Limits Applied to Clone Path (Bug Fix)</h1>
+<h2>Summary</h2>
+<h1>NFSv4.1 Client Fix: Session Size Limits Applied to Clone Path</h1>
+<h2>Classification</h2>
+<p><strong>Bug fix.</strong> This thread delivers a concrete patch addressing a regression in the Linux NFS client's automount clone path, where session size limits were not being enforced for submounts.</p>
+<h2>Background (Prior Week)</h2>
+<p>Last week, this thread began when Salvatore Bonaccorso <a href="https://lore.kernel.org/linux-nfs/177349021750.3039212.10211295677877269201@eldamar.lan/">reported a regression</a> caused by commit <code>2b092175f5e3</code> ("NFS: Fix inheritance of the block sizes when automounting"). Users experienced EIO errors on Dell EMC Isilon/OneFS servers when using large rsize/wsize values (1 MB). The discussion revealed a semantic mismatch: the Linux client trusted <code>maxread</code>/<code>maxwrite</code> without cross-checking against <code>max_request_size</code>, while OneFS treated those limits as total packet size rather than payload-only.</p>
+<p>Maintainer Trond Myklebust <a href="https://lore.kernel.org/linux-nfs/46a87e31656d23d633bfe63ea.camel@kernel.org/">stated</a>:</p>
+<blockquote>
+<p>"The point is, we expect the value of maxwrite to be set to a reasonable value w.r.t. max_request_size so that the client doesn't have to sanity check everybody and their dog's server."</p>
+</blockquote>
+<p>Jeff Layton <a href="https://lore.kernel.org/linux-nfs/73c3a6a03fbe30a4f4b05c7fe58b3dceda87c45b.camel@kernel.org/">countered</a> that the client should be more defensive:</p>
+<blockquote>
+<p>"ISTM the client should clamp the length down to something shorter that allows the request to fit."</p>
+</blockquote>
+<p>No patch landed last week; the thread remained in analysis mode.</p>
+<h2>This Week's Activity</h2>
+<p>Tushar Sariya <a href="https://lore.kernel.org/linux-nfs/20260404142831.3341498-1-tushar.sariya77@gmail.com/">submitted a v2 patch series</a> this week, proposing a targeted fix for the NFSv4.1 automount clone path. The patch addresses a specific gap: while top-level mounts apply session size clamping via <code>nfs4_server_common_setup()</code>, the clone path (<code>nfs4_clone_server()</code>) skips these limits entirely.</p>
+<h3>The Problem</h3>
+<p>Sariya <a href="https://lore.kernel.org/linux-nfs/20260404142831.3341498-2-tushar.sariya77@gmail.com/">explained</a>:</p>
+<blockquote>
+<p>"nfs4_clone_server() builds a child nfs_server for same-server automounted submounts but never calls nfs4_session_limit_rwsize() or nfs4_session_limit_xasize() after nfs_clone_server(). This means the child mount can end up with rsize/wsize values that exceed the negotiated session channel limits, causing NFS4ERR_REQ_TOO_BIG and EIO on servers that enforce tight max_request_size budgets."</p>
+</blockquote>
+<p>The issue was exposed by commit <code>2b092175f5e3</code>, which changed submounts to no longer unconditionally inherit the parent's already-clamped rsize/wsize. On servers with tight <code>max_request_size</code> budgets (such as Dell EMC Isilon/OneFS), child mounts ended up with raw, unclamped values that exceeded session channel limits.</p>
+<h3>The Fix</h3>
+<p>The patch applies the same session-limit clamping used by top-level mounts to the clone path:</p>
+<blockquote>
+<p>"Top-level mounts go through nfs4_server_common_setup() which calls these limiters after nfs_probe_server(). Apply the same clamping on the clone path for consistency."</p>
+</blockquote>
+<p>The changes touch three files (<code>fs/nfs/internal.h</code>, <code>fs/nfs/nfs4client.c</code>, <code>fs/nfs/nfs4proc.c</code>) with a minimal 7-line addition and 2-line removal. The patch is marked with <code>Fixes: 2b092175f5e3</code> and <code>Cc: stable@vger.kernel.org</code>.</p>
+<p>Sariya noted testing limitations:</p>
+<blockquote>
+<p>"I was unable to reproduce the exact failure locally as it appears to require a server that enforces tight max_request_size budgets. The fix is based on code analysis — the clone path is missing the same session-limit clamping that top-level mounts apply in nfs4_server_common_setup(). Tested that the kernel builds and boots successfully."</p>
+</blockquote>
+<h2>Evolution of the Discussion</h2>
+<p>The thread evolved from a broad debate about client-vs-server responsibility for size limit enforcement (last week) to a concrete, surgical fix targeting a specific code path gap (this week). Sariya's patch does not attempt to solve the broader interoperability mismatch with OneFS's interpretation of <code>max_request_size</code>; rather, it ensures that the NFS client's clone path respects its own session limits consistently, preventing child mounts from exceeding negotiated budgets.</p>
+<h2>Final Conclusions</h2>
+<ul>
+<li><strong>A targeted fix has been proposed</strong>: The v2 patch applies session size clamping to the NFSv4.1 automount clone path, ensuring consistency with top-level mount behavior.</li>
+<li><strong>The patch is minimal and well-scoped</strong>: It addresses a specific code path omission rather than attempting to overhaul the client's size negotiation logic.</li>
+<li><strong>No maintainer review yet this week</strong>: As of the end of this window, the patch has been submitted but not yet reviewed or acknowledged by Trond Myklebust or other maintainers.</li>
+<li><strong>Broader interoperability question remains open</strong>: This fix mitigates one symptom (unclamped values on clone paths) but does not resolve the deeper semantic mismatch between Linux client and OneFS server interpretations of size limits, which was debated last week.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260404142831.3341498-1-tushar.sariya77@gmail.com/">2026-04-04 Tushar Sariya <a href="mailto:tushar.sariya77@gmail.com">tushar.sariya77@gmail.com</a> — [PATCH v2 0/1] NFSv4.1: Apply session size limits on clone path</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260404142831.3341498-2-tushar.sariya77@gmail.com/">2026-04-04 Tushar Sariya <a href="mailto:tushar.sariya77@gmail.com">tushar.sariya77@gmail.com</a> — [PATCH v2 1/1] NFSv4.1: Apply session size limits on clone path</a></li>
+</ul>
+  </main>
+</body>
+</html>

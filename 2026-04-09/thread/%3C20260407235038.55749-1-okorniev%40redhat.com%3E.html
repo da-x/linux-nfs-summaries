@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd: Fix mtime/ctime updates for CLONE/COPY with delegated attributes</title>
+  <meta name="description" content="Type: Bug fix">
+  <meta property="og:title" content="nfsd: Fix mtime/ctime updates for CLONE/COPY with delegated attributes">
+  <meta property="og:description" content="Type: Bug fix">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-04-09T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd: Fix mtime/ctime updates for CLONE/COPY with delegated attributes">
+  <meta name="twitter:description" content="Type: Bug fix">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-04-09</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd: Fix mtime/ctime updates for CLONE/COPY with delegated attributes</h1>
+<h2>Summary</h2>
+<h2>nfsd: Fix mtime/ctime updates for CLONE/COPY with delegated attributes</h2>
+<p><strong>Type:</strong> Bug fix</p>
+<p><strong>Status:</strong> Under review; v2 planned to address reviewer feedback.</p>
+<h3>Overview</h3>
+<p>Olga Kornievskaia submitted a three-patch series <a href="https://lore.kernel.org/linux-nfs/20260407235038.55749-1-okorniev@redhat.com/">addressing a regression</a> where the <code>generic/407</code> xfstest fails when delegated attributes are present on NFS files. The root cause is that when a file is opened with a delegation, it uses the <code>NOCMTIME</code> flag, which suppresses mtime/ctime updates to avoid getting out of sync with the client's delegated view. However, server-side operations like CLONE and COPY modify the destination file and should update its timestamps so that subsequent GETATTR queries return correct values.</p>
+<p>The series splits the fix into three patches:</p>
+<ol>
+<li><strong>CLONE</strong>: Update mtime/ctime on the destination when performing a CLONE operation <a href="https://lore.kernel.org/linux-nfs/20260407235038.55749-2-okorniev@redhat.com/">Patch 1/3</a>.</li>
+<li><strong>Synchronous COPY</strong>: Update mtime/ctime upon completion of synchronous COPY <a href="https://lore.kernel.org/linux-nfs/20260407235038.55749-3-okorniev@redhat.com/">Patch 2/3</a>.</li>
+<li><strong>Asynchronous COPY</strong>: The most complex case — update timestamps when the background copy thread completes, not during compound processing <a href="https://lore.kernel.org/linux-nfs/20260407235038.55749-4-okorniev@redhat.com/">Patch 3/3</a>.</li>
+</ol>
+<h3>Key Technical Arguments</h3>
+<h4>Timestamp Semantics for CLONE/COPY</h4>
+<p>Olga raised an open question about whether CLONE/COPY should also update atime on the source or destination:</p>
+<blockquote>
+<p>"An outstanding question I have is whether or not a CLONE/COPY operation is supposed to also update the atime on the source file? But also atime for the dest file as well?" <a href="https://lore.kernel.org/linux-nfs/20260407235038.55749-1-okorniev@redhat.com/">Cover letter</a></p>
+</blockquote>
+<p>Jeff Layton provided guidance based on Linux's internal implementation:</p>
+<blockquote>
+<p>"CLONE/COPY aren't defined by POSIX so I'm not sure we have clear guidance about the atime on the source or destination. Within Linux, COPY is implemented using reads and writes though, so I'd expect that the source file has its atime updated, and the destination gets a new c/time." <a href="https://lore.kernel.org/linux-nfs/f3e31a7630123006fed5aeca7fa383d28f06dbe2.camel@kernel.org/">Review</a></p>
+</blockquote>
+<p>Jeff gave an overall positive assessment:</p>
+<blockquote>
+<p>"This all looks good to me. Thanks for fixing this up, Olga!" <a href="https://lore.kernel.org/linux-nfs/fc8049617da1b2920144ae27ef0ec71d9deb2e5c.camel@kernel.org/">Reviewed-by</a></p>
+</blockquote>
+<h4>Delegation Recall Concerns (Patch 1/3 — CLONE)</h4>
+<p>Chuck Lever raised a concern about whether calling <code>notify_change()</code> without the <code>ATTR_DELEG</code> flag would trigger an unwanted delegation recall:</p>
+<blockquote>
+<p>"I think there is an active delegation here. Without ATTR_DELEG, notify_change() calls try_break_deleg(), which will return -EWOULDBLOCK, causing the setattr to be silently skipped. Wouldn't it also initiate a CB_RECALL as well?" <a href="https://lore.kernel.org/linux-nfs/9a8cdd25-a3e6-4e4c-bfb3-bd8a7f90b077@app.fastmail.com/">Review</a></p>
+</blockquote>
+<p>Olga responded that the destination file is opened for write and holds its own delegation, so no conflict occurs in practice. However, she agreed to set <code>ATTR_DELEG</code> explicitly to avoid evaluating the recall path:</p>
+<blockquote>
+<p>"However, looking at the code I now see that it does make sense to set ATTR_DELEG so that the code under 'if (!(ia_valid &amp; ATTR_DELEG))' is not evaluated." <a href="https://lore.kernel.org/linux-nfs/CAN-5tyHNsZvoo+QB8Ug2Sbgq7asUUtr-RYDMM8MxuQGgfySnPw@mail.gmail.com/">Response</a></p>
+</blockquote>
+<p>Chuck also noted that timestamps should only be updated on success:</p>
+<blockquote>
+<p>"Should this check whether nfsd4_clone_file_range() succeeded before updating timestamps? If the clone fails, the file content is not modified, so a timestamp update would be incorrect." <a href="https://lore.kernel.org/linux-nfs/9a8cdd25-a3e6-4e4c-bfb3-bd8a7f90b077@app.fastmail.com/">Review</a></p>
+</blockquote>
+<p>Olga acknowledged this and confirmed a v2 would restrict the update to successful operations:</p>
+<blockquote>
+<p>"Sounds like a v2 is needed when it's only done for success." <a href="https://lore.kernel.org/linux-nfs/CAN-5tyHNsZvoo+QB8Ug2Sbgq7asUUtr-RYDMM8MxuQGgfySnPw@mail.gmail.com/">Response</a></p>
+</blockquote>
+<h4>Ordering and Error Handling in Asynchronous COPY (Patch 3/3)</h4>
+<p>Chuck Lever identified several issues in the async COPY patch:</p>
+<ol>
+<li><strong>Timestamp update ordering</strong>: The mtime/ctime update should precede the <code>CB_OFFLOAD</code> callback so that a client issuing GETATTR in response sees the updated values:</li>
+</ol>
+<blockquote>
+<p>"Jeff earlier suggested that the timestamp update should happen before sending CB_OFFLOAD, so that a client issuing GETATTR in response to the callback sees the updated timestamps." <a href="https://lore.kernel.org/linux-nfs/937c9434-07b1-408a-95e1-a5db7962c504@app.fastmail.com/">Review</a></p>
+</blockquote>
+<p>Olga agreed: "I'll move it up." <a href="https://lore.kernel.org/linux-nfs/CAN-5tyEjhiD1=K=ShJxGXfkvs+KARC_j0WZSqgHRBDm_d7Xcpw@mail.gmail.com/">Response</a></p>
+<ol start="2">
+<li><strong>Dentry reference counting bug</strong>: Chuck identified a critical refcount underflow in the error path of <code>nfsd4_copy()</code>. Three early error exits jump to <code>out_dec_async_copy_err</code> <em>before</em> the <code>dget()</code> is performed, yet the cleanup code checks <code>FMODE_NOCMTIME</code> to decide whether to call <code>dput()</code>:</li>
+</ol>
+<blockquote>
+<p>"If FMODE_NOCMTIME happens to be set when one of the early gotos fires, this calls dput without a matching dget, resulting in a dentry refcount underflow." <a href="https://lore.kernel.org/linux-nfs/937c9434-07b1-408a-95e1-a5db7962c504@app.fastmail.com/">Review</a></p>
+</blockquote>
+<p>He proposed checking <code>async_copy-&gt;d_dst</code> instead, which is NULL before the <code>dget</code> and non-NULL after:</p>
+<blockquote>
+<p>"Would it be simpler to check async_copy-&gt;d_dst here instead of re-reading FMODE_NOCMTIME? That field is NULL before the dget and non-NULL after, which handles both cases correctly." <a href="https://lore.kernel.org/linux-nfs/937c9434-07b1-408a-95e1-a5db7962c504@app.fastmail.com/">Review</a></p>
+</blockquote>
+<p>Olga confirmed she would fix the error handling in v2: "I will attempt to correct my error handling dput() in v2!" <a href="https://lore.kernel.org/linux-nfs/CAN-5tyEjhiD1=K=ShJxGXfkvs+KARC_j0WZSqgHRBDm_d7Xcpw@mail.gmail.com/">Response</a></p>
+<h4>Centralizing Timestamp Updates (Patch 2/3 — Sync COPY)</h4>
+<p>Chuck suggested a refactoring approach that would benefit both sync and async paths:</p>
+<blockquote>
+<p>"Thinking aloud: If you updated the time stamps in _nfsd_copy_file_range() wouldn't that take care of both the sync and async cases, and you could determine precisely whether a data change had been made to the destination file?" <a href="https://lore.kernel.org/linux-nfs/79484488-0f0b-4ddd-99f6-6ba15373573b@app.fastmail.com/">Suggestion</a></p>
+</blockquote>
+<p>Olga also raised uncertainty about whether partial failures (e.g., ENOSPC after some data was written) should still trigger timestamp updates, noting: "nfsd4_do_copy can return say ENOSPC but it would have modified the file as well. So I'm not clear if we need to special case return values?" <a href="https://lore.kernel.org/linux-nfs/CAN-5tyG6JFJ=e9Jkmk0TnzvszWXVneDnDaceA_AOhDtK=ScVog@mail.gmail.com/">Response</a></p>
+<h3>Conclusions and Next Steps</h3>
+<p>The patch series addresses a real bug where delegated attributes prevent proper mtime/ctime updates on CLONE/COPY operations, causing <code>generic/407</code> test failures. Jeff Layton provided a Reviewed-by tag for the overall approach. Chuck Lever's detailed review uncovered:</p>
+<ul>
+<li>A need to guard timestamp updates behind success checks</li>
+<li>A delegation recall avoidance fix via <code>ATTR_DELEG</code></li>
+<li>Correct ordering of timestamp updates relative to <code>CB_OFFLOAD</code> callbacks</li>
+<li>A dentry refcount underflow in the async COPY error path</li>
+<li>A potential architectural improvement by centralizing timestamp logic in <code>_nfsd_copy_file_range()</code></li>
+</ul>
+<p>Olga Kornievskaia confirmed all points would be addressed in v2. The discussion remains focused on NFS server-side correctness and proper interaction with delegated attributes — an important area for maintaining data consistency in modern NFS deployments.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260407235038.55749-1-okorniev@redhat.com/">2026-04-07 Olga Kornievskaia <a href="mailto:okorniev@redhat.com">okorniev@redhat.com</a> — [PATCH 0/3] nfsd update mtime/ctime on CLONE/COPY with delegated attritutes </a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260407235038.55749-4-okorniev@redhat.com/">2026-04-07 Olga Kornievskaia <a href="mailto:okorniev@redhat.com">okorniev@redhat.com</a> — [PATCH 3/3] nfsd: update mtime/ctime on asynchronous COPY with delegated attributes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260407235038.55749-2-okorniev@redhat.com/">2026-04-07 Olga Kornievskaia <a href="mailto:okorniev@redhat.com">okorniev@redhat.com</a> — [PATCH 1/3] nfsd: update mtime/ctime on CLONE in presense of delegated attributes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260407235038.55749-3-okorniev@redhat.com/">2026-04-07 Olga Kornievskaia <a href="mailto:okorniev@redhat.com">okorniev@redhat.com</a> — [PATCH 2/3] nfsd: update mtime/ctime on synchronous COPY with delegated attributes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/f3e31a7630123006fed5aeca7fa383d28f06dbe2.camel@kernel.org/">2026-04-08 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 0/3] nfsd update mtime/ctime on CLONE/COPY with delegated attritutes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/fc8049617da1b2920144ae27ef0ec71d9deb2e5c.camel@kernel.org/">2026-04-08 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 0/3] nfsd update mtime/ctime on CLONE/COPY with delegated attritutes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/9a8cdd25-a3e6-4e4c-bfb3-bd8a7f90b077@app.fastmail.com/">2026-04-08 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 1/3] nfsd: update mtime/ctime on CLONE in presense of delegated attributes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/c79b8e38-cc5c-436f-8145-2213dc1256c0@app.fastmail.com/">2026-04-08 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 2/3] nfsd: update mtime/ctime on synchronous COPY with delegated attributes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/937c9434-07b1-408a-95e1-a5db7962c504@app.fastmail.com/">2026-04-08 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 3/3] nfsd: update mtime/ctime on asynchronous COPY with delegated attributes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAN-5tyHNsZvoo+QB8Ug2Sbgq7asUUtr-RYDMM8MxuQGgfySnPw@mail.gmail.com/">2026-04-08 Olga Kornievskaia <a href="mailto:aglo@umich.edu">aglo@umich.edu</a> — Re: [PATCH 1/3] nfsd: update mtime/ctime on CLONE in presense of delegated attributes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAN-5tyG6JFJ=e9Jkmk0TnzvszWXVneDnDaceA_AOhDtK=ScVog@mail.gmail.com/">2026-04-08 Olga Kornievskaia <a href="mailto:aglo@umich.edu">aglo@umich.edu</a> — Re: [PATCH 2/3] nfsd: update mtime/ctime on synchronous COPY with delegated attributes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAN-5tyEjhiD1=K=ShJxGXfkvs+KARC_j0WZSqgHRBDm_d7Xcpw@mail.gmail.com/">2026-04-08 Olga Kornievskaia <a href="mailto:aglo@umich.edu">aglo@umich.edu</a> — Re: [PATCH 3/3] nfsd: update mtime/ctime on asynchronous COPY with delegated attributes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/79484488-0f0b-4ddd-99f6-6ba15373573b@app.fastmail.com/">2026-04-08 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 2/3] nfsd: update mtime/ctime on synchronous COPY with delegated attributes</a></li>
+</ul>
+  </main>
+</body>
+</html>

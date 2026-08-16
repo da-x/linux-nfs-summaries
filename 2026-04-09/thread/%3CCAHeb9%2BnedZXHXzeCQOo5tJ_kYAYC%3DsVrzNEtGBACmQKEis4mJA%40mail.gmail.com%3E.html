@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS close() Semantics Debate: Blocking Behavior During Server Unavailability</title>
+  <meta name="description" content="This thread, initiated by Jon Curley of Pure Storage on April 6, 2026, addresses a subtle but significant bug in the Linux NFS client&#39;s close() semantics. The discussion centers on whether close() should guarantee that pending writes are…">
+  <meta property="og:title" content="NFS close() Semantics Debate: Blocking Behavior During Server Unavailability">
+  <meta property="og:description" content="This thread, initiated by Jon Curley of Pure Storage on April 6, 2026, addresses a subtle but significant bug in the Linux NFS client&#39;s close() semantics. The discussion centers on whether close() should guarantee that pending writes are…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-04-09T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS close() Semantics Debate: Blocking Behavior During Server Unavailability">
+  <meta name="twitter:description" content="This thread, initiated by Jon Curley of Pure Storage on April 6, 2026, addresses a subtle but significant bug in the Linux NFS client&#39;s close() semantics. The discussion centers on whether close() should guarantee that pending writes are…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-04-09</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS close() Semantics Debate: Blocking Behavior During Server Unavailability</h1>
+<h2>Summary</h2>
+<h1>NFS close does not block when server is unavailable</h1>
+<h2>Overview</h2>
+<p>This thread, initiated by Jon Curley of Pure Storage on April 6, 2026, addresses a subtle but significant bug in the Linux NFS client's <code>close()</code> semantics. The discussion centers on whether <code>close()</code> should guarantee that pending writes are flushed to the server before returning — particularly when the server is unavailable or returning errors. This is classified as a <strong>bug fix / semantic correctness</strong> discussion rather than a new feature or protocol change.</p>
+<h2>Key Technical Arguments</h2>
+<h3>The Problem: <code>close()</code> Returns Success While Writes Are Still Failing</h3>
+<p>Jon Curley opened the thread by describing test failures in their automation linked to server unavailability <a href="https://lore.kernel.org/linux-nfs/CAHeb9+nedZXHXzeCQOo5tJ_kYAYC=sVrzNEtGBACmQKEis4mJA@mail.gmail.com/">As reported by Jon Curley</a>:</p>
+<blockquote>
+<p>"We've recently been investigating test failures in our automation linked to server failures. What we've noticed is that failures during WRITE do not block close(). Close simply returns success even though the writes are in a failure loop."</p>
+</blockquote>
+<p>Curley demonstrated that this is easily reproducible with pNFS flexfiles, where a data server returning <code>EACCES</code> (a fencing mechanism per the flexfiles RFC) causes writes to enter a <code>RESET_TO_PNFS</code> loop. Commands like <code>dd</code> return success while writes are stuck in this retry loop, and <code>close()</code> does not block or report the failure.</p>
+<p>Curley traced the root cause to commit <a href="https://github.com/torvalds/linux/commit/aded8d7b54f250af6deb72fde475291cfba513d1"><code>aded8d7b54f2</code></a> ("NFS: Don't inadvertently clear writeback errors"), which replaced <code>vfs_fsync</code> with <code>nfs_wb_all</code> in <code>nfs_file_flush</code>. He noted that <code>nfs_file_fsync</code> employs a much more rigorous flushing algorithm, including a <code>redirtied_pages</code> interlock to handle <code>RESET_TO_PNFS</code> events, while <code>nfs_file_flush</code> (called by <code>close()</code>) does not.</p>
+<blockquote>
+<p>"I'm not trying to get into an O_PONIES argument here but I always thought NFS close-to-open semantics meant that NFS close makes a strict effort to flush writes to the server before finishing."</p>
+</blockquote>
+<h3>Trond Myklebust's Response: POSIX vs. Hard Mount Semantics</h3>
+<p>NFS client maintainer Trond Myklebust responded by clarifying the distinction between <code>fsync()</code> and <code>close()</code> semantics <a href="https://lore.kernel.org/linux-nfs/5b6c25a9f1d8d0f8c9a1fe8f7bf83f749aeacc20.camel@kernel.org/">As explained by Trond Myklebust</a>:</p>
+<blockquote>
+<p>"Now the difference between how fsync() and close() work is really down to whether or not we need to give a hard guarantee that the data is really on disk or not when the syscall completes."</p>
+</blockquote>
+<p>Myklebust explained that:</p>
+<ul>
+<li><strong><code>fsync()</code></strong> must guarantee data is on storage. It uses the <code>redirtied_pages</code> counter to monitor resends, though this does not completely avoid live locks.</li>
+<li><strong><code>close()</code></strong> does not need such a guarantee under POSIX, as it is "just a convenience that ensures close-to-open semantics can be made to work." It calls <code>nfs_wb_all()</code>, which does not wait for resends to finish and thus avoids live locks.</li>
+</ul>
+<p>He also addressed the pNFS flexfiles nuance: errors from data servers should not be treated as fatal; instead, the client should report them to the metadata server and potentially fail over or request a new layout. The metadata server's <code>LAYOUTGET</code> may then return the fatal error if no resolution is possible.</p>
+<blockquote>
+<p>"Now we can definitely discuss whether or not that close() behaviour is correct: it does not lose data (so there are no hard mount violations), but it also doesn't offer the same guarantees that fsync() does w.r.t. whether the data is on disk on exit."</p>
+</blockquote>
+<h3>Curley's Counter-Argument: Operation Reordering Causes Application Failures</h3>
+<p>Curley pushed back, agreeing that POSIX doesn't require persistence after <code>close()</code> but raising a more critical concern: <strong>incorrect application behavior due to operation reordering</strong> <a href="https://lore.kernel.org/linux-nfs/CAHeb9+=3d+yErB+a0rhW0v+n1kV348E+8veznYszXzkkbOMVJg@mail.gmail.com/">As argued by Jon Curley</a>:</p>
+<blockquote>
+<p>"My concern is incorrect application behavior &amp; compatibility."</p>
+</blockquote>
+<p>He described a concrete test failure scenario:</p>
+<ol>
+<li>Write to a file, extending it to size N (<code>dd</code>)</li>
+<li>Assert the file size equals N (<code>stat</code>)</li>
+<li>Truncate the file to size M, where M &lt; N (<code>ftruncate</code>)</li>
+<li>Assert the file size equals M (<code>stat</code>)</li>
+</ol>
+<p>Step 4 occasionally failed because "the close flush did not finish the writes in step 1, the client reordered writeback after the setattr in step 3." This reordering caused the truncate (setattr) to complete before the pending writes, resulting in the file retaining size N instead of M.</p>
+<blockquote>
+<p>"Reordering operations to storage caused incorrect behavior. I suspect this violates POSIX semantics?"</p>
+</blockquote>
+<p>Curley concluded with a broader concern about NFS's perceived POSIX compatibility:</p>
+<blockquote>
+<p>"I already hear plenty of complaints that NFS with default mount settings isn't POSIX compatible because writes aren't visible to other clients after the write syscall completes. Would we start telling people that the rule is really fsync-close-to-open?"</p>
+</blockquote>
+<h2>Evolution of the Discussion</h2>
+<p>The thread evolved from a specific bug report about <code>close()</code> not blocking during server failures to a deeper philosophical and practical debate about NFS semantics:</p>
+<ol>
+<li><strong>Initial observation</strong>: Curley identified that <code>close()</code> returns success while writes are in a failure loop, contrary to expected "close-to-open" semantics.</li>
+<li><strong>Historical analysis</strong>: Curley traced the behavior change to a specific commit that replaced <code>vfs_fsync</code> with <code>nfs_wb_all</code>.</li>
+<li><strong>Maintainer clarification</strong>: Myklebust distinguished between <code>fsync()</code> (hard guarantee) and <code>close()</code> (POSIX convenience), framing the current behavior as intentional to avoid live locks.</li>
+<li><strong>Practical counter-example</strong>: Curley demonstrated that the current behavior causes real application failures due to operation reordering, not just data persistence issues.</li>
+</ol>
+<h2>Final Conclusions</h2>
+<p>The thread ended without a definitive resolution or patch proposal. Key takeaways:</p>
+<ul>
+<li>The current NFS client implementation allows <code>close()</code> to return before pending writes complete, which can cause <strong>operation reordering bugs</strong> in applications that rely on close-to-open semantics.</li>
+<li>Trond Myklebust acknowledged that the behavior is debatable: "we can definitely discuss whether or not that close() behaviour is correct."</li>
+<li>Jon Curley raised a compelling argument that the NFS client may require stricter <code>close()</code> semantics to achieve correct application behavior, particularly in distributed environments where operation ordering matters.</li>
+<li>The discussion highlights a tension between avoiding live locks (the current design goal) and providing reliable close-to-open semantics (an application expectation).</li>
+</ul>
+<p>This thread underscores an ongoing challenge in NFS client development: balancing performance and reliability against POSIX compatibility expectations. No patch was proposed during this week's activity, but the issue remains open for further discussion and potential remediation.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/CAHeb9+nedZXHXzeCQOo5tJ_kYAYC=sVrzNEtGBACmQKEis4mJA@mail.gmail.com/">2026-04-06 Jon Curley <a href="mailto:jcurley@purestorage.com">jcurley@purestorage.com</a> — NFS close does not block when server is unavailable</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/5b6c25a9f1d8d0f8c9a1fe8f7bf83f749aeacc20.camel@kernel.org/">2026-04-06 Trond Myklebust <a href="mailto:trondmy@kernel.org">trondmy@kernel.org</a> — Re: NFS close does not block when server is unavailable</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAHeb9+=3d+yErB+a0rhW0v+n1kV348E+8veznYszXzkkbOMVJg@mail.gmail.com/">2026-04-06 Jon Curley <a href="mailto:jcurley@purestorage.com">jcurley@purestorage.com</a> — Re: NFS close does not block when server is unavailable</a></li>
+</ul>
+  </main>
+</body>
+</html>
