@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>blktests udev Timeout Traced to nfsrahead Latency Regression in nfs-utils</title>
+  <meta name="description" content="This week, Red Hat&#39;s Yi Zhang provided a root-cause analysis for a widespread test infrastructure failure affecting the Linux NFS community. The thread addresses a bug report titled &quot;[bug report] Most blktests block/ failed with &#39;Timed out…">
+  <meta property="og:title" content="blktests udev Timeout Traced to nfsrahead Latency Regression in nfs-utils">
+  <meta property="og:description" content="This week, Red Hat&#39;s Yi Zhang provided a root-cause analysis for a widespread test infrastructure failure affecting the Linux NFS community. The thread addresses a bug report titled &quot;[bug report] Most blktests block/ failed with &#39;Timed out…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-03-05T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="blktests udev Timeout Traced to nfsrahead Latency Regression in nfs-utils">
+  <meta name="twitter:description" content="This week, Red Hat&#39;s Yi Zhang provided a root-cause analysis for a widespread test infrastructure failure affecting the Linux NFS community. The thread addresses a bug report titled &quot;[bug report] Most blktests block/ failed with &#39;Timed out…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-03-05</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>blktests udev Timeout Traced to nfsrahead Latency Regression in nfs-utils</h1>
+<h2>Summary</h2>
+<h1>blktests Failures Traced to <code>nfsrahead</code> udev Rule Latency Regression</h1>
+<h2>Classification: Bug Fix / nfs-utils User-Space Issue</h2>
+<p>This week, Red Hat's Yi Zhang provided a root-cause analysis for a widespread test infrastructure failure affecting the Linux NFS community. The thread addresses a bug report titled "[bug report] Most blktests block/ failed with 'Timed out while waiting for udev queue to empty.'" — a system-wide timeout error that was disrupting block-layer testing environments.</p>
+<h2>Background</h2>
+<p>The <code>blktests</code> suite, used extensively for validating block layer functionality in the Linux kernel, began failing en masse with udev queue exhaustion errors. The symptom was a system-wide <code>"Timed out while waiting for udev queue to empty"</code> message, indicating that the <code>systemd-udevd</code> daemon's worker threads were saturated and unable to process device events within the expected timeframe.</p>
+<h2>Root Cause Analysis</h2>
+<p>In his analysis posted on March 5 <a href="https://lore.kernel.org/linux-nfs/CAHj4cs8URj2fJ7KyP9ViAm6npVOaMiAErnw2uFyPYEU2wb7G_w@mail.gmail.com/">Yi Zhang</a>, Yi Zhang traced the problem to a regression in <code>nfs-utils</code>, specifically in the behavior of the <code>nfsrahead</code> binary invoked by udev rules.</p>
+<blockquote>
+<p>"After analyzing the systemd-udevd logs I found that the udev rule <code>/usr/lib/udev/rules.d/99-nfs.rules</code> triggers <code>/usr/libexec/nfsrahead</code> for every new block device."</p>
+</blockquote>
+<p>The core issue is a dramatic increase in latency for non-NFS devices:</p>
+<blockquote>
+<p>"In the current version, this binary takes exactly 10 seconds to return an exit code 2 for non-NFS devices. This latency, multiplied by thousands of test-generated events, exhausts udev worker threads and blocks the event queue, leading to the system-wide 'Timed out while waiting for udev queue to empty' error."</p>
+</blockquote>
+<p>By contrast, the previous version of <code>nfsrahead</code> returned much more quickly:</p>
+<blockquote>
+<p>"In the previous version, the binary <code>/usr/libexec/nfsraheadprevious</code> returns exit code 2 in 1 second."</p>
+</blockquote>
+<h2>Version Comparison</h2>
+<p>Yi Zhang provided detailed udev logs comparing two versions of <code>nfs-utils</code>:</p>
+<table><thead><tr><th>Package</th><th>Behavior</th></tr></thead><tbody>
+<tr><td><code>nfs-common-utils-2.8.4-4.rc3.fc44</code> (nfs-utils 2.8.5-rc3)</td><td>Returns exit code 2 in ~1 second</td></tr>
+<tr><td><code>nfs-common-utils-2.8.5-0.rc3.fc44</code> (nfs-utils 2.8.6-rc3)</td><td>Returns exit code 2 in ~10 seconds</td></tr>
+</tbody></table>
+<p>The logs clearly show the 10-second delay: the command is started at <code>Mar 04 06:07:14</code> but does not fail until <code>Mar 04 06:07:24</code>, a full 10 seconds later. During this time, udev worker threads are blocked, and subsequent device events (such as <code>nullb0</code> removal and re-addition) queue up behind the stalled nfsrahead invocation.</p>
+<h2>Identified Regression Source</h2>
+<p>Yi Zhang identified the specific commit responsible for the regression in the <code>nfs-utils</code> repository:</p>
+<blockquote>
+<p>"After checking the changelog for the latest nfs-utils, seems it was introduced from commit <a href="https://git.linux-nfs.org/?p=steved/nfs-utils.git;a=commit;h=2b62ac4c273a647df07400dc1126fceb76ad96c0">2b62ac4c273a647df07400dc1126fceb76ad96c0</a>."</p>
+</blockquote>
+<p>This commit, authored by Steve Dickson (steved), is in the upstream <code>nfs-utils</code> tree and introduced a behavioral change that increased the timeout for non-NFS device detection from 1 second to 10 seconds.</p>
+<h2>Impact on NFS Client Development</h2>
+<p>While this is technically an <code>nfs-utils</code> user-space issue rather than a kernel NFS client bug, it has significant implications for NFS client development and testing:</p>
+<ol>
+<li>
+<p><strong>Test Infrastructure Reliability</strong>: The <code>blktests</code> suite is critical for validating block layer changes that may interact with NFS over block devices (e.g., NFS over RDMA, pNFS block layouts). Widespread test failures obscure real bugs and slow down development cycles.</p>
+</li>
+<li>
+<p><strong>udev Integration</strong>: The <code>99-nfs.rules</code> udev rule is designed to automatically configure read-ahead settings for NFS-backed block devices via the <code>nfsrahead</code> helper. The regression demonstrates how user-space tooling changes can have cascading effects on system stability, particularly in high-throughput testing scenarios where thousands of virtual block devices are created and destroyed rapidly.</p>
+</li>
+<li>
+<p><strong>Performance Sensitivity</strong>: The 10x increase in latency (from 1s to 10s) for non-NFS devices is particularly problematic because the vast majority of block devices on a system are <em>not</em> NFS-backed. This means the regression affects nearly all device events, not just NFS-related ones.</p>
+</li>
+</ol>
+<h2>Current Status</h2>
+<p>As of this week's activity, Yi Zhang has completed the root-cause analysis and identified the offending commit. No patch or resolution was posted in this window. The next steps would likely involve:</p>
+<ul>
+<li>Upstream <code>nfs-utils</code> maintainers (notably Steve Dickson) reviewing the regression</li>
+<li>A potential fix to reduce the timeout for non-NFS devices back to 1 second, or implementing a faster detection mechanism</li>
+<li>Distribution packagers (e.g., Fedora, given the <code>.fc44</code> package references) applying backports</li>
+</ul>
+<h2>Key Takeaway</h2>
+<blockquote>
+<p>"This latency, multiplied by thousands of test-generated events, exhausts udev worker threads and blocks the event queue."</p>
+</blockquote>
+<p>This quote from Yi Zhang encapsulates the fundamental problem: a seemingly minor change in user-space tooling (a 9-second increase in timeout) can have disproportionate system-wide effects when invoked at scale through udev rules. For NFS client developers, this underscores the importance of ensuring that nfs-utils components remain performant and non-disruptive, even when operating on non-NFS devices.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/CAHj4cs8URj2fJ7KyP9ViAm6npVOaMiAErnw2uFyPYEU2wb7G_w@mail.gmail.com/">2026-03-05 Yi Zhang <a href="mailto:yi.zhang@redhat.com">yi.zhang@redhat.com</a> — Re: [bug report] Most blktests block/ failed with "Timed out while waiting for udev queue to empty."</a></li>
+</ul>
+  </main>
+</body>
+</html>

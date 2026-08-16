@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS Unmount Notification: Kernel Callbacks vs. exportfs -F</title>
+  <meta name="description" content="This week&#39;s discussion concluded the exploration of kernel-side mechanisms to notify NFSD when an underlying filesystem is unmounted, a feature intended to resolve NFSv4 unmount hangs caused by outstanding delegations and locks. After last…">
+  <meta property="og:title" content="NFS Unmount Notification: Kernel Callbacks vs. exportfs -F">
+  <meta property="og:description" content="This week&#39;s discussion concluded the exploration of kernel-side mechanisms to notify NFSD when an underlying filesystem is unmounted, a feature intended to resolve NFSv4 unmount hangs caused by outstanding delegations and locks. After last…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-03-05T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS Unmount Notification: Kernel Callbacks vs. exportfs -F">
+  <meta name="twitter:description" content="This week&#39;s discussion concluded the exploration of kernel-side mechanisms to notify NFSD when an underlying filesystem is unmounted, a feature intended to resolve NFSv4 unmount hangs caused by outstanding delegations and locks. After last…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-03-05</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS Unmount Notification: Kernel Callbacks vs. exportfs -F</h1>
+<h2>Summary</h2>
+<h1>NFS Unmount Notification: Kernel Callbacks vs. <code>exportfs -F</code></h1>
+<h2>Summary</h2>
+<p>This week's discussion concluded the exploration of kernel-side mechanisms to notify NFSD when an underlying filesystem is unmounted, a feature intended to resolve NFSv4 unmount hangs caused by outstanding delegations and locks. After last week's pivot from VFS notifier chains to a userspace <code>exportfs -F</code> solution, Jan Kara and Jeff Layton weighed in on alternative kernel callbacks. Their exchange confirmed that existing superblock operations are insufficient for this use case, reinforcing the consensus that a userspace-driven approach via <code>exportfs</code> is the most pragmatic path forward.</p>
+<h2>Key Technical Arguments</h2>
+<h3>The Limitation of <code>-&gt;umount_begin</code></h3>
+<p>Jan Kara suggested that if the proposed <code>exportfs -F</code> option proved unworkable, the existing <code>-&gt;umount_begin</code> superblock callback could potentially be adapted to provide the necessary notification:</p>
+<blockquote>
+<p>"If this option flies, then I guess it is the most sensible variant. If it doesn't work for some reason, then something like -&gt;umount_begin sb callback could be twisted (may possibly need some extension) to provide the needed notification? At least in my naive understanding it was created for usecases like this..." <a href="https://lore.kernel.org/linux-nfs/3r5imygq5ah4khza5fsbgam6ss6ohla24p4ikmbpfpjoj4qmns@f6bw344w4axz/">Jan Kara</a></p>
+</blockquote>
+<p>Jeff Layton quickly clarified why <code>-&gt;umount_begin</code> is unsuitable for this problem. The callback only fires when <code>MNT_FORCE</code> (force unmount) is specified, whereas the desired behavior should apply to normal administrative unmounts after an unexport. More importantly, he noted that the notification needs to target NFSD, not the filesystem being unmounted:</p>
+<blockquote>
+<p>"umount_begin is a superblock op that only occurs when MNT_FORCE is set. In this case though, we really want something that calls back into nfsd, rather than to the fs being unmounted." <a href="https://lore.kernel.org/linux-nfs/74db1cb73ef8571e2e38187b668a83d28e19933b.camel@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<h3>A Preferred Callback Architecture</h3>
+<p>Jeff proposed a more elegant kernel-side alternative: a callback mechanism that NFSD could register to run just before <code>umount_begin</code>, which would allow proper state teardown during force unmounts as well. He argued this would be superior from a user interface perspective compared to introducing new <code>exportfs</code> options:</p>
+<blockquote>
+<p>"Maybe you could add some sort of callback that nfsd could register that runs just before umount_begin does? That would be preferable from a UI standpoint than dealing with a new exportfs option, IMO. MNT_FORCE could then (in theory) properly allow for state teardown in nfsd that way, which seems rather natural." <a href="https://lore.kernel.org/linux-nfs/74db1cb73ef8571e2e38187b668a83d28e19933b.camel@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<h2>Evolution of the Discussion</h2>
+<p>The broader thread, as summarized in prior weeks, began with Chuck Lever's patch series proposing a VFS umount notifier chain to allow NFSD to revoke NFSv4 state (opens, locks, delegations) when a filesystem is unmounted. The discussion revealed fundamental timing flaws: both SRCU notifiers and <code>fsnotify</code> <code>FS_UNMOUNT</code> events fire only after all file references are closed, but NFSD holds files open while state is outstanding, creating a circular dependency that causes unmount to hang with <code>EBUSY</code>.</p>
+<p>Last week, the consensus shifted toward a userspace solution: adding a <code>-F</code> flag to <code>exportfs -u</code> that explicitly instructs NFSD to release all locks and close all state on the filesystem before completing the unexport. Chuck Lever agreed this would meet his needs and could leverage the existing "unlock filesystem" API <a href="https://lore.kernel.org/linux-nfs/d7abef36-ce90-4b36-af16-e8bd61b963ed@kernel.org/">as noted last week</a>.</p>
+<p>This week's contributions from Jan Kara and Jeff Layton represent final kernel-side considerations. While Jeff's proposed NFSD-registered callback is architecturally appealing, it would still require kernel changes to the VFS unmount path. Given that the <code>exportfs -F</code> approach can be implemented by teaching <code>exportfs</code> to invoke the existing "unlock filesystem" API after unexporting—leaving the kernel largely untouched—the userspace solution remains the most expedient path forward.</p>
+<h2>Final Conclusions</h2>
+<p><strong>Discussion Type:</strong> This is primarily a <strong>bug fix / feature enhancement</strong> discussion aimed at resolving NFSv4 unmount hangs when clients hold outstanding state (delegations, locks). It involves both protocol semantics (NFSv4 state management) and VFS infrastructure considerations.</p>
+<p><strong>Status:</strong> The kernel-side patch series adding umount notifiers appears stalled due to timing constraints. The preferred path forward is:</p>
+<ol>
+<li>
+<p><strong>Short-term:</strong> Implement <code>exportfs -F</code> (or similar) to explicitly flush NFSD state after unexport, leveraging the existing "unlock filesystem" API. This requires no kernel changes beyond potentially exposing or refining that API.</p>
+</li>
+<li>
+<p><strong>Long-term (optional):</strong> Jeff Layton's suggestion of an NFSD-registered callback running before <code>umount_begin</code> could enable proper state teardown during <code>MNT_FORCE</code> unmounts, but this is not immediately necessary for the core use case.</p>
+</li>
+</ol>
+<p>The remaining open question from last week—whether state revocation should be the default behavior of <code>exportfs -u</code> or require an explicit flag—has not been resolved and requires input from the linux-nfs@ review committee. NeilBrown argued that automatic revocation could break users relying on undocumented NFSv4 state persistence after unexport, while Chuck Lever noted that some administrators expect "unexport followed by unmount" to work seamlessly as it did in NFSv3.</p>
+<h2>Messages This Week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/3r5imygq5ah4khza5fsbgam6ss6ohla24p4ikmbpfpjoj4qmns@f6bw344w4axz/">2026-03-02 Jan Kara <a href="mailto:jack@suse.cz">jack@suse.cz</a> — Re: [PATCH v3 1/3] fs: add umount notifier chain for filesystem unmount notification</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/74db1cb73ef8571e2e38187b668a83d28e19933b.camel@kernel.org/">2026-03-02 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v3 1/3] fs: add umount notifier chain for filesystem unmount notification</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/3r5imygq5ah4khza5fsbgam6ss6ohla24p4ikmbpfpjoj4qmns@f6bw344w4axz/">2026-03-02 Jan Kara <a href="mailto:jack@suse.cz">jack@suse.cz</a> — Re: [PATCH v3 1/3] fs: add umount notifier chain for filesystem unmount notification</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/74db1cb73ef8571e2e38187b668a83d28e19933b.camel@kernel.org/">2026-03-02 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v3 1/3] fs: add umount notifier chain for filesystem unmount notification</a></li>
+</ul>
+  </main>
+</body>
+</html>

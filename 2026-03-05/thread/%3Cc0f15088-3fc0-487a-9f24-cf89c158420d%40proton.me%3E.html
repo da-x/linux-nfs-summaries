@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD Regression: ENOLCK on Read-Only Files and NLM Lock Semantics</title>
+  <meta name="description" content="This week’s discussion centered on a regression introduced by commit 4cc9b9f2bf4d (&quot;nfsd: refine and rename NFSD_MAY_LOCK&quot;), which causes NFS clients to receive -ENOLCK (No locks available) when attempting to acquire exclusive locks on…">
+  <meta property="og:title" content="NFSD Regression: ENOLCK on Read-Only Files and NLM Lock Semantics">
+  <meta property="og:description" content="This week’s discussion centered on a regression introduced by commit 4cc9b9f2bf4d (&quot;nfsd: refine and rename NFSD_MAY_LOCK&quot;), which causes NFS clients to receive -ENOLCK (No locks available) when attempting to acquire exclusive locks on…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-03-05T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSD Regression: ENOLCK on Read-Only Files and NLM Lock Semantics">
+  <meta name="twitter:description" content="This week’s discussion centered on a regression introduced by commit 4cc9b9f2bf4d (&quot;nfsd: refine and rename NFSD_MAY_LOCK&quot;), which causes NFS clients to receive -ENOLCK (No locks available) when attempting to acquire exclusive locks on…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-03-05</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD Regression: ENOLCK on Read-Only Files and NLM Lock Semantics</h1>
+<h2>Summary</h2>
+<h2>NFSD Regression: -ENOLCK on Read-Only Files via NLM</h2>
+<p>This week’s discussion centered on a regression introduced by commit <code>4cc9b9f2bf4d</code> ("nfsd: refine and rename NFSD_MAY_LOCK"), which causes NFS clients to receive <code>-ENOLCK</code> (No locks available) when attempting to acquire exclusive locks on read-only files (e.g., ISO images) using the Network Lock Manager (NLM).</p>
+<h3>Verification of Persistence</h3>
+<p>The thread confirmed that the issue persists across multiple kernel versions. <strong>Thorsten Leemhuis</strong> <a href="https://lore.kernel.org/linux-nfs/418f30b5-06ae-471f-bf5f-f14f3f75deff@leemhuis.info/">noted</a> that the stable backport <code>18744bc56b0ec</code> corresponds to the upstream commit and asked if mainline kernels were affected. <strong>Salvatore Bonaccorso</strong> <a href="https://lore.kernel.org/linux-nfs/aagJUlFIJkjgbEHQ@eldamar.lan/">confirmed</a> the regression is reproducible in kernel 6.19.5:</p>
+<blockquote>
+<p>"Not tested 7.0-rc2, but the issue is reproducible still in 6.19.5."</p>
+</blockquote>
+<h3>Technical Root Cause</h3>
+<p><strong>Olga Kornievskaia</strong> <a href="https://lore.kernel.org/linux-nfs/CAN-5tyGgiKnBAjrMq_vJ+rBhFQ1DDWWv_Szxdxy0WVbsJ0FwOg@mail.gmail.com/">explained</a> that the failure occurs when a user lacks write permissions on a file while the server uses <code>auth_nlm</code>. She referenced prior discussions indicating that <code>flock</code> should fail under these conditions unless specific export policies are used:</p>
+<blockquote>
+<p>"I suspect that this occurs when the user running flock does not have write access to the file it's trying to get an exclusive lock on... Change export policy to no_auth_nlm if it's desired that flock gets an exclusive lock on a file without write permissions."</p>
+</blockquote>
+<p><strong>Sasha Levin</strong>, via an AI-generated analysis, detailed the root cause: commit <code>4cc9b9f2bf4d</code> removed a permission downgrade in <code>nfsd_permission()</code> that previously changed lock request checks from <code>MAY_WRITE</code> to <code>MAY_READ</code>. This removal caused <code>inode_permission(MAY_WRITE)</code> to fail for read-only files. The analysis proposed restoring the downgrade:</p>
+<blockquote>
+<p>"The fix is to restore the permission downgrade for NFSD_MAY_NLM in nfsd_permission()... This restores the 'else' branch behavior that was lost in 4cc9b9f2bf4d."</p>
+</blockquote>
+<h3>Debate on Correctness vs. Regression</h3>
+<p><strong>NeilBrown</strong>, the author of the original commit, argued that the current behavior is technically correct due to the mapping of <code>flock</code> to <code>fcntl</code> locks over NLM. He explained:</p>
+<blockquote>
+<p>"exclusive flock locks only require read access to the file... exclusive fcntl locks require write access to the file... So if you open a file on NFS read-only and attempt an exclusive flock, that will be sent to the server as a full-range fcntl lock which should require write access."</p>
+</blockquote>
+<p>He suggested workarounds such as using <code>local_lock=flock</code> or ensuring clients request shared locks for read-only files:</p>
+<blockquote>
+<p>"It would seems to make sense to tell qemu that the device is read-only. Then it will hopefully only request a shared lock... I think that the current behaviour is correct, however I do understand that it is a regression and maybe that justifies incorrect behaviour."</p>
+</blockquote>
+<h3>Conclusion</h3>
+<p>The discussion highlighted a tension between backward compatibility and semantic correctness in NFS locking. While the regression breaks existing workflows for read-only files, NeilBrown contends that the new behavior aligns with POSIX <code>fcntl</code> semantics. No definitive patch was agreed upon this week, but users were advised to adjust export policies or mount options to mitigate the issue.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/418f30b5-06ae-471f-bf5f-f14f3f75deff@leemhuis.info/">2026-02-27 Thorsten Leemhuis <a href="mailto:regressions@leemhuis.info">regressions@leemhuis.info</a> — Re: Regression: Missing check in nfsd_permission() causes -ENOLCK No locks available</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aagJUlFIJkjgbEHQ@eldamar.lan/">2026-03-04 Salvatore Bonaccorso <a href="mailto:carnil@debian.org">carnil@debian.org</a> — Re: Bug#1128861: Regression: Missing check in nfsd_permission() causes -ENOLCK No locks available</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAN-5tyGgiKnBAjrMq_vJ+rBhFQ1DDWWv_Szxdxy0WVbsJ0FwOg@mail.gmail.com/">2026-03-04 Olga Kornievskaia <a href="mailto:aglo@umich.edu">aglo@umich.edu</a> — Re: Regression: Missing check in nfsd_permission() causes -ENOLCK No locks available</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260304154427.443501-1-sashal@kernel.org/">2026-03-04 Sasha Levin <a href="mailto:sashal@kernel.org">sashal@kernel.org</a> — Re: Regression: Missing check in nfsd_permission() causes -ENOLCK No locks available</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177266540127.7472.3460090956713656639@noble.neil.brown.name/">2026-03-04 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: Regression: Missing check in nfsd_permission() causes -ENOLCK No locks available</a></li>
+</ul>
+  </main>
+</body>
+</html>

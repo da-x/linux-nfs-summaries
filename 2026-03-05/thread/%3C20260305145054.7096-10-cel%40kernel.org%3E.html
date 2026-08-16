@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>xprtrdma: Race Fixes and Refactoring for nconnect Scalability</title>
+  <meta name="description" content="This week, Chuck Lever submitted [PATCH v2 0/8] &quot;Fix various races in xprtrdma&quot; to the Linux NFS mailing list, an eight-patch series targeting the RDMA transport layer (xprtrdma) of the SUNRPC subsystem. The series addresses a combination…">
+  <meta property="og:title" content="xprtrdma: Race Fixes and Refactoring for nconnect Scalability">
+  <meta property="og:description" content="This week, Chuck Lever submitted [PATCH v2 0/8] &quot;Fix various races in xprtrdma&quot; to the Linux NFS mailing list, an eight-patch series targeting the RDMA transport layer (xprtrdma) of the SUNRPC subsystem. The series addresses a combination…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-03-05T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="xprtrdma: Race Fixes and Refactoring for nconnect Scalability">
+  <meta name="twitter:description" content="This week, Chuck Lever submitted [PATCH v2 0/8] &quot;Fix various races in xprtrdma&quot; to the Linux NFS mailing list, an eight-patch series targeting the RDMA transport layer (xprtrdma) of the SUNRPC subsystem. The series addresses a combination…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-03-05</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>xprtrdma: Race Fixes and Refactoring for nconnect Scalability</h1>
+<h2>Summary</h2>
+<h1>xprtrdma: Race Fixes and Refactoring for nconnect Scalability</h1>
+<h2>Overview</h2>
+<p>This week, Chuck Lever submitted [PATCH v2 0/8] "Fix various races in xprtrdma" to the Linux NFS mailing list, an eight-patch series targeting the RDMA transport layer (<code>xprtrdma</code>) of the SUNRPC subsystem. The series addresses a combination of critical race conditions, performance bottlenecks, and code cleanup — all motivated by Lever's testing of the <code>nconnect</code> mount option with NFS/RDMA.</p>
+<blockquote>
+<p>"Since commit b326df4a8ec6 ('NFS: enable nconnect for RDMA'), the nconnect mount option has been enabled on proto=rdma NFS mount points. Utilizing this option increases the IOPS throughput that an NFS mount point is capable of."
+— <a href="https://lore.kernel.org/linux-nfs/20260305145054.7096-10-cel@kernel.org/">Chuck Lever</a></p>
+</blockquote>
+<p>Lever explained that enabling <code>nconnect</code> "surfaces some subtle race conditions that are well-buried when there is only a single QP." The series therefore blends <strong>bug fixes</strong> (four patches addressing races and hangs) with <strong>performance enhancements</strong> and <strong>structural refactoring</strong> (four patches optimizing memory registration and receive buffer management).</p>
+<h2>Key Bug Fixes</h2>
+<h3>1. Receive Counter Hang on Early Exit (Patch 1/8)</h3>
+<p>Contributed by Eric Badger of Pure Storage, this patch fixes a hang in <code>rpcrdma_xprt_drain()</code> that occurs under high memory pressure. When <code>rpcrdma_post_recvs()</code> fails to create a work request or exits early, the <code>re_receiving</code> counter was not decremented, causing the drain completion to never trigger:</p>
+<blockquote>
+<p>"In the event that rpcrdma_post_recvs() fails to create a work request (due to memory allocation failure, say) or otherwise exits early, we should decrement ep-&gt;re_receiving before returning. Otherwise we will hang in rpcrdma_xprt_drain() as re_receiving will never reach zero and the completion will never be triggered."
+— <a href="https://lore.kernel.org/linux-nfs/20260305145054.7096-11-cel@kernel.org/">Eric Badger</a></p>
+</blockquote>
+<p>The patch fixes a regression introduced by commit <code>15788d1d1077</code> ("xprtrdma: Do not refresh Receive Queue while it is draining"). Lever appended a lighthearted note to this patch:</p>
+<blockquote>
+<p>"Whoops, didn't mean to include this one because you should already have it. But, it shows that I am testing it."
+— <a href="https://lore.kernel.org/linux-nfs/0e60efac-e810-405a-94c4-d9c2809517f9@app.fastmail.com/">Chuck Lever</a></p>
+</blockquote>
+<h3>2. Send Context Race Blocking Transport (Patch 2/8)</h3>
+<p>This patch closes a race between <code>rpcrdma_sendctx_get_locked()</code> and <code>rpcrdma_sendctx_put_locked()</code> that can permanently set the <code>XPRT_WRITE_SPACE</code> flag, blocking all further sends on a transport:</p>
+<blockquote>
+<p>"After the sender releases XPRT_LOCKED, the release path refuses to wake the next task because XPRT_WRITE_SPACE is set. The sender retries, finds XPRT_WRITE_SPACE still set, and sleeps on xprt_sending. No further Send completions arrive to clear the flag because no new Sends can be posted."
+— <a href="https://lore.kernel.org/linux-nfs/20260305145054.7096-12-cel@kernel.org/">Chuck Lever</a></p>
+</blockquote>
+<p>With <code>nconnect</code>, this is particularly dangerous: "the stalled transport's share of congestion credits are never returned, starving the remaining transports as well."</p>
+<h3>3. Lost-Wakeup Race in Slot Allocation (Patch 4/8)</h3>
+<p>A race existed between <code>xprt_rdma_alloc_slot()</code> and <code>xprt_rdma_free_slot()</code> where a buffer freed after the pool was found empty but before a task joined the backlog would be returned to the pool with no waiter to wake. The fix re-checks the pool after joining the backlog and uses <code>xprt_add_backlog_noncongested()</code> to ensure every allocation reaches the proper re-check path.</p>
+<h3>4. Unnecessary 250 ms Delay on Backlog Wakeup (Patch 3/8)</h3>
+<p>A prior commit set <code>tk_status</code> to <code>-ENOMEM</code> in <code>xprt_rdma_alloc_slot()</code>, causing tasks woken from the backlog to sleep for HZ/4 (~250 ms) before retrying — even though a slot was already available. Lever noted:</p>
+<blockquote>
+<p>"a task woken from the backlog has a slot waiting for it, so the 250 ms rpc_delay adds latency without benefit."
+— <a href="https://lore.kernel.org/linux-nfs/20260305145054.7096-13-cel@kernel.org/">Chuck Lever</a></p>
+</blockquote>
+<h2>Performance and Structural Enhancements</h2>
+<h3>Decoupling Write-Pad Registration (Patch 5/8)</h3>
+<p>The write-pad MR registration (<code>frwr_wp_create</code>) was decoupled from the general <code>frwr_map</code> function by inlining the registration logic. This simplifies error handling and prepares for the removal of the <code>rpcrdma_mr_seg</code> intermediate structure.</p>
+<h3>Replacing rpcrdma_mr_seg with xdr_buf Cursor (Patch 6/8)</h3>
+<p>This is the most substantial refactoring patch. It eliminates the <code>rpcrdma_mr_seg[]</code> intermediate representation — described as "a relic of when multiple registration strategies existed (FMR, physical, FRWR)" — and replaces it with a lightweight 16-byte <code>rpcrdma_xdr_cursor</code> on the stack. This removes a 6240-byte <code>rl_segments[260]</code> array from each <code>rpcrdma_req</code>.</p>
+<p>The patch also fixes a pre-existing bug in write-pad statistics accounting:</p>
+<blockquote>
+<p>"Fix a pre-existing bug in rpcrdma_encode_write_list where the write-pad statistics accumulator added mr-&gt;mr_length from the last data MR rather than the write-pad MR."
+— <a href="https://lore.kernel.org/linux-nfs/20260305145054.7096-16-cel@kernel.org/">Chuck Lever</a></p>
+</blockquote>
+<h3>Scaling Receive Batch Size (Patch 7/8)</h3>
+<p>The fixed <code>RPCRDMA_MAX_RECV_BATCH</code> of 7 was replaced with a per-endpoint value scaled to 25% of the negotiated credit window. For a typical 128-credit connection, this raises the batch from 7 to 32:</p>
+<blockquote>
+<p>"reducing doorbell frequency by roughly 4x and amortizing the per-batch atomic and MMIO costs over a larger group of receive WRs."
+— <a href="https://lore.kernel.org/linux-nfs/20260305145054.7096-17-cel@kernel.org/">Chuck Lever</a></p>
+</blockquote>
+<h3>Post Receive Buffers After RPC Completion (Patch 8/8)</h3>
+<p>The <code>rpcrdma_post_recvs()</code> call was moved from CQ poll context to after the RPC has been decoded and completed, reducing latency on the critical reply path:</p>
+<blockquote>
+<p>"Every cycle spent refilling the Receive Queue delays delivery of the reply to the NFS layer."
+— <a href="https://lore.kernel.org/linux-nfs/20260305145054.7096-18-cel@kernel.org/">Chuck Lever</a></p>
+</blockquote>
+<h2>Discussion and Issues Discovered</h2>
+<p>Anna Schumaker reported regressions after applying Patch 6/8 during cthon testing with both soft iWARP and soft RoCE:</p>
+<blockquote>
+<p>"After this patch I start to see a bunch of errors running cthon tests with both soft iwarp and soft roce. With NFSv3 I see IO errors... I can't even get that far with NFSv4.2, the mounts just fail."
+— <a href="https://lore.kernel.org/linux-nfs/0f75a763-5ec9-4829-85b8-9a6ccb059704@app.fastmail.com/">Anna Schumaker</a></p>
+</blockquote>
+<p>She observed <code>Input/output error</code> on NFSv3 operations and mount failures on NFSv4.2. Lever acknowledged the report:</p>
+<blockquote>
+<p>"D'oh! I'll try to track it down."
+— <a href="https://lore.kernel.org/linux-nfs/61b6ee13-71ac-4205-94a3-6c8daa94fd0b@kernel.org/">Chuck Lever</a></p>
+</blockquote>
+<p>This exchange occurred just outside the weekly window (March 6), indicating that further debugging and likely a v3 of the series will follow.</p>
+<h2>Conclusion</h2>
+<p>This eight-patch series represents a significant investment in NFS/RDMA client reliability and performance, particularly for <code>nconnect</code> deployments. The race condition fixes address real-world deadlock and hang scenarios, while the structural refactoring modernizes the memory registration path. However, Anna Schumaker's regression report on Patch 6/8 suggests that the cursor-based MR registration changes require further attention before merging.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260305145054.7096-10-cel@kernel.org/">2026-03-05 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 0/8] Fix various races in xprtrdma</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260305145054.7096-12-cel@kernel.org/">2026-03-05 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 2/8] xprtrdma: Close sendctx get/put race that can block a transport</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260305145054.7096-11-cel@kernel.org/">2026-03-05 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 1/8] xprtrdma: Decrement re_receiving on the early exit paths</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260305145054.7096-13-cel@kernel.org/">2026-03-05 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 3/8] xprtrdma: Avoid 250 ms delay on backlog wakeup</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260305145054.7096-15-cel@kernel.org/">2026-03-05 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 5/8] xprtrdma: Decouple frwr_wp_create from frwr_map</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260305145054.7096-14-cel@kernel.org/">2026-03-05 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 4/8] xprtrdma: Close lost-wakeup race in xprt_rdma_alloc_slot</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260305145054.7096-17-cel@kernel.org/">2026-03-05 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 7/8] xprtrdma: Scale receive batch size with credit window</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260305145054.7096-16-cel@kernel.org/">2026-03-05 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 6/8] xprtrdma: Replace rpcrdma_mr_seg with xdr_buf cursor</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260305145054.7096-18-cel@kernel.org/">2026-03-05 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 8/8] xprtrdma: Post receive buffers after RPC completion</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/0e60efac-e810-405a-94c4-d9c2809517f9@app.fastmail.com/">2026-03-05 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v2 1/8] xprtrdma: Decrement re_receiving on the early exit paths</a></li>
+</ul>
+  </main>
+</body>
+</html>

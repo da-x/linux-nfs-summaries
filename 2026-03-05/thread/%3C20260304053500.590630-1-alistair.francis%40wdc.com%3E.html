@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NVMe-TCP TLS KeyUpdate Support and Handshake Infrastructure Enhancements</title>
+  <meta name="description" content="This week, Alistair Francis submitted version 7 of a five-patch series introducing support for receiving TLS 1.3 KeyUpdate requests in NVMe-TCP [\[PATCH v7…">
+  <meta property="og:title" content="NVMe-TCP TLS KeyUpdate Support and Handshake Infrastructure Enhancements">
+  <meta property="og:description" content="This week, Alistair Francis submitted version 7 of a five-patch series introducing support for receiving TLS 1.3 KeyUpdate requests in NVMe-TCP [\[PATCH v7…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-03-05T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NVMe-TCP TLS KeyUpdate Support and Handshake Infrastructure Enhancements">
+  <meta name="twitter:description" content="This week, Alistair Francis submitted version 7 of a five-patch series introducing support for receiving TLS 1.3 KeyUpdate requests in NVMe-TCP [\[PATCH v7…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-03-05</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NVMe-TCP TLS KeyUpdate Support and Handshake Infrastructure Enhancements</h1>
+<h2>Summary</h2>
+<p>This week, Alistair Francis submitted version 7 of a five-patch series introducing support for receiving TLS 1.3 <strong>KeyUpdate</strong> requests in NVMe-TCP <a href="https://lore.kernel.org/linux-nfs/20260304053500.590630-1-alistair.francis@wdc.com/">[PATCH v7 0/5]</a>. While primarily targeting NVMe-oF, the series also enhances the underlying kernel TLS handshake infrastructure, which is shared with NFS over TLS implementations via SunRPC.</p>
+<h3>Feature Overview and Motivation</h3>
+<p>The TLS 1.3 specification (RFC 8446) permits clients or servers to initiate a KeyUpdate, typically when sequence numbers approach overflow or after significant data encryption. As Western Digital's upcoming NVMe-TCP hardware controllers implement this behavior, the Linux kernel must handle these events gracefully to prevent connection aborts. The series builds upon existing <code>EKEYEXPIRED</code> detection mechanisms, allowing the kernel to forward KeyUpdate requests to userspace (e.g., <code>ktls-utils</code>). Userspace can then restore session state from the keyring and update keys without dropping the connection.</p>
+<h3>Technical Implementation and NFS-Relevant Infrastructure</h3>
+<p>The patch series introduces several structural changes to the <code>net/handshake</code> subsystem:</p>
+<ul>
+<li><strong>Key Serial Persistence:</strong> Patch 1/5 allows userspace to include a key serial number during handshake completion. This serial is stored and returned to userspace during KeyUpdate events, enabling session correlation. Notably, this infrastructure update modifies <code>net/sunrpc/svcsock.c</code> and <code>net/sunrpc/xprtsock.c</code>, ensuring that NFS/RDMA/TLS stacks benefit from the same robust key management capabilities <a href="https://lore.kernel.org/linux-nfs/20260304053500.590630-2-alistair.francis@wdc.com/">[PATCH v7 1/5]</a>.</li>
+<li><strong>Reusing Handshake Context:</strong> A new function, <code>handshake_req_keyupdate</code>, reuses the existing handshake request from the initial connection setup rather than creating a new one, optimizing resource usage <a href="https://lore.kernel.org/linux-nfs/20260304053500.590630-3-alistair.francis@wdc.com/">[PATCH v7 2/5]</a>.</li>
+<li><strong>NVMe-TCP Integration:</strong> Patches 4/5 and 5/5 integrate this logic into the NVMe host and target drivers, respectively, handling <code>EKEYEXPIRED</code> returns by triggering the handshake callback rather than failing I/O <a href="https://lore.kernel.org/linux-nfs/20260304053500.590630-5-alistair.francis@wdc.com/">[PATCH v7 4/5]</a>.</li>
+</ul>
+<h3>Review Discussion and Conclusions</h3>
+<p>The discussion focused on the robustness of TLS record handling in the NVMe host driver (Patch 4/5). Hannes Reinecke reviewed the implementation and suggested simplifying the control flow for unhandled TLS records.</p>
+<blockquote>
+<p>"I think a simple 'if' condition would be sufficient here, or do you have handling of other TLS record types queued somewhere? And we should log unhandled TLS records." <a href="https://lore.kernel.org/linux-nfs/103c958f-d5f9-47d3-9be8-dd7225368fd5@suse.de/">Hannes Reinecke</a></p>
+</blockquote>
+<p>Alistair Francis agreed with the simplification, noting it would facilitate future extensibility:</p>
+<blockquote>
+<p>"I like this approach as it makes it really easy to handle more types in the future. I don't have any more record types queued anywhere so I can change it to an if statement." <a href="https://lore.kernel.org/linux-nfs/CAKmqyKPdJ2bgT2JaXi_38obyFTjRQ_rR5EdGmP81so8MEJNRVw@mail.gmail.com/">Alistair Francis</a></p>
+</blockquote>
+<p>However, Hannes raised a critical security concern in a follow-up message. Since the KeyUpdate handling is now decoupled from the main state machine as a simple callback, unhandled TLS records (such as TLS Alerts) might be ignored rather than causing a connection reset.</p>
+<blockquote>
+<p>"This is now a simple callback, and doesn't influence the main state machine. In particular, we do <em>not</em> reset the connection... if we received an unhandled TLS record. I guess we should be doing that nevertheless, as unhandled TLS records also will include things like TLS Alert which really require us to reset the connection." <a href="https://lore.kernel.org/linux-nfs/f6e8f196-7bd0-4f94-86e0-cb27c7e69d0a@suse.de/">Hannes Reinecke</a></p>
+</blockquote>
+<h3>Final Status</h3>
+<p>The thread concludes with an agreement to simplify the record type checking and add logging for unhandled records. The open item for the next revision is to ensure that critical unhandled TLS records, such as Alerts, properly trigger a connection reset to maintain security integrity. This feature represents a significant step toward production-ready NVMe-TCP over TLS support in the Linux kernel.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260304053500.590630-1-alistair.francis@wdc.com/">2026-03-04 alistair23@gmail.com — [PATCH v7 0/5] nvme-tcp: Support receiving KeyUpdate requests</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260304053500.590630-2-alistair.francis@wdc.com/">2026-03-04 alistair23@gmail.com — [PATCH v7 1/5] net/handshake: Store the key serial number on completion</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260304053500.590630-3-alistair.francis@wdc.com/">2026-03-04 alistair23@gmail.com — [PATCH v7 2/5] net/handshake: Define handshake_req_keyupdate</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260304053500.590630-4-alistair.francis@wdc.com/">2026-03-04 alistair23@gmail.com — [PATCH v7 3/5] net/handshake: Support KeyUpdate message types</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260304053500.590630-5-alistair.francis@wdc.com/">2026-03-04 alistair23@gmail.com — [PATCH v7 4/5] nvme-tcp: Support KeyUpdate</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260304053500.590630-6-alistair.francis@wdc.com/">2026-03-04 alistair23@gmail.com — [PATCH v7 5/5] nvmet-tcp: Support KeyUpdate</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/103c958f-d5f9-47d3-9be8-dd7225368fd5@suse.de/">2026-03-04 Hannes Reinecke <a href="mailto:hare@suse.de">hare@suse.de</a> — Re: [PATCH v7 4/5] nvme-tcp: Support KeyUpdate</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAKmqyKPdJ2bgT2JaXi_38obyFTjRQ_rR5EdGmP81so8MEJNRVw@mail.gmail.com/">2026-03-04 Alistair Francis <a href="mailto:alistair23@gmail.com">alistair23@gmail.com</a> — Re: [PATCH v7 4/5] nvme-tcp: Support KeyUpdate</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/f6e8f196-7bd0-4f94-86e0-cb27c7e69d0a@suse.de/">2026-03-05 Hannes Reinecke <a href="mailto:hare@suse.de">hare@suse.de</a> — Re: [PATCH v7 4/5] nvme-tcp: Support KeyUpdate</a></li>
+</ul>
+  </main>
+</body>
+</html>

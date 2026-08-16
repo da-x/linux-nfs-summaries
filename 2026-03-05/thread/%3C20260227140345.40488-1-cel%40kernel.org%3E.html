@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>svcrdma v2: 18-Patch Performance Scalability Series Submitted</title>
+  <meta name="description" content="Chuck Lever submitted version 2 of his &quot;svcrdma performance scalability enhancements&quot; series this week, expanding from the 15-patch RFC submitted two weeks ago to an 18-patch formal submission PATCH v2 00/18. The series targets the NFS…">
+  <meta property="og:title" content="svcrdma v2: 18-Patch Performance Scalability Series Submitted">
+  <meta property="og:description" content="Chuck Lever submitted version 2 of his &quot;svcrdma performance scalability enhancements&quot; series this week, expanding from the 15-patch RFC submitted two weeks ago to an 18-patch formal submission PATCH v2 00/18. The series targets the NFS…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-03-05T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="svcrdma v2: 18-Patch Performance Scalability Series Submitted">
+  <meta name="twitter:description" content="Chuck Lever submitted version 2 of his &quot;svcrdma performance scalability enhancements&quot; series this week, expanding from the 15-patch RFC submitted two weeks ago to an 18-patch formal submission PATCH v2 00/18. The series targets the NFS…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-03-05</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>svcrdma v2: 18-Patch Performance Scalability Series Submitted</h1>
+<h2>Summary</h2>
+<h1>svcrdma v2: 18-Patch Performance Scalability Series Submitted</h1>
+<h2>Summary</h2>
+<p>Chuck Lever submitted version 2 of his "svcrdma performance scalability enhancements" series this week, expanding from the 15-patch RFC submitted two weeks ago to an 18-patch formal submission <a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-1-cel@kernel.org/">PATCH v2 00/18</a>. The series targets the NFS server-side RDMA transport (<code>svcrdma</code>) and aims to lower per-connection resource utilization, reduce lock contention, and decrease interrupt/doorbell rates as connection counts scale.</p>
+<p>This is a <strong>performance optimization series</strong> (not a new feature or protocol change), rebased onto v7.0-rc1. No replies were received within this week's window.</p>
+<h2>Changes Since RFC</h2>
+<p>Lever outlined several key improvements over the RFC version:</p>
+<blockquote>
+<p>"Changes since RFC: Rebase on v7.0-rc1; Address thundering herd in SQ fairness implementation; Release Send contexts during xpo_release_ctxt; Skip xpt_reserved accounting for RDMA; Close several races." <a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-1-cel@kernel.org/">Chuck Lever</a></p>
+</blockquote>
+<p>The series grew from 15 to 18 patches, with three new patches added in the <code>sunrpc</code> layer to eliminate spurious transport enqueue attempts and unnecessary atomic accounting overhead.</p>
+<h2>Key Technical Arguments</h2>
+<h3>Profiling-Driven Bottleneck Identification</h3>
+<p>Lever's motivation stems from profiling an 8KB NFSv3 read/write workload over RDMA, which revealed where overhead accumulates as connection count grows:</p>
+<blockquote>
+<p>"Roughly 4% of total CPU time goes to contention on the svcrdma_wq unbound workqueue pool lock, driven by cascading work item re-queues through the Send completion path. Receive completion processing acquires a per-transport spinlock on every inbound message. Doorbell and completion event counts scale with Write chunk usage." <a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-1-cel@kernel.org/">Chuck Lever</a></p>
+</blockquote>
+<p>Additionally, <code>svc_alloc_arg()</code> scans approximately 259 <code>rq_pages</code> slots per receive even when only a few pages need replacement.</p>
+<h3>Three Recurring Strategies</h3>
+<h4>1. Lock-Free Lists Replace Spinlock-Protected Queues</h4>
+<p>Patches <a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-8-cel@kernel.org/">07/18</a> and <a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-9-cel@kernel.org/">08/18</a> convert the receive completion queue (<code>sc_rq_dto_q</code>) and Read completion queue (<code>sc_read_complete_q</code>) to use <code>llist</code> (lock-free lists). This eliminates producer-side locking entirely on the hottest paths:</p>
+<blockquote>
+<p>"The lock remains for sc_read_complete_q, but the primary hot path (receive completion and consumption) no longer requires it. This eliminates producer-side contention entirely." <a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-8-cel@kernel.org/">Chuck Lever</a></p>
+</blockquote>
+<p>With both queues converted, the <code>sc_rq_dto_lock</code> spinlock is removed entirely from the receive and Read completion paths.</p>
+<h4>2. Send Context Release Deferred to nfsd Thread</h4>
+<p>Patch <a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-11-cel@kernel.org/">10/18</a> replaces the global <code>svcrdma_wq</code> workqueue with a per-transport lock-free list. The Send completion handler appends send contexts to <code>sc_send_release_list</code> without further teardown. The nfsd thread drains this list in <code>xpo_release_ctxt</code> between RPCs, performing DMA unmapping and resource release in batch:</p>
+<blockquote>
+<p>"This eliminates both the workqueue pool lock and the DMA unmap cost from the Send completion path. DMA unmapping can be expensive when an IOMMU is present in strict mode, as each unmap triggers a synchronous hardware IOTLB invalidation." <a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-11-cel@kernel.org/">Chuck Lever</a></p>
+</blockquote>
+<p>Patch <a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-10-cel@kernel.org/">09/18</a> further removes the intermediate re-queue for write chunk resource release, freeing these resources inline during send context teardown.</p>
+<h4>3. Work Request Chaining and Doorbell Reduction</h4>
+<p>Patch <a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-5-cel@kernel.org/">04/18</a> links Write chunk RDMA Write WRs onto the RPC Reply's Send WR chain, so a single <code>ib_post_send()</code> covers both operations with one completion event:</p>
+<blockquote>
+<p>"A single completion event signals that all operations have finished. This reduces both doorbell rate and completion rate, as well as eliminating the latency of a round-trip between the Write chunk completion and the subsequent Send WR posting." <a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-5-cel@kernel.org/">Chuck Lever</a></p>
+</blockquote>
+<p>Patch <a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-12-cel@kernel.org/">11/18</a> switches Receive Queue posting from small fixed batches to watermark-triggered bulk replenishment, provisioned at twice the negotiated credit limit. For a typical configuration with 128 credits, this means ~128 Receives per posting rather than frequent small batches.</p>
+<h4>4. Fair Queuing for Send Queue Access (Thundering Herd Fix)</h4>
+<p>Patch <a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-2-cel@kernel.org/">01/18</a> introduces a ticket-based fair queuing system for Send Queue slot allocation. A notable improvement since RFC addresses the thundering herd problem:</p>
+<blockquote>
+<p>"This separation ensures that send completions (the high-frequency wake source) wake only the current ticket holder rather than all queued waiters." <a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-2-cel@kernel.org/">Chuck Lever</a></p>
+</blockquote>
+<p>The implementation uses two atomic counters (<code>sc_sq_ticket_head</code> and <code>sc_sq_ticket_tail</code>) and a dedicated wait queue for ticket ordering, separate from the SQ capacity wait queue.</p>
+<h4>5. Eliminating Spurious Transport Enqueue Attempts</h4>
+<p>Three new patches (<a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-14-cel@kernel.org/">13/18</a>, <a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-16-cel@kernel.org/">15/18</a>, and <a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-17-cel@kernel.org/">16/18</a>) address a significant source of wasted CPU cycles. Trace data from a 256KB NFSv3 WRITE workload revealed:</p>
+<blockquote>
+<p>"approximately 14 enqueue attempts per RPC, with 62% returning immediately due to no pending work." <a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-14-cel@kernel.org/">Chuck Lever</a></p>
+</blockquote>
+<p>Patch <a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-15-cel@kernel.org/">14/18</a> adds a retry mechanism when receive queues drain transiently, noting:</p>
+<blockquote>
+<p>"Trace data from a 256KB NFSv3 workload over RDMA shows 267,848 of 464,355 transport dequeues (57.7%) are these empty bounces. Each bounce costs roughly 37 us. During the READ phase, empty bounces consume 8.6% of thread capacity and inflate inter-RPC gaps by an average of 87 us." <a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-15-cel@kernel.org/">Chuck Lever</a></p>
+</blockquote>
+<p>Patch <a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-19-cel@kernel.org/">18/18</a> skips <code>xpt_reserved</code> accounting for non-UDP transports (TCP and RDMA), eliminating measurable dead overhead:</p>
+<blockquote>
+<p>"At 257K ops/sec over NFS/RDMA, this is measurable dead overhead." <a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-19-cel@kernel.org/">Chuck Lever</a></p>
+</blockquote>
+<h4>6. Cache Line Separation and Per-Object Caching</h4>
+<p>Patch <a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-7-cel@kernel.org/">06/18</a> uses <code>____cacheline_aligned_in_smp</code> annotations to separate frequently modified fields in <code>struct svcxprt_rdma</code> into distinct cache lines, reducing false sharing between the Send context cache, R/W context cache, and SQ availability counter.</p>
+<p>Patch <a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-13-cel@kernel.org/">12/18</a> adds a per-recv_ctxt single-entry cache for <code>svc_rdma_chunk</code> structures:</p>
+<blockquote>
+<p>"Over 99% of RPC Calls that specify RPC/RDMA chunks provide only a single chunk, so a single cached chunk handles the common case." <a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-13-cel@kernel.org/">Chuck Lever</a></p>
+</blockquote>
+<h2>Evolution and Conclusions</h2>
+<p>This v2 submission builds directly on the RFC from two weeks prior, incorporating fixes for identified issues (thundering herd in SQ fairness, race conditions) and expanding the scope to include sunrpc-layer optimizations that eliminate spurious dispatches. The series touches 11 files with 582 insertions and 267 deletions.</p>
+<p>The code is available in Lever's <code>svcrdma-next</code> branch at: https://git.kernel.org/pub/scm/linux/kernel/git/cel/linux.git/log/?h=svcrdma-next</p>
+<p>No discussion or review comments were received within this week's window. The series represents a comprehensive, profiling-driven optimization effort for the NFS server-side RDMA transport, with particular focus on reducing lock contention, doorbell rates, and CPU cache invalidation traffic under high-scale workloads.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-1-cel@kernel.org/">2026-02-27 Chuck Lever — [PATCH v2 00/18] svcrdma performance scalability enhancements</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-2-cel@kernel.org/">2026-02-27 Chuck Lever — [PATCH v2 01/18] svcrdma: Add fair queuing for Send Queue access</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-3-cel@kernel.org/">2026-02-27 Chuck Lever — [PATCH v2 02/18] svcrdma: Clean up use of rdma-&gt;sc_pd-&gt;device in Receive paths</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-4-cel@kernel.org/">2026-02-27 Chuck Lever — [PATCH v2 03/18] svcrdma: Clean up use of rdma-&gt;sc_pd-&gt;device</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-5-cel@kernel.org/">2026-02-27 Chuck Lever — [PATCH v2 04/18] svcrdma: Add Write chunk WRs to the RPC's Send WR chain</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-6-cel@kernel.org/">2026-02-27 Chuck Lever — [PATCH v2 05/18] svcrdma: Factor out WR chain linking into helper</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-7-cel@kernel.org/">2026-02-27 Chuck Lever — [PATCH v2 06/18] svcrdma: Reduce false sharing in struct svcxprt_rdma</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-8-cel@kernel.org/">2026-02-27 Chuck Lever — [PATCH v2 07/18] svcrdma: Use lock-free list for Receive Queue tracking</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-9-cel@kernel.org/">2026-02-27 Chuck Lever — [PATCH v2 08/18] svcrdma: Convert Read completion queue to use lock-free list</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-10-cel@kernel.org/">2026-02-27 Chuck Lever — [PATCH v2 09/18] svcrdma: Release write chunk resources without re-queuing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-11-cel@kernel.org/">2026-02-27 Chuck Lever — [PATCH v2 10/18] svcrdma: Defer send context release to xpo_release_ctxt</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-12-cel@kernel.org/">2026-02-27 Chuck Lever — [PATCH v2 11/18] svcrdma: Use watermark-based Receive Queue replenishment</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-13-cel@kernel.org/">2026-02-27 Chuck Lever — [PATCH v2 12/18] svcrdma: Add per-recv_ctxt chunk context cache</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-14-cel@kernel.org/">2026-02-27 Chuck Lever — [PATCH v2 13/18] svcrdma: clear XPT_DATA on sc_read_complete_q consumption</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-15-cel@kernel.org/">2026-02-27 Chuck Lever — [PATCH v2 14/18] svcrdma: retry when receive queues drain transiently</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-16-cel@kernel.org/">2026-02-27 Chuck Lever — [PATCH v2 15/18] svcrdma: clear XPT_DATA on sc_rq_dto_q consumption</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-17-cel@kernel.org/">2026-02-27 Chuck Lever — [PATCH v2 16/18] sunrpc: skip svc_xprt_enqueue when no work is pending</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-18-cel@kernel.org/">2026-02-27 Chuck Lever — [PATCH v2 17/18] sunrpc: skip svc_xprt_enqueue in svc_xprt_received when idle</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-19-cel@kernel.org/">2026-02-27 Chuck Lever — [PATCH v2 18/18] sunrpc: Skip xpt_reserved accounting for non-UDP transports</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-1-cel@kernel.org/">2026-02-27 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 00/18] svcrdma performance scalability enhancements</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-2-cel@kernel.org/">2026-02-27 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 01/18] svcrdma: Add fair queuing for Send Queue access</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-3-cel@kernel.org/">2026-02-27 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 02/18] svcrdma: Clean up use of rdma-&gt;sc_pd-&gt;device in Receive paths</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-4-cel@kernel.org/">2026-02-27 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 03/18] svcrdma: Clean up use of rdma-&gt;sc_pd-&gt;device</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-5-cel@kernel.org/">2026-02-27 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 04/18] svcrdma: Add Write chunk WRs to the RPC's Send WR chain</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-7-cel@kernel.org/">2026-02-27 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 06/18] svcrdma: Reduce false sharing in struct svcxprt_rdma</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-6-cel@kernel.org/">2026-02-27 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 05/18] svcrdma: Factor out WR chain linking into helper</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-8-cel@kernel.org/">2026-02-27 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 07/18] svcrdma: Use lock-free list for Receive Queue tracking</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-9-cel@kernel.org/">2026-02-27 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 08/18] svcrdma: Convert Read completion queue to use lock-free list</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-10-cel@kernel.org/">2026-02-27 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 09/18] svcrdma: Release write chunk resources without re-queuing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-11-cel@kernel.org/">2026-02-27 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 10/18] svcrdma: Defer send context release to xpo_release_ctxt</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-13-cel@kernel.org/">2026-02-27 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 12/18] svcrdma: Add per-recv_ctxt chunk context cache</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-12-cel@kernel.org/">2026-02-27 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 11/18] svcrdma: Use watermark-based Receive Queue replenishment</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-14-cel@kernel.org/">2026-02-27 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 13/18] svcrdma: clear XPT_DATA on sc_read_complete_q consumption</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-15-cel@kernel.org/">2026-02-27 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 14/18] svcrdma: retry when receive queues drain transiently</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-16-cel@kernel.org/">2026-02-27 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 15/18] svcrdma: clear XPT_DATA on sc_rq_dto_q consumption</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-17-cel@kernel.org/">2026-02-27 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 16/18] sunrpc: skip svc_xprt_enqueue when no work is pending</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-19-cel@kernel.org/">2026-02-27 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 18/18] sunrpc: Skip xpt_reserved accounting for non-UDP transports</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260227140345.40488-18-cel@kernel.org/">2026-02-27 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 17/18] sunrpc: skip svc_xprt_enqueue in svc_xprt_received when idle</a></li>
+</ul>
+  </main>
+</body>
+</html>

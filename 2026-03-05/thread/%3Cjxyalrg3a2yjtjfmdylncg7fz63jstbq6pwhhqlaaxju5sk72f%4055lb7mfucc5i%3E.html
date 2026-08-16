@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS Unmount Notification: Kernel Callback Complexity Reinforces Userspace Path</title>
+  <meta name="description" content="This week&#39;s discussion on the umount notifier chain for NFSD state revocation deepened the technical analysis of why a VFS-level notification mechanism is problematic. After prior weeks&#39; exploration revealed that both SRCU notifiers and…">
+  <meta property="og:title" content="NFS Unmount Notification: Kernel Callback Complexity Reinforces Userspace Path">
+  <meta property="og:description" content="This week&#39;s discussion on the umount notifier chain for NFSD state revocation deepened the technical analysis of why a VFS-level notification mechanism is problematic. After prior weeks&#39; exploration revealed that both SRCU notifiers and…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-03-05T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS Unmount Notification: Kernel Callback Complexity Reinforces Userspace Path">
+  <meta name="twitter:description" content="This week&#39;s discussion on the umount notifier chain for NFSD state revocation deepened the technical analysis of why a VFS-level notification mechanism is problematic. After prior weeks&#39; exploration revealed that both SRCU notifiers and…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-03-05</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS Unmount Notification: Kernel Callback Complexity Reinforces Userspace Path</h1>
+<h2>Summary</h2>
+<h1>NFS Unmount Notification: Kernel Callback Complexity Reinforces Userspace Path</h1>
+<h2>Summary</h2>
+<p>This week's discussion on the umount notifier chain for NFSD state revocation deepened the technical analysis of why a VFS-level notification mechanism is problematic. After prior weeks' exploration revealed that both SRCU notifiers and <code>fsnotify</code> events fire too late to resolve NFSv4 unmount hangs, Jan Kara, Jeff Layton, NeilBrown, and Christian Brauner examined the remaining kernel-side options. Their exchange confirmed that determining when to drop NFSD state in a race-free manner is exceptionally complex, reinforcing the consensus that a userspace-driven solution via <code>exportfs</code> is the most pragmatic path forward.</p>
+<h2>Key Technical Arguments</h2>
+<h3>The Race Condition Problem with "Last Unmount" Detection</h3>
+<p>Jan Kara identified a fundamental difficulty with any VFS-based notification approach: determining whether an unmount represents the <em>last</em> reference to a superblock is impossible to do in a race-free manner before acquiring <code>namespace_lock()</code>:</p>
+<blockquote>
+<p>"Thinking about this more - Chuck was also writing about the problem of needing to shutdown the state only when this is the last unmount of a superblock but until we grab namespace_lock(), that's impossible to tell in a race-free manner? And how about lazy unmounts? There it would seem to be extra hard to determine when NFS needs to drop it's delegations since you need to figure out whether all file references are NFS internal only? It all seems like a notification from VFS isn't the right place to solve this issue..." <a href="https://lore.kernel.org/linux-nfs/2fdaxflmm7hottalnc3wbyzvjp4i5cd6etyvgzq4v3oktfwuuf@spgdoi45urqd/">Jan Kara</a></p>
+</blockquote>
+<p>This observation highlights two distinct challenges:</p>
+<ol>
+<li><strong>Race-free detection:</strong> The kernel cannot determine if an unmount is the final one until after locking, at which point it may be too late to revoke state before <code>EBUSY</code> is returned.</li>
+<li><strong>Lazy unmounts (<code>MNT_DETACH</code>):</strong> With lazy unmounts, the vfsmount is detached immediately but cleanup occurs later, making it even harder to determine when NFSD should release its delegations.</li>
+</ol>
+<h3>Jeff Layton's Defense of the Unmount Trigger</h3>
+<p>Jeff Layton articulated why unmount remains the most natural trigger for state revocation from an administrator's perspective:</p>
+<blockquote>
+<p>"The issue is that traditionally, 'exportfs -u' is what unexports the filesystem and at that point you can (usually) unmount it. We'd ideally like to have a solution that doesn't create extra steps or change this, since there is already a lot of automation and muscle memory around these commands." <a href="https://lore.kernel.org/linux-nfs/d65b010cec3df6d999becf8afb3186d2a101a369.camel@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<p>He contrasted NFSv3, which has no long-term state (aside from lockd), with NFSv4, where NFSD holds files open for extended periods:</p>
+<blockquote>
+<p>"With v4 that changed and nfsd holds files open for much longer. We can't drop all the state when fs is unexported, as it's not uncommon for it to be reexported soon afterward, and we can't force a grace period at that point to allow reclaim." <a href="https://lore.kernel.org/linux-nfs/d65b010cec3df6d999becf8afb3186d2a101a369.camel@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<p>Jeff acknowledged that if no VFS hook could be added, he would understand — but emphasized the desirability of a kernel-side solution for this use case:</p>
+<blockquote>
+<p>"If we can't add some sort of hook to the umount path, then I'll understand, but it would be a nice to have for this use-case." <a href="https://lore.kernel.org/linux-nfs/d65b010cec3df6d999becf8afb3186d2a101a369.camel@kernel.org/">Jeff Layton</a></p>
+</blockquote>
+<h3>NeilBrown's Argument Against Kernel-Side Guessing</h3>
+<p>NeilBrown offered a nuanced critique, arguing that targeting the "last unmount" of a superblock is the wrong abstraction. Instead, he suggested NFSD should consider dropping state when a specific <em>vfsmount</em> is being considered for unmount:</p>
+<blockquote>
+<p>"I think it could be appropriate to drop nfsd state when the vfsmount is being considered for unmount - including lazy unmount - whether the superblock has other mounts or not." <a href="https://lore.kernel.org/linux-nfs/177248440227.7472.10468707970508358030@noble.neil.brown.name/">NeilBrown</a></p>
+</blockquote>
+<p>However, he concluded that implementing this dependency correctly would be "messy" and advocated for explicit userspace control:</p>
+<blockquote>
+<p>"I think it would be messy to get this dependency correct. i.e. I think that guessing, in the kernel, what the user wants is problematic. I think giving the user the tools to say exactly what they want is best." <a href="https://lore.kernel.org/linux-nfs/177248440227.7472.10468707970508358030@noble.neil.brown.name/">NeilBrown</a></p>
+</blockquote>
+<h3>Christian Brauner's Agreement</h3>
+<p>Christian Brauner concurred with NeilBrown's assessment, endorsing the principle of explicit userspace control over implicit kernel-side behavior:</p>
+<blockquote>
+<p>"Very much agree." <a href="https://lore.kernel.org/linux-nfs/20260304-leitbild-erhielten-49507b3a6f59@brauner/">Christian Brauner</a></p>
+</blockquote>
+<h2>Evolution of the Discussion</h2>
+<p>This thread, originally initiated by Chuck Lever's patch series proposing a VFS umount notifier chain, has evolved through several stages:</p>
+<ol>
+<li><strong>Prior weeks:</strong> Discovery that SRCU notifiers and <code>fsnotify</code> <code>FS_UNMOUNT</code> events fire too late (after all files are closed), creating a circular dependency with NFSD-held file references.</li>
+<li><strong>Last week:</strong> Pivot toward a userspace solution via <code>exportfs -F</code>, with debate over whether state revocation should be default or opt-in.</li>
+<li><strong>This week:</strong> Deep technical analysis confirming that kernel-side notification mechanisms face insurmountable complexity due to race conditions, lazy unmount semantics, and the difficulty of determining "last unmount" status in a lock-free manner.</li>
+</ol>
+<h2>Final Conclusions</h2>
+<p><strong>Discussion Type:</strong> This is primarily a <strong>bug fix / feature enhancement</strong> discussion aimed at resolving NFSv4 unmount hangs caused by outstanding client state (delegations, locks, opens). It touches on protocol semantics (NFSv4 state management), VFS infrastructure, and userspace tooling.</p>
+<p><strong>Status:</strong> The kernel-side patch series adding umount notifiers remains stalled. This week's exchange solidified the consensus that:</p>
+<ol>
+<li><strong>VFS-level notifications are fundamentally flawed</strong> for this use case due to race conditions in determining "last unmount" status and complications with lazy unmounts.</li>
+<li><strong>A userspace solution via <code>exportfs -F</code></strong> (or similar) remains the most pragmatic path forward, leveraging the existing "unlock filesystem" API without requiring kernel VFS changes.</li>
+<li><strong>Explicit user control is preferred</strong> over implicit kernel-side guessing, as endorsed by both NeilBrown and Christian Brauner.</li>
+</ol>
+<p>The remaining open question — whether state revocation should be the default behavior of <code>exportfs -u</code> or require an explicit flag — has not been resolved and requires input from the linux-nfs@ review committee.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/2fdaxflmm7hottalnc3wbyzvjp4i5cd6etyvgzq4v3oktfwuuf@spgdoi45urqd/">2026-03-02 Jan Kara <a href="mailto:jack@suse.cz">jack@suse.cz</a> — Re: [PATCH v3 1/3] fs: add umount notifier chain for filesystem unmount notification</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/d65b010cec3df6d999becf8afb3186d2a101a369.camel@kernel.org/">2026-03-02 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v3 1/3] fs: add umount notifier chain for filesystem unmount notification</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177248440227.7472.10468707970508358030@noble.neil.brown.name/">2026-03-02 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v3 1/3] fs: add umount notifier chain for filesystem unmount notification</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260304-leitbild-erhielten-49507b3a6f59@brauner/">2026-03-04 Christian Brauner <a href="mailto:brauner@kernel.org">brauner@kernel.org</a> — Re: [PATCH v3 1/3] fs: add umount notifier chain for filesystem unmount notification</a></li>
+</ul>
+  </main>
+</body>
+</html>

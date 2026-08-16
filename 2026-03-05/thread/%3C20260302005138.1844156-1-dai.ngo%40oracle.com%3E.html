@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>pNFS: Serializing SCSI PR Registration to Prevent Reservation Conflicts</title>
+  <meta name="description" content="This week, a critical bug fix for the pNFS block layout client was proposed and reviewed. The patch addresses a race condition in SCSI Persistent Reservation (PR) registration that could lead to I/O failures under concurrent load.">
+  <meta property="og:title" content="pNFS: Serializing SCSI PR Registration to Prevent Reservation Conflicts">
+  <meta property="og:description" content="This week, a critical bug fix for the pNFS block layout client was proposed and reviewed. The patch addresses a race condition in SCSI Persistent Reservation (PR) registration that could lead to I/O failures under concurrent load.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-03-05T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="pNFS: Serializing SCSI PR Registration to Prevent Reservation Conflicts">
+  <meta name="twitter:description" content="This week, a critical bug fix for the pNFS block layout client was proposed and reviewed. The patch addresses a race condition in SCSI Persistent Reservation (PR) registration that could lead to I/O failures under concurrent load.">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-03-05</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>pNFS: Serializing SCSI PR Registration to Prevent Reservation Conflicts</h1>
+<h2>Summary</h2>
+<p>This week, a critical bug fix for the pNFS block layout client was proposed and reviewed. The patch addresses a race condition in SCSI Persistent Reservation (PR) registration that could lead to I/O failures under concurrent load.</p>
+<h3>The Bug: Race Condition in PR Registration</h3>
+<p>Dai Ngo from Oracle identified an issue where multiple threads initiating I/O to the same SCSI device via pNFS could trigger reservation conflicts. Currently, the function <code>bl_register_scsi()</code> sets the <code>PNFS_BDEV_REGISTERED</code> flag <em>before</em> completing the actual PR operation. If multiple threads start concurrently:</p>
+<ol>
+<li>The first thread sets the flag and begins registration.</li>
+<li>Other threads see the flag is set, skip registration, and immediately proceed to issue I/O.</li>
+<li>Since the PR registration isn't complete, these early I/Os hit <code>RESERVATION CONFLICT</code>, forcing a fallback to the Metadata Server (MDS).</li>
+</ol>
+<p>As Dai explained in the patch submission:</p>
+<blockquote>
+<p>"Protect the registration path with a mutex so only one thread performs PR registration at a time. Other threads wait for registration to finish and only then re-check PNFS_BDEV_REGISTERED, ensuring no I/O is issued until PR registration is complete."</p>
+</blockquote>
+<p>He provided a specific <code>fio</code> workload capable of reproducing the issue, involving multiple jobs with high I/O depth to saturate bandwidth and trigger parallel Data Server connections.</p>
+<h3>Review and Refinement</h3>
+<p>Christoph Hellwig reviewed the patch and suggested improvements for code consistency and clarity:</p>
+<ol>
+<li><strong>Naming and Placement</strong>: He requested moving the new mutex field up in the structure definition (away from function pointers) and renaming it to <code>pbd_registration_mutex</code> with a descriptive comment.</li>
+<li><strong>Symmetry and Locking Scheme</strong>: Christoph pointed out that the patch only protected registration, not unregistration. He argued for fully protecting both paths:
+<blockquote>
+<p>"This seems to only lock the registration side, and not the unregistration side, which is a bit odd. If you fully protect register/unregister we also don't need atomic bitops for PNFS_BDEV_REGISTERED and have a more consistent locking scheme."</p>
+</blockquote>
+</li>
+</ol>
+<p>Dai initially resisted adding the mutex to unregistration, arguing that it occurs during unmount where races are unlikely and harmless:</p>
+<blockquote>
+<p>"The reason I did not use the mutex on unregistration is because unregistration happens when the export is unmounted and I don't see any race condition can happen at that time. Besides, even if there is race condition on the unregistration the consequence is a duplicate SCSI PR unregistration which is harmless."</p>
+</blockquote>
+<p>However, he acknowledged that adding it would make the code symmetric. Dai also questioned whether the <code>PNFS_BDEV_REGISTERED</code> bit was still necessary if both paths were mutex-protected:</p>
+<blockquote>
+<p>"Even we fully protect register/unregister don't we still need the PNFS_BDEV_REGISTERED bit so the others thread can check and skip the register/unregister op?"</p>
+</blockquote>
+<p>Christoph clarified that while the bit is still needed for threads to quickly determine if registration has occurred, it no longer requires atomic bit operations if the mutex protects the state changes:</p>
+<blockquote>
+<p>"Yes, but it doesn't need to use the atomic bit ops."</p>
+</blockquote>
+<h3>Testing Infrastructure Discussion</h3>
+<p>The inclusion of a <code>fio</code> test case sparked a brief discussion on integrating such tests into the NFS development workflow. Christoph expressed interest in wiring up such tests:</p>
+<blockquote>
+<p>"I wish we could wire this up somewhere. Not sure what the right place for these kinds of nfs tests are, though."</p>
+</blockquote>
+<p>Chuck Lever noted that he had previously added pNFS with iSCSI testing workflows to <code>kdevops</code>, including fstests and other suites, but has struggled to find resources to integrate them into the main NFSD test matrix.</p>
+<h3>Conclusion</h3>
+<p>The discussion concluded with Dai agreeing to prepare a v2 of the patch incorporating Christoph's suggestions:</p>
+<ul>
+<li>Renaming the mutex to <code>pbd_registration_mutex</code>.</li>
+<li>Adding a descriptive comment.</li>
+<li>Moving the mutex field in the structure.</li>
+<li>Extending the mutex protection to cover unregistration for symmetry and consistent locking, thereby allowing the removal of atomic bit operations for <code>PNFS_BDEV_REGISTERED</code>.</li>
+</ul>
+<p>This fix is crucial for NFS client stability in high-concurrency pNFS environments using SCSI layouts, preventing unnecessary fallbacks to the MDS and potential performance degradation.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260302005138.1844156-1-dai.ngo@oracle.com/">2026-03-02 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — [PATCH 1/1] pNFS: Serialize SCSI PR registration to avoid reservation conflicts</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aab_XbwjYoIPk2_a@infradead.org/">2026-03-03 Christoph Hellwig <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [PATCH 1/1] pNFS: Serialize SCSI PR registration to avoid reservation conflicts</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/f17b9186-9339-41ad-830f-1a622f4b267f@app.fastmail.com/">2026-03-03 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 1/1] pNFS: Serialize SCSI PR registration to avoid reservation conflicts</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/53291a21-4a4a-4f43-8f8d-73f9415d6128@oracle.com/">2026-03-03 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — Re: [PATCH 1/1] pNFS: Serialize SCSI PR registration to avoid reservation conflicts</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aagvmtZ0t-GKwrZ4@infradead.org/">2026-03-04 Christoph Hellwig <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [PATCH 1/1] pNFS: Serialize SCSI PR registration to avoid reservation conflicts</a></li>
+</ul>
+  </main>
+</body>
+</html>
