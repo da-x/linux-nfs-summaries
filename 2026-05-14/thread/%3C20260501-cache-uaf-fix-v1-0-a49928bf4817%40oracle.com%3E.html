@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SUNRPC: Refining cache_check_rcu() UAF fixes and dropping unnecessary netns guard</title>
+  <meta name="description" content="This thread discusses the refinement of a patch series addressing Use-After-Free (UAF) vulnerabilities in the SUNRPC cache content files, specifically focusing on cache_check_rcu() races. The discussion centers on validating the root cause…">
+  <meta property="og:title" content="SUNRPC: Refining cache_check_rcu() UAF fixes and dropping unnecessary netns guard">
+  <meta property="og:description" content="This thread discusses the refinement of a patch series addressing Use-After-Free (UAF) vulnerabilities in the SUNRPC cache content files, specifically focusing on cache_check_rcu() races. The discussion centers on validating the root cause…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-14T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="SUNRPC: Refining cache_check_rcu() UAF fixes and dropping unnecessary netns guard">
+  <meta name="twitter:description" content="This thread discusses the refinement of a patch series addressing Use-After-Free (UAF) vulnerabilities in the SUNRPC cache content files, specifically focusing on cache_check_rcu() races. The discussion centers on validating the root cause…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-14</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>SUNRPC: Refining cache_check_rcu() UAF fixes and dropping unnecessary netns guard</h1>
+<h2>Summary</h2>
+<p>This thread discusses the refinement of a patch series addressing Use-After-Free (UAF) vulnerabilities in the SUNRPC cache content files, specifically focusing on <code>cache_check_rcu()</code> races. The discussion centers on validating the root cause of reported crashes and ensuring patches address actual bugs rather than perceived ones.</p>
+<h3>Key Technical Arguments</h3>
+<p><strong>1. Misidentification of the Root Cause for SUNRPC Caches</strong>
+Initially, developer Yang Erkun <a href="https://lore.kernel.org/linux-nfs/4bb9ed6b-1a64-406a-9239-b0560ca963cc@huawei.com/">questioned</a> whether the UAF reported by Misbah was related to network namespace teardown, similar to a recent NFSd fix (<code>e7fcf179b82d</code>). He noted he could not reproduce the issue and suspected the dentry teardown path.</p>
+<p>Chuck Lever clarified that while <code>e7fcf179b82d</code> fixed a specific oops in <code>/proc/fs/nfs/exports</code>, the SUNRPC cache files (<code>/proc/net/rpc/&lt;cache&gt;/content</code>) have different synchronization properties. He initially suggested Patch 5/6 of his series, which adds <code>get_net()</code> guards to SUNRPC cache opens, addressed a similar hole.</p>
+<p><strong>2. The Role of <code>proc_entry_rundown</code></strong>
+Erkun <a href="https://lore.kernel.org/linux-nfs/4ee398d0-d2ec-45b2-8214-6e35520fca2d@huawei.com/">provided a detailed analysis</a> arguing that Patch 5/6 might be unnecessary. He explained that SUNRPC cache files are accessed via <code>proc_reg_read</code>, which calls <code>use_pde</code>. During cache unregistration, <code>cache_unregister_net()</code> triggers <code>proc_remove()</code>, which invokes <code>proc_entry_rundown()</code>.</p>
+<blockquote>
+<p>"The proc_entry_rundown function waits until unuse_pde is called in proc_reg_read. Therefore, I'm not sure if forgetting to call get_net when opening /proc/net/rpc/&lt;cache&gt;/content is the root cause of the null pointer in c_show."</p>
+</blockquote>
+<p>Erkun correctly identified that <code>proc_entry_rundown</code> blocks until all active readers have finished, ensuring that <code>cache_destroy_net()</code> (which frees <code>cd-&gt;hash_table</code>) only runs after no reader can dereference the cache detail structure.</p>
+<p><strong>3. Identification of the Actual Bug: Patch 3/6</strong>
+Chuck Lever <a href="https://lore.kernel.org/linux-nfs/98268bb4-2e97-4728-96a6-37b2a4a3ae5d@app.fastmail.com/">conceded</a> that Erkun's analysis was correct. He acknowledged that the changelog for Patch 5/6 overstated the window for SUNRPC cache files.</p>
+<blockquote>
+<p>"Walked the synchronization. You're right... The sunrpc cache files reach c_show through proc_reg_read(), which goes through use_pde()/unuse_pde() and is covered by rundown. 5/6 doesn't close the hazard its changelog describes."</p>
+</blockquote>
+<p>Chuck identified that <strong>Patch 3/6</strong> is the actual fix for Misbah's reproducer. The bug lies in <code>ip_map_put()</code>, which synchronously drops an <code>auth_domain</code> reference:</p>
+<blockquote>
+<p>"A reader walking auth.unix.ip/content under rcu_read_lock() can dereference im-&gt;m_client after the auth_domain has been freed. Same shape as 48db892356d6's svc_export fix, applied to ip_map."</p>
+</blockquote>
+<p>Patch 3/6 moves this release into a deferred callback via <code>queue_rcu_work()</code>, ensuring the sub-object survives the RCU grace period.</p>
+<h3>Final Conclusions and Action Items</h3>
+<p>The discussion concluded with Chuck Lever outlining specific changes for v2 of the patch series:</p>
+<ol>
+<li><strong>Drop or Reframe Patch 5/6:</strong> Since <code>proc_entry_rundown</code> already protects SUNRPC cache files from the namespace teardown race, Patch 5/6 is not a bug fix for the described UAF.
+<blockquote>
+<p>"For v2: re-test Misbah's reproducer with patches 1-4 and 6 only and see whether 3/6 alone closes the crash. If it does, drop 5/6; if it doesn't, reframe 5/6 as a consistency change without the UAF claim..."</p>
+</blockquote>
+</li>
+<li><strong>Focus on Patch 3/6:</strong> The critical fix is deferring <code>auth_domain_put()</code> in <code>ip_map</code> release to prevent UAF during RCU traversal.</li>
+<li><strong>Rewrite Cover Letter:</strong> The cover letter must be rewritten to accurately reflect that Patch 5/6 does not fix a UAF in SUNRPC cache files, avoiding misleading claims about network namespace lifetime extension for these specific debugfs/procfs entries.</li>
+</ol>
+<p>This thread highlights the importance of rigorous synchronization analysis in kernel development, where seemingly analogous bugs (NFSd vs. SUNRPC) may have different root causes due to subtle differences in procfs entry handling.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/4bb9ed6b-1a64-406a-9239-b0560ca963cc@huawei.com/">2026-05-08 yangerkun <a href="mailto:yangerkun@huawei.com">yangerkun@huawei.com</a> — Re: [PATCH 0/6] SUNRPC: Address remaining cache_check_rcu() UAF in cache content files</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/05f93fc4-59d7-4735-bc7d-a00d1497687a@huawei.com/">2026-05-08 yangerkun <a href="mailto:yangerkun@huawei.com">yangerkun@huawei.com</a> — Re: [PATCH 0/6] SUNRPC: Address remaining cache_check_rcu() UAF in cache content files</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/10019b42-4589-4f9f-8d5b-d8197db1ce3c@huawei.com/">2026-05-08 yangerkun <a href="mailto:yangerkun@huawei.com">yangerkun@huawei.com</a> — Re: [PATCH 0/6] SUNRPC: Address remaining cache_check_rcu() UAF in cache content files</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/39819ad4-3105-4802-b5e2-79e131b25984@huawei.com/">2026-05-08 yangerkun <a href="mailto:yangerkun@huawei.com">yangerkun@huawei.com</a> — Re: [PATCH 0/6] SUNRPC: Address remaining cache_check_rcu() UAF in cache content files</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/f4caa4fa-f15f-4c95-8318-d4ec216e6090@app.fastmail.com/">2026-05-08 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 0/6] SUNRPC: Address remaining cache_check_rcu() UAF in cache content files</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/4ee398d0-d2ec-45b2-8214-6e35520fca2d@huawei.com/">2026-05-09 yangerkun <a href="mailto:yangerkun@huawei.com">yangerkun@huawei.com</a> — Re: [PATCH 0/6] SUNRPC: Address remaining cache_check_rcu() UAF in cache content files</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/98268bb4-2e97-4728-96a6-37b2a4a3ae5d@app.fastmail.com/">2026-05-10 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 0/6] SUNRPC: Address remaining cache_check_rcu() UAF in cache content files</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>XFS pNFS: Fix overlapping extents in LAYOUTGET replies</title>
+  <meta name="description" content="This thread addresses a critical bug fix in the XFS filesystem&#39;s pNFS block layout implementation, specifically concerning how extent mappings are returned during LAYOUTGET operations. The discussion centers on preventing overlapping…">
+  <meta property="og:title" content="XFS pNFS: Fix overlapping extents in LAYOUTGET replies">
+  <meta property="og:description" content="This thread addresses a critical bug fix in the XFS filesystem&#39;s pNFS block layout implementation, specifically concerning how extent mappings are returned during LAYOUTGET operations. The discussion centers on preventing overlapping…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-14T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="XFS pNFS: Fix overlapping extents in LAYOUTGET replies">
+  <meta name="twitter:description" content="This thread addresses a critical bug fix in the XFS filesystem&#39;s pNFS block layout implementation, specifically concerning how extent mappings are returned during LAYOUTGET operations. The discussion centers on preventing overlapping…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-14</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>XFS pNFS: Fix overlapping extents in LAYOUTGET replies</h1>
+<h2>Summary</h2>
+<p>This thread addresses a critical bug fix in the XFS filesystem's pNFS block layout implementation, specifically concerning how extent mappings are returned during <code>LAYOUTGET</code> operations. The discussion centers on preventing overlapping extents from being sent to NFS clients, which can lead to data corruption or protocol violations.</p>
+<h3>Problem Identification</h3>
+<p>Dai Ngo submitted a patch <a href="https://lore.kernel.org/linux-nfs/20260512172238.2495085-1-dai.ngo@oracle.com/">fixing overlapping extents returned for pNFS LAYOUTGET</a>. The root cause was identified in <code>xfs_fs_map_blocks()</code>, which passed the <code>XFS_BMAPI_ENTIRE</code> flag to <code>xfs_bmapi_read()</code>. This caused the block mapping code to return the entire extent rather than trimming it to the requested range.</p>
+<blockquote>
+<p>"A single LAYOUTGET request from the client can cause the server to issue multiple calls to xfs_fs_map_blocks() for different offsets within the same extent. Because of the use of XFS_BMAPI_ENTIRE flag, these calls can produce overlapping mappings."</p>
+</blockquote>
+<p>This behavior resulted in ambiguous extent selection on the client side, potentially leading to incorrect device selection and inconsistent datastate handling. The issue was discovered using the <code>xfstest generic/075</code> test with an NFSv4.2 mount and SCSI layout.</p>
+<h3>Technical Discussion and Review</h3>
+<p>Darrick J. Wong provided detailed feedback, clarifying the mechanism of the overlap:</p>
+<blockquote>
+<p>"Nitpicking: _ENTIRE causes bmapi_read to return the whole extent instead of trimming it down to the requested range."</p>
+</blockquote>
+<p>He illustrated a scenario where concurrent file allocation changes could result in overlapping mappings being sent to the client, such as:
+<code>{.offset = 0, .length = 4096, ...}</code> followed by <code>{.offset = 0, .length = 8192, ...}</code>.</p>
+<p>Darrick also suggested simplifying the patch by hardcoding <code>0</code> instead of introducing a new variable for flags:</p>
+<blockquote>
+<p>"Why not just replace the argument to xfs_bmapi_read with a constant zero?"</p>
+</blockquote>
+<p>Christoph Hellwig raised an important point about client-side robustness:</p>
+<blockquote>
+<p>"Please also add a check to the client that catches this and doesn't use the layout that has extents outside the requested range. And maybe warn about it as well."</p>
+</blockquote>
+<p>However, Dai Ngo clarified that while the extents overlapped, they covered exactly the range requested in the LAYOUTGET operation. He provided an on-the-wire capture showing two SCSI extents starting at the same offset but with different lengths (53248 and 77824 bytes), both within the requested range.</p>
+<h3>Client-Side Handling</h3>
+<p>The discussion touched upon whether the NFS client's <code>ext_tree_insert()</code> function could handle overlapping extents gracefully. Dai Ngo noted:</p>
+<blockquote>
+<p>"After reviewing ext_tree_insert(), with assist from Codex, I think this function handles overlapping extents properly... IMHO, I think we still should fix xfs_fs_map_blocks() to avoid any overhead and complication in ext_tree_insert having to handle overlapping extents."</p>
+</blockquote>
+<p>Darrick Wong acknowledged the approach, stating:</p>
+<blockquote>
+<p>"Not passing XFS_BMAPI_ENTIRE into bmapi_read sounds fine to me."</p>
+</blockquote>
+<h3>Conclusion</h3>
+<p>The consensus was that fixing the server-side behavior in <code>xfs_fs_map_blocks()</code> by removing the <code>XFS_BMAPI_ENTIRE</code> flag is the correct approach. This ensures that only the requested range is mapped, eliminating the possibility of overlapping extents in LAYOUTGET replies. The patch also included a minor cleanup to drop an unnecessary error check.</p>
+<p>This fix is marked for stable backport to v6.19 and addresses a regression introduced by commit <code>cc6c40e09d7b1</code> ("NFSD/blocklayout: Support multiple extents per LAYOUTGET").</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260512172238.2495085-1-dai.ngo@oracle.com/">2026-05-12 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — [PATCH 1/1] xfs: fix overlapping extents returned for pNFS LAYOUTGET</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260512173402.GO9555@frogsfrogsfrogs/">2026-05-12 "Darrick J. Wong" <a href="mailto:djwong@kernel.org">djwong@kernel.org</a> — Re: [PATCH 1/1] xfs: fix overlapping extents returned for pNFS LAYOUTGET</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/bee02ca2-ca85-4098-b025-21532d1317e9@oracle.com/">2026-05-12 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — Re: [PATCH 1/1] xfs: fix overlapping extents returned for pNFS LAYOUTGET</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/agQhzg-0aeISwOGW@infradead.org/">2026-05-13 Christoph Hellwig <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [PATCH 1/1] xfs: fix overlapping extents returned for pNFS LAYOUTGET</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/961eb355-2f52-47a0-9399-e050a4e535a2@oracle.com/">2026-05-13 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — Re: [PATCH 1/1] xfs: fix overlapping extents returned for pNFS LAYOUTGET</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/06d9b1ae-e46f-459c-bcb4-1a5ca4ded4b0@oracle.com/">2026-05-13 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — Re: [PATCH 1/1] xfs: fix overlapping extents returned for pNFS LAYOUTGET</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260514002513.GQ9555@frogsfrogsfrogs/">2026-05-14 "Darrick J. Wong" <a href="mailto:djwong@kernel.org">djwong@kernel.org</a> — Re: [PATCH 1/1] xfs: fix overlapping extents returned for pNFS LAYOUTGET</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/26365a46-bdac-4e8a-a951-de904c3e5606@oracle.com/">2026-05-14 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — Re: [PATCH 1/1] xfs: fix overlapping extents returned for pNFS LAYOUTGET</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260514174909.GZ9555@frogsfrogsfrogs/">2026-05-14 "Darrick J. Wong" <a href="mailto:djwong@kernel.org">djwong@kernel.org</a> — Re: [PATCH 1/1] xfs: fix overlapping extents returned for pNFS LAYOUTGET</a></li>
+</ul>
+  </main>
+</body>
+</html>

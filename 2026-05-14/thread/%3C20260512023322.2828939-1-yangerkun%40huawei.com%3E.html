@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD: Revert deferred export cleanup to fix unmount regression</title>
+  <meta name="description" content="This thread centers on a patch by Yang Erkun to revert commit 48db892356d6 (&quot;NFSD: Defer sub-object cleanup in export put callbacks&quot;). The discussion focuses on whether reverting this change reintroduces a Use-After-Free (UAF) bug or if it…">
+  <meta property="og:title" content="NFSD: Revert deferred export cleanup to fix unmount regression">
+  <meta property="og:description" content="This thread centers on a patch by Yang Erkun to revert commit 48db892356d6 (&quot;NFSD: Defer sub-object cleanup in export put callbacks&quot;). The discussion focuses on whether reverting this change reintroduces a Use-After-Free (UAF) bug or if it…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-14T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSD: Revert deferred export cleanup to fix unmount regression">
+  <meta name="twitter:description" content="This thread centers on a patch by Yang Erkun to revert commit 48db892356d6 (&quot;NFSD: Defer sub-object cleanup in export put callbacks&quot;). The discussion focuses on whether reverting this change reintroduces a Use-After-Free (UAF) bug or if it…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-14</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD: Revert deferred export cleanup to fix unmount regression</h1>
+<h2>Summary</h2>
+<h2>Discussion Overview</h2>
+<p>This thread centers on a patch by Yang Erkun to <strong>revert</strong> commit <code>48db892356d6</code> ("NFSD: Defer sub-object cleanup in export put callbacks"). The discussion focuses on whether reverting this change reintroduces a Use-After-Free (UAF) bug or if it is necessary to fix an unmount regression.</p>
+<h2>Key Technical Arguments</h2>
+<h3>The Proposal: Revert Deferred Cleanup</h3>
+<p>Yang Erkun <a href="https://lore.kernel.org/linux-nfs/20260512023322.2828939-1-yangerkun@huawei.com/">proposed the revert</a>, arguing that the original commit introduced a regression related to unmounting (<code>exportfs-ra-umount</code>), which had previously been fixed by commit <code>69d803c40ede</code>. Yang claimed that the UAF issue the original commit aimed to solve was actually resolved by commit <code>e7fcf179b82d</code> ("NFSD: Hold net reference for the lifetime of /proc/fs/nfs/exports fd").</p>
+<blockquote>
+<p>"Commit 48db892356d6 ... introduces a regression that was already fixed by commit 69d803c40ede ... Therefore, reverting commit 48db892356d6 ... is necessary to fix this regression."</p>
+</blockquote>
+<h3>Jeff Layton's Safety Concerns</h3>
+<p>Jeff Layton <a href="https://lore.kernel.org/linux-nfs/a6c66164d75e6cfa530892b9f5f25ab9d677a9fa.camel@kernel.org/">raised significant concerns</a> about the safety of the revert. He distinguished between two separate issues:</p>
+<ol>
+<li>The net reference lifetime issue (addressed by <code>e7fcf179b82d</code>).</li>
+<li>A concurrent UAF where <code>cache_clean()</code> drops references while RCU readers (<code>c_show</code>, <code>e_show</code>) iterate the cache.</li>
+</ol>
+<p>Jeff argued that simply holding the net reference does not prevent <code>cache_clean()</code> from freeing sub-objects (like <code>path</code> and <code>auth_domain</code>) while an RCU reader is accessing them. If the revert applies, <code>path_put()</code> and <code>auth_domain_put()</code> are called immediately. While <code>kfree_rcu()</code> protects the main struct, it does not protect the sub-objects if they are freed directly.</p>
+<blockquote>
+<p>"Does this re-introduce the UAF that 48db892356d6 was fixing?"</p>
+</blockquote>
+<h3>Resolution of the UAF Concern</h3>
+<p>Yang Erkun <a href="https://lore.kernel.org/linux-nfs/5701706a-6a54-4bcb-a2ce-83eac3d4b715@huaweicloud.com/">clarified</a> that the sub-objects themselves (<code>dentry</code>, <code>mnt</code>, <code>auth_domain</code>) are also freed via RCU mechanisms (e.g., <code>call_rcu</code> in <code>dentry_free</code>, <code>cleanup_mnt</code>, etc.). Therefore, the <code>rcu_read_lock()</code> held by the readers <em>does</em> protect access to these sub-objects.</p>
+<blockquote>
+<p>"No, something like release of dentry/mnt ek-&gt;ek_client-&gt;name all protected will call_rcu ... so rcu_read_lock/rcu_read_unlock for c_show/e_show can protect this trigger UAF."</p>
+</blockquote>
+<p>Satisfied with this explanation, Jeff Layton <a href="https://lore.kernel.org/linux-nfs/da2da3a188b1823bad89e876001a5281351d8eb7.camel@kernel.org/">provided his Reviewed-by</a>:</p>
+<blockquote>
+<p>"Got it. Thanks for the explanation. In that case, I'm fine with reverting this patch."</p>
+</blockquote>
+<h3>Integration with Ongoing Workqueue Refactoring</h3>
+<p>Chuck Lever <a href="https://lore.kernel.org/linux-nfs/0ce8ae76-da17-4b25-b1f8-6fa955654a57@app.fastmail.com/">noted a conflict</a> with his own in-flight series, which replaces <code>nfsd_export_wq</code> with a workqueue managed in <code>sunrpc.ko</code>. He questioned whether his approach of deferring resource release via a WQ was still the correct solution.</p>
+<blockquote>
+<p>"It appears to me our fixes conflict with each other... But my series continues to use a WQ to defer resource release for all the cache-related files in /proc/fs/nfsd. Is that the wrong solution?"</p>
+</blockquote>
+<p>Yang Erkun <a href="https://lore.kernel.org/linux-nfs/56174eb9-d074-4f8e-872b-f13b09813b2c@huaweicloud.com/">responded</a> that he preferred avoiding the workqueue if possible, as he did not believe deferring <code>auth_domain_put</code> was necessary. He offered to adapt his patch to Chuck's series but emphasized that the single-patch revert would be easier to backport to LTS kernels.</p>
+<blockquote>
+<p>"Certainly, as long as it doesn't reintroduce the exportfs-ra-umount issue, it seems acceptable. However, I would rather avoid doing it."</p>
+</blockquote>
+<h2>Final Conclusions</h2>
+<ul>
+<li><strong>Bug Fix Type:</strong> This is a <strong>revert</strong> to fix a regression (unmount hang/failure) introduced by a previous attempt to fix a UAF.</li>
+<li><strong>Safety:</strong> The revert is deemed safe because the sub-objects accessed by RCU readers are themselves freed via RCU, preventing UAFs.</li>
+<li><strong>Next Steps:</strong> Yang Erkun will likely need to adapt his patch to account for Chuck Lever's ongoing workqueue refactoring in <code>sunrpc.ko</code>, though there is a preference for minimizing complexity if the unmount regression is resolved.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260512023322.2828939-1-yangerkun@huawei.com/">2026-05-12 Yang Erkun <a href="mailto:yangerkun@huawei.com">yangerkun@huawei.com</a> — [PATCH] Revert "NFSD: Defer sub-object cleanup in export put callbacks"</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/a6c66164d75e6cfa530892b9f5f25ab9d677a9fa.camel@kernel.org/">2026-05-12 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH] Revert "NFSD: Defer sub-object cleanup in export put callbacks"</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/5701706a-6a54-4bcb-a2ce-83eac3d4b715@huaweicloud.com/">2026-05-12 yangerkun <a href="mailto:yangerkun@huaweicloud.com">yangerkun@huaweicloud.com</a> — Re: [PATCH] Revert "NFSD: Defer sub-object cleanup in export put callbacks"</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/da2da3a188b1823bad89e876001a5281351d8eb7.camel@kernel.org/">2026-05-12 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH] Revert "NFSD: Defer sub-object cleanup in export put callbacks"</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/34c46a7c-14e7-4966-bec3-060e26ca08d7@huawei.com/">2026-05-12 yangerkun <a href="mailto:yangerkun@huawei.com">yangerkun@huawei.com</a> — Re: [PATCH] Revert "NFSD: Defer sub-object cleanup in export put callbacks"</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/0ce8ae76-da17-4b25-b1f8-6fa955654a57@app.fastmail.com/">2026-05-12 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH] Revert "NFSD: Defer sub-object cleanup in export put callbacks"</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/cd07fc25-8c9d-42af-9bd8-36d1565a80ca@huawei.com/">2026-05-13 yangerkun <a href="mailto:yangerkun@huawei.com">yangerkun@huawei.com</a> — Re: [PATCH] Revert "NFSD: Defer sub-object cleanup in export put callbacks"</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/55ec615a-3b80-4608-ac52-1c0215b789a7@app.fastmail.com/">2026-05-13 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH] Revert "NFSD: Defer sub-object cleanup in export put callbacks"</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/56174eb9-d074-4f8e-872b-f13b09813b2c@huaweicloud.com/">2026-05-13 yangerkun <a href="mailto:yangerkun@huaweicloud.com">yangerkun@huaweicloud.com</a> — Re: [PATCH] Revert "NFSD: Defer sub-object cleanup in export put callbacks"</a></li>
+</ul>
+  </main>
+</body>
+</html>
