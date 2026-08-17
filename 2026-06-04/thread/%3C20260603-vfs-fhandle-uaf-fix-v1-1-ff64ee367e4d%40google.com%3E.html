@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Jann Horn fixes UAF in may_decode_fh() via RCU-protected mnt_ns read; VFS maintainers clarify namespace lifetime semantics</title>
+  <meta name="description" content="This week brought a focused, fast-moving bug-fix discussion on the linux-nfs list (cross-posted to VFS) centered on a use-after-free vulnerability in the open_by_handle_at() syscall path. Google security researcher Jann Horn submitted a…">
+  <meta property="og:title" content="Jann Horn fixes UAF in may_decode_fh() via RCU-protected mnt_ns read; VFS maintainers clarify namespace lifetime semantics">
+  <meta property="og:description" content="This week brought a focused, fast-moving bug-fix discussion on the linux-nfs list (cross-posted to VFS) centered on a use-after-free vulnerability in the open_by_handle_at() syscall path. Google security researcher Jann Horn submitted a…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-04T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Jann Horn fixes UAF in may_decode_fh() via RCU-protected mnt_ns read; VFS maintainers clarify namespace lifetime semantics">
+  <meta name="twitter:description" content="This week brought a focused, fast-moving bug-fix discussion on the linux-nfs list (cross-posted to VFS) centered on a use-after-free vulnerability in the open_by_handle_at() syscall path. Google security researcher Jann Horn submitted a…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-04</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Jann Horn fixes UAF in may_decode_fh() via RCU-protected mnt_ns read; VFS maintainers clarify namespace lifetime semantics</h1>
+<h2>Summary</h2>
+<h1>fhandle: Fix UAF due to unlocked -&gt;mnt_ns read in may_decode_fh()</h1>
+<h2>Overview</h2>
+<p>This week brought a focused, fast-moving bug-fix discussion on the linux-nfs list (cross-posted to VFS) centered on a use-after-free vulnerability in the <code>open_by_handle_at()</code> syscall path. Google security researcher Jann Horn submitted a patch fixing an unlocked read of <code>mount::mnt_ns</code> in <code>may_decode_fh()</code>, and VFS maintainers Al Viro and Christian Brauner engaged in a detailed back-and-forth to nail down the precise lifetime semantics of mount namespaces that make the RCU-based fix correct.</p>
+<h2>The Bug</h2>
+<p>This is a <strong>bug fix</strong> (not a new feature or protocol change). Jann Horn's <a href="https://lore.kernel.org/linux-nfs/20260603-vfs-fhandle-uaf-fix-v1-1-ff64ee367e4d@google.com/">initial patch</a> describes the race:</p>
+<blockquote>
+<p>"may_decode_fh() accesses mount::mnt_ns without holding any locks; that means the mount can concurrently be unmounted, and the mnt_namespace can concurrently be freed after an RCU grace period."</p>
+</blockquote>
+<p>The race requires a mount point created via <code>open_tree(..., OPEN_TREE_CLONE)</code>, where one thread calls <code>__do_sys_open_by_handle_at</code> (which traverses into <code>may_decode_fh</code> → <code>is_mounted</code> → reads <code>mount::mnt_ns</code>) while another thread closes the last file descriptor, triggering <code>umount_tree</code> → <code>free_mnt_ns</code> → <code>call_rcu(mnt_ns_release_rcu)</code> → eventual <code>kfree</code>. The UAF manifests when the RCU callback frees the namespace while the first thread is still dereferencing it.</p>
+<p>Horn noted the bug is only reachable with <code>CONFIG_PREEMPTION</code> or <code>CONFIG_RCU_STRICT_GRACE_PERIOD</code>, since an RCU grace period must elapse during a single syscall without explicit preemption. He assessed the security impact as limited:</p>
+<blockquote>
+<p>"This doesn't seem to have interesting security impact; worst-case, it could leak the result of an integer comparison to userspace (from the level check in cap_capable()), cause an endless loop, or crash the kernel by dereferencing an invalid address."</p>
+</blockquote>
+<p>The fix takes <code>rcu_read_lock()</code> around the <code>mnt_ns</code> access (mirroring what <code>__prepend_path()</code> already does), adds <code>WRITE_ONCE()</code> on racing writers, and documents the pointer's semantics. The patch carries a <code>Fixes:</code> tag for commit 620c266f3949 ("fhandle: relax open_by_handle_at() permission checks") and is Cc'd to stable.</p>
+<p>Horn also offered additional tooling: "I used custom tooling to force this race condition to occur and check that it leads to a KASAN splat - let me know if you want me to create a kernel patch to force the race condition and a reproducer you can run." He acknowledged his own role in the original bug: "I remember Christian asking me for feedback on the patch that introduced the bug, and I missed the bug because I didn't realize what the semantics of mount::mnt_ns are..."</p>
+<h2>The Discussion: Why Is RCU Sufficient?</h2>
+<p>The core technical question raised by Al Viro was whether the RCU delay between zeroing <code>-&gt;mnt_ns</code> and freeing the namespace is actually guaranteed. In his <a href="https://lore.kernel.org/linux-nfs/20260603181523.GW2636677@ZenIV/">first reply</a>, Viro wrote:</p>
+<blockquote>
+<p>"Umm... It's somewhat subtle - at the very least you need to explain why there will be an RCU delay between umount_tree() clearing that and having the sucker freed."</p>
+</blockquote>
+<p>Horn proposed documentation language in his <a href="https://lore.kernel.org/linux-nfs/CAG48ez1DGQ8MbFWWi+n0Br84cBF_wSrNgPqd+NSxAcbAK7WR7g@mail.gmail.com/">next reply</a>:</p>
+<blockquote>
+<p>"This is like an __rcu pointer which is protected by RCU and namespace_sem; however, because most accesses happen under namespace_sem, it is not marked as __rcu, and RCU access is done with READ_ONCE()."</p>
+</blockquote>
+<p>Viro then provided the <a href="https://lore.kernel.org/linux-nfs/20260603184151.GY2636677@ZenIV/">detailed correctness argument</a>:</p>
+<blockquote>
+<p>"Basically, the store that cleared -&gt;mnt_ns has been done in namespace_sem scope and that scope is either no later than the scope in put_mnt_ns() that has dropped the active refcount of ns to zero. At the beginning of that scope in put_mnt_ns() we are guaranteed to have the passive refcount positive. Dropping the passive reference happens after an rcu delay started in later in the same namespace_sem scope and namespace is not freed until the passive refcount reaches zero."</p>
+</blockquote>
+<p>He immediately <a href="https://lore.kernel.org/linux-nfs/20260603185013.GZ2636677@ZenIV/">corrected himself</a> on a wording error ("s/either//") and summarized his position:</p>
+<blockquote>
+<p>"TL;DR: your fix is correct, but needs a better explanation of correctness. If nothing else, I'd like to have the above findable on lore - I've way too many pieces of half-baked docs sitting around in local notes as it is ;-/"</p>
+</blockquote>
+<h2>Refining the Documentation Language</h2>
+<p>The rest of the thread became an exercise in precise kernel documentation. Viro pushed back on Horn's initial phrasing of "active" for the namespace state, noting in <a href="https://lore.kernel.org/linux-nfs/20260603185324.GA2636677@ZenIV/">this message</a>:</p>
+<blockquote>
+<p>"Umm... That's actually 'active or has <em>just</em> dropped the last active reference and didn't get around to scheduling decrement of passive refcount yet', unfortunately. Hell knows - 'active or deactivating', perhaps?"</p>
+</blockquote>
+<p>He added a <a href="https://lore.kernel.org/linux-nfs/20260603190225.GB2636677@ZenIV/">clarification</a> about the distinction between "active" as a state and "active reference" as a refcount concept:</p>
+<blockquote>
+<p>"Note that 'active' in such context is easy to mistake for 'active reference', which it definitely isn't - it does not contribute to active refcount. Mounts within a namespace do not pin it - it's the other way round; they are guaranteed to stay live until they leave the sucker."</p>
+</blockquote>
+<p>Horn <a href="https://lore.kernel.org/linux-nfs/CAG48ez34NaE5DCdC=VQWFRPds6JHwGq2YJDF5e6XUtGPNfQq+g@mail.gmail.com/">agreed</a> and proposed "Containing namespace (active or deactivating, non-refcounted)." Viro <a href="https://lore.kernel.org/linux-nfs/20260603192559.GC2636677@ZenIV/">endorsed</a> this phrasing:</p>
+<blockquote>
+<p>"That would probably do for now... The lifecycle for mnt_namespace really needs to be documented; right now we have a maze of twisty little functions around that area and it takes quite a non-trivial amount of searching to recall the names - and I am familiar with the area ;-/"</p>
+</blockquote>
+<h2>Christian Brauner's Reference-Count Taxonomy</h2>
+<p>The thread concluded with <a href="https://lore.kernel.org/linux-nfs/20260604-vorboten-gebilde-entbunden-1c6652465d69@brauner/">Christian Brauner's detailed explanation</a> (the maintainer who originally requested feedback on the buggy patch) of the three distinct reference counts in play:</p>
+<blockquote>
+<p>"(1) generic reference count of namespaces in general: __ns_ref - for mntns: keeps the mount namespace and the mounts attached to it alive
+(2) active reference count of namespaces in general: __ns_ref_active. - always a subset of (1) - only regulates userspace visibility of the namespace and has no lifetime implications per se. 'active' just means 'reachable from userspace'. It's nothing that the mount layer itself should care about at all.
+(3) passive reference count of struct mnt_namespace - keeps the mount namespace alive but not the mounts attached to it"</p>
+</blockquote>
+<p>He emphasized the practical significance: "With (3) you can grab a reference to the mount namespaces without pinning the mounts in it... At no point does the caller need to artificially prolong the lifetime of a mount namespaces by grabbing a __ns_ref reference count. This is especially useful if the caller needs to do a bunch of sleeping operations before they can actually do the meat of the work they need."</p>
+<h2>NFS Client Relevance</h2>
+<p>While this fix lives in <code>fs/fhandle.c</code> (VFS layer), it directly affects NFS client userspace: any process calling <code>open_by_handle_at()</code> on an NFS mount handle is subject to this race. The <code>may_decode_fh()</code> function is the VFS gatekeeper that validates file handles before dispatching to filesystem-specific decode routines (including NFS's <code>nfs_decode_filehandle</code>). A UAF here could corrupt kernel state before the NFS client code ever runs, making this a critical correctness fix for NFS handle-based operations.</p>
+<h2>Status</h2>
+<p>The fix is confirmed correct by both Viro and Brauner. The remaining work is documentation polish—Horn will update the commit message and in-tree comments with the agreed-upon "active or deactivating" language and the RCU-delay justification. No v2 has been posted yet as of this week's window close, but consensus on correctness is clear.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260603-vfs-fhandle-uaf-fix-v1-1-ff64ee367e4d@google.com/">2026-06-03 Jann Horn <a href="mailto:jannh@google.com">jannh@google.com</a> — [PATCH] fhandle: fix UAF due to unlocked -&gt;mnt_ns read in may_decode_fh()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260603181523.GW2636677@ZenIV/">2026-06-03 Al Viro <a href="mailto:viro@zeniv.linux.org.uk">viro@zeniv.linux.org.uk</a> — Re: [PATCH] fhandle: fix UAF due to unlocked -&gt;mnt_ns read in may_decode_fh()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAG48ez1DGQ8MbFWWi+n0Br84cBF_wSrNgPqd+NSxAcbAK7WR7g@mail.gmail.com/">2026-06-03 Jann Horn <a href="mailto:jannh@google.com">jannh@google.com</a> — Re: [PATCH] fhandle: fix UAF due to unlocked -&gt;mnt_ns read in may_decode_fh()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260603182454.GX2636677@ZenIV/">2026-06-03 Al Viro <a href="mailto:viro@zeniv.linux.org.uk">viro@zeniv.linux.org.uk</a> — Re: [PATCH] fhandle: fix UAF due to unlocked -&gt;mnt_ns read in may_decode_fh()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260603184151.GY2636677@ZenIV/">2026-06-03 Al Viro <a href="mailto:viro@zeniv.linux.org.uk">viro@zeniv.linux.org.uk</a> — Re: [PATCH] fhandle: fix UAF due to unlocked -&gt;mnt_ns read in may_decode_fh()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAG48ez0Jte3UE8wn9Ljs3o2uVDFB24Zbp9zBdaj+D5c4R0+TSQ@mail.gmail.com/">2026-06-03 Jann Horn <a href="mailto:jannh@google.com">jannh@google.com</a> — Re: [PATCH] fhandle: fix UAF due to unlocked -&gt;mnt_ns read in may_decode_fh()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260603185013.GZ2636677@ZenIV/">2026-06-03 Al Viro <a href="mailto:viro@zeniv.linux.org.uk">viro@zeniv.linux.org.uk</a> — Re: [PATCH] fhandle: fix UAF due to unlocked -&gt;mnt_ns read in may_decode_fh()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260603185324.GA2636677@ZenIV/">2026-06-03 Al Viro <a href="mailto:viro@zeniv.linux.org.uk">viro@zeniv.linux.org.uk</a> — Re: [PATCH] fhandle: fix UAF due to unlocked -&gt;mnt_ns read in may_decode_fh()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260603190225.GB2636677@ZenIV/">2026-06-03 Al Viro <a href="mailto:viro@zeniv.linux.org.uk">viro@zeniv.linux.org.uk</a> — Re: [PATCH] fhandle: fix UAF due to unlocked -&gt;mnt_ns read in may_decode_fh()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAG48ez34NaE5DCdC=VQWFRPds6JHwGq2YJDF5e6XUtGPNfQq+g@mail.gmail.com/">2026-06-03 Jann Horn <a href="mailto:jannh@google.com">jannh@google.com</a> — Re: [PATCH] fhandle: fix UAF due to unlocked -&gt;mnt_ns read in may_decode_fh()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAG48ez2kK2dB4Tva0aNdWphV6BS021A4bf6a_cu_yOEJ8Uy=PQ@mail.gmail.com/">2026-06-03 Jann Horn <a href="mailto:jannh@google.com">jannh@google.com</a> — Re: [PATCH] fhandle: fix UAF due to unlocked -&gt;mnt_ns read in may_decode_fh()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260603192559.GC2636677@ZenIV/">2026-06-03 Al Viro <a href="mailto:viro@zeniv.linux.org.uk">viro@zeniv.linux.org.uk</a> — Re: [PATCH] fhandle: fix UAF due to unlocked -&gt;mnt_ns read in may_decode_fh()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260604-vorboten-gebilde-entbunden-1c6652465d69@brauner/">2026-06-04 Christian Brauner <a href="mailto:brauner@kernel.org">brauner@kernel.org</a> — Re: [PATCH] fhandle: fix UAF due to unlocked -&gt;mnt_ns read in may_decode_fh()</a></li>
+</ul>
+  </main>
+</body>
+</html>

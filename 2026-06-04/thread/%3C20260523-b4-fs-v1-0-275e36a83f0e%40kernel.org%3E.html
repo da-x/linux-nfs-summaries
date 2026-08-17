@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>jbd2/kmalloc follow-up: Ted Ts&#39;o probes allocator semantics; Wilcox favors fixing the allocator over fallback paths</title>
+  <meta name="description" content="Type: API modernization / cleanup (with a side-conversation about memory-allocator design). Not a new feature or protocol change. Status: The underlying 17-patch series was already merged into vfs-7.2.misc last week; this week&#39;s activity…">
+  <meta property="og:title" content="jbd2/kmalloc follow-up: Ted Ts&#39;o probes allocator semantics; Wilcox favors fixing the allocator over fallback paths">
+  <meta property="og:description" content="Type: API modernization / cleanup (with a side-conversation about memory-allocator design). Not a new feature or protocol change. Status: The underlying 17-patch series was already merged into vfs-7.2.misc last week; this week&#39;s activity…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-04T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="jbd2/kmalloc follow-up: Ted Ts&#39;o probes allocator semantics; Wilcox favors fixing the allocator over fallback paths">
+  <meta name="twitter:description" content="Type: API modernization / cleanup (with a side-conversation about memory-allocator design). Not a new feature or protocol change. Status: The underlying 17-patch series was already merged into vfs-7.2.misc last week; this week&#39;s activity…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-04</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>jbd2/kmalloc follow-up: Ted Ts'o probes allocator semantics; Wilcox favors fixing the allocator over fallback paths</h1>
+<h2>Summary</h2>
+<h1>jbd2 <code>__get_free_pages()</code> → <code>kmalloc()</code>: post-merge design discussion</h1>
+<p><strong>Type:</strong> API modernization / cleanup (with a side-conversation about memory-allocator design). Not a new feature or protocol change.
+<strong>Status:</strong> The underlying 17-patch series was already merged into <code>vfs-7.2.misc</code> last week; this week's activity is a technical follow-up on the jbd2 patch specifically.</p>
+<h2>Bridge to prior weeks</h2>
+<p>Last week (week ending 2026-05-28) Mike Rapoport posted the full "[PATCH 00/17] fs: replace __get_free_pages() call with kmalloc()" series, which Christian Brauner applied to <code>vfs-7.2.misc</code> on May 27. That series touched two <strong>NFS client</strong> paths — <code>[PATCH 05/17]</code> swapping a temporary page for <code>kmalloc()</code> in <code>nfs_show_devname()</code>, and <code>[PATCH 06/17]</code> removing genuinely dead <code>page</code>/<code>page2</code> buffers in the NFSv4 transport-replacement path (<code>nfs4_replace_transport()</code>). This week's thread is a continuation of the review of <strong><code>[PATCH 10/17]</code> (jbd2)</strong>, which had already drawn a brief question from David Laight about whether <code>__get_free_pages()</code> returns physically contiguous memory.</p>
+<h2>This week's discussion (June 3–4)</h2>
+<p>The conversation restarted when ext4 maintainer Theodore Ts'o <a href="https://lore.kernel.org/linux-nfs/yfzx3jgzwesernofl7mzixa2mhjfii5v3o7yapghtmozixrpfu@6bsh7iixyiov/">reopened the jbd2 patch</a>, motivated by a historical concern:</p>
+<blockquote>
+<p>"So historically <code>__get_free_pages()</code> was more efficient than kmalloc since previously the kmalloc overhead meant that a single 4k allocation would take two pages instead of one. I'm guessing that has since changed?"</p>
+</blockquote>
+<p>Ts'o asked Rapoport to explain, for someone not tracking allocator changes over time: how <code>kmalloc</code> compares to <code>__get_free_page</code> at order == 1 (memory and CPU overhead), what <code>kmalloc()</code> does when handed a size larger than <code>PAGE_SIZE</code> (contiguous? error? BUG?), and the overhead at 2× and 8× <code>PAGE_SIZE</code>.</p>
+<p>Mike Rapoport <a href="https://lore.kernel.org/linux-nfs/aiEX4UTxEnBTjVKo@kernel.org/">answered point by point</a>, confirming that the historical inefficiency is gone:</p>
+<blockquote>
+<p>"Today there's no memory overhead for kmalloc(PAGE_SIZE). Cache refill takes more pages of course, but they will be handed over to the next kmalloc(PAGE_SIZE)."</p>
+<p>"There's no memory overhead when order == 1. As for the CPU overhead, the difference for the fast path allocations is not measurable and for the slow path it is anyway determined by the amount of reclaim involved rather than by what allocator is used."</p>
+<p>"For size &gt;= PAGE_SIZE kmalloc() always returns contiguous page aligned memory. Larger allocations (&gt; PAGE_SIZE * 2) go straight to the page allocator."</p>
+</blockquote>
+<p>Ts'o <a href="https://lore.kernel.org/linux-nfs/ximvn6jwgtam665a4droqkp73o55kwvd5uukyidwjesmysobth@oe7rigpsjfkz/">thanked Rapoport and pivoted to a broader design question</a>: whether a filesystem could ask for "physically contiguous pages if possible, but ... fall back to a vmalloc-style approach" when contiguity is too hard to obtain. He floated using <code>kmalloc()</code> with flags that suppress forced reclaim/compaction and falling back to <code>vmalloc()</code> on failure, asking whether there's a better way.</p>
+<p>Matthew Wilcox <a href="https://lore.kernel.org/linux-nfs/aiGPu2XwaM31fvl9@casper.infradead.org/">responded</a> — noting first that he'd rather see his own "Remove special jbd2 slabs" patch taken instead of this one — and pushed back firmly on the fallback idea:</p>
+<blockquote>
+<p>"I think we'd like to avoid doing that. A lot of code has various workarounds for deficiencies in the memory allocator (some of which have been fixed and thus the workarounds only complicate matters). If the memory allocator(s) aren't providing what you need ... it's best to get that fixed rather than having fallback paths."</p>
+</blockquote>
+<p>Wilcox also clarified the contiguity guarantee ("What users are guaranteed is that kmalloc returns physically contiguous memory. And that if it's a power-of-two that it's naturally aligned"), defended requiring folios to stay contiguous, and sketched the direction he'd prefer:</p>
+<blockquote>
+<p>"We've been trying to move in the direction of exposing more high-level APIs so people can say 'I want to allocate 10MB of memory but it doesn't need to be contiguous' and have the allocator either fail the whole thing up front or make efforts to ensure that you get the whole 10MB. It's a lot more efficient than calling get_free_page() 2500 times and possibly having reclaim run a dozen different times."</p>
+</blockquote>
+<h2>Key takeaways</h2>
+<ul>
+<li><strong>No regression from the swap:</strong> Rapoport confirmed there is no memory overhead at order == 1, negligible fast-path CPU difference, and guaranteed contiguous, page-aligned memory for <code>kmalloc()</code> sizes ≥ <code>PAGE_SIZE</code>. This validates the jbd2 conversion (and by extension the NFS client conversions in patches 05/06).</li>
+<li><strong>Design consensus:</strong> Wilcox's position is that callers should not build their own kmalloc→vmalloc fallbacks; instead, allocator deficiencies should be fixed at the source, ideally via higher-level allocation APIs.</li>
+<li><strong>Open threads (just outside this window):</strong> David Laight and others continued the jbd2 discussion on June 5 (after the week closed), so the design question is not yet fully settled.</li>
+</ul>
+<h2>Relevance to NFS client development</h2>
+<p>The direct NFS impact was last week's merge, but this week reinforces its safety: the <code>kmalloc()</code>-based allocations now in <code>nfs_show_devname()</code> and the cleaned-up <code>nfs4_replace_transport()</code> rest on the same allocator guarantees Rapoport confirmed here. Wilcox's broader argument — prefer fixing the allocator over sprinkling fallback paths through filesystem code — is a useful guiding principle for future NFS client memory-allocation work, since the client relies heavily on page-based buffers in its I/O and transport paths.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/yfzx3jgzwesernofl7mzixa2mhjfii5v3o7yapghtmozixrpfu@6bsh7iixyiov/">2026-06-03 "Theodore Tso" <a href="mailto:tytso@mit.edu">tytso@mit.edu</a> — Re: [PATCH 10/17] jbd2: replace __get_free_pages() with kmalloc()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aiEX4UTxEnBTjVKo@kernel.org/">2026-06-04 Mike Rapoport <a href="mailto:rppt@kernel.org">rppt@kernel.org</a> — Re: [PATCH 10/17] jbd2: replace __get_free_pages() with kmalloc()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ximvn6jwgtam665a4droqkp73o55kwvd5uukyidwjesmysobth@oe7rigpsjfkz/">2026-06-04 "Theodore Tso" <a href="mailto:tytso@mit.edu">tytso@mit.edu</a> — Re: [PATCH 10/17] jbd2: replace __get_free_pages() with kmalloc()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aiGPu2XwaM31fvl9@casper.infradead.org/">2026-06-04 Matthew Wilcox <a href="mailto:willy@infradead.org">willy@infradead.org</a> — Re: [PATCH 10/17] jbd2: replace __get_free_pages() with kmalloc()</a></li>
+</ul>
+  </main>
+</body>
+</html>

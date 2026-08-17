@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SUNRPC server-side init race fixes: gssp_lock and percpu counter allocation</title>
+  <meta name="description" content="On May 30, Chuck Lever posted a small two-patch series titled Fix two latent server-side initialization bugs targeting the SUNRPC server subsystem. Both patches address the same structural bug shape — an object becoming reachable by a…">
+  <meta property="og:title" content="SUNRPC server-side init race fixes: gssp_lock and percpu counter allocation">
+  <meta property="og:description" content="On May 30, Chuck Lever posted a small two-patch series titled Fix two latent server-side initialization bugs targeting the SUNRPC server subsystem. Both patches address the same structural bug shape — an object becoming reachable by a…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-04T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="SUNRPC server-side init race fixes: gssp_lock and percpu counter allocation">
+  <meta name="twitter:description" content="On May 30, Chuck Lever posted a small two-patch series titled Fix two latent server-side initialization bugs targeting the SUNRPC server subsystem. Both patches address the same structural bug shape — an object becoming reachable by a…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-04</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>SUNRPC server-side init race fixes: gssp_lock and percpu counter allocation</h1>
+<h2>Summary</h2>
+<h1>SUNRPC server-side init race fixes: gssp_lock and percpu counter allocation</h1>
+<h2>Overview</h2>
+<p>On May 30, Chuck Lever posted a small two-patch series titled <a href="https://lore.kernel.org/linux-nfs/20260530-tier2-local-v1-0-fc294d34848a@oracle.com/">Fix two latent server-side initialization bugs</a> targeting the SUNRPC server subsystem. Both patches address the same structural bug shape — an object becoming reachable by a consumer while a field it depends on is still invalid — but in different code paths. The series attracted quick review from Jeff Layton, who issued Reviewed-by tags on both patches within roughly 90 minutes of posting, with one design-level objection to Patch 2 that was resolved by mutual agreement before the end of the day.</p>
+<p>This thread sits alongside the <a href="https://lore.kernel.org/linux-nfs/20260530-nfsd-fixes-v2-0-f27e8eb4d974@kernel.org/">nfsd fixes grab bag v2</a> posted the same day, making May 30 a particularly productive day for NFS server-side bug fixing.</p>
+<h2>Nature of the discussion</h2>
+<p>This is a <strong>bug fix</strong> series — specifically, two latent initialization-ordering bugs in the SUNRPC server that are only exposed under narrow trigger conditions (preemption-timed writes or percpu allocation failure). Neither patch introduces new functionality or changes any protocol behavior.</p>
+<h2>Patch 1: sunrpc: init gssp_lock before publishing proc entry</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260530-tier2-local-v1-1-fc294d34848a@oracle.com/">Chris Mason's patch</a> (signed off by Chuck Lever) fixes a race in <code>create_use_gss_proxy_proc_entry()</code>. The function calls <code>proc_create_data()</code> to publish <code>/proc/net/rpc/use-gss-proxy</code> <em>before</em> calling <code>init_gssp_clnt()</code> which runs <code>mutex_init()</code> on <code>sn-&gt;gssp_lock</code>. Once the dentry is linked, it is immediately reachable from userspace.</p>
+<p>The commit message lays out the race precisely:</p>
+<blockquote>
+<p>"A writer that wins the race locks a zero-filled struct mutex. On CONFIG_DEBUG_MUTEXES the missing magic value trips a 'lock used without init' splat; on a production kernel the fast path acquires the lock via CMPXCHG(owner, 0, current). In the latter case a second writer that arrives before init_gssp_clnt() re-zeroes owner can enter set_gssp_clnt() concurrently, shut down the first writer's clnt while it is still in use, and leak the loser's clnt."</p>
+</blockquote>
+<p>The fix moves <code>mutex_init(&amp;sn-&gt;gssp_lock)</code> into <code>sunrpc_init_net()</code> so its lifetime matches the <code>sunrpc_net</code> structure. The safety argument rests on module load order: sunrpc.ko is a build-time dependency of auth_rpcgss.ko, guaranteeing that <code>sunrpc_init_net()</code> has already run on every net namespace before any auth_gss pernet init can publish the proc entry. This also eliminates the now-unnecessary lazy <code>init_gssp_clnt()</code> helper and its prototype.</p>
+<p>Jeff Layton reviewed this patch quickly:</p>
+<blockquote>
+<p>"Reviewed-by: Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a>"</p>
+</blockquote>
+<p>[id://6af9dffa68943c3bc7b92e833a7a1deb42f1f430.camel@kernel.org]</p>
+<h2>Patch 2: SUNRPC: Check svc pool percpu counter allocation</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260530-tier2-local-v1-2-fc294d34848a@oracle.com/">Chuck Lever's own patch</a> addresses a more insidious bug in <code>__svc_create()</code>. The function initializes three per-pool <code>percpu_counter</code> stats and ignores every return value. On allocation failure, the counter is left with <code>fbc-&gt;counters == NULL</code> and its embedded spinlock, list_head, and count never initialized.</p>
+<p>The consequences are severe but hard to trigger:</p>
+<blockquote>
+<p>"Once that service is live, the hot-path increments in svc_xprt_enqueue(), svc_handle_xprt(), and svc_pool_wake_idle_thread() reach a counter whose backing pointer is NULL. The pointer is a per-cpu offset, so the access does not fault: it resolves to offset zero of the current CPU's per-cpu area and silently corrupts whatever variable lives there."</p>
+</blockquote>
+<p>The trigger requires a percpu allocation failure during RPC server startup — reachable only by a local administrator under memory pressure or fault injection. A remote peer cannot induce the bad state.</p>
+<h3>Review discussion on Patch 2</h3>
+<p>Jeff Layton <a href="https://lore.kernel.org/linux-nfs/0b0a969d8c8dd4769faf8ea2f0589e5af5a9a0a3.camel@kernel.org/">reviewed the patch</a> and initially approved it, but raised a structural concern about the use of <code>percpu_counter_init_many()</code>:</p>
+<blockquote>
+<p>"Switching to this looks like a good thing, but it means that the svc_pool struct fields now have some strict ordering requirements. The percpu_counters all need to be snuggled up together. That deserves a comment to that effect in the struct svc_pool, so that we don't inadvertently break it later."</p>
+</blockquote>
+<p>He still issued his Reviewed-by: "Patch itself looks fine though."</p>
+<p>Chuck Lever <a href="https://lore.kernel.org/linux-nfs/89e89bd2-3054-443d-9852-c1a28d9d9ed8@app.fastmail.com/">responded</a> briefly:</p>
+<blockquote>
+<p>"A comment or a static_assert"</p>
+</blockquote>
+<p>Then Layton <a href="https://lore.kernel.org/linux-nfs/36d0e0ea5f69e600267d9adad085f1fb5d2f6fd9.camel@kernel.org/">revised his position</a>, citing an external observation:</p>
+<blockquote>
+<p>"Actually, sashiko points out that struct randomization could break here too. Given that service creation isn't a hot codepath, I'd keep these as discrete percpu_counter_init/destroy() calls and avoid the hassle."</p>
+</blockquote>
+<p>Chuck Lever <a href="https://lore.kernel.org/linux-nfs/fe9ad070-18fe-43d1-95d1-34420f266efb@kernel.org/">agreed immediately</a>:</p>
+<blockquote>
+<p>"Yeah. It's too clever by half."</p>
+</blockquote>
+<p>The final resolution: the patch will be revised to use three discrete <code>percpu_counter_init()</code> / <code>percpu_counter_destroy()</code> calls instead of the <code>_many</code> variants, eliminating both the struct-layout fragility and the risk from CONFIG_RANDSTRUCT field randomization. The Reviewed-by stands for the logic (checking return values and unwinding on failure), but the implementation detail changes.</p>
+<h2>Key technical arguments</h2>
+<ol>
+<li>
+<p><strong>Init-before-publish invariant</strong>: Both patches enforce that no consumer can observe an object mid-initialization. Patch 1 relies on module dependency ordering (sunrpc.ko before auth_rpcgss.ko); Patch 2 relies on local error handling within <code>__svc_create()</code>.</p>
+</li>
+<li>
+<p><strong>Silent corruption vs. crash</strong>: The percpu counter bug is particularly dangerous because it does not produce a page fault — the NULL per-cpu pointer resolves to offset zero of the current CPU's per-cpu area, silently corrupting an unrelated variable. This makes it far harder to diagnose in the field than a straightforward oops.</p>
+</li>
+<li>
+<p><strong>Simplicity over micro-optimization</strong>: The final design decision on Patch 2 reflects a common kernel review principle — service creation is not a hot path, so three separate <code>percpu_counter_init()</code> calls are preferable to one <code>_many</code> call that imposes fragile struct layout constraints vulnerable to future refactoring or compiler-level randomization.</p>
+</li>
+</ol>
+<h2>Significance for NFS client development</h2>
+<p>While both fixes target the server side, they have indirect relevance to client developers:</p>
+<ul>
+<li>The <strong>gssp_lock race</strong> affects any NFS client (or server) using RPCSEC_GSS authentication via gssproxy. A corrupted lock state could manifest as intermittent authentication failures or leaked RPC clients visible on the client side during re-authentication storms.</li>
+<li>The <strong>percpu counter corruption</strong> could cause <code>pool_stats</code> to report garbage values, potentially confusing monitoring tools that track NFS server load from the client's perspective (e.g., via <code>/proc/fs/nfsd/pool_stats</code> on a local export). More critically, silent per-cpu memory corruption in the server's hot path could lead to unpredictable RPC handling delays or dropped requests that clients would see as timeouts.</li>
+</ul>
+<h2>Final state</h2>
+<p>As of the end of the week window (June 4), the thread shows both patches reviewed with one pending revision (discrete percpu init/destroy calls for Patch 2). No merge confirmation has appeared in this thread yet, but given the quick turnaround and clean review, a v2 posting or direct application to nfsd-testing is expected imminently.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260530-tier2-local-v1-0-fc294d34848a@oracle.com/">2026-05-30 Chuck Lever — [PATCH 0/2] Fix two latent server-side initialization bugs</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260530-tier2-local-v1-1-fc294d34848a@oracle.com/">2026-05-30 Chuck Lever (from Chris Mason) — [PATCH 1/2] sunrpc: init gssp_lock before publishing proc entry</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260530-tier2-local-v1-2-fc294d34848a@oracle.com/">2026-05-30 Chuck Lever — [PATCH 2/2] SUNRPC: Check svc pool percpu counter allocation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/0b0a969d8c8dd4769faf8ea2f0589e5af5a9a0a3.camel@kernel.org/">2026-05-30 Jeff Layton — Re: [PATCH 2/2] (Reviewed-by + struct ordering concern)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/6af9dffa68943c3bc7b92e833a7a1deb42f1f430.camel@kernel.org/">2026-05-30 Jeff Layton — Re: [PATCH 1/2] (Reviewed-by)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/89e89bd2-3054-443d-9852-c1a28d9d9ed8@app.fastmail.com/">2026-05-30 Chuck Lever — Re: [PATCH 2/2] (comment or static_assert)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/36d0e0ea5f69e600267d9adad085f1fb5d2f6fd9.camel@kernel.org/">2026-05-30 Jeff Layton — Re: [PATCH 2/2] (struct randomization; use discrete calls)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/fe9ad070-18fe-43d1-95d1-34420f266efb@kernel.org/">2026-05-30 Chuck Lever — Re: [PATCH 2/2] ("too clever by half")</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260530-tier2-local-v1-0-fc294d34848a@oracle.com/">2026-05-30 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 0/2] Fix two latent server-side initialization bugs</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260530-tier2-local-v1-1-fc294d34848a@oracle.com/">2026-05-30 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 1/2] sunrpc: init gssp_lock before publishing proc entry</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260530-tier2-local-v1-2-fc294d34848a@oracle.com/">2026-05-30 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 2/2] SUNRPC: Check svc pool percpu counter allocation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/0b0a969d8c8dd4769faf8ea2f0589e5af5a9a0a3.camel@kernel.org/">2026-05-30 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 2/2] SUNRPC: Check svc pool percpu counter allocation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/6af9dffa68943c3bc7b92e833a7a1deb42f1f430.camel@kernel.org/">2026-05-30 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 1/2] sunrpc: init gssp_lock before publishing proc entry</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/89e89bd2-3054-443d-9852-c1a28d9d9ed8@app.fastmail.com/">2026-05-30 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 2/2] SUNRPC: Check svc pool percpu counter allocation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/36d0e0ea5f69e600267d9adad085f1fb5d2f6fd9.camel@kernel.org/">2026-05-30 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 2/2] SUNRPC: Check svc pool percpu counter allocation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/fe9ad070-18fe-43d1-95d1-34420f266efb@kernel.org/">2026-05-30 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 2/2] SUNRPC: Check svc pool percpu counter allocation</a></li>
+</ul>
+  </main>
+</body>
+</html>

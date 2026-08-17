@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd per-client fair-queue dispatch RFC: identity-based fairness reframed into a sparse-flow service floor</title>
+  <meta name="description" content="Benjamin Coddington posted a four-patch RFC on June 3 proposing per-client fair-queue dispatch for nfsd, targeting a long-standing starvation problem: because the server pulls ready transports from a single per-pool FIFO, &quot;a client&#39;s share…">
+  <meta property="og:title" content="nfsd per-client fair-queue dispatch RFC: identity-based fairness reframed into a sparse-flow service floor">
+  <meta property="og:description" content="Benjamin Coddington posted a four-patch RFC on June 3 proposing per-client fair-queue dispatch for nfsd, targeting a long-standing starvation problem: because the server pulls ready transports from a single per-pool FIFO, &quot;a client&#39;s share…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-04T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd per-client fair-queue dispatch RFC: identity-based fairness reframed into a sparse-flow service floor">
+  <meta name="twitter:description" content="Benjamin Coddington posted a four-patch RFC on June 3 proposing per-client fair-queue dispatch for nfsd, targeting a long-standing starvation problem: because the server pulls ready transports from a single per-pool FIFO, &quot;a client&#39;s share…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-04</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd per-client fair-queue dispatch RFC: identity-based fairness reframed into a sparse-flow service floor</h1>
+<h2>Summary</h2>
+<h1>nfsd per-client fair-queue dispatch: an RFC that quickly outgrew its own design</h1>
+<h2>What landed this week</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/cover.1780498019.git.bcodding@hammerspace.com/">Benjamin Coddington posted a four-patch RFC on June 3</a> proposing per-client fair-queue dispatch for nfsd, targeting a long-standing starvation problem: because the server pulls ready transports from a single per-pool FIFO, "a client's share of nfsd service scales with the number of connections it holds rather than being shared per client."</p>
+<p>The cover letter is unusually data-driven. Coddington measured an 8-thread pool doing fixed-latency operations (10 ms/op, ~648 ops/s ceiling) and showed that a single-connection interactive client drops from 241 ops/s down to 38 as a greedy peer opens 1→16 connections:</p>
+<blockquote>
+<p>"The interactive client's share tracks 1/(K+1) and its throughput falls roughly 6x while it does nothing different. NFSv4.1 behaves identically (89% greedy at K=8) even when the greedy connections are bound to a single session, because the dispatch decision is below the NFS version."</p>
+</blockquote>
+<p>The original design was identity-based: an opaque per-transport fairness key in <code>svc_xprt</code> (defaulting to source address with port excluded), a fixed hash-bucket scheduler guarded by a per-pool spinlock on the opt-in path only, an <code>nfsd.fairq</code> module parameter, and a clientid stamp for NFSv4.1 sessions. The result was a 72→182 ops/s recovery for the interactive client at K=8 with no aggregate throughput loss.</p>
+<h2>The review turned the design inside out</h2>
+<p>The discussion moved fast and in an unexpected direction. Three reviewers — NeilBrown, Chuck Lever, and Jeff Layton — converged on the same set of objections within a day:</p>
+<p><strong>NeilBrown's first pushback (June 3)</strong> rejected both the mechanism and the opt-in framing:</p>
+<blockquote>
+<p>"I'm not keen on the hash bucket approach, though I can't clearly say why. I'm also not keen on the opt-in design. I don't like asking the admin to tune performance. We should always provide optimal performance."</p>
+</blockquote>
+<p>He sketched a lockless alternative — a per-client object with its own <code>lwq</code> of xprts, itself in an <code>lwq</code> of clients, refcounted by xprts and RCU-freed — and argued that a per-client in-flight cap would only be acceptable "if the admin didn't have to tune it," noting v4.1 slot-based flow control could provide feedback but "With v3 I don't think there is any way to get the needed feed-back."</p>
+<p><strong>Daire Byrne (June 4)</strong> offered field context from a production NFSv3 deployment, describing workarounds they already run: <code>svc_rpc_per_connection_limit</code>, fq qdisc for per-stream maxrate, and prio qdiscs to prefer workstation subnets over a render farm. "I guess anything that can give us better control over these kinds of 'QOS' scenarios we'll happily take."</p>
+<p><strong>Chuck Lever's reframe (June 4)</strong> was the pivotal message. After agreeing with NeilBrown on dropping the module parameter ("a module parameter is outdated and way too global") and flagging identity as a trap — "fairness-by-client-address means all clients behind a NAT get reduced to a single fairness unit" — he proposed changing the problem class entirely:</p>
+<blockquote>
+<p>"Instead, we could look at the problem as 'preventing starvation of any one connection' rather than the more difficult goal of 'ensuring complete scheduling fairness'. This changes the problem class fundamentally."</p>
+</blockquote>
+<p>He argued that nothing in Coddington's data is technically starved today — the FIFO guarantees every backlogged transport one receive per cycle — but "the floor" degrades linearly with the aggressor's connection count. The reframed contract, he wrote, "dissolves the hardest challenges": no client identity, no NAT collapse, no client-object lifetime, and NFSv3/v4.0/LOCALIO all come for free. He pointed at fq_codel as prior art:</p>
+<blockquote>
+<p>"fq_codel's success comes less from its fair queueing than from its sparse-flow optimization; that is, flows with nothing in flight jump the queue and heavy flows share what remains."</p>
+</blockquote>
+<h2>Coddington's synthesis: a burst-sized allowance</h2>
+<p>Coddington embraced the reframe and immediately identified its one real wrinkle. A single-RPC quantum only helps the first RPC of an interactive command — "loading a web page whose browser cache is on NFS is a readdir, then stat/open/read across many files." His rough numbers for a 50-RPC command against a 16-connection aggressor:</p>
+<blockquote>
+<p>"today (per-transport FIFO): 50 * 17 / 650 ~= 1.3 s; sparse-flow, 1-RPC quantum: ~= 1.3 s (only the first RPC saved); whole command prioritized: 50 / 650 ~= 0.08 s"</p>
+</blockquote>
+<p>His proposal: grant an idle→active connection a budget of ~N RPCs, re-granted each time it returns to idle. This stays identity-free and connection-count-proof because "a sustained stream never returns to idle, so it collects the allowance once and is in the bulk tier forever after." He flagged <code>xpt_nr_rqsts</code> as the existing in-flight signal needed for the sparse/bulk classification, committed to dropping the module parameter ("I'll drop the module parameter. With the reframe below the fair path is cheap enough to be always-on"), folding the measurement hook into the series, and producing new numbers with a properly interactive (not backlogged) client shape.</p>
+<p>Lever agreed on prototyping: "Why not prototype a burst-sized allowance and then we can examine the behavior using your test harness to see how much of a difference it makes." He also pushed for a single mechanism over per-version fallbacks, keeping things "no more complicated than necessary."</p>
+<h2>Jeff Layton's late additions (June 4)</h2>
+<p>Layton's two messages closed out the week. On NeilBrown's v3 feedback question, he suggested:</p>
+<blockquote>
+<p>"Shrink the TCP window to 0 for a bit on the connection(s)? That's the typical way to slow down a spammy client on a TCP socket. It's a bit coarse grained but typically the best we can do with v3. IDK, could we do something with the ECN flag?"</p>
+</blockquote>
+<p>In his broader reply he endorsed the direction — "These seem like pretty clear improvements" — and offered practical guidance: IP address as default key with nfsd overriding later for sessionid/clientid; debugfs knobs acceptable during experimentation but "The goal at the end should be 'no tunables'"; per-session fairness for v4.1, clientid for v4.0, IP-without-port for v3. On the mechanism question he was agnostic: "Whatever performs best, most likely. This will be in a hot path."</p>
+<h2>Nature and significance</h2>
+<p>This is a <strong>new feature / scheduling redesign</strong> RFC, not a bug fix or protocol change — though it addresses what Coddington frames as a service-quality defect (linear degradation of the interactive floor with aggressor connection count). The week's outcome is a design pivot: from identity-based proportional fair queueing (hash buckets, clientid keys, opt-in module parameter) to an always-on, identity-free sparse-flow service floor keyed on <code>xpt_nr_rqsts</code> with a burst-sized priority allowance.</p>
+<p>For NFS <strong>client</strong> developers, the practical implications are:</p>
+<ul>
+<li>The reframe means NFSv3 and NFSv4.0 clients benefit without any protocol change or client-side cooperation — no new slot negotiation, no session identity required.</li>
+<li>The "burst-sized allowance" design directly targets the interactive desktop / workstation use case (Daire's render-farm-vs-workstation scenario), which is where client developers most often hear about nfsd starvation complaints.</li>
+<li>Coddington's commitment to include measurement/observability in the final series means client-side testing will have server-side instrumentation to correlate command-completion latency against aggressor connection counts.</li>
+</ul>
+<h2>Open items at week's end</h2>
+<ol>
+<li>The burst-sized allowance (N) needs prototyping and measurement — "how many RPCs is an interactive cycle" is the one remaining parameter, with Coddington leaning toward a generous fixed default over an admin knob.</li>
+<li>NeilBrown's lockless per-client <code>lwq</code> design vs. the sparse/bulk tier approach are not yet reconciled; Coddington acknowledged the "hard part" of repointing xprts from v3-style (IP) to v4.1 (clientid) identity on session bind, suggesting a one-time XPRT flag.</li>
+<li>New benchmark numbers with a properly interactive client shape are owed.</li>
+<li>Jeff Layton's TCP-window-zero / ECN idea for v3 feedback is unexplored.</li>
+</ol>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/cover.1780498019.git.bcodding@hammerspace.com/">2026-06-03 Benjamin Coddington — [PATCH RFC 0/4] nfsd: per-client fair-queue dispatch</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/bd45e015132b2d8beaeb0e4013d0bc4e5061932b.1780498019.git.bcodding@hammerspace.com/">2026-06-03 Benjamin Coddington — [PATCH RFC 1/4] sunrpc: add a per-transport fairness key to svc_xprt</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/2397ad4a9949c55f84a93ec3fad82a77a0fc7544.1780498019.git.bcodding@hammerspace.com/">2026-06-03 Benjamin Coddington — [PATCH RFC 2/4] sunrpc: dispatch ready transports fairly per client</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/93347e4eac42588a9533b37e09c28b4b53a55413.1780498019.git.bcodding@hammerspace.com/">2026-06-03 Benjamin Coddington — [PATCH RFC 3/4] nfsd: add a fairq module parameter</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/5f3a6acbc4f5347ddc231d5ed33500128a85c547.1780498019.git.bcodding@hammerspace.com/">2026-06-03 Benjamin Coddington — [PATCH RFC 4/4] nfsd: key NFSv4.1 connections by clientid for fair queueing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178052714769.2082204.16375565668618050718@noble.neil.brown.name/">2026-06-03 NeilBrown — Re: (lockless per-client lwq design, no opt-in)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAPt2mGPwabhiSCJ-2U1MMnEcMqDNiXG_4LLbN0s1VOGY9oscXA@mail.gmail.com/">2026-06-04 Daire Byrne — Re: (production QOS context, fq/prio qdiscs)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/9733CABE-73D0-460E-A710-DA9215E2FC17@hammerspace.com/">2026-06-04 Benjamin Coddington — Re: (endorsing lockless, flagging xprt-repoint race)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/89ec5776-1a61-4713-b331-bb4edb9f5b0a@app.fastmail.com/">2026-06-04 Chuck Lever — Re: (reframe to sparse-flow service floor, fq_codel prior art)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/C13BCFC6-BEFA-427E-8431-DDAC6076C1B3@hammerspace.com/">2026-06-04 Benjamin Coddington — Re: (burst-sized allowance synthesis, xpt_nr_rqsts)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/66c34ced-abb4-4615-88ea-c048d704f582@app.fastmail.com/">2026-06-04 Chuck Lever — Re: (prototype burst allowance, single mechanism)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/929f6172207b3d13f641c6b6b7ba8d819273f300.camel@kernel.org/">2026-06-04 Jeff Layton — Re: (TCP window zero / ECN for v3 feedback)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/d2950dab8efe3302e4d8c3a1212b6b65fb4cafc8.camel@kernel.org/">2026-06-04 Jeff Layton — Re: (endorsement, no tunables goal, per-version key guidance)</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/cover.1780498019.git.bcodding@hammerspace.com/">2026-06-03 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — [PATCH RFC 0/4] nfsd: per-client fair-queue dispatch</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/bd45e015132b2d8beaeb0e4013d0bc4e5061932b.1780498019.git.bcodding@hammerspace.com/">2026-06-03 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — [PATCH RFC 1/4] sunrpc: add a per-transport fairness key to svc_xprt</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/2397ad4a9949c55f84a93ec3fad82a77a0fc7544.1780498019.git.bcodding@hammerspace.com/">2026-06-03 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — [PATCH RFC 2/4] sunrpc: dispatch ready transports fairly per client</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/93347e4eac42588a9533b37e09c28b4b53a55413.1780498019.git.bcodding@hammerspace.com/">2026-06-03 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — [PATCH RFC 3/4] nfsd: add a fairq module parameter</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/5f3a6acbc4f5347ddc231d5ed33500128a85c547.1780498019.git.bcodding@hammerspace.com/">2026-06-03 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — [PATCH RFC 4/4] nfsd: key NFSv4.1 connections by clientid for fair queueing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178052714769.2082204.16375565668618050718@noble.neil.brown.name/">2026-06-03 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH RFC 0/4] nfsd: per-client fair-queue dispatch</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAPt2mGPwabhiSCJ-2U1MMnEcMqDNiXG_4LLbN0s1VOGY9oscXA@mail.gmail.com/">2026-06-04 Daire Byrne <a href="mailto:daire@dneg.com">daire@dneg.com</a> — Re: [PATCH RFC 0/4] nfsd: per-client fair-queue dispatch</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/9733CABE-73D0-460E-A710-DA9215E2FC17@hammerspace.com/">2026-06-04 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — Re: [PATCH RFC 0/4] nfsd: per-client fair-queue dispatch</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/89ec5776-1a61-4713-b331-bb4edb9f5b0a@app.fastmail.com/">2026-06-04 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH RFC 0/4] nfsd: per-client fair-queue dispatch</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/C13BCFC6-BEFA-427E-8431-DDAC6076C1B3@hammerspace.com/">2026-06-04 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — Re: [PATCH RFC 0/4] nfsd: per-client fair-queue dispatch</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/66c34ced-abb4-4615-88ea-c048d704f582@app.fastmail.com/">2026-06-04 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH RFC 0/4] nfsd: per-client fair-queue dispatch</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178060749888.3392745.1825875653073966173@noble.neil.brown.name/">2026-06-04 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH RFC 0/4] nfsd: per-client fair-queue dispatch</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/929f6172207b3d13f641c6b6b7ba8d819273f300.camel@kernel.org/">2026-06-04 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH RFC 0/4] nfsd: per-client fair-queue dispatch</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/d2950dab8efe3302e4d8c3a1212b6b65fb4cafc8.camel@kernel.org/">2026-06-04 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH RFC 0/4] nfsd: per-client fair-queue dispatch</a></li>
+</ul>
+  </main>
+</body>
+</html>

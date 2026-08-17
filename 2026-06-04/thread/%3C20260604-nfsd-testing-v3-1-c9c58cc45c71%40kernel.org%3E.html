@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd filecache shutdown-race fix lands as v3: net-ref approach abandoned in favor of widened nfsd_gc_lock</title>
+  <meta name="description" content="This thread is the v3 resend of a single patch that was PATCH 8/9 in Jeff Layton&#39;s &quot;locally-triggerable bugs&quot; series. That series went through two full review cycles this week: the original eight-patch v1 posted June 1 drew a scalability…">
+  <meta property="og:title" content="nfsd filecache shutdown-race fix lands as v3: net-ref approach abandoned in favor of widened nfsd_gc_lock">
+  <meta property="og:description" content="This thread is the v3 resend of a single patch that was PATCH 8/9 in Jeff Layton&#39;s &quot;locally-triggerable bugs&quot; series. That series went through two full review cycles this week: the original eight-patch v1 posted June 1 drew a scalability…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-04T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd filecache shutdown-race fix lands as v3: net-ref approach abandoned in favor of widened nfsd_gc_lock">
+  <meta name="twitter:description" content="This thread is the v3 resend of a single patch that was PATCH 8/9 in Jeff Layton&#39;s &quot;locally-triggerable bugs&quot; series. That series went through two full review cycles this week: the original eight-patch v1 posted June 1 drew a scalability…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-04</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd filecache shutdown-race fix lands as v3: net-ref approach abandoned in favor of widened nfsd_gc_lock</h1>
+<h2>Summary</h2>
+<h1>nfsd filecache shutdown-race fix lands as v3: net-ref approach abandoned in favor of widened <code>nfsd_gc_lock</code></h1>
+<h2>Context from prior weeks</h2>
+<p>This thread is the <strong>v3 resend</strong> of a single patch that was PATCH 8/9 in Jeff Layton's "locally-triggerable bugs" series. That series went through two full review cycles this week: <a href="https://lore.kernel.org/linux-nfs/20260601-nfsd-testing-v1-0-d0f61e536df8@kernel.org/">the original eight-patch v1 posted June 1</a> drew a scalability objection from Al Viro about taking <code>get_net()</code>/<code>put_net()</code> on every file allocation, and <a href="https://lore.kernel.org/linux-nfs/20260602-nfsd-testing-v2-0-e4ea62e3cd5c@kernel.org/">the nine-patch v2 posted June 2</a> reworked the patch to take the net ref only at disposal time. Even that rework was rejected: Chuck Lever identified a put-ordering race in <code>nfsd_file_put_local()</code> and a placement flaw where <code>get_net()</code> sat "at the consuming end of the window it is meant to close." Layton conceded on June 3 — <a href="https://lore.kernel.org/linux-nfs/a73e18542a62c33954279878a9ca01c0ec182cb9.camel@kernel.org/">"&gt; Ok, I'm convinced, and the fix looks fairly straightforward. If you're ok with merging the rest of the set, I'll plan to resend this one separately."</a> — and Lever merged the other eight patches into nfsd-testing that same day.</p>
+<p>This week's single message is that promised resend, posted June 4.</p>
+<h2>The patch (June 4)</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260604-nfsd-testing-v3-1-c9c58cc45c71@kernel.org/">Jeff Layton posted the standalone v3</a> on June 4 at 13:57 UTC, with a cover note that frames it as the last piece of the series:</p>
+<blockquote>
+<p>"This is the remaining patch from the 9 patch series I posted earlier this week. This version doesn't touch the net refcount and instead relies on increasing the scope of the nfsd_gc_lock."</p>
+</blockquote>
+<p>The bug being fixed is a per-net shutdown race in the filecache. As Layton describes it, the shrinker, GC worker, and fsnotify/lease callbacks can unhash an <code>nfsd_file</code> from the rhashtable and then call <code>nfsd_file_dispose_list_delayed()</code> to move it to the per-net dispose list. If <code>nfsd_file_cache_shutdown_net()</code> runs concurrently, its rhashtable walk misses the already-unhashed file, and its drain of the per-net dispose list can run before the file has been queued:</p>
+<blockquote>
+<p>"The file then sits on the per-net list with no thread to drain it, leaking both the file and its associated state."</p>
+</blockquote>
+<p>The root cause is a synchronization gap: the GC worker and shrinker already hold <code>nfsd_gc_lock</code> while walking the LRU, but they release it <em>before</em> calling <code>nfsd_file_dispose_list_delayed()</code>, and the fsnotify/lease path (<code>nfsd_file_close_inode</code>) has no synchronisation at all.</p>
+<h3>The three-part fix</h3>
+<p>Rather than taking net references (the approach rejected in v1/v2), v3 widens the existing spinlock:</p>
+<ol>
+<li><strong>Widen <code>nfsd_gc_lock</code></strong> in both <code>nfsd_file_gc()</code> and <code>nfsd_file_lru_scan()</code> to cover the <code>nfsd_file_dispose_list_delayed()</code> call.</li>
+<li><strong>Wrap <code>nfsd_file_close_inode()</code></strong> in <code>nfsd_gc_lock</code> so that all three callers of <code>nfsd_file_dispose_list_delayed()</code> hold the lock.</li>
+<li><strong>Add a <code>spin_lock/unlock(nfsd_gc_lock)</code> barrier</strong> in <code>nfsd_file_cache_shutdown_net()</code> after the purge, "so that any in-progress disposal has fully completed before the per-net list is drained."</li>
+</ol>
+<p>Layton justifies the spinlock choice: "All operations inside the lock are non-sleeping (rhashtable lookups, atomic bit/refcount ops, list moves, svc_wake_up), so the spinlock is appropriate."</p>
+<p>The change touches a single file (<code>fs/nfsd/filecache.c</code>) with 26 insertions and 9 deletions. It carries <code>Fixes: 43fd953fa7e2 ("nfsd: simplify the delayed disposal list code")</code> and an <code>Assisted-by: Claude:claude-opus-4-8</code> tag, continuing the series' pattern of AI-assisted analysis with human architectural judgment.</p>
+<h2>Evolution across versions</h2>
+<p>The patch's journey through three versions illustrates a notable design pivot in kernel locking strategy:</p>
+<table><thead><tr><th>Version</th><th>Approach</th><th>Outcome</th></tr></thead><tbody>
+<tr><td>v1 (June 1)</td><td><code>get_net()</code> at allocation, <code>put_net()</code> at free</td><td>Rejected by Al Viro for cacheline scalability</td></tr>
+<tr><td>v2 (June 2)</td><td><code>get_net()</code> only at disposal time + <code>NFSD_FILE_NET_HELD</code> flag</td><td>Rejected by Chuck Lever for put-ordering race and <code>get_net()</code> placement</td></tr>
+<tr><td>v3 (June 4)</td><td>Widen <code>nfsd_gc_lock</code> to cover dispose calls; no net ref</td><td>Posted, pending merge</td></tr>
+</tbody></table>
+<p>The v3 approach is arguably the cleanest of the three: it avoids adding any new reference-counting machinery, leverages a lock that already exists for this code path, and the critical section remains short (all non-sleeping operations). The tradeoff is slightly longer spinlock hold times during GC/shrinker operation, but since those paths are already serialized on <code>nfsd_gc_lock</code> for the LRU walk, the additional time is bounded by a single list move and atomic refcount decrement.</p>
+<h2>Nature of the discussion</h2>
+<p>This is a <strong>bug fix</strong> — specifically a memory leak (file + associated state) triggered by a race between filecache disposal and per-net namespace teardown. It is not a new feature or protocol change. The thread contains no review replies within this week's window; it is a standalone resend awaiting Chuck Lever's merge decision.</p>
+<h2>Significance for NFS client development</h2>
+<p>While the fix is entirely server-side, its implications for client-facing deployments are concrete:</p>
+<ul>
+<li><strong>Namespace teardown reliability</strong>: Any deployment using network namespaces with active NFS exports (containers, k8s pods, multi-tenant servers) could previously leak file cache entries when a namespace was destroyed while files were in-flight through the GC/shrinker path. For clients, this manifests as server-side resource exhaustion over time — each leaked <code>nfsd_file</code> pins an underlying <code>struct file</code>, dentry, and inode.</li>
+<li><strong>Shrinker interaction</strong>: The memory shrinker is a global mechanism that fires under memory pressure. On heavily-loaded NFS servers serving many clients, the shrinker path was one of the three race participants. Clients generating sustained I/O load increase the probability of hitting this window during namespace teardown.</li>
+<li><strong>Lease/fsnotify path</strong>: The fsnotify/lease callback (<code>nfsd_file_close_inode</code>) was the most exposed path since it had <em>no</em> prior synchronization. Clients that trigger file closes (via <code>CLOSE</code>, delegation recall, or lease expiry) while a namespace is being torn down were the primary trigger vector.</li>
+</ul>
+<h2>Final conclusions and open items</h2>
+<ol>
+<li><strong>The v3 patch has been posted</strong> but no merge confirmation from Chuck Lever appears within this week's window. Given that Layton explicitly framed it as "the remaining patch" and Lever had already merged the other eight, a quick merge is expected.</li>
+<li><strong>The net-reference approach is definitively abandoned</strong> in favor of lock widening. This resolves both Al Viro's scalability concern (no atomic counter on a shared cacheline) and Chuck Lever's correctness objection (no new refcount to order).</li>
+<li><strong>The full nine-patch "locally-triggerable bugs" series is now complete</strong> — eight patches merged June 3, and the ninth (this patch) posted June 4. The series represents a comprehensive hardening of nfsd's filecache lifetime management, eliminating an entire class of shutdown races by consolidating synchronization under <code>nfsd_gc_lock</code>.</li>
+</ol>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260604-nfsd-testing-v3-1-c9c58cc45c71@kernel.org/">2026-06-04 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3] nfsd: close shrinker/GC/fsnotify vs per-net shutdown race in filecache</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260604-nfsd-testing-v3-1-c9c58cc45c71@kernel.org/">2026-06-04 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3] nfsd: close shrinker/GC/fsnotify vs per-net shutdown race in filecache</a></li>
+</ul>
+  </main>
+</body>
+</html>

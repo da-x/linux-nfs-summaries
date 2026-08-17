@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>knfsd per-client fair scheduling: Coddington publishes benchmark data; slot-table design takes shape</title>
+  <meta name="description" content="Classification: This is an RFC-stage feature proposal / protocol-adjacent scheduling change for the NFS server (knfsd/sunrpc), not a traditional client bug fix. It addresses a structural fairness defect in how nfsd divides its thread pool…">
+  <meta property="og:title" content="knfsd per-client fair scheduling: Coddington publishes benchmark data; slot-table design takes shape">
+  <meta property="og:description" content="Classification: This is an RFC-stage feature proposal / protocol-adjacent scheduling change for the NFS server (knfsd/sunrpc), not a traditional client bug fix. It addresses a structural fairness defect in how nfsd divides its thread pool…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-04T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="knfsd per-client fair scheduling: Coddington publishes benchmark data; slot-table design takes shape">
+  <meta name="twitter:description" content="Classification: This is an RFC-stage feature proposal / protocol-adjacent scheduling change for the NFS server (knfsd/sunrpc), not a traditional client bug fix. It addresses a structural fairness defect in how nfsd divides its thread pool…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-04</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>knfsd per-client fair scheduling: Coddington publishes benchmark data; slot-table design takes shape</h1>
+<h2>Summary</h2>
+<h1>knfsd per-client fair scheduling: measurement week, and a slot-table design emerges</h1>
+<p><strong>Classification:</strong> This is an <strong>RFC-stage feature proposal / protocol-adjacent scheduling change</strong> for the NFS <em>server</em> (knfsd/sunrpc), not a traditional client bug fix. It addresses a structural fairness defect in how nfsd divides its thread pool across clients. The week's work is largely about <strong>NFS server-side dispatch and the practical behavior of NFSv3 vs. v4.1 clients</strong> on shared infrastructure — relevant to anyone tuning <code>nconnect</code>, slot tables, or running mixed-version exports.</p>
+<h2>Bridge from last week</h2>
+<p>Last week (<a href="https://lore.kernel.org/linux-nfs/D33770A1-9098-4F1A-93EF-590E6C0B7638@hammerspace.com/">prior summary</a>), Benjamin Coddington (Hammerspace) opened the RFC arguing that a client opening many TCP connections plus a large v4.1 slot table can saturate the whole nfsd thread pool and starve other clients, because "the xprt is the unit of fairness." Chuck Lever welcomed it as "a well-known shortcoming of NFSD" but pushed back on making the client the fairness unit, and floated an alternative: for NFSv4.1+, have NFSD schedule per-session and manage each session's load by <strong>raising and lowering its slot table</strong>. Coddington endorsed that idea ("Indeed, sounds good") and left the thread with an open question — <strong>"What about v3?"</strong> Lever had also asked for "numbers instead of speculating."</p>
+<h2>This week: the promised numbers arrive</h2>
+<p>The week opens with <a href="https://lore.kernel.org/linux-nfs/E903163B-6A5B-47C6-BC91-3894BB9EAD08@hammerspace.com/">Coddington delivering the benchmark data he owed</a>. He isolated the dispatch path with a small debug patch to nfsd: a request bearing a "magic" filehandle is answered after a fixed, caller-specified delay at the top of <code>fh_verify()</code>, before any export/dentry work — so each thread is held for a known time D and does zero filesystem work. With T threads that pins the pool ceiling at ~T/D ops/s and makes nfsd thread-time the only contended resource. A userspace load client then runs a "greedy" client (K connections) against an "interactive" client (1 connection), both oversubscribing the server; the v3 probe is GETATTR, the v4.1 probe is <code>COMPOUND{SEQUENCE, PUTFH}</code> with the greedy client's K connections bound to one session via <code>BIND_CONN_TO_SESSION</code>.</p>
+<p>The headline finding: <strong>a client's share of nfsd service tracks its transport count, not its identity.</strong> With 8 threads and D=10ms, sweeping the greedy client's connections K against a fixed single-connection interactive client:</p>
+<pre><code>K    interactive ops/s   intr share   greedy share
+1         240.6            50.4%         49.6%
+2         216.0            33.8%         66.2%
+4         129.4            20.1%         79.9%
+8          72.2            11.2%         88.8%
+16          38.0             5.9%        94.1%
+</code></pre>
+<p>The interactive client lands at ~1/(K+1) of the pool. Coddington stresses three points:</p>
+<blockquote>
+<p>"under saturation a client's share of nfsd service tracks its transport count, not its identity -- a one-connection client gets ~1/(K+1) of the pool when another client drives K connections."</p>
+</blockquote>
+<p>The interactive client is "actively harmed, not just out-numbered" — alone it sustains 229 ops/s; with the K=16 greedy client present it drops to 38 (a 6× reduction) and its median latency climbs from 16ms to 105ms. The result holds for v4.1 too: "the split is 89% / 11%, identical to v3. The session is a clear client identity, but the dispatch path ignores it -- the unfairness is in sunrpc, below the version." And it's structural, not a small-pool artifact — sweeping thread count leaves the ratio flat while only the absolute ceiling moves (K=16 total throughput: 321 / 649 / 1299 ops/s at T = 4 / 8 / 16).</p>
+<p>He directly answers Lever's earlier skepticism that a saturated pool isn't an xprt-scheduling problem:</p>
+<blockquote>
+<p>"Saturation is the setup; the per-xprt split is the problem."</p>
+</blockquote>
+<p>Coddington notes he kept it to the pure scheduling case on purpose, because it's "the most conservative," and offers to share the standalone harness or run other configurations — "different fairness units, per-connection caps, and so on."</p>
+<h2>NeilBrown joins: slot-table pressure as the mechanism</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/178044079821.2082204.6117918610145832039@noble.neil.brown.name/">Neil Brown then enters the thread</a>, converging on Lever's slot-table idea and proposing a concrete, low-cost mechanism:</p>
+<blockquote>
+<p>"I agree that managing slot numbers is likely to be a good approach. It doesn't make much sense to allocate to any client more slots than the maximum number of threads - does it?"</p>
+</blockquote>
+<p>He points out there's existing precedent — "We already have code to reduce slots numbers based on memory pressure" — and suggests extending it:</p>
+<blockquote>
+<p>"let every client have a least one unused slot until the total slots across all clients reaches the maximum number of threads. Then apply pressure evenly like we do for memory shortage. Idle clients will get pushed back to 1 slot, active client will tend towards a 'fair' share based on how comparatively busy they are."</p>
+</blockquote>
+<p>He concedes the limitation: "This wouldn't help for v3 of course but I don't think we need these advanced features for v3."</p>
+<h2>The v3 question becomes central</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/561e9ac6-348f-4d6d-b896-38dbe5ede3bc@app.fastmail.com/">Lever replies</a> with two refinements. First, the thread count isn't a fixed constant: "these days the number of threads isn't fixed. As load goes up the number of threads increases." Second, he pushes back on de-prioritizing v3 with a pointed jab — "Ben's employer might disagree with that :-)" — and adds that NFSD may also need to consider <strong>LOCALIO</strong> workloads.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20555E8B-0E49-4328-8B31-0F73C3D286FE@hammerspace.com/">Coddington confirms the stakes</a>: "Yes - v3 is pretty important to us here."</p>
+<p><a href="https://lore.kernel.org/linux-nfs/178052807961.2082204.13323491503071931242@noble.neil.brown.name/">Neil Brown follows up on the dynamic-thread wrinkle</a>, acknowledging there's still an upper limit ("that is what I was thinking of") but flagging a subtlety: the effective maximum may be lower than the configured one if allocating a new server thread fails. He musingly notes it "should probably use GFP_RETRY_MAYFAIL or maybe even GFP_NORETRY when adding extra threads," that they'd need to track an "effective-maximum which is probably the largest maximum seen," and floats a side question: "should we add a shrinker to stop nfsd threads when memory is tight?"</p>
+<p>The week closes with <a href="https://lore.kernel.org/linux-nfs/178060780940.3392745.3574880233025675236@noble.neil.brown.name/">Neil Brown asking Coddington to justify v3</a>: "Can you remind me why v3 is important for you? Is it the lower state-management overhead, or something else?"</p>
+<h2>Just past the window: the question gets answered</h2>
+<p>Two replies landed on June 5 (just outside this week's window) that resolve the open thread. <a href="https://lore.kernel.org/linux-nfs/83C74302-2A2B-48B6-B0F0-D5E8CB487BBC@hammerspace.com/">Coddington explains</a>: "Flexfiles uses v3 in its data plane," and the stateless nature of v3 gives it distinct advantages that "can't be added to v4." He adds a key architectural constraint: "because knfsd doesn't have different resource pools for each version we're going to want to continue to balance the pool for all versions exported." <a href="https://lore.kernel.org/linux-nfs/a6225380-8520-4789-a64d-b8b94310dd67@app.fastmail.com/">Lever frames the stakes</a>: "At a higher altitude, I am treating this issue as a partial DoS surface, so it does indeed have to be addressed for all NFS versions to eliminate that surface."</p>
+<h2>Conclusions and open threads</h2>
+<ul>
+<li><strong>The problem is now quantified, not just asserted.</strong> Coddington's data confirms the per-transport split is structural, version-independent (it lives in sunrpc, below v3/v4.1), and survives thread-count scaling. The RFC has moved from "is this real?" to "how do we fix it?"</li>
+<li><strong>A concrete mechanism is emerging:</strong> dynamic slot-table pressure (reusing the existing memory-pressure slot-reduction code) for NFSv4.1+, rather than a full per-client fair-queueing scheduler in sunrpc. This is lighter-weight and reuses proven infrastructure.</li>
+<li><strong>The v3 gap is the live design tension.</strong> The slot-table fix is inherently v4.1+; Coddington's Flexfiles data-plane use of v3 (and Lever's "partial DoS surface" framing) means a complete solution must also cover v3, likely via source-address fallback or a different mechanism — still unresolved.</li>
+<li><strong>Secondary open items:</strong> tracking an <em>effective</em> thread maximum under dynamic pool growth and possible allocation failures; whether to add a shrinker to stop nfsd threads under memory pressure; and how LOCALIO workloads fit into the fairness model.</li>
+</ul>
+<p>No patch has been posted this week — the discussion remains at the design/measurement stage, but it has sharpened considerably toward a slot-table-based approach with an acknowledged v3 hole that must be closed.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/E903163B-6A5B-47C6-BC91-3894BB9EAD08@hammerspace.com/">2026-06-02 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — Re: [RFC] knfsd: per-client fair scheduling to prevent single-client starvation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178044079821.2082204.6117918610145832039@noble.neil.brown.name/">2026-06-02 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [RFC] knfsd: per-client fair scheduling to prevent single-client starvation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/561e9ac6-348f-4d6d-b896-38dbe5ede3bc@app.fastmail.com/">2026-06-03 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [RFC] knfsd: per-client fair scheduling to prevent single-client starvation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20555E8B-0E49-4328-8B31-0F73C3D286FE@hammerspace.com/">2026-06-03 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — Re: [RFC] knfsd: per-client fair scheduling to prevent single-client starvation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178052807961.2082204.13323491503071931242@noble.neil.brown.name/">2026-06-03 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [RFC] knfsd: per-client fair scheduling to prevent single-client starvation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178060780940.3392745.3574880233025675236@noble.neil.brown.name/">2026-06-04 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [RFC] knfsd: per-client fair scheduling to prevent single-client starvation</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Delegation-recall debate: Coddington defends pre-emptive return; Trond and Macklem push back on v4.1 recall necessity</title>
+  <meta name="description" content="This week the thread that opened last week with Benjamin Coddington&#39;s single-patch series — a Linux NFSv4 client change to preemptively return a write delegation when a SETATTR drops the holder&#39;s own write access — moved from initial…">
+  <meta property="og:title" content="Delegation-recall debate: Coddington defends pre-emptive return; Trond and Macklem push back on v4.1 recall necessity">
+  <meta property="og:description" content="This week the thread that opened last week with Benjamin Coddington&#39;s single-patch series — a Linux NFSv4 client change to preemptively return a write delegation when a SETATTR drops the holder&#39;s own write access — moved from initial…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-04T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Delegation-recall debate: Coddington defends pre-emptive return; Trond and Macklem push back on v4.1 recall necessity">
+  <meta name="twitter:description" content="This week the thread that opened last week with Benjamin Coddington&#39;s single-patch series — a Linux NFSv4 client change to preemptively return a write delegation when a SETATTR drops the holder&#39;s own write access — moved from initial…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-04</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Delegation-recall debate: Coddington defends pre-emptive return; Trond and Macklem push back on v4.1 recall necessity</h1>
+<h2>Summary</h2>
+<h1>Delegation-recall debate: is the client's pre-emptive write-delegation return actually needed?</h1>
+<h2>Overview</h2>
+<p>This week the thread that opened last week with Benjamin Coddington's single-patch series — <a href="https://lore.kernel.org/linux-nfs/cover.1779995818.git.bcodding@hammerspace.com/">a Linux NFSv4 client change to preemptively return a write delegation when a SETATTR drops the holder's own write access</a> — moved from initial posting into active, substantive review. All six in-window messages landed on Friday, 2026-05-29, and the discussion was driven by two of the client's principal maintainers: <strong>Trond Myklebust</strong> (Hammerspace / Linux NFS client maintainer) and <strong>Rick Macklem</strong> (FreeBSD knfsd author).</p>
+<p>This is a <strong>client-side bug fix / performance optimization</strong> in the delegation state machine. The patch (in <code>fs/nfs/nfs4proc.c</code>) makes the client detect, before issuing a SETATTR that would strip its own write access, and synchronously return the delegation first — flushing dirty data — so the attribute change then proceeds on an open/special stateid rather than triggering a server-initiated <code>CB_RECALL</code>. The week's debate was not about whether the patch is <em>correct</em>, but about whether the recall it avoids is even <em>required</em> for NFSv4.1+, and where the real latency win should live.</p>
+<h2>Trond's opening pushback: v4.1 need not recall at all</h2>
+<p>Trond opened the review by challenging the premise of the whole optimization. He argued that while recalling a delegation in this situation is mandatory under NFSv4.0, "that is certainly not true for NFSv4.1":</p>
+<blockquote>
+<p>"if the holder of a write delegation is just changing the mode, then that should never result in a delegation recall for a well written NFSv4.1 server. The reason is this does not impact the client's ability to cache data, metadata or lock state. It only impacts its ability to rely on previously cached access data when handling new opens."</p>
+</blockquote>
+<p>He extended the same skepticism to uid/gid changes ("the right behaviour is to err on the side of not recalling"), with one carve-out for attribute delegations where the holder's credential might lose the ability to update atime/mtime on return. His bottom line split the problem cleanly:</p>
+<blockquote>
+<p>"So yes to pre-emptive invalidation of the access cache, but I'm very sceptical to actually pre-emptively returning the delegation or even the layouts."</p>
+</blockquote>
+<p>In short, Trond was arguing that the <em>correct</em> client-side response is to invalidate the cached access result, not to tear down the delegation — and that a well-behaved v4.1 server should not be recalling in the first place.</p>
+<h2>Coddington's core defense: the recall is about truncate semantics, not cache coherence</h2>
+<p>Coddington responded by reframing <em>why</em> servers actually do recall here. He conceded Trond's point on mode changes and confirmed the stale-access exposure is already handled — the SETATTR reply path sets <code>NFS_INO_INVALID_ACCESS</code> in <code>nfs_update_inode()</code>, and a fresh open over the delegation still revalidates through <code>nfs_may_open() -&gt; nfs_do_access()</code> rather than trusting the cache. But he argued the recall is not about data/metadata/lock coherence; it is about the <strong>truncate path</strong>:</p>
+<blockquote>
+<p>"When the change removes the holder's write, a later SETATTR(size) under the delegation carries the delegation stateid, not an open stateid (nfs4_copy_delegation_stateid()), and the client can reopen O_WRONLY from the delegation with no OPEN on the wire — so the server can't tell whether the holder still has the file open for write, nor apply the usual 'open-for-write overrides current mode' check for the truncate."</p>
+</blockquote>
+<p>The recall forces a <code>DELEGRETURN + CLAIM_DELEGATE_CUR</code> reclaim that re-establishes a real (or absent) open stateid, "letting the server decide the truncate correctly." He then redirected the optimization's value:</p>
+<blockquote>
+<p>"For write-retaining SETATTRs none of that applies and the server shouldn't recall — which is where the latency I was chasing actually came from, and the better place to remove it."</p>
+</blockquote>
+<p>This was a notable concession: Coddington acknowledged the latency he was targeting actually lives in the <em>write-retaining</em> case (where servers are over-recalling), not necessarily the access-dropping case the patch addresses.</p>
+<h2>Rick Macklem enters: delayed writes and server-side authorization</h2>
+<p>Macklem, speaking from the FreeBSD server side, pushed back on Trond's "no impact on cached data" framing by raising <strong>delayed writes</strong>:</p>
+<blockquote>
+<p>"The case I would be concerned about is delayed writes sitting in the client."</p>
+</blockquote>
+<p>He questioned whether an NFSv4.1/4.2 server <em>should</em> always allow writes from a delegation holder, noting he wasn't sure RFC 8881 spelled it out ("I'm never sure, given that monstrous document") and admitting "the FreeBSD server does not do that" — though the FreeBSD server does allow the file's <em>owner</em> to write. He asked what knfsd currently does, and floated leaving the recall decision up to the server:</p>
+<blockquote>
+<p>"I might argue that whether or not clearing mode bits requires a delegation recall should be left up to the server."</p>
+</blockquote>
+<p>In a follow-up he flagged a "quirky corner": if the server provided a non-empty ACE for the delegation's permissions field, then these SETATTRs either require a recall or the client must invalidate use of that ACE — and he suggested the latter, again leaving recall to the server. He also asked, unprompted by anyone, "Lost me. What's an attribute delegation?"</p>
+<h2>Coddington's technical rebuttal: knfsd already authorizes via stateid</h2>
+<p>Coddington gave a detailed, code-level answer that effectively closed Macklem's data-safety concern for Linux. On delayed writes:</p>
+<blockquote>
+<p>"Those stay safe on Linux. The client flushes cached writes on the delegation (or open) stateid, and knfsd authorizes a WRITE from the stateid's granted access, not from a re-check of the current mode — nfsd4_write() just rides the already-open, write-capable nfsd_file resolved from the stateid, so a later mode change doesn't block the holder's writes."</p>
+</blockquote>
+<p>He drew the sharp conclusion: "The only way to lose data is a server that neither honors the holder's stateid writes nor recalls." On what knfsd does, he confirmed it already allows delegation-holder writes and framed it as FreeBSD's target behavior in disguise:</p>
+<blockquote>
+<p>"So knfsd effectively already does the override you're considering for FreeBSD, just implicitly — write authorization comes from the open/deleg stateid, the same principle as the truncate-via-stateid case."</p>
+</blockquote>
+<p>On the ACE corner, he confirmed the Linux client never uses the server-supplied permissions ACE at all:</p>
+<blockquote>
+<p>"decode_rw_delegation() parses the delegation's permissions ACE and discards it (decode_ace() is passed a NULL sink), and the client always does its own ACCESS. So there's nothing to invalidate on our side, and agreed: the recall decision belongs to the server."</p>
+</blockquote>
+<p>He also clarified Trond's attribute-delegation aside for Macklem: the <code>*_ATTRS_DELEG</code> variants "additionally delegate attribute authority — notably the timestamps — so the client can hold and modify them and write them back at DELEGRETURN," which is what Trond meant by the holder's credential needing to retain access.</p>
+<h2>Macklem's closing synthesis: a server-side path forward</h2>
+<p>Macklem closed the thread with a constructive, cross-cutting observation that reframed the whole exchange around a <em>server</em> fix rather than the client patch. Noting Coddington's server already authorizes WRITE via the delegation stateid:</p>
+<blockquote>
+<p>"it could allow SETATTR(size) based on a delegation stateid as well. (SETATTR(size) is just a weird variant of WRITE. is it not.)"</p>
+</blockquote>
+<p>He then raised the strategic cost of the client-side pre-emptive return — that it may preemptively remove the incentive for servers to solve this properly:</p>
+<blockquote>
+<p>"I suppose the disadvantage of doing the DELEGRETURN pre-emptively will never allow server implementations to figure out how to allow it without a CB_RECALL, etc."</p>
+</blockquote>
+<p>He committed to a concrete FreeBSD change and acknowledged the interim reality:</p>
+<blockquote>
+<p>"I do plan on patching the FreeBSD server to allow READ, WRITE and SETATTR(size) based on a write delegation stateid (and READ based on a read delegation stateid). ... The FreeBSD server will be doing the CB_RECALL in the meantime."</p>
+</blockquote>
+<p>He signed off warmly: "Useful discussion. Thanks, rick."</p>
+<h2>Conclusions</h2>
+<ul>
+<li><strong>The patch's correctness is uncontested.</strong> Coddington's conservative design — false positives degrade to existing behavior, false negatives are impossible — held up under review.</li>
+<li><strong>The real disagreement was about <em>necessity</em>, not safety.</strong> Trond argued a well-written NFSv4.1 server should not recall on mode/uid/gid changes and that the client should only invalidate the access cache; Coddington countered that servers <em>do</em> recall here, and for a sound reason tied to truncate-via-stateid semantics, with the latency win actually belonging in the write-retaining case.</li>
+<li><strong>A key technical finding emerged:</strong> knfsd already authorizes WRITE (and could authorize SETATTR(size)) purely from the delegation/open stateid rather than re-checking current mode — meaning the data-safety concern that might justify a recall is already handled by Linux's server.</li>
+<li><strong>The discussion pivoted toward a server-side fix.</strong> Macklem's plan to patch the FreeBSD server to honor READ/WRITE/SETATTR(size) via delegation stateids points to the more durable solution, while noting the client's pre-emptive return could inadvertently remove the pressure that drives such server improvements.</li>
+</ul>
+<p>The thread ended amicably with no final verdict on whether the patch should land as-is; it stands as a well-reasoned optimization whose long-term value depends on how servers evolve their delegation-recall behavior.</p>
+<h2>Messages this week (2026-05-29)</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/461703b49f85216f6f6b18656e290287b0f701a0.camel@kernel.org/">Trond Myklebust — v4.1 need not recall; sceptical of pre-emptive return</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAM5tNy54_NMkaj-x8Z_0TenMutrm0N=KvMKBER2+3Gou7DO7iQ@mail.gmail.com/">Rick Macklem — delayed-writes concern; recall decision to server; asks what knfsd does</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAM5tNy69MksnS0bvrO0VdgHQLzJHq7CWt9Koo8DEX8xrhyr7ag@mail.gmail.com/">Rick Macklem — ACE corner case; client should invalidate ACE, leave recall to server</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/32A38159-77F7-41CC-9567-2089531D05F1@hammerspace.com/">Benjamin Coddington — recall is about truncate semantics; latency win in write-retaining case</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/92DCE3BE-6F5C-483C-A60E-78443BDAF67F@hammerspace.com/">Benjamin Coddington — knfsd authorizes via stateid; client discards ACE; explains attribute delegation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAM5tNy5apeovZgH-Uci4ESEHzAP4A9ATMp0djR2Ttr-HM1peSA@mail.gmail.com/">Rick Macklem — server could allow SETATTR(size) via stateid; plans FreeBSD patch</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/461703b49f85216f6f6b18656e290287b0f701a0.camel@kernel.org/">2026-05-29 Trond Myklebust <a href="mailto:trondmy@kernel.org">trondmy@kernel.org</a> — Re: [PATCH 1/1] nfs: return a write delegation when a SETATTR drops our write access</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAM5tNy54_NMkaj-x8Z_0TenMutrm0N=KvMKBER2+3Gou7DO7iQ@mail.gmail.com/">2026-05-29 Rick Macklem <a href="mailto:rick.macklem@gmail.com">rick.macklem@gmail.com</a> — Re: [PATCH 1/1] nfs: return a write delegation when a SETATTR drops our write access</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAM5tNy69MksnS0bvrO0VdgHQLzJHq7CWt9Koo8DEX8xrhyr7ag@mail.gmail.com/">2026-05-29 Rick Macklem <a href="mailto:rick.macklem@gmail.com">rick.macklem@gmail.com</a> — Re: [PATCH 1/1] nfs: return a write delegation when a SETATTR drops our write access</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/32A38159-77F7-41CC-9567-2089531D05F1@hammerspace.com/">2026-05-29 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — Re: [PATCH 1/1] nfs: return a write delegation when a SETATTR drops our write access</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/92DCE3BE-6F5C-483C-A60E-78443BDAF67F@hammerspace.com/">2026-05-29 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — Re: [PATCH 1/1] nfs: return a write delegation when a SETATTR drops our write access</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAM5tNy5apeovZgH-Uci4ESEHzAP4A9ATMp0djR2Ttr-HM1peSA@mail.gmail.com/">2026-05-29 Rick Macklem <a href="mailto:rick.macklem@gmail.com">rick.macklem@gmail.com</a> — Re: [PATCH 1/1] nfs: return a write delegation when a SETATTR drops our write access</a></li>
+</ul>
+  </main>
+</body>
+</html>

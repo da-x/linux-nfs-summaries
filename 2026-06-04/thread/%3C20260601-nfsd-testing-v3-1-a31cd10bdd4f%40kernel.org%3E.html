@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd OPEN ACL leak fix v3 merged: single op_release call-site closes last gap</title>
+  <meta name="description" content="This thread is the final, two-message coda to a three-week saga about a posix_acl refcount leak in the Linux NFSv4 server (nfsd). After PATCH v2 was reviewed and approved last week — with NeilBrown suggesting a structural cleanup and Chuck…">
+  <meta property="og:title" content="nfsd OPEN ACL leak fix v3 merged: single op_release call-site closes last gap">
+  <meta property="og:description" content="This thread is the final, two-message coda to a three-week saga about a posix_acl refcount leak in the Linux NFSv4 server (nfsd). After PATCH v2 was reviewed and approved last week — with NeilBrown suggesting a structural cleanup and Chuck…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-04T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd OPEN ACL leak fix v3 merged: single op_release call-site closes last gap">
+  <meta name="twitter:description" content="This thread is the final, two-message coda to a three-week saga about a posix_acl refcount leak in the Linux NFSv4 server (nfsd). After PATCH v2 was reviewed and approved last week — with NeilBrown suggesting a structural cleanup and Chuck…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-04</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd OPEN ACL leak fix v3 merged: single op_release call-site closes last gap</h1>
+<h2>Summary</h2>
+<h1>nfsd OPEN ACL leak fix v3 merged: single <code>op_release</code> call-site closes the last gap</h1>
+<h2>Summary</h2>
+<p>This thread is the final, two-message coda to a three-week saga about a posix_acl refcount leak in the Linux NFSv4 server (nfsd). After <a href="https://lore.kernel.org/linux-nfs/20260531-nfsd-testing-v2-1-e13e6355fc07@kernel.org/">PATCH v2 was reviewed and approved</a> last week — with NeilBrown suggesting a structural cleanup and Chuck Lever agreeing that "v3 sounds fine" — <a href="https://lore.kernel.org/linux-nfs/20260601-nfsd-testing-v3-1-a31cd10bdd4f@kernel.org/">Jeff Layton posted the v3 patch</a> on June 1, and <a href="https://lore.kernel.org/linux-nfs/178037202577.29007.13514470184077854481.b4-ty@b4/">Chuck Lever applied it to nfsd-testing</a> the next morning. The fix is now merged, closing out a remotely triggerable memory-exhaustion vector against NFSv4 servers.</p>
+<h2>Context from prior weeks (brief bridge)</h2>
+<p>The bug was introduced by commit <code>5fc51dfc2eb1</code> ("NFSD: Add support for XDR decoding POSIX draft ACLs"), which made <code>nfsd4_decode_createhow4()</code> allocate refcounted <code>struct posix_acl</code> objects and stash them in <code>open-&gt;op_pacl</code> and <code>open-&gt;op_dpacl</code>. Those refs had to be released when the OPEN compound finished — but two code paths leaked them:</p>
+<ol>
+<li><strong>The <code>nfsd4_open_omfg</code> short-circuit:</strong> when <code>nfsd4_decode_open_claim4()</code> returns a non-seqid-mutating error, the dispatcher skips <code>op_func</code> (i.e., <code>nfsd4_open()</code> never runs), so the release pair that lived at <code>nfsd4_open()</code>'s <code>out_err:</code> label was never reached.</li>
+<li><strong>The v4.0 replay path:</strong> <code>op_release</code> was only invoked from <code>nfsd4_encode_operation()</code>, and the compound loop skips that encoder for replayed operations — so every ACL-bearing v4.0 OPEN retransmit leaked two refs.</li>
+</ol>
+<p>v1 (May 31) fixed the short-circuit by adding <code>nfsd4_open_release()</code> as <code>.op_release</code> for OP_OPEN. <a href="https://lore.kernel.org/linux-nfs/c2b22954-9f78-4ce0-abfd-e86a5bfac0b4@app.fastmail.com/">Chuck Lever caught the replay gap before merging</a>: "So every ACL-bearing v4.0 OPEN retransmit leaks two posix_acl refs." v2 (May 31) patched the replay branch, and <a href="https://lore.kernel.org/linux-nfs/178027597098.2923901.17316619429004997151@noble.neil.brown.name/">NeilBrown approved it while suggesting</a> a cleaner structure: "I think it would be even better if the -&gt;op_release() call were moved out of nfsd4_encode_operation() and places after this if-else. Then there would be only one call-site in a fairly obviously-correct place."</p>
+<h2>This week's activity (June 1 – June 2)</h2>
+<h3>v3 posted (June 1)</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260601-nfsd-testing-v3-1-a31cd10bdd4f@kernel.org/">Jeff Layton posted the v3 patch</a> on June 1, authored by Chris Mason and carrying review-by tags from both Chuck Lever and NeilBrown. The v3 changelog is terse:</p>
+<blockquote>
+<p>"Changes in v3:</p>
+<ul>
+<li>Move op_release to a single callsite that accomodates all cases"</li>
+</ul>
+</blockquote>
+<p>The patch makes the structural change NeilBrown proposed. Rather than calling <code>op_release()</code> separately in the normal-encode branch and the replay branch, it hoists the call out of both branches and places it once, after the if-else in <code>nfsd4_proc_compound()</code>:</p>
+<blockquote>
+<p>"Move the op_release() call out of nfsd4_encode_operation() and the replay branch, placing it after the if-else in nfsd4_proc_compound(). This gives a single call site in a fairly obviously-correct place, covering both the normal encoding and replay paths."</p>
+</blockquote>
+<p>The OP_OPEN wiring from v2 is retained: <code>nfsd4_open_release()</code> is registered as <code>.op_release</code> for OP_OPEN, and the now-redundant <code>posix_acl_release()</code> pair is removed from <code>nfsd4_open()</code>'s <code>out_err:</code> label to avoid a double-release. As Layton's commit message notes, "posix_acl_release() is NULL-safe, so the single release site covers both the normal path and the nfsd4_open_omfg short-circuit." The diff touches <code>fs/nfsd/nfs4proc.c</code> (+11/-2) and <code>fs/nfsd/nfs4xdr.c</code> (-3).</p>
+<h3>Merged (June 2)</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/178037202577.29007.13514470184077854481.b4-ty@b4/">Chuck Lever applied the patch to nfsd-testing</a> on June 2, quoting the commit message and confirming:</p>
+<blockquote>
+<p>"Applied to nfsd-testing, thanks!"
+"[1/1] nfsd: release OPEN-decoded posix ACLs via op_release — commit: 844f63869b2038377b82cdb90f8872acbdc8fde3"</p>
+</blockquote>
+<p>The merge landed roughly eighteen hours after the v3 posting, with no further review comments in between.</p>
+<h2>Nature of the discussion</h2>
+<p>This is a <strong>bug fix</strong> — not a new feature or protocol change. Specifically, it repairs a posix_acl refcount leak on two NFSv4 OPEN error paths (the <code>nfsd4_open_omfg</code> short-circuit and the v4.0 replay path), tagged with <code>Fixes: 5fc51dfc2eb1</code>. The v3 iteration was driven purely by a code-quality improvement (single call-site vs. duplicated calls in two branches) rather than any new defect.</p>
+<h2>Significance for NFS client development</h2>
+<p>Though this is a server-side fix, the implications for clients are concrete:</p>
+<ul>
+<li><strong>NFSv4.0 clients</strong> were most directly exposed: any v4.0 client retransmitting an OPEN carrying POSIX ACL attributes (even non-conformantly, since knfsd does not gate attribute acceptance by minorversion) triggered two posix_acl ref leaks per retransmit — a memory-exhaustion DoS vector against the server.</li>
+<li><strong>NFSv4.2+ clients</strong> using the POSIX draft ACL extension (RFC 8881) were exposed on the short-circuit path: any OPEN with ACL createhow4 attributes that failed claim validation leaked two refs per attempt.</li>
+<li>The fix restores the server-side invariant that all decoded resources are released regardless of which error or replay path is taken — a guarantee clients can rely on for reliable operation under retries and malformed-request conditions.</li>
+</ul>
+<h2>Final conclusions</h2>
+<ol>
+<li><strong>The patch is merged</strong> into nfsd-testing as commit <code>844f63869b2038377b82cdb90f8872acbdc8fde3</code>, resolving the leak on both the short-circuit and replay paths.</li>
+<li><strong>NeilBrown's single-call-site restructuring</strong> was adopted in v3, making the "every op gets released" invariant structurally obvious.</li>
+<li>The thread is <strong>closed</strong>; no open items remain for this fix. (The separate question of whether knfsd should gate attribute acceptance by minorversion, raised in the parent series, remains deferred to a different changeset.)</li>
+</ol>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601-nfsd-testing-v3-1-a31cd10bdd4f@kernel.org/">2026-06-01 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3] nfsd: release OPEN-decoded posix ACLs via op_release</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178037202577.29007.13514470184077854481.b4-ty@b4/">2026-06-02 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: (applied to nfsd-testing)</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601-nfsd-testing-v3-1-a31cd10bdd4f@kernel.org/">2026-06-01 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3] nfsd: release OPEN-decoded posix ACLs via op_release</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178037202577.29007.13514470184077854481.b4-ty@b4/">2026-06-02 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v3] nfsd: release OPEN-decoded posix ACLs via op_release</a></li>
+</ul>
+  </main>
+</body>
+</html>

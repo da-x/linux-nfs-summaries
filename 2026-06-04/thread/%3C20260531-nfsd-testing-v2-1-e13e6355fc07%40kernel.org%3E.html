@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd OPEN ACL leak fix v2: replay path patched, NeilBrown suggests single call-site cleanup for v3</title>
+  <meta name="description" content="This thread is the direct continuation of PATCH 5/6 from Jeff Layton&#39;s six-patch &quot;medium-severity bugfixes&quot; series posted on May 31. In that series, Chris Mason&#39;s fix addressed a posix_acl refcount leak on the NFSv4 OPEN short-circuit…">
+  <meta property="og:title" content="nfsd OPEN ACL leak fix v2: replay path patched, NeilBrown suggests single call-site cleanup for v3">
+  <meta property="og:description" content="This thread is the direct continuation of PATCH 5/6 from Jeff Layton&#39;s six-patch &quot;medium-severity bugfixes&quot; series posted on May 31. In that series, Chris Mason&#39;s fix addressed a posix_acl refcount leak on the NFSv4 OPEN short-circuit…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-04T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd OPEN ACL leak fix v2: replay path patched, NeilBrown suggests single call-site cleanup for v3">
+  <meta name="twitter:description" content="This thread is the direct continuation of PATCH 5/6 from Jeff Layton&#39;s six-patch &quot;medium-severity bugfixes&quot; series posted on May 31. In that series, Chris Mason&#39;s fix addressed a posix_acl refcount leak on the NFSv4 OPEN short-circuit…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-04</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd OPEN ACL leak fix v2: replay path patched, NeilBrown suggests single call-site cleanup for v3</h1>
+<h2>Summary</h2>
+<h1>nfsd OPEN ACL leak fix v2: replay path patched, NeilBrown suggests single call-site cleanup for v3</h1>
+<h2>Context from prior weeks</h2>
+<p>This thread is the direct continuation of <a href="https://lore.kernel.org/linux-nfs/20260531-nfsd-testing-v1-5-7bfa481b0540@kernel.org/">PATCH 5/6 from Jeff Layton's six-patch "medium-severity bugfixes" series</a> posted on May 31. In that series, Chris Mason's fix addressed a posix_acl refcount leak on the NFSv4 OPEN short-circuit path: when <code>nfsd4_decode_open_claim4()</code> returns a non-seqid-mutating error, the compound dispatcher skips <code>op_func</code> entirely, but the decoded ACLs in <code>open-&gt;op_pacl</code> and <code>open-&gt;op_dpacl</code> still needed releasing. The v1 fix added <code>nfsd4_open_release()</code> as <code>.op_release</code> for OP_OPEN.</p>
+<p>However, <a href="https://lore.kernel.org/linux-nfs/c2b22954-9f78-4ce0-abfd-e86a5bfac0b4@app.fastmail.com/">Chuck Lever caught a gap before merging</a>:</p>
+<blockquote>
+<p>"The double-free fix is right, but op_release is not called unconditionally after every op, and that gap leaks the ACLs on the v4.0 replay path."</p>
+</blockquote>
+<p>He explained that <code>op_release</code> runs only inside <code>nfsd4_encode_operation()</code>, and the compound loop skips that encoder for replayed operations: "So every ACL-bearing v4.0 OPEN retransmit leaks two posix_acl refs." Lever applied the other five patches to nfsd-testing and asked Layton to resend just this one.</p>
+<h2>This week's activity (May 31 – June 1)</h2>
+<h3>v2 posted (May 31)</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260531-nfsd-testing-v2-1-e13e6355fc07@kernel.org/">Jeff Layton posted the v2 patch</a> on May 31, incorporating Chuck Lever's fix. The v2 changelog is concise:</p>
+<blockquote>
+<p>"Changes in v2:</p>
+<ul>
+<li>Ensure that op_release is called in the v4.0 replay case as well"</li>
+</ul>
+</blockquote>
+<p>The patch (authored by Chris Mason, reviewed by Chuck Lever) makes two changes to <code>fs/nfsd/nfs4proc.c</code>:</p>
+<ol>
+<li>
+<p><strong>Adds <code>op_release</code> call to the replay branch.</strong> The compound loop has two encoding branches — <code>nfsd4_encode_operation()</code> for normal ops and <code>nfsd4_encode_replay()</code> for v4.0 replayed ops. Previously, <code>op_release</code> was only called from the former. The v2 patch adds the release call to the replay path as well, ensuring cleanup on every code path.</p>
+</li>
+<li>
+<p><strong>Wires <code>nfsd4_open_release()</code> as <code>.op_release</code> for OP_OPEN</strong> and removes the now-redundant <code>posix_acl_release()</code> pair from <code>nfsd4_open()</code>'s <code>out_err:</code> label to avoid double-release. As Layton notes in the commit message, "posix_acl_release() is NULL-safe, so the single release site covers both the normal path and the nfsd4_open_omfg short-circuit."</p>
+</li>
+</ol>
+<p>The patch carries a <code>Fixes:</code> tag pointing to commit <code>5fc51dfc2eb1</code> ("NFSD: Add support for XDR decoding POSIX draft ACLs"), confirming this is a regression fix for a bug introduced when POSIX draft ACL support was added.</p>
+<h3>NeilBrown's review and cleanup suggestion (June 1)</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/178027597098.2923901.17316619429004997151@noble.neil.brown.name/">NeilBrown reviewed the patch</a> early on June 1 and approved it, but offered a structural improvement:</p>
+<blockquote>
+<p>"I think this patch is good, but I think it would be even better if the -&gt;op_release() call were moved out of nfsd4_encode_operation() and places after this if-else. Then there would be only one call-site in a fairly obviously-correct place."</p>
+</blockquote>
+<p>His reasoning is straightforward: rather than having <code>op_release</code> called in two separate branches (the normal encode path and the replay path), it should be hoisted to a single point after both branches converge, making the invariant "every op gets released" structurally obvious. He granted a review-by on the current version nonetheless:</p>
+<blockquote>
+<p>"Reviewed-by: NeilBrown <a href="mailto:neil@brown.name">neil@brown.name</a>"</p>
+</blockquote>
+<h3>Layton's response and v3 decision (June 1)</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/6924de18c6fd50d61e39b426bcfdce7617ce2976.camel@kernel.org/">Layton agreed with the suggestion</a> later that day:</p>
+<blockquote>
+<p>"I like that idea. I'll be testing a pile of other patches today anyway, so I'll make this change and test it alongside the rest."</p>
+</blockquote>
+<p>He then offered Chuck Lever two options: "you can either take this one and I'll do a cleanup patch along the lines of what Neil suggests, or I can send a v3."</p>
+<h3>Chuck Lever's decision (June 1)</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/a53a1a3e-d7df-45a7-a3ba-8946d2570ba7@oracle.com/">Chuck Lever opted for the cleaner path</a>:</p>
+<blockquote>
+<p>"v3 sounds fine."</p>
+</blockquote>
+<p>This means the patch will not be merged in its current v2 form. Layton will send a v3 that incorporates NeilBrown's single-call-site restructuring, and Chuck Lever will merge that version into nfsd-testing.</p>
+<h2>Nature of the discussion</h2>
+<p>This is a <strong>bug fix</strong> — specifically, a posix_acl refcount leak on two NFSv4 OPEN error paths:</p>
+<ol>
+<li>The <code>nfsd4_open_omfg</code> short-circuit (when claim decoding fails with a non-seqid-mutating error), and</li>
+<li>The v4.0 replay path (when an ACL-bearing OPEN is retransmitted).</li>
+</ol>
+<p>Both leaks are remotely triggerable: any client sending a malformed OPEN compound with valid POSIX ACL createhow4 attributes, or retransmitting such an OPEN over v4.0, would cause two posix_acl reference leaks per request. Over time, this constitutes a memory exhaustion DoS vector against the server.</p>
+<p>The discussion is not about a new feature or protocol change. It is a targeted fix for a regression introduced by commit <code>5fc51dfc2eb1</code>, with the v2→v3 evolution driven by a code-quality improvement (single call-site vs. duplicated calls in two branches).</p>
+<h2>Significance for NFS client development</h2>
+<p>While this is a server-side fix, it has direct implications for NFS clients:</p>
+<ul>
+<li><strong>NFSv4.0 clients</strong> are most directly affected: any v4.0 client retransmitting an OPEN with POSIX ACL attributes (even non-conformantly, since as Layton noted in the parent thread, "knfsd doesn't gate attributes by minorversion") would trigger the leak on every retransmit. This is a potential DoS vector against servers that accept such requests.</li>
+<li><strong>NFSv4.2+ clients</strong> using the POSIX draft ACL extension (RFC 8881) are affected on the short-circuit path: any OPEN with ACL createhow4 attributes that fails claim validation leaks two posix_acl refs per attempt.</li>
+<li>The fix ensures that the server's compound dispatcher properly releases all decoded resources regardless of which error path is taken, restoring the invariant that clients can rely on for reliable operation under error conditions (retries, malformed requests, etc.).</li>
+</ul>
+<h2>Final conclusions and open items</h2>
+<p>As of the end of this week's window:</p>
+<ol>
+<li><strong>v2 is reviewed and approved</strong> by NeilBrown (with a structural suggestion) and was already reviewed by Chuck Lever.</li>
+<li><strong>A v3 is expected</strong> incorporating NeilBrown's single-call-site cleanup, per Chuck Lever's "v3 sounds fine."</li>
+<li><strong>The patch will be merged into nfsd-testing</strong> after the v3 is posted and tested (Layton indicated he'd test it alongside other patches).</li>
+<li>The broader question of whether knfsd should gate attribute acceptance by minorversion (raised in the parent thread) remains open and deferred to a separate changeset.</li>
+</ol>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260531-nfsd-testing-v2-1-e13e6355fc07@kernel.org/">2026-05-31 Jeff Layton — [PATCH v2] nfsd: release OPEN-decoded posix ACLs via op_release</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178027597098.2923901.17316619429004997151@noble.neil.brown.name/">2026-06-01 NeilBrown — Re: (Reviewed-by + single call-site suggestion)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/6924de18c6fd50d61e39b426bcfdce7617ce2976.camel@kernel.org/">2026-06-01 Jeff Layton — Re: (agrees, will test, offers v3)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/a53a1a3e-d7df-45a7-a3ba-8946d2570ba7@oracle.com/">2026-06-01 Chuck Lever — Re: ("v3 sounds fine")</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260531-nfsd-testing-v2-1-e13e6355fc07@kernel.org/">2026-05-31 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v2] nfsd: release OPEN-decoded posix ACLs via op_release</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178027597098.2923901.17316619429004997151@noble.neil.brown.name/">2026-06-01 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v2] nfsd: release OPEN-decoded posix ACLs via op_release</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/6924de18c6fd50d61e39b426bcfdce7617ce2976.camel@kernel.org/">2026-06-01 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v2] nfsd: release OPEN-decoded posix ACLs via op_release</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/a53a1a3e-d7df-45a7-a3ba-8946d2570ba7@oracle.com/">2026-06-01 Chuck Lever <a href="mailto:chuck.lever@oracle.com">chuck.lever@oracle.com</a> — Re: [PATCH v2] nfsd: release OPEN-decoded posix ACLs via op_release</a></li>
+</ul>
+  </main>
+</body>
+</html>

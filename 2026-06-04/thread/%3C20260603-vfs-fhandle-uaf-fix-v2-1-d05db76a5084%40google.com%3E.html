@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>fhandle: UAF fix for unlocked mnt_ns read in may_decode_fh() — rapid review and merge</title>
+  <meta name="description" content="Type: Bug fix (use-after-free in VFS file-handle layer, affecting NFS client via open_by_handle_at())">
+  <meta property="og:title" content="fhandle: UAF fix for unlocked mnt_ns read in may_decode_fh() — rapid review and merge">
+  <meta property="og:description" content="Type: Bug fix (use-after-free in VFS file-handle layer, affecting NFS client via open_by_handle_at())">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-04T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="fhandle: UAF fix for unlocked mnt_ns read in may_decode_fh() — rapid review and merge">
+  <meta name="twitter:description" content="Type: Bug fix (use-after-free in VFS file-handle layer, affecting NFS client via open_by_handle_at())">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-04</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>fhandle: UAF fix for unlocked mnt_ns read in may_decode_fh() — rapid review and merge</h1>
+<h2>Summary</h2>
+<h1>fhandle: UAF fix for unlocked <code>-&gt;mnt_ns</code> read in <code>may_decode_fh()</code></h1>
+<p><strong>Type:</strong> Bug fix (use-after-free in VFS file-handle layer, affecting NFS client via <code>open_by_handle_at()</code>)</p>
+<h2>Overview</h2>
+<p>Google's Jann Horn submitted a two-day sprint to fix a use-after-free (UAF) in the kernel's file-handle decoding path — code that NFS clients exercise through <code>open_by_handle_at()</code> when resolving an opaque file handle back to a filesystem path. The bug, introduced by a 2024 commit that relaxed permission checks on <code>open_by_handle_at()</code>, allowed a concurrent unmount to free the mount namespace while <code>may_decode_fh()</code> was still reading <code>mount::mnt_ns</code> without any lock held.</p>
+<p>The v1 patch landed Wednesday evening (June 3), drew immediate and detailed review from Al Viro within an hour, and the revised v2 was applied to the <code>vfs.fixes</code> branch by Christian Brauner the following morning (June 4) — a remarkably fast turnaround for a concurrency fix touching core VFS semantics.</p>
+<h2>The Bug</h2>
+<p>Jann Horn's <a href="https://lore.kernel.org/linux-nfs/20260603-vfs-fhandle-uaf-fix-v1-1-ff64ee367e4d@google.com/">v1 submission</a> laid out the race in a clear three-column diagram:</p>
+<blockquote>
+<p>"may_decode_fh() accesses mount::mnt_ns without holding any locks; that means the mount can concurrently be unmounted, and the mnt_namespace can concurrently be freed after an RCU grace period."</p>
+</blockquote>
+<p>The trigger requires a mount created via <code>open_tree(..., OPEN_TREE_CLONE)</code>: one thread calls <code>close()</code> on the file descriptor, which dissolves the mount tree and frees the namespace; another thread simultaneously enters <code>open_by_handle_at()</code>, reaches <code>may_decode_fh() → is_mounted()</code>, and dereferences the now-freed <code>mnt_namespace</code>.</p>
+<p>Horn noted the practical reachability constraints:</p>
+<blockquote>
+<p>"This bug is unreachable unless one of the following is set: CONFIG_PREEMPTION, CONFIG_RCU_STRICT_GRACE_PERIOD — because it requires an RCU grace period to happen during a syscall without an explicit preemption."</p>
+</blockquote>
+<p>He also assessed the security impact as limited:</p>
+<blockquote>
+<p>"This doesn't seem to have interesting security impact; worst-case, it could leak the result of an integer comparison to userspace (from the level check in cap_capable()), cause an endless loop, or crash the kernel by dereferencing an invalid address."</p>
+</blockquote>
+<p>The fix was straightforward — wrap the <code>mnt_ns</code> access in <code>rcu_read_lock()</code> (mirroring what <code>__prepend_path()</code> already does) — but the subtlety lay in <em>why</em> RCU is sufficient here.</p>
+<h2>The Review: Documenting mnt_namespace Lifecycle</h2>
+<p>Al Viro <a href="https://lore.kernel.org/linux-nfs/20260603181523.GW2636677@ZenIV/">responded within 37 minutes</a>, not objecting to the fix but pressing for a proper explanation of <em>why</em> RCU access is valid:</p>
+<blockquote>
+<p>"Umm... It's somewhat subtle - at the very least you need to explain why there will be an RCU delay between umount_tree() clearing that and having the sucker freed."</p>
+</blockquote>
+<p>This kicked off a focused discussion about the mnt_namespace lifecycle. Viro explained the invariant in <a href="https://lore.kernel.org/linux-nfs/20260603184151.GY2636677@ZenIV/">a follow-up</a>:</p>
+<blockquote>
+<p>"Basically, the store that cleared -&gt;mnt_ns has been done in namespace_sem scope and that scope is either no later than the scope in put_mnt_ns() that has dropped the active refcount of ns to zero. At the beginning of that scope in put_mnt_ns() we are guaranteed to have the passive refcount positive. Dropping the passive reference happens after an rcu delay started in later in the same namespace_sem scope and namespace is not freed until the passive refcount reaches zero."</p>
+</blockquote>
+<p>He then confirmed:</p>
+<blockquote>
+<p>"TL;DR: your fix is correct, but needs a better explanation of correctness. If nothing else, I'd like to have the above findable on lore - I've way too many pieces of half-baked docs sitting around in local notes as it is ;-/"</p>
+</blockquote>
+<p>Horn proposed comment wording, and Viro refined the terminology — the namespace is "active or deactivating," not simply "active," because mounts within a namespace do not pin it:</p>
+<blockquote>
+<p>"Mounts within a namespace do not pin it - it's the other way round; they are guaranteed to stay live until they leave the sucker. Anything that hasn't left by the time the active refcount of namespace drops to zero will get pushed out."</p>
+</blockquote>
+<p>Viro also flagged a documentation gap in general:</p>
+<blockquote>
+<p>"The lifecycle for mnt_namespace really needs to be documented; right now we have a maze of twisty little functions around that area and it takes quite a non-trivial amount of searching to recall the names - and I am familiar with the area ;-/"</p>
+</blockquote>
+<h2>v2 and Merge</h2>
+<p>Horn posted <a href="https://lore.kernel.org/linux-nfs/20260603-vfs-fhandle-uaf-fix-v2-1-d05db76a5084@google.com/">v2</a> about 2 hours later, incorporating Viro's feedback:</p>
+<blockquote>
+<p>"Changes in v2: improve comment on mnt_ns semantics based on discussion with viro@"</p>
+</blockquote>
+<p>The patch touches three files (<code>fs/fhandle.c</code>, <code>fs/mount.h</code>, <code>fs/namespace.c</code>), adding the <code>rcu_read_lock()</code> guard, documenting <code>mnt_ns</code> semantics in the header, and converting racing writers to use <code>WRITE_ONCE()</code>. It carries a <code>Fixes:</code> tag pointing at commit <code>620c266f3949</code> ("fhandle: relax open_by_handle_at() permission checks") and is Cc'd to stable.</p>
+<p>Horn also offered additional tooling:</p>
+<blockquote>
+<p>"I used custom tooling to force this race condition to occur and check that it leads to a KASAN splat - let me know if you want me to create a kernel patch to force the race condition and a reproducer you can run."</p>
+</blockquote>
+<p>And acknowledged his own earlier oversight in reviewing the original commit:</p>
+<blockquote>
+<p>"I remember Christian asking me for feedback on the patch that introduced the bug, and I missed the bug because I didn't realize what the semantics of mount::mnt_ns are..."</p>
+</blockquote>
+<p>Christian Brauner <a href="https://lore.kernel.org/linux-nfs/20260604-hingibt-rechen-medien-fd15311d6cc7@brauner/">applied the patch</a> to <code>vfs.fixes</code> on June 4 at 07:40 UTC:</p>
+<blockquote>
+<p>"Applied to the vfs.fixes branch of the vfs/vfs.git tree. Patches in the vfs.fixes branch should appear in linux-next soon."</p>
+</blockquote>
+<p>In a <a href="https://lore.kernel.org/linux-nfs/20260604-vorboten-gebilde-entbunden-1c6652465d69@brauner/">separate reply</a> on the v1 thread, Brauner provided a useful taxonomy of namespace reference counts that complements Viro's explanation:</p>
+<blockquote>
+<p>"(1) generic reference count of namespaces in general: __ns_ref — for mntns: keeps the mount namespace and the mounts attached to it alive; (2) active reference count... only regulates userspace visibility of the namespace and has no lifetime implications per se; (3) passive reference count of struct mnt_namespace — keeps the mount namespace alive but not the mounts attached to it."</p>
+</blockquote>
+<h2>NFS Relevance</h2>
+<p>While this is a VFS-layer fix, it directly affects NFS client code paths: any user-space program (including NFS-aware tools like <code>nfsdcltrack</code> or container runtimes) that calls <code>open_by_handle_at()</code> on a file handle obtained from an NFS export will traverse <code>may_decode_fh()</code>. The fix ensures the mount-namespace pointer is safely read even under concurrent unmount, preventing a kernel crash or information leak in that path. The stable Cc indicates it will be backported to all supported kernels.</p>
+<h2>Timeline (all within this week)</h2>
+<table><thead><tr><th>Time (UTC)</th><th>Event</th></tr></thead><tbody>
+<tr><td>Jun 3, 17:38</td><td>v1 posted by Jann Horn</td></tr>
+<tr><td>Jun 3, 18:15–19:26</td><td>Rapid review exchange with Al Viro (11 messages)</td></tr>
+<tr><td>Jun 3, 19:32</td><td>v2 posted with improved comments</td></tr>
+<tr><td>Jun 4, 07:40</td><td>Applied to <code>vfs.fixes</code> by Christian Brauner</td></tr>
+<tr><td>Jun 4, 07:56</td><td>Brauner's supplementary explanation of ns refcount taxonomy</td></tr>
+</tbody></table>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260603-vfs-fhandle-uaf-fix-v2-1-d05db76a5084@google.com/">2026-06-03 Jann Horn <a href="mailto:jannh@google.com">jannh@google.com</a> — [PATCH v2] fhandle: fix UAF due to unlocked -&gt;mnt_ns read in may_decode_fh()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260604-hingibt-rechen-medien-fd15311d6cc7@brauner/">2026-06-04 Christian Brauner <a href="mailto:brauner@kernel.org">brauner@kernel.org</a> — Re: [PATCH v2] fhandle: fix UAF due to unlocked -&gt;mnt_ns read in may_decode_fh()</a></li>
+</ul>
+  </main>
+</body>
+</html>

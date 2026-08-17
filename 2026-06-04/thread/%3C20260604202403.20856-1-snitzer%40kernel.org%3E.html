@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Snitzer patches flexfiles client to honor FF_FLAGS_NO_IO_THRU_MDS on fatal DS errors and write fallback</title>
+  <meta name="description" content="This week&#39;s activity in this thread is a single, tightly-scoped bug-fix submission from Mike Snitzer (Red Hat), posted on 2026-06-04. The series targets the NFSv4 flexfiles client and addresses two distinct code paths where the…">
+  <meta property="og:title" content="Snitzer patches flexfiles client to honor FF_FLAGS_NO_IO_THRU_MDS on fatal DS errors and write fallback">
+  <meta property="og:description" content="This week&#39;s activity in this thread is a single, tightly-scoped bug-fix submission from Mike Snitzer (Red Hat), posted on 2026-06-04. The series targets the NFSv4 flexfiles client and addresses two distinct code paths where the…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-04T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Snitzer patches flexfiles client to honor FF_FLAGS_NO_IO_THRU_MDS on fatal DS errors and write fallback">
+  <meta name="twitter:description" content="This week&#39;s activity in this thread is a single, tightly-scoped bug-fix submission from Mike Snitzer (Red Hat), posted on 2026-06-04. The series targets the NFSv4 flexfiles client and addresses two distinct code paths where the…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-04</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Snitzer patches flexfiles client to honor FF_FLAGS_NO_IO_THRU_MDS on fatal DS errors and write fallback</h1>
+<h2>Summary</h2>
+<h2>NFSv4/flexfiles: fix unwanted in-band IO fallback from DS to MDS</h2>
+<p>This week's activity in this thread is a single, tightly-scoped bug-fix submission from Mike Snitzer (Red Hat), posted on 2026-06-04. The series targets the NFSv4 flexfiles client and addresses two distinct code paths where the <code>FF_FLAGS_NO_IO_THRU_MDS</code> layout flag — which explicitly forbids I/O through the Metadata Server — is silently ignored, causing unwanted in-band (MDS) I/O.</p>
+<h3>What kind of change this is</h3>
+<p>This is a <strong>bug fix</strong> for the NFSv4 flexfiles client, not a new feature or protocol change. It corrects two regressions/oversights where the kernel's pNFS fallback logic routes I/O to the MDS even when the layout segment carries <code>FF_FLAGS_NO_IO_THRU_MDS</code> (typically set on single-mirror appliance layouts).</p>
+<h3>Context and motivation</h3>
+<p>In the <a href="https://lore.kernel.org/linux-nfs/20260604202403.20856-1-snitzer@kernel.org/">cover letter</a>, Snitzer frames the problem clearly:</p>
+<blockquote>
+<p>"If FF_FLAGS_NO_IO_THRU_MDS flag is set then NFSv4 flexfiles should never fallback to trying to issue IO directly to the MDS."</p>
+</blockquote>
+<p>He notes that a Hammerspace test exposed the bug by widening the window between <code>LAYOUTRETURN</code> and the next <code>LAYOUTGET</code>, during which unwanted in-band I/O could be issued:</p>
+<blockquote>
+<p>"A Hammerspace test that caused the time between layout return and get to be much longer widened exposure for unwanted in-band IO to be issued by flexfiles. The test allowed for these fixes to be developed and the test now passes."</p>
+</blockquote>
+<h3>Patch 1/2 — fatal DS connect errors</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260604202403.20856-2-snitzer@kernel.org/">PATCH 1/2</a> targets a regression introduced by commit <code>f06bedfa62d5</code> ("pNFS/flexfiles: don't attempt pnfs on fatal DS errors"). That earlier commit taught <code>ff_layout_{read,write}_pagelist()</code> to return <code>PNFS_NOT_ATTEMPTED</code> when <code>nfs4_ff_layout_prepare_ds()</code> fails with a fatal errno (e.g., <code>-ETIMEDOUT</code> from a SOFTCONN connect deadline). The intent was to avoid spinning on unreachable data servers.</p>
+<p>However, as Snitzer explains, the fallback path that follows is unconditional:</p>
+<blockquote>
+<p>"That fallback is unconditional and silently violates FF_FLAGS_NO_IO_THRU_MDS: when the layout segment carries the flag (typically single-mirror appliance layouts where MDS I/O is explicitly forbidden), the out_failed: path's <code>&amp;&amp; !ds_fatal_error</code> clause overrides the flag's short-circuit through ff_layout_avoid_mds_available_ds() and routes the I/O to the MDS file handle anyway."</p>
+</blockquote>
+<p>The practical trigger is a data-server restart: SOFTCONN exhaustion produces <code>-ETIMEDOUT</code>, which is fatal per <code>nfs_error_is_fatal()</code>, which triggers <code>PNFS_NOT_ATTEMPTED</code>, which "silently goes to MDS."</p>
+<p>The fix preserves the upstream intent of not spinning on fatal errors for layouts that <em>permit</em> MDS fallback, but for layouts with <code>FF_FLAGS_NO_IO_THRU_MDS</code> set, it marks the layout for return and requests <code>PNFS_TRY_AGAIN</code> instead:</p>
+<blockquote>
+<p>"For layouts with FF_FLAGS_NO_IO_THRU_MDS set, mark the layout for return and request PNFS_TRY_AGAIN instead; if the server cannot supply a usable layout the failure now surfaces cleanly via pnfs_update_layout(), rather than via silent MDS I/O that contradicts the flag."</p>
+</blockquote>
+<h3>Patch 2/2 — pg_get_mirror_count_write</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260604202403.20856-3-snitzer@kernel.org/">PATCH 2/2</a> addresses a second, related gap. The <code>FF_FLAGS_NO_IO_THRU_MDS</code> flag lives on each layout segment (lseg), so when there is no current lseg — for example between <code>LAYOUTRETURN</code> and the next <code>LAYOUTGET</code> — the per-lseg check cannot run.</p>
+<p>Snitzer introduces a sticky header-level flag (<code>NFS4_FF_HDR_NO_IO_THRU_MDS</code> bit in <code>struct nfs4_flexfile_layout::flags</code>) that is set whenever <code>ff_layout_alloc_lseg()</code> parses an lseg with the no-fallback flag:</p>
+<blockquote>
+<p>"The bit is never cleared for the lifetime of the layout hdr; the server is assumed to be consistent in its no-fallback policy per file."</p>
+</blockquote>
+<p>This new header-level bit gates <code>ff_layout_pg_get_mirror_count_write()</code>. Previously, when <code>pnfs_update_layout()</code> returned NULL (due to <code>NFS_LAYOUT_BULK_RECALL</code>, a failed layout I/O test, or blocked layoutgets), the code unconditionally called <code>nfs_pageio_reset_write_mds()</code> — "a source of unwanted WRITE to MDS." The fix checks the new bit and, if set, surfaces <code>-EAGAIN</code> instead:</p>
+<blockquote>
+<p>"Fix it by checking NFS4_FF_HDR_NO_IO_THRU_MDS bit, and if set surface -EAGAIN instead; the writepage-side caller (nfs_do_writepage() for buffered, nfs_direct_write_reschedule() for O_DIRECT) then redirties the request so writeback retries via pNFS."</p>
+</blockquote>
+<h3>Discussion status</h3>
+<p>As of the end of this reporting window (2026-06-04), no replies or review comments have appeared in-thread. The series is 45 lines of insertions across two files (<code>fs/nfs/flexfilelayout/flexfilelayout.c</code> and <code>.h</code>) and carries <code>Fixes:</code> tags pointing to the two upstream commits that introduced the gaps. Snitzer closes with "All review appreciated."</p>
+<h3>Significance for NFS client development</h3>
+<p>This is a meaningful correctness fix for flexfiles-based appliance deployments (e.g., Hammerspace) where MDS I/O is architecturally forbidden. The bug could have caused data to be written to or read from the wrong server during transient DS unavailability, potentially violating consistency guarantees that the storage vendor relies on. The introduction of a sticky header-level flag is a small but notable architectural addition to the flexfiles layout code, acknowledging that fallback decisions can occur in lseg-less windows and need a persistent policy signal.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260604202403.20856-1-snitzer@kernel.org/">2026-06-04 Mike Snitzer <a href="mailto:snitzer@kernel.org">snitzer@kernel.org</a> — [PATCH 0/2] NFSv4/flexfiles: fix unwanted in-band IO fallback from DS to MDS</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260604202403.20856-2-snitzer@kernel.org/">2026-06-04 Mike Snitzer <a href="mailto:snitzer@kernel.org">snitzer@kernel.org</a> — [PATCH 1/2] NFSv4/flexfiles: honor FF_FLAGS_NO_IO_THRU_MDS on fatal DS connect errors</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260604202403.20856-3-snitzer@kernel.org/">2026-06-04 Mike Snitzer <a href="mailto:snitzer@kernel.org">snitzer@kernel.org</a> — [PATCH 2/2] NFSv4/flexfiles: honor FF_FLAGS_NO_IO_THRU_MDS in pg_get_mirror_count_write</a></li>
+</ul>
+  </main>
+</body>
+</html>

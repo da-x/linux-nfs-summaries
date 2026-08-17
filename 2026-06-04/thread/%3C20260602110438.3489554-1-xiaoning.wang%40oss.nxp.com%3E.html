@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS client: fix stale PG_UPTODATE warning in nfs_free_request() after read errors</title>
+  <meta name="description" content="This week, NXP engineer Clark Wang posted a one-patch series to the linux-nfs list addressing a long-dormant bug in the NFS client read path. The thread is currently just the cover letter and the patch itself, both posted on 2026-06-02,…">
+  <meta property="og:title" content="NFS client: fix stale PG_UPTODATE warning in nfs_free_request() after read errors">
+  <meta property="og:description" content="This week, NXP engineer Clark Wang posted a one-patch series to the linux-nfs list addressing a long-dormant bug in the NFS client read path. The thread is currently just the cover letter and the patch itself, both posted on 2026-06-02,…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-04T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS client: fix stale PG_UPTODATE warning in nfs_free_request() after read errors">
+  <meta name="twitter:description" content="This week, NXP engineer Clark Wang posted a one-patch series to the linux-nfs list addressing a long-dormant bug in the NFS client read path. The thread is currently just the cover letter and the patch itself, both posted on 2026-06-02,…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-04</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS client: fix stale PG_UPTODATE warning in nfs_free_request() after read errors</h1>
+<h2>Summary</h2>
+<h1>NFS client: fix stale PG_UPTODATE warning in nfs_free_request() after read errors</h1>
+<h2>Overview</h2>
+<p>This week, NXP engineer <strong>Clark Wang</strong> posted a one-patch series to the linux-nfs list addressing a long-dormant bug in the NFS <em>client</em> read path. The thread is currently just the <a href="https://lore.kernel.org/linux-nfs/20260602110438.3489554-1-xiaoning.wang@oss.nxp.com/">cover letter</a> and the <a href="https://lore.kernel.org/linux-nfs/20260602110438.3489554-2-xiaoning.wang@oss.nxp.com/">patch itself</a>, both posted on 2026-06-02, with no maintainer or community replies yet in this window. It is squarely a <strong>bug fix</strong> for the NFS client (not a protocol change or new feature), and it lands in the same <code>nfs_free_request()</code> territory that has produced other stale-flag WARNING reports earlier this year.</p>
+<h2>The reported bug</h2>
+<p>Wang found the problem "occasionally occurring in the recent daily test based on 6.18" on an NXP i.MX952 EVK board, producing a kernel WARNING at <code>fs/nfs/pagelist.c:587</code> inside <code>nfs_free_request()</code>, reached via the read-completion path (<code>nfs_read_completion</code> → <code>nfs_release_request</code> → <code>nfs_page_group_destroy</code> → <code>nfs_free_request</code>).</p>
+<p>He notes the issue is deterministic to reproduce:</p>
+<blockquote>
+<p>"This WARN dump can be reliably reproduced on my side by using rsize=1024 during NFS mount and disconnecting the connection while reading data from NFS."</p>
+</blockquote>
+<h2>Root-cause analysis</h2>
+<p>The heart of the report is Wang's diagnosis of how <code>PG_UPTODATE</code> accumulates across subrequests:</p>
+<blockquote>
+<p>"I found when a folio is split into multiple subrequests, the PG_UPTODATE flag is set each time a subrequest data read succeeds. As earlier subrequests succeed, this bit accumulates progressively; however, if a later subrequest fails, all previously accumulated bits must be invalidated."</p>
+</blockquote>
+<p>The failure mode: when a folio's read is split into several subrequests, early completions that fall within <code>hdr-&gt;good_bytes</code> advance the page group's uptodate state. If a <em>later</em> subrequest in the same group then completes with <code>NFS_IOHDR_ERROR</code>, the error path of <code>nfs_read_completion()</code> does not clear the previously accumulated bits:</p>
+<blockquote>
+<p>"The problem arises because the error path of nfs_read_completion() does not properly clear these stale bits, leading to a WARN when the page group is destroyed."</p>
+</blockquote>
+<p>Wang traces the offending logic back to a very old commit and candidly flags his uncertainty about whether it was intentional:</p>
+<blockquote>
+<p>"The logic causing this issue appears to have existed since '67d0338edd71 (nfs: page group syncing in read path)', which is a very old patch. No one seemed to have reported this issue before. I'm not sure if this was intentionally designed that way? (Sorry, I don't know much about NFS; Just study some code to try fixing this issue.)"</p>
+</blockquote>
+<h2>The proposed fix</h2>
+<p>The single patch, <em>"nfs: keep PG_UPTODATE clear after read errors in page groups"</em>, touches <code>fs/nfs/read.c</code> (+24/-1) and <code>include/linux/nfs_page.h</code> (+1). Rather than merely clearing the flag once on error, it introduces a <strong>sticky page-group read-failed flag</strong>:</p>
+<blockquote>
+<p>"Add a sticky page-group read-failed flag. Once any subrequest in the group is known to be bad, mark the group failed, clear any accumulated PG_UPTODATE state, and refuse further PG_UPTODATE synchronization for the rest of the completion walk."</p>
+</blockquote>
+<p>This matters because a naive one-shot clear would not be enough — as Wang explains, "a subsequent successful subrequest can re-enter <code>nfs_page_group_set_uptodate()</code>, restore the page-group sync state, and leave stale PG_UPTODATE behind for <code>nfs_page_group_destroy()</code> to trip over in <code>nfs_free_request()</code>." The sticky flag prevents that rebuild for the remainder of the completion walk.</p>
+<p>The patch carries a <code>Fixes: 67d0338edd71 ("nfs: page group syncing in read path")</code> tag and is signed off by Clark Wang. (The actual diff was omitted at ingest, so the precise implementation details are not reproduced here.)</p>
+<h2>Context and significance</h2>
+<p>This joins a recurring pattern of stale-page-flag WARNINGs surfacing in <code>nfs_free_request()</code> on the NFS client. Earlier this year there were separate reports about a stale <strong><code>PG_WB_END</code></strong> flag during read completion with FS-Cache enabled (Mike Owen, March 9 and April 1, 2026). Wang's report is distinct — it concerns <strong><code>PG_UPTODATE</code></strong> and the subrequest-splitting / partial-read error path rather than FS-Cache writeback — but the shared symptom (a stale page-group flag tripping a WARN at teardown) underscores how delicate the page-group state machine is when reads are fragmented across multiple RPCs.</p>
+<h2>Status / open questions</h2>
+<ul>
+<li><strong>No replies yet</strong> in this window; the patch is awaiting maintainer review.</li>
+<li>Wang explicitly invites discussion and acknowledges his limited NFS background, so expect scrutiny on whether the sticky-flag approach is the cleanest fix versus an alternative (e.g., clearing state more centrally in <code>nfs_read_completion()</code>).</li>
+<li>The key open question he poses — whether the original behavior was "intentionally designed that way" — will likely drive the maintainer response.</li>
+</ul>
+<h2>Key messages</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260602110438.3489554-1-xiaoning.wang@oss.nxp.com/">PATCH 0/1 cover letter</a> — Clark Wang, 2026-06-02</li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260602110438.3489554-2-xiaoning.wang@oss.nxp.com/">PATCH 1/1: nfs: keep PG_UPTODATE clear after read errors in page groups</a> — Clark Wang, 2026-06-02</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260602110438.3489554-1-xiaoning.wang@oss.nxp.com/">2026-06-02 xiaoning.wang@oss.nxp.com — [PATCH 0/1] WARNING dump caused by PG_UPTODATE in nfs_free_request()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260602110438.3489554-2-xiaoning.wang@oss.nxp.com/">2026-06-02 xiaoning.wang@oss.nxp.com — [PATCH 1/1] nfs: keep PG_UPTODATE clear after read errors in page groups</a></li>
+</ul>
+  </main>
+</body>
+</html>

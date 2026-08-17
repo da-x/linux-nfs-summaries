@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>sunrpc: fix uninitialized xprt_create_args structure (v2)</title>
+  <meta name="description" content="A single-message thread landed this week on linux-nfs, carrying a bug-fix patch to the SUNRPC client&#39;s sysfs transport-switch code. The patch is version 2 of a fix from Hongling Zeng (KylinOS) that addresses an uninitialized stack…">
+  <meta property="og:title" content="sunrpc: fix uninitialized xprt_create_args structure (v2)">
+  <meta property="og:description" content="A single-message thread landed this week on linux-nfs, carrying a bug-fix patch to the SUNRPC client&#39;s sysfs transport-switch code. The patch is version 2 of a fix from Hongling Zeng (KylinOS) that addresses an uninitialized stack…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-04T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="sunrpc: fix uninitialized xprt_create_args structure (v2)">
+  <meta name="twitter:description" content="A single-message thread landed this week on linux-nfs, carrying a bug-fix patch to the SUNRPC client&#39;s sysfs transport-switch code. The patch is version 2 of a fix from Hongling Zeng (KylinOS) that addresses an uninitialized stack…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-04</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>sunrpc: fix uninitialized xprt_create_args structure (v2)</h1>
+<h2>Summary</h2>
+<h1>sunrpc: Fix Uninitialized <code>xprt_create_args</code> in sysfs Transport Switch Path</h1>
+<h2>Overview</h2>
+<p>A single-message thread landed this week on linux-nfs, carrying a <strong>bug-fix patch</strong> to the SUNRPC client's sysfs transport-switch code. The patch is version 2 of a fix from Hongling Zeng (KylinOS) that addresses an uninitialized stack structure in <code>rpc_sysfs_xprt_switch_add_xprt_store()</code>, with review and suggestion credits to NFS maintainer Jeff Layton.</p>
+<p>The thread contains only the v2 submission itself — <a href="https://lore.kernel.org/linux-nfs/20260603013652.12904-1-zenghongling@kylinos.cn/">posted by Hongling Zeng on 2026-06-03</a> — with no further replies in the mailing-list archive within the current window. The v1 discussion and Layton's review apparently happened outside the indexed history (no earlier messages from this thread appear in the corpus), so the v2 changelog is the primary record of how the patch evolved.</p>
+<h2>The Bug</h2>
+<p>The fix targets a classic C footgun in the NFS client's sysfs interface: a stack-allocated <code>xprt_create_args</code> structure that was never zeroed before being passed to the transport-setup path. As Zeng explains in the cover letter:</p>
+<blockquote>
+<p>"The xprt_create_args structure is allocated on the stack without initialization in rpc_sysfs_xprt_switch_add_xprt_store(). While some fields are manually populated, critical fields like srcaddr, bc_xps, and flags contain uninitialized stack garbage."</p>
+</blockquote>
+<p>Zeng enumerates three concrete failure modes this can cause:</p>
+<blockquote>
+<ol>
+<li>Kernel panic when xs_setup_xprt() dereferences garbage srcaddr</li>
+<li>Information leak if srcaddr points to sensitive stack data</li>
+<li>Unpredictable behavior if flags has random bits set</li>
+</ol>
+</blockquote>
+<p>This is squarely an <strong>NFS client bug fix</strong> — the affected code path (<code>net/sunrpc/sysfs.c</code>) is exercised when userspace writes a new transport into an existing xprt-switch via sysfs, which is the mechanism NFS clients use to hot-add transports (e.g., for multipath or RDMA/TCP failover setups). A garbage <code>srcaddr</code> pointer being dereferenced by <code>xs_setup_xprt()</code> is a real kernel-panic risk on any system that uses this interface.</p>
+<h2>The Fix and Its Evolution</h2>
+<p>The fix itself is minimal — a one-line change in <code>net/sunrpc/sysfs.c</code> (1 insertion, 1 deletion) to zero-initialize the structure so that all unused fields are NULL/0:</p>
+<blockquote>
+<p>"The fix is to zero-initialize the structure to ensure all unused fields are NULL/0, preventing the transport setup code from acting on garbage data."</p>
+</blockquote>
+<p>What makes this v2 interesting is the evolution noted in the changelog. Layton — who both suggested and reviewed the fix — pushed back on the initial approach:</p>
+<blockquote>
+<p>"Changes in V2:</p>
+<ul>
+<li>Use designated initializer instead of memset, as suggested by Jeff Layton</li>
+<li>Add Reviewed-by tag"</li>
+</ul>
+</blockquote>
+<p>So the v1 patch evidently used <code>memset()</code> to zero the structure, and Layton's review steered it toward a C99 designated initializer — a more idiomatic kernel style that lets the compiler verify field names at compile time rather than relying on a runtime memory wipe. The patch now carries both <code>Suggested-by: Jeff Layton</code> and <code>Reviewed-by: Jeff Layton</code>, signaling maintainer-level buy-in before submission.</p>
+<h2>Significance for NFS Client Development</h2>
+<p>While small in diff size, this fix touches a security- and stability-relevant path in the NFS client:</p>
+<ul>
+<li><strong>Stability</strong>: Eliminates a potential kernel panic in the transport hot-add path.</li>
+<li><strong>Security</strong>: Closes an information-leak vector where uninitialized stack data could be exposed through a garbage <code>srcaddr</code> pointer.</li>
+<li><strong>Maintainability</strong>: The designated-initializer approach (per Layton's suggestion) makes the code more robust against future struct field additions — new fields will be zeroed by default rather than silently inheriting stack garbage.</li>
+</ul>
+<p>The patch is marked <code>Cc: stable@vger.kernel.org</code>, indicating Zeng considers this suitable for backport to stable kernel trees — a reasonable call given that the bug class (uninitialized stack data in a user-triggerable sysfs path) can affect any running system, not just new deployments.</p>
+<h2>Status</h2>
+<p>As of the end of this reporting week, the v2 patch has been submitted with full review from the NFS maintainer but no visible merge confirmation or additional discussion in the thread. Given the <code>Reviewed-by</code> tag and the trivial nature of the change, it is a strong candidate for inclusion in the next merge window or stable update.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260603013652.12904-1-zenghongling@kylinos.cn/">2026-06-03 Hongling Zeng <a href="mailto:zenghongling@kylinos.cn">zenghongling@kylinos.cn</a> — [PATCH v2] sunrpc: fix uninitialized xprt_create_args structure</a></li>
+</ul>
+  </main>
+</body>
+</html>

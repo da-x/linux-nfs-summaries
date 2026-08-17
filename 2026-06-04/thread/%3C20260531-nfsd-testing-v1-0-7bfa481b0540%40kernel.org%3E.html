@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd medium-severity bugfixes: six remote-triggerable fixes land, with a replay-path ACL leak and a cross-mount cleanup to follow</title>
+  <meta name="description" content="This thread is part of the same week&#39;s flurry of NFS server-side hardening work. Just one day earlier, Jeff Layton posted and merged the v2 &quot;grab bag&quot; series of nine patches covering panics, UAFs, data corruption, and DoS vectors. The…">
+  <meta property="og:title" content="nfsd medium-severity bugfixes: six remote-triggerable fixes land, with a replay-path ACL leak and a cross-mount cleanup to follow">
+  <meta property="og:description" content="This thread is part of the same week&#39;s flurry of NFS server-side hardening work. Just one day earlier, Jeff Layton posted and merged the v2 &quot;grab bag&quot; series of nine patches covering panics, UAFs, data corruption, and DoS vectors. The…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-04T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd medium-severity bugfixes: six remote-triggerable fixes land, with a replay-path ACL leak and a cross-mount cleanup to follow">
+  <meta name="twitter:description" content="This thread is part of the same week&#39;s flurry of NFS server-side hardening work. Just one day earlier, Jeff Layton posted and merged the v2 &quot;grab bag&quot; series of nine patches covering panics, UAFs, data corruption, and DoS vectors. The…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-04</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd medium-severity bugfixes: six remote-triggerable fixes land, with a replay-path ACL leak and a cross-mount cleanup to follow</h1>
+<h2>Summary</h2>
+<h1>nfsd medium-severity bugfixes: six remote-triggerable fixes land, with a replay-path ACL leak and a cross-mount cleanup to follow</h1>
+<h2>Context from prior weeks</h2>
+<p>This thread is part of the same week's flurry of NFS server-side hardening work. Just one day earlier, <a href="https://lore.kernel.org/linux-nfs/20260530-nfsd-fixes-v2-0-f27e8eb4d974@kernel.org/">Jeff Layton posted and merged the v2 "grab bag" series</a> of nine patches covering panics, UAFs, data corruption, and DoS vectors. The "medium-severity" series summarized here was posted the following day as a separate, more tightly scoped set of fixes — all classified as remote-triggerable memory leaks, refcounting bugs, and one tracepoint buffer overrun.</p>
+<h2>Series overview (May 31)</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260531-nfsd-testing-v1-0-7bfa481b0540@kernel.org//">Jeff Layton posted the six-patch series</a> on May 31, describing it as:</p>
+<blockquote>
+<p>"These are classified as medium-severity, remote-triggerable. Some memory leaks and refcounting bugs, and a potential buffer overrun in a tracepoint."</p>
+</blockquote>
+<p>The series is co-authored by Chris Mason (3 patches) and Jeff Layton (3 patches), touching six files with 39 insertions and 25 deletions. Base commit is <code>d9f35aa8be6e</code> on the nfsd-testing tree.</p>
+<h3>Patch-by-patch highlights</h3>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260531-nfsd-testing-v1-1-7bfa481b0540@kernel.org/">PATCH 1/6: Size fh_verify server sockaddr slot by xpt_locallen</a></strong> — Chris Mason's fix for a tracepoint buffer overrun. The <code>nfsd_fh_verify</code> and <code>nfsd_fh_verify_err</code> tracepoints declared the server sockaddr slot sized by <code>xpt_remotelen</code> but filled it from <code>xpt_local</code> using <code>xpt_locallen</code>. As Mason explains:</p>
+<blockquote>
+<p>"When xpt_locallen exceeds xpt_remotelen, __assign_sockaddr's memcpy writes past the reserved ring-buffer slot."</p>
+</blockquote>
+<p>The bug is particularly nasty on NFS/UDP, where <code>svc_xprt_set_remote()</code> is never called (only TCP and RDMA invoke it), so <code>xpt_remotelen</code> stays 0 for the transport's lifetime. Every fh_verify trace for an NFSv2/v3-over-UDP request then copies 16 or 28 bytes into a zero-byte slot. The fix aligns with all other NFSD tracepoints that already size the server slot by <code>xpt_locallen</code>.</p>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260531-nfsd-testing-v1-2-7bfa481b0540@kernel.org/">PATCH 2/6: Release path refs on follow_down() error</a></strong> — Another Chris Mason fix. In <code>nfsd_cross_mnt()</code>, a local <code>struct path</code> is initialized with <code>mntget()</code> and <code>dget()</code> before calling <code>follow_down()</code>. On error, the code jumped to <code>out</code> without releasing those references:</p>
+<blockquote>
+<p>"Every other early-exit arm in nfsd_cross_mnt() (other-namespace return, IS_ERR(exp2), and the success tail after the swap) already calls path_put(&amp;path); the err &lt; 0 arm is the lone omission."</p>
+</blockquote>
+<p>The leak inflates <code>mnt_count</code> and <code>d_count</code> on each failed cross-mount, "blocking umount and pinning dentries against the shrinker," and is reachable by any authenticated NFS client through <code>nfsd_lookup_dentry</code> or the NFSv4 READDIR encode path.</p>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260531-nfsd-testing-v1-3-7bfa481b0540@kernel.org/">PATCH 3/6: Fix nfsd_file leak on inter-server COPY setup failure</a></strong> — Layton's fix for a straightforward error-path leak. When <code>nfsd4_setup_inter_ssc()</code> fails, <code>nfsd4_copy()</code> returned <code>nfserr_offload_denied</code> directly, bypassing the <code>out:</code> label where <code>release_copy_files()</code> would drop the <code>nf_dst</code> reference. Each failed inter-server COPY leaked one <code>nfsd_file</code>, "pinning file/inode/dentry/vfsmount."</p>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260531-nfsd-testing-v1-4-7bfa481b0540@kernel.org/">PATCH 4/6: Fix dentry ref leak on V4ROOT export filehandle lookup</a></strong> — Layton's fix for a craftable-filehandle leak. <code>nfsd_set_fh_dentry()</code> leaked the dentry reference from <code>exportfs_decode_fh_raw()</code> when the NFS3_FHSIZE or NFS_FHSIZE switch cases detected <code>NFSEXP_V4ROOT</code> and jumped to <code>out</code>. The <code>out:</code> label called <code>exp_put()</code> but never <code>dput(dentry)</code>, and <code>fhp-&gt;fh_dentry</code> was never assigned so <code>fh_put()</code> couldn't compensate. As Layton notes, "A crafted NFSv3 filehandle targeting a V4ROOT export's fsid triggers the leak on every request."</p>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260531-nfsd-testing-v1-5-7bfa481b0540@kernel.org/">PATCH 5/6: Release OPEN-decoded posix ACLs via op_release</a></strong> — Chris Mason's fix for a posix_acl refcount leak on the NFSv4 OPEN short-circuit path. When <code>nfsd4_decode_open_claim4()</code> returns a non-seqid-mutating error, the dispatcher short-circuits before <code>op_func</code> runs, but <code>op_release</code> must still release <code>op_pacl</code> and <code>op_dpacl</code>. Before this change, OP_OPEN had no <code>.op_release</code> in <code>nfsd4_ops[]</code>, so both posix_acl refs leaked on every malformed OPEN compound carrying valid POSIX ACL createhow4 attributes. The fix adds <code>nfsd4_open_release()</code> as <code>.op_release</code> for OP_OPEN and removes the now-redundant release pair from <code>nfsd4_open()</code>'s <code>out_err:</code> label to avoid double-release.</p>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260531-nfsd-testing-v1-6-7bfa481b0540@kernel.org/">PATCH 6/6: Fix layout fence worker double-reference race</a></strong> — Layton's fix for a pNFS layout stateid leak. The workqueue core clears <code>WORK_STRUCT_PENDING</code> before the callback is invoked, so <code>delayed_work_pending()</code> in <code>lm_breaker_timedout()</code> can return false while the fence worker is already running:</p>
+<blockquote>
+<p>"This lets the breaker take a duplicate sc_count reference and schedule a new worker that coalesces with the in-progress one. The extra reference is never put, leaking the layout stateid."</p>
+</blockquote>
+<p>The fix replaces the racy <code>delayed_work_pending()</code> check with an <code>ls_fence_inflight</code> boolean set atomically with <code>refcount_inc_not_zero()</code> under <code>ls_lock</code>, and removes the self-rearm <code>mod_delayed_work()</code> at the top of the worker.</p>
+<h2>Review discussion and evolution</h2>
+<h3>Chuck Lever's replay-path catch (May 31)</h3>
+<p>The series was merged quickly, but not without a significant review catch. <a href="https://lore.kernel.org/linux-nfs/178024277887.699547.17672585328822959963.b4-ty@b4//">Chuck Lever applied five of the six patches to nfsd-testing</a> on May 31, but held back PATCH 5/6 after identifying a gap in the fix:</p>
+<blockquote>
+<p>"The double-free fix is right, but op_release is not called unconditionally after every op, and that gap leaks the ACLs on the v4.0 replay path."</p>
+</blockquote>
+<p>Lever pointed out that <code>op_release</code> runs only at the <code>release:</code> label inside <code>nfsd4_encode_operation()</code>, and the compound loop skips that encoder on a replay:</p>
+<blockquote>
+<p>"So every ACL-bearing v4.0 OPEN retransmit leaks two posix_acl refs."</p>
+</blockquote>
+<p>He provided a concrete fix — calling <code>op-&gt;opdesc-&gt;op_release(&amp;op-&gt;u)</code> in the <code>nfserr_replay_me</code> branch — and noted: "I've applied the other 5 in this series, so you can just resend this one."</p>
+<p><a href="https://lore.kernel.org/linux-nfs/88e604a80e7fcf5721bf0bd0f205c7ce07c011c8.camel@kernel.org//">Jeff Layton acknowledged the catch</a>: "Good catch, will fix." He also raised an interesting protocol question:</p>
+<blockquote>
+<p>"I initially had hoped that we could rely on the fact that a v4.0 client couldn't issue an OPEN with a POSIX ACL attribute in it, but it turns out that knfsd doesn't gate attributes by minorversion. Maybe it should? That's a separate changeset though if so."</p>
+</blockquote>
+<p>This highlights a broader protocol-hygiene gap: the kernel NFS server accepts and processes v4.2+ attributes (like POSIX draft ACLs) even from v4.0 clients, which is technically non-conformant but has practical security implications for error paths like this one.</p>
+<h3>Al Viro's cross-mount cleanup (June 1)</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260601184715.GJ2636677@ZenIV//">Al Viro weighed in on PATCH 2/6</a> the following day, suggesting a broader cleanup of <code>nfsd_cross_mnt()</code>:</p>
+<blockquote>
+<p>"Might be better to unify all those path_put()... Something like this, perhaps?"</p>
+</blockquote>
+<p>He proposed moving all <code>path_put()</code> calls past the point where the codepaths join, eliminating the separate <code>path_put()</code> on each failure exit. <a href="https://lore.kernel.org/linux-nfs/8080069f52abd6d6c6dc199c52e6b14e961f3cc8.camel@kernel.org//">Jeff Layton responded favorably</a>: "Looks reasonable. Chuck has already taken this patch into his tree, but we could do a cleanup on top. Want to send us an 'official' patch?"</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260601193139.GK2636677@ZenIV//">Al Viro sent the formal patch</a> with the caveat: "Not a problem, but it's completely untested. It compiles, but..." The commit message explains the rationale:</p>
+<blockquote>
+<p>"Instead of having a separate path_put() on each failure exit, as well as on the normal path, let's move all of those past the point where these codepaths join. We want to keep the ordering between path_put() and exp_put(), so move that one as well."</p>
+</blockquote>
+<p>Layton confirmed he'd test it: "Thanks Al. I'll toss it onto the pile that I'm testing." <a href="https://lore.kernel.org/linux-nfs/ba5047f3-c24f-4005-9468-9c08a9d653e2@oracle.com//">Chuck Lever noted</a> that the cleanup could be applied directly: "We can replace any of the patches already in nfsd-testing, it's a topic branch."</p>
+<h2>Nature of the discussion</h2>
+<p>This is a <strong>bug fix series</strong> — not a new feature or protocol change. All six patches address remotely-triggerable defects: a tracepoint buffer overrun (PATCH 1), three memory/refcount leaks on error paths (PATCHES 2–4), a posix_acl refcount leak on the OPEN short-circuit path (PATCH 5), and a layout stateid double-reference race in pNFS fencing (PATCH 6). The discussion evolved from a clean merge of five patches into two follow-up items: a replay-path ACL leak fix for PATCH 5/6, and an untested cleanup patch for <code>nfsd_cross_mnt()</code> from Al Viro.</p>
+<h2>Significance for NFS client development</h2>
+<p>While all fixes are server-side, several have direct implications for client behavior and testing:</p>
+<ul>
+<li>The <strong>fh_verify tracepoint overrun</strong> (PATCH 1) is particularly relevant for any deployment using ftrace/perf on NFS/UDP servers — the zero-byte slot means every single fh_verify event was corrupting ring buffer memory. Clients using NFSv2/v3 over UDP are the trigger, though the corruption is entirely server-side.</li>
+<li>The <strong>layout fence worker double-reference race</strong> (PATCH 6) directly affects pNFS clients: a leaked layout stateid means the server can't properly reclaim or re-fence layouts, potentially causing client-visible stalls during lease manager fencing operations. Clients relying on timely layout recalls after server restarts are most affected.</li>
+<li>The <strong>V4ROOT dentry leak</strong> (PATCH 4) is a DoS vector: "A crafted NFSv3 filehandle targeting a V4ROOT export's fsid triggers the leak on every request." Any client that can send arbitrary filehandles (including misconfigured or malicious ones) can pin dentries indefinitely.</li>
+<li>The <strong>inter-server COPY leak</strong> (PATCH 3) affects deployments using NFSv4.1+ inter-server copy operations; each failed setup leaks a file reference that pins the underlying inode, potentially preventing filesystem unmounts.</li>
+<li>The <strong>replay-path ACL leak</strong> identified by Chuck Lever is notable for NFSv4.0 clients specifically: any v4.0 client retransmitting an OPEN with POSIX ACL attributes (even if non-conformant) would trigger the leak on every retransmit, making it a potential DoS vector against servers accepting such requests.</li>
+</ul>
+<h2>Final conclusions and open items</h2>
+<p>As of the end of this week's window:</p>
+<ol>
+<li><strong>Five of six patches are merged</strong> into nfsd-testing with commit hashes confirmed by Chuck Lever.</li>
+<li><strong>PATCH 5/6 needs a v2</strong> to add <code>op_release</code> on the v4.0 replay path, as directed by Chuck Lever. Layton has acknowledged and committed to resending.</li>
+<li><strong>Al Viro's cleanup patch</strong> for <code>nfsd_cross_mnt()</code> is in Jeff Layton's testing queue but untested; it will presumably be applied on top of or as a replacement for the already-merged PATCH 2/6.</li>
+<li>The question of whether knfsd should gate attribute acceptance by minorversion (raised by Layton) remains open and was explicitly deferred to a separate changeset.</li>
+</ol>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260531-nfsd-testing-v1-0-7bfa481b0540@kernel.org/">2026-05-31 Jeff Layton — [PATCH 0/6] nfsd: medium-severity bugfixes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260531-nfsd-testing-v1-1-7bfa481b0540@kernel.org/">2026-05-31 Jeff Layton — [PATCH 1/6] nfsd: size fh_verify server sockaddr slot by xpt_locallen</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260531-nfsd-testing-v1-2-7bfa481b0540@kernel.org/">2026-05-31 Jeff Layton — [PATCH 2/6] nfsd: release path refs on follow_down() error</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260531-nfsd-testing-v1-3-7bfa481b0540@kernel.org/">2026-05-31 Jeff Layton — [PATCH 3/6] nfsd: fix nfsd_file leak on inter-server COPY setup failure</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260531-nfsd-testing-v1-4-7bfa481b0540@kernel.org/">2026-05-31 Jeff Layton — [PATCH 4/6] nfsd: fix dentry ref leak on V4ROOT export filehandle lookup</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260531-nfsd-testing-v1-5-7bfa481b0540@kernel.org/">2026-05-31 Jeff Layton — [PATCH 5/6] nfsd: release OPEN-decoded posix ACLs via op_release</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260531-nfsd-testing-v1-6-7bfa481b0540@kernel.org/">2026-05-31 Jeff Layton — [PATCH 6/6] nfsd: fix layout fence worker double-reference race</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178024277887.699547.17672585328822959963.b4-ty@b4/">2026-05-31 Chuck Lever — Re: [PATCH 0/6] (applied 5 of 6 to nfsd-testing)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/c2b22954-9f78-4ce0-abfd-e86a5bfac0b4@app.fastmail.com/">2026-05-31 Chuck Lever — Re: [PATCH 5/6] (replay-path ACL leak identified)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/88e604a80e7fcf5721bf0bd0f205c7ce07c011c8.camel@kernel.org/">2026-05-31 Jeff Layton — Re: [PATCH 5/6] (acknowledged, will fix)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601184715.GJ2636677@ZenIV/">2026-06-01 Al Viro — Re: [PATCH 2/6] (unified path_put cleanup proposed)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/8080069f52abd6d6c6dc199c52e6b14e961f3cc8.camel@kernel.org/">2026-06-01 Jeff Layton — Re: [PATCH 2/6] (looks reasonable, want official patch?)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601193139.GK2636677@ZenIV/">2026-06-01 Al Viro — Re: [PATCH 2/6] (formal cleanup patch, untested)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/9b5877ad4ce260c572a5eb9fede02b0ba8825544.camel@kernel.org/">2026-06-01 Jeff Layton — Re: [PATCH 2/6] (will test)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ba5047f3-c24f-4005-9468-9c08a9d653e2@oracle.com/">2026-06-01 Chuck Lever — Re: [PATCH 2/6] (can replace in nfsd-testing)</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260531-nfsd-testing-v1-0-7bfa481b0540@kernel.org/">2026-05-31 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 0/6] nfsd: medium-severity bugfixes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260531-nfsd-testing-v1-1-7bfa481b0540@kernel.org/">2026-05-31 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 1/6] nfsd: size fh_verify server sockaddr slot by xpt_locallen</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260531-nfsd-testing-v1-2-7bfa481b0540@kernel.org/">2026-05-31 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 2/6] nfsd: release path refs on follow_down() error</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260531-nfsd-testing-v1-3-7bfa481b0540@kernel.org/">2026-05-31 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 3/6] nfsd: fix nfsd_file leak on inter-server COPY setup failure</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260531-nfsd-testing-v1-4-7bfa481b0540@kernel.org/">2026-05-31 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 4/6] nfsd: fix dentry ref leak on V4ROOT export filehandle lookup</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260531-nfsd-testing-v1-5-7bfa481b0540@kernel.org/">2026-05-31 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 5/6] nfsd: release OPEN-decoded posix ACLs via op_release</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260531-nfsd-testing-v1-6-7bfa481b0540@kernel.org/">2026-05-31 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 6/6] nfsd: fix layout fence worker double-reference race</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178024277887.699547.17672585328822959963.b4-ty@b4/">2026-05-31 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 0/6] nfsd: medium-severity bugfixes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/c2b22954-9f78-4ce0-abfd-e86a5bfac0b4@app.fastmail.com/">2026-05-31 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 5/6] nfsd: release OPEN-decoded posix ACLs via op_release</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/88e604a80e7fcf5721bf0bd0f205c7ce07c011c8.camel@kernel.org/">2026-05-31 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 5/6] nfsd: release OPEN-decoded posix ACLs via op_release</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601184715.GJ2636677@ZenIV/">2026-06-01 Al Viro <a href="mailto:viro@zeniv.linux.org.uk">viro@zeniv.linux.org.uk</a> — Re: [PATCH 2/6] nfsd: release path refs on follow_down() error</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/8080069f52abd6d6c6dc199c52e6b14e961f3cc8.camel@kernel.org/">2026-06-01 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 2/6] nfsd: release path refs on follow_down() error</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601193139.GK2636677@ZenIV/">2026-06-01 Al Viro <a href="mailto:viro@zeniv.linux.org.uk">viro@zeniv.linux.org.uk</a> — Re: [PATCH 2/6] nfsd: release path refs on follow_down() error</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/9b5877ad4ce260c572a5eb9fede02b0ba8825544.camel@kernel.org/">2026-06-01 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 2/6] nfsd: release path refs on follow_down() error</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ba5047f3-c24f-4005-9468-9c08a9d653e2@oracle.com/">2026-06-01 Chuck Lever <a href="mailto:chuck.lever@oracle.com">chuck.lever@oracle.com</a> — Re: [PATCH 2/6] nfsd: release path refs on follow_down() error</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sachdeva Reports Dirty-Bit Bug: Pages Not Re-dirtied After Failed fsync on ENOSPC/EDQUOT</title>
+  <meta name="description" content="This week, the long-running discussion on preventing ENOSPC/EDQUOT writeback errors on network filesystems received its most concrete technical contribution to date. Piyush Sachdeva returned with experimental findings that pinpoint a…">
+  <meta property="og:title" content="Sachdeva Reports Dirty-Bit Bug: Pages Not Re-dirtied After Failed fsync on ENOSPC/EDQUOT">
+  <meta property="og:description" content="This week, the long-running discussion on preventing ENOSPC/EDQUOT writeback errors on network filesystems received its most concrete technical contribution to date. Piyush Sachdeva returned with experimental findings that pinpoint a…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-04T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Sachdeva Reports Dirty-Bit Bug: Pages Not Re-dirtied After Failed fsync on ENOSPC/EDQUOT">
+  <meta name="twitter:description" content="This week, the long-running discussion on preventing ENOSPC/EDQUOT writeback errors on network filesystems received its most concrete technical contribution to date. Piyush Sachdeva returned with experimental findings that pinpoint a…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-04</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Sachdeva Reports Dirty-Bit Bug: Pages Not Re-dirtied After Failed fsync on ENOSPC/EDQUOT</h1>
+<h2>Summary</h2>
+<h1>Sachdeva Reports Dirty-Bit Bug: Pages Not Re-dirtied After Failed fsync on ENOSPC/EDQUOT</h1>
+<h2>Overview</h2>
+<p>This week, the long-running discussion on preventing <code>ENOSPC</code>/<code>EDQUOT</code> writeback errors on network filesystems received its most concrete technical contribution to date. Piyush Sachdeva returned with experimental findings that pinpoint a specific behavioral discrepancy in how the kernel handles failed flushes — one that could mask data-loss conditions from applications that correctly check <code>fsync()</code> return values.</p>
+<h2>Context: Prior Weeks</h2>
+<p>The thread began on 2026-05-05 when Sachdeva raised the fundamental problem of silent data loss via buffered writes on network filesystems, noting that "A user or application can keep issuing writes to an fd well beyond the available space, since buffered writes return success as soon as data is copied to the page cache." Jeff Layton responded by framing this as an inherent limitation of delayed writeback and recommending that applications proactively call <code>fallocate()</code> to reserve space. In a follow-up the following week, Sachdeva noted that even NFSv4.2's <code>ALLOCATE</code> operation "ends up checking for space during write-back as well," meaning the data-loss window persists, and promised to run experiments.</p>
+<h2>This Week's Finding: A Dirty-Bit Handling Discrepancy</h2>
+<p>Sachdeva's <a href="https://lore.kernel.org/linux-nfs/m2tsribxyy.fsf@gmail.com/">message of June 4</a> reports a specific behavioral bug discovered during those experiments. The key observation concerns what happens when <code>fsync(2)</code> fails with <code>ENOSPC</code> or <code>EDQUOT</code>:</p>
+<blockquote>
+<p>"the NetFS layer, used by the SMB client to do the writeback, doesn't re-set the dirty bit on the pages/folios on which fsync fails. At this point the pages with critical user-data are sitting in the pagecache, but no longer marked dirty/referenced by the inode of the file."</p>
+</blockquote>
+<p>He notes that this behavior is specific to <code>EDQUOT</code>/<code>ENOSPC</code> errors, as opposed to <code>EIO</code>:</p>
+<blockquote>
+<p>"This behavior is seen for EDQUOT/ENOSPC errors, contrary to EIO errors where data is re-dirtied. It seems that EDQUOT/ENOSPC are treated as non-retriable errors, as a reason the dirty bit is not re-set."</p>
+</blockquote>
+<p>Crucially, Sachdeva confirmed this is not limited to SMB:</p>
+<blockquote>
+<p>"I noticed that NFS also has a similar behavior where the pages are not dirty after the failed fsync."</p>
+</blockquote>
+<h2>The Practical Consequence</h2>
+<p>The most alarming implication is that an application which correctly calls <code>fsync()</code> before <code>close()</code> — the recommended pattern for detecting writeback errors — will see the error on <code>fsync()</code>, but if it then retries or inspects state, the data is already effectively orphaned from the inode's dirty list. Moreover:</p>
+<blockquote>
+<p>"Naturally, now that the fsync is tried before calling close, and with the data not-dirty anymore, no errors are seen on close."</p>
+</blockquote>
+<p>This means a second <code>fsync()</code> or <code>close()</code> after the first failure will silently succeed, giving the application false confidence that the problem has been resolved (e.g., after increasing server capacity).</p>
+<h2>Sachdeva's Proposed Direction</h2>
+<p>Despite acknowledging that the <code>close(2)</code> manpage states close should not be retried upon failure, Sachdeva argues for a specific kernel behavior change:</p>
+<blockquote>
+<p>"I do believe that the data should still remain dirty. An application (should) calling fsync before close would monitor for errors, and should be able to retry the fsync after increasing the capacity on the server."</p>
+</blockquote>
+<p>This positions the issue as a <strong>bug fix candidate</strong>: treating <code>ENOSPC</code>/<code>EDQUOT</code> as non-retriable in the writeback error path (by clearing the dirty bit) is inconsistent with how <code>EIO</code> is handled, and it defeats the purpose of the <code>fsync()</code>-before-<code>close()</code> error-detection pattern.</p>
+<h2>Classification</h2>
+<p>This week's contribution shifts the thread from an architectural discussion toward a <strong>concrete bug fix</strong> in NFS client (and NetFS/SMB) writeback error handling. The specific defect is: on <code>ENOSPC</code>/<code>EDQUOT</code> during writeback triggered by <code>fsync()</code>, the kernel fails to re-dirty the affected pages/folios, unlike its behavior for <code>EIO</code>. This makes retry-after-capacity-increase impossible and can lead to silent data loss under memory pressure (clean pages are reclaimable).</p>
+<h2>Status</h2>
+<p>No maintainer has yet responded to this week's finding. The thread awaits reaction from the NFS and NetFS maintainers on whether the dirty-bit clearing for <code>ENOSPC</code>/<code>EDQUOT</code> is intentional or an oversight, and whether a patch to re-dirty pages on these errors (matching <code>EIO</code> behavior) would be appropriate.</p>
+<h2>Messages This Week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/m2tsribxyy.fsf@gmail.com/">2026-06-04 Piyush Sachdeva <a href="mailto:s.piyush1024@gmail.com">s.piyush1024@gmail.com</a> — Re: [DISCUSSION] Preventing ENOSPC/EDQUOT writeback errors on network filesystems</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/m2tsribxyy.fsf@gmail.com/">2026-06-04 Piyush Sachdeva <a href="mailto:s.piyush1024@gmail.com">s.piyush1024@gmail.com</a> — Re: [DISCUSSION] Preventing ENOSPC/EDQUOT writeback errors on network filesystems</a></li>
+</ul>
+  </main>
+</body>
+</html>

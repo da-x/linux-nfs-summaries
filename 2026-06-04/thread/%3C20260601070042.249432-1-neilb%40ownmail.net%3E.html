@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NeilBrown&#39;s 18-patch RFC: replacing dentry_create() with vfs_lookup_open() to fix NFS re-export deadlocks</title>
+  <meta name="description" content="On June 1, NeilBrown posted an 18-patch RFC series titled &quot;VFS/nfsd: replace dentry_create()&quot;, a significant VFS and NFS server refactoring that introduces a new vfs_lookup_open() interface to consolidate lookup, create, and open…">
+  <meta property="og:title" content="NeilBrown&#39;s 18-patch RFC: replacing dentry_create() with vfs_lookup_open() to fix NFS re-export deadlocks">
+  <meta property="og:description" content="On June 1, NeilBrown posted an 18-patch RFC series titled &quot;VFS/nfsd: replace dentry_create()&quot;, a significant VFS and NFS server refactoring that introduces a new vfs_lookup_open() interface to consolidate lookup, create, and open…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-04T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NeilBrown&#39;s 18-patch RFC: replacing dentry_create() with vfs_lookup_open() to fix NFS re-export deadlocks">
+  <meta name="twitter:description" content="On June 1, NeilBrown posted an 18-patch RFC series titled &quot;VFS/nfsd: replace dentry_create()&quot;, a significant VFS and NFS server refactoring that introduces a new vfs_lookup_open() interface to consolidate lookup, create, and open…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-04</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NeilBrown's 18-patch RFC: replacing dentry_create() with vfs_lookup_open() to fix NFS re-export deadlocks</h1>
+<h2>Summary</h2>
+<h1>NeilBrown's 18-Patch RFC: Replacing <code>dentry_create()</code> with <code>vfs_lookup_open()</code></h1>
+<h2>Overview</h2>
+<p>On June 1, NeilBrown posted an <a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-1-neilb@ownmail.net/">18-patch RFC series</a> titled <em>"VFS/nfsd: replace dentry_create()"</em>, a significant VFS and NFS server refactoring that introduces a new <code>vfs_lookup_open()</code> interface to consolidate lookup, create, and open operations into a single call path for nfsd. The series is classified as a <strong>VFS API refactoring with bug-fix motivation</strong> — it eliminates the <code>dentry_create()</code> function entirely while fixing a deadlock class that would have been introduced by NeilBrown's earlier 53-patch directory-locking RFC.</p>
+<h2>Motivation: A Deadlock in the Prior Series</h2>
+<p>The cover letter makes the motivation explicit. NeilBrown's <a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-1-neilb@ownmail.net/">March 2026 53-patch series</a> proposed inverting the lock order between <code>inode_lock()</code> on a parent directory and <code>d_alloc_parallel()</code>. As he explains:</p>
+<blockquote>
+<p>"My recent proposal for inverting the order between inode_lock() on a parent dir and d_alloc_parallel() missed that fact that atomic_open() has two callers, and would have resulted in easy deadlocks from nfsd when re-exporting and NFS filesystem."</p>
+</blockquote>
+<p>The solution: rather than trying to make <code>dentry_create()</code> work under the new locking model, provide nfsd with a richer interface that includes all the locking and inode_operations calls internally, allowing nfsd to share more code with the system-call path.</p>
+<blockquote>
+<p>"I think the best way to fix this is to provide a richer interface for nfsd to use, which includes all the locking as well as inode_operations calls. This allows the nfsd behaviour to share more code with the system-call behaviour."</p>
+</blockquote>
+<h2>Series Structure</h2>
+<p>The 18 patches fall into three logical groups:</p>
+<h3>VFS Refactoring (Patches 01–05)</h3>
+<ul>
+<li><strong>Patch 01</strong>: Moves <code>mnt_want_write()</code> and parent inode locking from <code>open_last_lookups()</code> into <code>lookup_open()</code>, since they're only needed there.</li>
+<li><strong>Patch 02</strong>: Moves the <code>delegated_inode</code> retry loop into <code>lookup_open()</code>, eliminating a pointer that was passed around unnecessarily.</li>
+<li><strong>Patch 03</strong>: Replaces <code>struct nameidata</code> and <code>struct open_flag</code> pointer arguments to <code>lookup_open()</code> with individual fields, making it exportable.</li>
+<li><strong>Patch 04</strong>: Adds the new exported <code>vfs_lookup_open()</code> function — "a limited version of lookup_open() which is exported for nfsd to use - to replace dentry_create()."</li>
+<li><strong>Patch 05</strong>: Ensures <code>FMODE_CREATE</code> (actually <code>FMODE_CREATED</code>) is always set when a file is created via the <code>vfs_create()</code> branch, not just <code>atomic_open()</code>.</li>
+</ul>
+<h3>NFSD Refactoring (Patches 06–17)</h3>
+<p>These patches progressively restructure <code>nfsd4_create_file()</code>:</p>
+<ul>
+<li>Replace <code>fh_fill_both_attrs()</code> with a cleaner pre/post attribute model</li>
+<li>Move NFS-specific code into a preamble before VFS interaction</li>
+<li>Remove "subtlety" from the EXCLUSIVE/EXCLUSIVE4_1 switch cases</li>
+<li>Let the VFS report whether a file was actually created (fixing an assumption that breaks with <code>atomic_open</code>)</li>
+<li>Reduce the range of directory locks and write-access holds</li>
+<li>Open-code <code>nfsd4_vfs_create()</code> into <code>nfsd4_create_file()</code></li>
+<li><strong>Patch 16</strong>: The key switch — "switch nfsd4_create_file() to use vfs_lookup_open()"</li>
+<li><strong>Patch 17</strong>: Extend <code>vfs_lookup_open()</code> usage to non-creating opens as well, so that "when exporting NFS, the lookup and open can be combined using -&gt;atomic_open"</li>
+</ul>
+<h3>VFS Cleanup (Patch 18)</h3>
+<ul>
+<li>Remove <code>dentry_create()</code> entirely: "dentry_create() is no longer used and can be removed. vfs_lookup_open() is a better interface."</li>
+</ul>
+<h2>Key Technical Arguments</h2>
+<h3>The atomic_open Optimization</h3>
+<p>A central technical point in <a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-17-neilb@ownmail.net/">PATCH 16/18</a> is that the old code performed a separate lookup via <code>start_creating()</code> before calling <code>dentry_create()</code>, which then used <code>atomic_open()</code>. NeilBrown notes:</p>
+<blockquote>
+<p>"Part of the point of supporting atomic_open is to avoid needing a separate lookup. -&gt;atomic_open can do lookup, create, open all in one operation. So doing a lookup before dentry_create() is not optimal."</p>
+</blockquote>
+<p>The new <code>vfs_lookup_open()</code> eliminates this redundancy by combining all three operations.</p>
+<h3>O_EXCL Semantics for NFSv4</h3>
+<p>In <a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-17-neilb@ownmail.net/">PATCH 16/18</a>, NeilBrown clarifies a subtle protocol point:</p>
+<blockquote>
+<p>"We only set O_EXCL in the NFS4_CREATE_GUARDED case. This is an NFS protocol option which requests the server to take full responsibility for atomic-create. For NFS4_CREATE_EXCLUSIVE and NFS4_CREATE_EXCLUSIVE4_1 the NFS protocol takes responsibility for exclusive create by providing a verifier to store with the file, and using O_EXCL would interfere with this."</p>
+</blockquote>
+<h3>Locking Range Reduction</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-13-neilb@ownmail.net/">PATCH 12/18</a> reduces the directory lock scope:</p>
+<blockquote>
+<p>"We only need to hold the lock taken by start_creating() until the create has been attempted. Holding for longer can serve no purpose... Holding the lock prevents the name from being removed or renamed, but it doesn't prevent a GETATTR or a racing SETATTR or an OPEN."</p>
+</blockquote>
+<p>Similarly, <a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-16-neilb@ownmail.net/">PATCH 15/18</a> narrows the write-access hold, adding a second <code>want_write</code> only for the unusual case of a read-only creating open that still needs setattr.</p>
+<h2>Review Discussion: Jori Koolstra's Feedback</h2>
+<p>Jori Koolstra reviewed patches 01 through 05 on June 1, providing rapid and substantive feedback:</p>
+<h3>PATCH 01 — Reviewed-by with lockdep question</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/1841736563.45811.1780310868666@kpc.webmail.kpnmail.nl/">In his review of PATCH 01</a>, Koolstra raised a lockdep concern:</p>
+<blockquote>
+<p>"This is not about a change in your patch, but I do wonder whether we should also set the lockdep subclass here. We aren't taking any other locks, but that is also true in the create path of mknod, which ultimately calls start_dirop and there we do inode_lock_nested(dir, I_MUTEX_PARENT);"</p>
+</blockquote>
+<p>He concluded positively: "I will say we are doing a lot in lookup_open(), but since open_last_lookups() is its only caller, and there is no particular reason that I see for doing this work there, this is fine by me if it helps your nfsd refactor." — granting <strong>Reviewed-by</strong>.</p>
+<h3>PATCH 02 — Reviewed-by</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/1753137576.49821.1780313056882@kpc.webmail.kpnmail.nl/">On PATCH 02</a>, Koolstra noted the cognitive-load benefit: "It does make sense to me that we deal with the retry-loop in the function where we call try_break_deleg(). That part is then dealt with on return to open_last_lookups(). So I think, at least from a cognitive load perspective, this change makes sense." — <strong>Reviewed-by</strong>.</p>
+<h3>PATCH 03 — Reviewed-by with caveat</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/468562950.51964.1780313720060@kpc.webmail.kpnmail.nl/">On PATCH 03</a>, Koolstra acknowledged the churn: "I think the churn and pushing nd state through many arguments would normally be too much to justify the improvement of scope reduction, but for the goal of getting rid of dentry_create() this is fine." — <strong>Reviewed-by</strong>.</p>
+<h3>PATCH 04 — Questions raised (no Reviewed-by)</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/1651506692.61058.1780316587334@kpc.webmail.kpnmail.nl/">On PATCH 04</a>, Koolstra identified two issues:</p>
+<ol>
+<li><strong>O_EXCL enforcement</strong>: "Is O_EXCL enforced anywhere in this call path? I don't really know nfsd, but for the standard O_CREAT call chain, this happens in do_open(), and EEXIST is returned."</li>
+<li><strong>Nonsensical flags</strong>: "Also, maybe warn when nonsensical bits here, like __O_TMPFILE, are set in open_flag?"</li>
+</ol>
+<p>He also noted a positive side effect: "Ah, good, this fixes the bug in dentry_create() where on failing the open part of atomic_open() no other attempt was done by the vfs to do the open."</p>
+<h3>PATCH 05 — Question raised (no Reviewed-by)</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/207320656.62149.1780316970630@kpc.webmail.kpnmail.nl/">On PATCH 05</a>, Koolstra asked: "What if vfs_create() succeeded but vfs_open() failed? Then we don't set FMODE_CREATED, why?" — an open question about the semantics of <code>FMODE_CREATED</code> when the file exists but the open fails.</p>
+<h2>Context from Prior Weeks</h2>
+<p>This series is the direct successor to two related efforts:</p>
+<ul>
+<li>The <a href="https://lore.kernel.org/linux-nfs/20260312214330.3885211-1-neilb@ownmail.net/">53-patch "lift lookup out of exclusive lock" RFC</a> from March, which established the new locking model but exposed the nfsd deadlock issue.</li>
+<li>A <a href="https://lore.kernel.org/linux-nfs/20260526053004.4014491-1-neilb@ownmail.net/">two-patch fix series from May 26</a> that patched edge cases in <code>dentry_create()</code>'s use of <code>atomic_open()</code> — fixes that are now subsumed by the complete replacement of <code>dentry_create()</code>.</li>
+</ul>
+<p>The series is based on a merge of <code>nfsd-testing</code>, <code>vfs-next/work.dcache</code>, and <code>vfs/vfs.fixes</code>. NeilBrown notes: "I probably will need to resubmit after a bunch of that has hit mainline - though a few of the patches could easily be cherry-picked now."</p>
+<p>He also flags a dependency conflict: "This will conflict with the O_CREAT|O_DIRECTORY work so obviously we'll need to work out how to order them once we both have enough positive review."</p>
+<h2>Significance for NFS Client Development</h2>
+<p>While primarily a server-side refactoring, this series has important implications for NFS client behavior:</p>
+<ul>
+<li><strong>NFS re-export correctness</strong>: The deadlock fix directly affects servers that re-export NFS filesystems (a common pattern in storage virtualization). Clients connecting to such servers would have experienced deadlocks under the prior proposed locking changes.</li>
+<li><strong>atomic_open path unification</strong>: By routing nfsd's CREATE/OPEN through <code>vfs_lookup_open()</code> which can use <code>-&gt;atomic_open</code>, the server's file creation path becomes more consistent with local filesystem behavior. This matters for NFS clients that rely on atomic create semantics (e.g., NFS4_CREATE_GUARDED).</li>
+<li><strong>Locking range reduction</strong>: Narrower lock holds in nfsd mean less contention for concurrent client operations, potentially improving throughput under parallel CREATE/OPEN workloads.</li>
+<li><strong>Bug fix in open fallback</strong>: Koolstra's observation that the new code "fixes the bug in dentry_create() where on failing the open part of atomic_open() no other attempt was done by the vfs to do the open" is a genuine correctness improvement for NFS clients whose <code>atomic_open</code> implementations use <code>finish_no_open()</code>.</li>
+</ul>
+<h2>Status and Open Items</h2>
+<p>As of the end of this week's window:</p>
+<ol>
+<li><strong>Three Reviewed-by tags</strong> from Jori Koolstra (patches 01, 02, 03).</li>
+<li><strong>Two open questions</strong> on patches 04 and 05 awaiting NeilBrown's response.</li>
+<li><strong>Patches 06–18 have not yet been reviewed.</strong></li>
+<li>The series is explicitly RFC-stage, with NeilBrown inviting review: "Please review if you have time."</li>
+<li>A resubmission is expected once the base trees (nfsd-testing, vfs-next) stabilize in mainline.</li>
+</ol>
+<h2>Messages This Week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-1-neilb@ownmail.net/">2026-06-01 NeilBrown — [PATCH/RFC 00/18] VFS/nfsd: replace dentry_create()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-2-neilb@ownmail.net/">2026-06-01 NeilBrown — [PATCH 01/18] VFS: move mnt_want_write() and locking into lookup_open()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-3-neilb@ownmail.net/">2026-06-01 NeilBrown — [PATCH 02/18] VFS: move delegated_inode retry loop into lookup_open()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-4-neilb@ownmail.net/">2026-06-01 NeilBrown — [PATCH 03/18] VFS: replace nameidata and open_flag args to lookup_open()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-5-neilb@ownmail.net/">2026-06-01 NeilBrown — [PATCH 04/18] VFS: add vfs_lookup_open()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-6-neilb@ownmail.net/">2026-06-01 NeilBrown — [PATCH 05/18] VFS: dentry_create: always set FMODE_CREATE when file is created</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-7-neilb@ownmail.net/">2026-06-01 NeilBrown — [PATCH 06/18] nfsd: replace fh_fill_both_attrs() with fh_fill_post_noop()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-8-neilb@ownmail.net/">2026-06-01 NeilBrown — [PATCH 07/18] nfsd: move fh_want_write() after preamble in nfsd4_create_file()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-9-neilb@ownmail.net/">2026-06-01 NeilBrown — [PATCH 08/18] nfsd: move more nfs-specific code into preamble of nfsd4_create_file()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-10-neilb@ownmail.net/">2026-06-01 NeilBrown — [PATCH 09/18] nfsd: remove subtlety from nfsd4_create_file()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-11-neilb@ownmail.net/">2026-06-01 NeilBrown — [PATCH 10/18] nfsd: in nfsd4_create_file() let VFS report if file was created</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-12-neilb@ownmail.net/">2026-06-01 NeilBrown — [PATCH 11/18] nfsd: nfsd4_create_file(): remove NFSD_MAY_CREATE check</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-13-neilb@ownmail.net/">2026-06-01 NeilBrown — [PATCH 12/18] nfsd: reduce range of directory lock in nfsd4_create_file()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-14-neilb@ownmail.net/">2026-06-01 NeilBrown — [PATCH 13/18] nfsd: open-code nfsd4_vfs_create() into nfsd4_create_file()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-15-neilb@ownmail.net/">2026-06-01 NeilBrown — [PATCH 14/18] nfsd: move some code out of the d_really_is_negative() branch</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-16-neilb@ownmail.net/">2026-06-01 NeilBrown — [PATCH 15/18] nfsd: reduce want-write range in nfsd4_create_file()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-17-neilb@ownmail.net/">2026-06-01 NeilBrown — [PATCH 16/18] nfsd: switch nfsd4_create_file() to use vfs_lookup_open()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-18-neilb@ownmail.net/">2026-06-01 NeilBrown — [PATCH 17/18] nfsd: use vfs_lookup_open() for non-creating open requests too</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-19-neilb@ownmail.net/">2026-06-01 NeilBrown — [PATCH 18/18] VFS: remove dentry_create()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/1841736563.45811.1780310868666@kpc.webmail.kpnmail.nl/">2026-06-01 Jori Koolstra — Re: [PATCH 01/18] (Reviewed-by + lockdep question)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/1753137576.49821.1780313056882@kpc.webmail.kpnmail.nl/">2026-06-01 Jori Koolstra — Re: [PATCH 02/18] (Reviewed-by)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/468562950.51964.1780313720060@kpc.webmail.kpnmail.nl/">2026-06-01 Jori Koolstra — Re: [PATCH 03/18] (Reviewed-by)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/1651506692.61058.1780316587334@kpc.webmail.kpnmail.nl/">2026-06-01 Jori Koolstra — Re: [PATCH 04/18] (O_EXCL enforcement question + bug fix noted)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/207320656.62149.1780316970630@kpc.webmail.kpnmail.nl/">2026-06-01 Jori Koolstra — Re: [PATCH 05/18] (FMODE_CREATED semantics question)</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-1-neilb@ownmail.net/">2026-06-01 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH/RFC 00/18] VFS/nfsd: replace dentry_create()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-2-neilb@ownmail.net/">2026-06-01 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 01/18] VFS: move mnt_want_write() and locking into lookup_open()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-3-neilb@ownmail.net/">2026-06-01 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 02/18] VFS: move delegated_inode retry loop into lookup_open()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-4-neilb@ownmail.net/">2026-06-01 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 03/18] VFS: replace nameidata and open_flag args to lookup_open()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-5-neilb@ownmail.net/">2026-06-01 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 04/18] VFS: add vfs_lookup_open()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-6-neilb@ownmail.net/">2026-06-01 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 05/18] VFS: dentry_create: always set FMODE_CREATE when file is created.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-7-neilb@ownmail.net/">2026-06-01 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 06/18] nfsd: replace fh_fill_both_attrs() with fh_fill_post_noop()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-8-neilb@ownmail.net/">2026-06-01 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 07/18] nfsd: move fh_want_write() after preamble in nfsd4_create_file()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-9-neilb@ownmail.net/">2026-06-01 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 08/18] nfsd: move more nfs-specific code into preamble of nfsd4_create_file()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-10-neilb@ownmail.net/">2026-06-01 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 09/18] nfsd: remove subtlety from nfsd4_create_file()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-11-neilb@ownmail.net/">2026-06-01 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 10/18] nfsd: in nfsd4_create_file() let VFS report if file was created.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-12-neilb@ownmail.net/">2026-06-01 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 11/18] nfsd: nfsd4_create_file(): remove NFSD_MAY_CREATE check.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-13-neilb@ownmail.net/">2026-06-01 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 12/18] nfsd: reduce range of directory lock in nfsd4_create_file()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-14-neilb@ownmail.net/">2026-06-01 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 13/18] nfsd: open-code nfsd4_vfs_create() into nfsd4_create_file()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-15-neilb@ownmail.net/">2026-06-01 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 14/18] nfsd: move some code out of the d_really_is_negative() branch in nfsd4_create_file()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-16-neilb@ownmail.net/">2026-06-01 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 15/18] nfsd: reduce want-write range in nfsd4_create_file(</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-17-neilb@ownmail.net/">2026-06-01 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 16/18] nfsd: switch nfsd4_create_file() to use vfs_lookup_open()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-18-neilb@ownmail.net/">2026-06-01 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 17/18] nfsd: use vfs_lookup_open() for non-creating open requests too.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-19-neilb@ownmail.net/">2026-06-01 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 18/18] VFS: remove dentry_create()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/1841736563.45811.1780310868666@kpc.webmail.kpnmail.nl/">2026-06-01 Jori Koolstra <a href="mailto:jkoolstra@xs4all.nl">jkoolstra@xs4all.nl</a> — Re: [PATCH 01/18] VFS: move mnt_want_write() and locking into lookup_open()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/1753137576.49821.1780313056882@kpc.webmail.kpnmail.nl/">2026-06-01 Jori Koolstra <a href="mailto:jkoolstra@xs4all.nl">jkoolstra@xs4all.nl</a> — Re: [PATCH 02/18] VFS: move delegated_inode retry loop into lookup_open()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/468562950.51964.1780313720060@kpc.webmail.kpnmail.nl/">2026-06-01 Jori Koolstra <a href="mailto:jkoolstra@xs4all.nl">jkoolstra@xs4all.nl</a> — Re: [PATCH 03/18] VFS: replace nameidata and open_flag args to lookup_open()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/1651506692.61058.1780316587334@kpc.webmail.kpnmail.nl/">2026-06-01 Jori Koolstra <a href="mailto:jkoolstra@xs4all.nl">jkoolstra@xs4all.nl</a> — Re: [PATCH 04/18] VFS: add vfs_lookup_open()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/207320656.62149.1780316970630@kpc.webmail.kpnmail.nl/">2026-06-01 Jori Koolstra <a href="mailto:jkoolstra@xs4all.nl">jkoolstra@xs4all.nl</a> — Re: [PATCH 05/18] VFS: dentry_create: always set FMODE_CREATE when file is created.</a></li>
+</ul>
+  </main>
+</body>
+</html>

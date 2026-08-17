@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd fixes grab bag: v2 signals emerge — stable_how NAK&#39;d, callback UAF reworked, ACL cap and error codes refined</title>
+  <meta name="description" content="This thread began on May 28 when Jeff Layton posted a 10-patch &quot;grab bag&quot; of nfsd bug fixes covering remotely-triggerable panics, use-after-frees, DoS vectors, and a few protocol-correctness issues. Initial review from NeilBrown (on PATCH…">
+  <meta property="og:title" content="nfsd fixes grab bag: v2 signals emerge — stable_how NAK&#39;d, callback UAF reworked, ACL cap and error codes refined">
+  <meta property="og:description" content="This thread began on May 28 when Jeff Layton posted a 10-patch &quot;grab bag&quot; of nfsd bug fixes covering remotely-triggerable panics, use-after-frees, DoS vectors, and a few protocol-correctness issues. Initial review from NeilBrown (on PATCH…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-04T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd fixes grab bag: v2 signals emerge — stable_how NAK&#39;d, callback UAF reworked, ACL cap and error codes refined">
+  <meta name="twitter:description" content="This thread began on May 28 when Jeff Layton posted a 10-patch &quot;grab bag&quot; of nfsd bug fixes covering remotely-triggerable panics, use-after-frees, DoS vectors, and a few protocol-correctness issues. Initial review from NeilBrown (on PATCH…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-04</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd fixes grab bag: v2 signals emerge — stable_how NAK'd, callback UAF reworked, ACL cap and error codes refined</h1>
+<h2>Summary</h2>
+<h1>nfsd fixes grab bag: v2 signals emerge — stable_how NAK'd, callback UAF reworked, ACL cap and error codes refined</h1>
+<h2>Context from prior week</h2>
+<p>This thread began on May 28 when Jeff Layton posted a <a href="https://lore.kernel.org/linux-nfs/20260528-nfsd-fixes-v1-0-e78708eff77d@kernel.org/">10-patch "grab bag" of nfsd bug fixes</a> covering remotely-triggerable panics, use-after-frees, DoS vectors, and a few protocol-correctness issues. Initial review from NeilBrown (on PATCH 01's locking), Rick Macklem, and Chuck Lever (on PATCH 09's ACL cap) had already begun. This week saw the full breadth of that review unfold across all ten patches, with Layton committing to a v2 series and one patch being formally self-NAK'd.</p>
+<h2>Key developments this week</h2>
+<h3>PATCH 06: stable_how return — self-NAK'd</h3>
+<p>The most consequential decision of the week came from Layton himself on <a href="https://lore.kernel.org/linux-nfs/e13b7b601f0cefda78cf96458e6af6e466cfb5f2.camel@kernel.org/">PATCH 06 "NFSD: Enable return of an updated stable_how to NFS clients"</a>:</p>
+<blockquote>
+<p>"After looking at this more closely and talking it over with Chuck, self-NAK on this patch. It's not clear to me that it's safe to downgrade a SYNC write to an UNSTABLE one."</p>
+</blockquote>
+<p>Layton acknowledged the spec technically requires it — RFC 1813 §3.3.7 says the server MUST set committed to UNSTABLE if it didn't commit to stable storage — but flagged the practical risk: "it's not clear to me that the clients would be prepared to issue a COMMIT in those cases." Since this only affects users of the "async" export option, he concluded they could "safely just drop this one."</p>
+<p>Cedric Blancher followed up on May 30 with a client-side question: <a href="https://lore.kernel.org/linux-nfs/CALXu0Ud9542MSqpbKTWweoCbwJcX7gnzUW8yDT-2=YCoWLt2dQ@mail.gmail.com/">could the NFS client simply record write positions and lengths and only issue COMMIT on an explicit flush?</a> Layton confirmed the drop and clarified the client's expected behavior: "the client is more or less expected to keep track of what UNSTABLE writes are still outstanding and eventually issue one or more COMMIT calls to sync them out to disk."</p>
+<h3>PATCH 01: Delegation revoke BUG_ON — RCU approach adopted</h3>
+<p>Following NeilBrown's prior-week critique that the spinlock was insufficient, Layton <a href="https://lore.kernel.org/linux-nfs/c06960228dc36d25b5a7d0e3640c352bc0fd99d5.camel@kernel.org/">agreed on May 29</a>:</p>
+<blockquote>
+<p>"Good point. I think the right thing to do here is to use RCU to access this pointer. Don't think it's protected by anything now. I'll do some more analysis and put together a v2."</p>
+</blockquote>
+<p>This confirms the fix will move from a spinlock-protected read to proper RCU semantics for <code>fp-&gt;fi_deleg_file</code>.</p>
+<h3>PATCH 02: Callback drain — DoS vector identified, rework planned</h3>
+<p>Chuck Lever raised a significant concern about <a href="https://lore.kernel.org/linux-nfs/fc8740de-d9bd-4686-a30e-e0a6c1b7f351@app.fastmail.com/">PATCH 02's callback drain approach</a>:</p>
+<blockquote>
+<p>"Several NFSD callback done handlers retry indefinitely on NFS4ERR_DELAY via rpc_delay(), so a client that keeps replying DELAY leaves this per-client counter nonzero and blocks the foreground CREATE/BIND/DESTROY_SESSION request even though the callback no longer references the session being torn down."</p>
+<p>"this patch potentially introduces a client-controlled DoS vector."</p>
+</blockquote>
+<p>Layton <a href="https://lore.kernel.org/linux-nfs/a7d2a218bb9cb500df1af89e1db39b69b16417af.camel@kernel.org/">responded</a> with a rework plan: "I'm currently looking at reworking this so that each stage of the callback state machine can tolerate a NULL cl_cb_session pointer. If I can make that work, then we can fix the UAF without blocking." He confirmed "I'll definitely be sending a v2 of the series."</p>
+<h3>PATCH 03: Grace-end serialization — atomic bit op agreed</h3>
+<p>A brief but pointed exchange on <a href="https://lore.kernel.org/linux-nfs/c087f4c4-c17e-474e-a869-14077996beb6@app.fastmail.com/">PATCH 03</a> saw Chuck Lever question whether <code>try_cmpxchg</code> on a boolean is portable: "Perhaps try_cmpxchg on a boolean variable is not going to behave as you expect on every hardware platform."</p>
+<p>Layton initially pushed back — "We just need a single flag here though. try_cmpxchg() had better work the same way on every platform or a lot of stuff is FUBAR. Where wouldn't it?" — but Chuck cited that "Codex suggests on Hexagon, cmpxchg grabs more than just that boolean." Layton was <a href="https://lore.kernel.org/linux-nfs/a1363f45dec225d8ba59fc2ae50b206ebdd5996f.camel@kernel.org/">convinced</a>: "Ok, I'm convinced. What I think I'll do is add a new flags unsigned long to struct nfsd_net and we can convert most of the bools in that struct to use it instead."</p>
+<h3>PATCH 04: Reclaim dedup — commit message recast requested</h3>
+<p>Chuck Lever noted that <a href="https://lore.kernel.org/linux-nfs/6ffd3f72-0642-40f3-a302-9090e794aaa1@app.fastmail.com/">the motivating example in the commit message</a> was built on the legacy recovery-directory path, but the actual bug is nfsdcld-only. He asked Layton to "recast the example around the path the patch actually repairs — a boot-time cld enumeration record followed by an in-grace RECLAIM_COMPLETE downcall for the same cl_name." The code change itself was confirmed correct.</p>
+<h3>PATCH 08: Partial-write detection — data corruption risk debated</h3>
+<p>This patch drew the most back-and-forth. Chuck Lever <a href="https://lore.kernel.org/linux-nfs/5ef47df4-c9f4-4b7a-a493-71be1a95ee90@app.fastmail.com/">questioned its necessity</a>: "How many filesystems can return a short write in this case? My impression was that only the NFS client can do that."</p>
+<p>Layton <a href="https://lore.kernel.org/linux-nfs/c44f1ab33041c297510117903a9e48ae92bd118f.camel@kernel.org/">pushed back firmly</a>: "I'm fairly sure Ceph and CIFS can and they're exportable. For local filesystems, I'm not even sure how to audit that. Given that the potential effect is data corruption, omitting this patch based on guesswork about what filesystems are being exported seems unwise."</p>
+<p>Chuck <a href="https://lore.kernel.org/linux-nfs/15756486-5dbc-4d3f-b633-b8cc98d85e40@kernel.org/">conceded partially</a> but noted: "In any event, I think this one needs testing to confirm that the logic change doesn't introduce a regression in known working use cases." The patch appears likely to survive into v2 with added test coverage.</p>
+<h3>PATCH 09: ACL count cap — error code and rationale refined</h3>
+<p>The most-discussed patch from last week continued to evolve. Several threads of discussion converged:</p>
+<p><strong>Rationale for the cap:</strong> Chuck Lever <a href="https://lore.kernel.org/linux-nfs/71e5e6b6-f2d6-48ca-bc66-32064a2e0798@app.fastmail.com/">refined his position</a>: "A different take on this might be that we want to ensure that ACLs set via the NFSv4 POSIX ACL extension can always be retrieved via NFSACL. In that case, capping the ACE count at the same number makes sense." Layton <a href="https://lore.kernel.org/linux-nfs/4a35675f5627c2e1e3464cb893ff6e619e41e74b.camel@kernel.org/">confirmed the encoder already enforces this</a> and added a comment to the patch making the rationale explicit.</p>
+<p><strong>Error code debate:</strong> Chuck Lever <a href="https://lore.kernel.org/linux-nfs/d1d41aef-0add-44d6-ac53-b78334b885a3@app.fastmail.com/">argued against nfserr_resource</a>: "nfserr_resource is consistent with other fattr4 decoders, but does not make sense here, IMO. A better choice is nfserr_inval." Layton initially defended the choice: "An ACL that long doesn't violate the spec... the implementation just can't handle it. I do agree that nfserr_resource is not the ideal error code, but it's the closest error I can see that says 'you hit an internal limitation of the server'."</p>
+<p>Chuck <a href="https://lore.kernel.org/linux-nfs/a2a8d609-4e48-4d28-8749-1f0654464bba@kernel.org/">pressed further</a>: "Among other reasons, NFS4ERR_RESOURCE does not exist outside of NFSv4.0. The server is not out of resources in this case. For NFSv4.1+ NFSD's compound encoder converts it to either nfserr_rep_too_big or nfserr_rep_too_big_to_cache, neither of which are close to appropriate."</p>
+<p>Rick Macklem <a href="https://lore.kernel.org/linux-nfs/CAM5tNy7jHYEjaJk5t5sjr+2BZfiiVGgNqcQf1J1+1ad6WhUP0Q@mail.gmail.com/">weighed in</a> as the author of the NFSv4 POSIX ACL spec: "Looking at Table 12 in RFC8881, NFS4ERR_INVAL seems the best fit for SETATTR, although I didn't specify that in my draft. (It's a bit unfortunate that there is no other error values, since NFS4ERR_INVAL gets used for everything else, but??) Maybe I should add that to the draft?"</p>
+<p><strong>Bubble sort question:</strong> Cedric Blancher <a href="https://lore.kernel.org/linux-nfs/CALXu0Ud0WUrpGE-2JNNid7UUCA9N5m4zCakc7oEreF6UcAQKRQ@mail.gmail.com/">asked pointedly</a>: "What about (finally) getting rid of the bubble sort?" Layton <a href="https://lore.kernel.org/linux-nfs/f6b874a758e8337b875c18217347491ecc248617.camel@kernel.org/">responded</a>: "It's certainly not clear to me that it's necessary (is it?). I'm not opposed to removing it, but I'd rather not make a behavioral change like this in the context of this patchset. Maybe you could propose a patch to remove it?"</p>
+<h3>PATCH 10: Symlink target length — named constant nit</h3>
+<p>Chuck Lever offered a <a href="https://lore.kernel.org/linux-nfs/bce151c1-2575-4ab2-be20-9f022c7a2be0@app.fastmail.com/">clean-up suggestion</a>: use the protocol-defined <code>NFS4_MAXPATHLEN</code> instead of raw <code>PATH_MAX</code>, and change the boundary from <code>&gt;= PATH_MAX</code> to <code>&gt; NFS4_MAXPATHLEN</code> to match v3's idiom (which accepts a target of exactly PATH_MAX bytes).</p>
+<h2>Status and conclusions</h2>
+<p>The thread is clearly heading toward a <strong>v2 series</strong>. Layton has committed to reworking at least three patches:</p>
+<ul>
+<li>PATCH 01: switch to RCU for <code>fi_deleg_file</code> access</li>
+<li>PATCH 02: eliminate the blocking drain in favor of NULL-tolerant callback state machine</li>
+<li>PATCH 03: convert to atomic bit ops via a new <code>flags</code> field in <code>struct nfsd_net</code></li>
+</ul>
+<p>PATCH 06 is formally <strong>dropped</strong> (self-NAK). The remaining patches appear close to final, with minor comment/commit-message adjustments pending. No merge decision has been posted yet within this window.</p>
+<h2>Significance for NFS client development</h2>
+<p>While this series targets the server, several fixes have direct client-side implications:</p>
+<ul>
+<li>The <strong>delegation revoke race</strong> (PATCH 01) is explicitly client-reachable — two clients can trigger a kernel panic by racing on layout stateids.</li>
+<li>The <strong>partial-write detection fix</strong> (PATCH 08) prevents silent data corruption when the underlying filesystem returns short writes during direct I/O, which matters for NFS re-export scenarios and Ceph/CIFS-backed exports.</li>
+<li>The <strong>callback UAF fix</strong> (PATCH 02) addresses a scenario where a malicious or buggy client can keep replying NFS4ERR_DELAY to trigger a DoS on session teardown — relevant to any NFSv4.1+ client implementation.</li>
+<li>The <strong>stable_how NAK</strong> means clients will not see servers downgrade SYNC writes to UNSTABLE via this path, preserving existing COMMIT behavior for "async" export users.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/71e5e6b6-f2d6-48ca-bc66-32064a2e0798@app.fastmail.com/">2026-05-29 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 09/10] nfsd: cap decoded POSIX ACL count to bound sort cost</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CALXu0Ud0WUrpGE-2JNNid7UUCA9N5m4zCakc7oEreF6UcAQKRQ@mail.gmail.com/">2026-05-29 Cedric Blancher <a href="mailto:cedric.blancher@gmail.com">cedric.blancher@gmail.com</a> — Re: [PATCH 09/10] nfsd: cap decoded POSIX ACL count to bound sort cost</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/4a35675f5627c2e1e3464cb893ff6e619e41e74b.camel@kernel.org/">2026-05-29 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 09/10] nfsd: cap decoded POSIX ACL count to bound sort cost</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/f6b874a758e8337b875c18217347491ecc248617.camel@kernel.org/">2026-05-29 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 09/10] nfsd: cap decoded POSIX ACL count to bound sort cost</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/e13b7b601f0cefda78cf96458e6af6e466cfb5f2.camel@kernel.org/">2026-05-29 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 06/10] NFSD: Enable return of an updated stable_how to NFS clients</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/e351bffb-cedc-4f76-a006-ee49a86a5f68@kernel.org/">2026-05-29 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 09/10] nfsd: cap decoded POSIX ACL count to bound sort cost</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/c06960228dc36d25b5a7d0e3640c352bc0fd99d5.camel@kernel.org/">2026-05-29 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 01/10] nfsd: fix BUG_ON in nfsd4_alloc_layout_stateid on racing delegation revoke</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/fc8740de-d9bd-4686-a30e-e0a6c1b7f351@app.fastmail.com/">2026-05-29 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 02/10] nfsd: drain callbacks and clear cl_cb_session</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/c087f4c4-c17e-474e-a869-14077996beb6@app.fastmail.com/">2026-05-29 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 03/10] nfsd: serialize nfsd4_end_grace() with atomic test-and-set</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/fdbe9d990b0bd14ba0f76f4a989c08a218678c43.camel@kernel.org/">2026-05-29 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 03/10] nfsd: serialize nfsd4_end_grace() with atomic test-and-set</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/b51daabc-fb34-4cf2-a5e9-2c0e59e1d5c0@kernel.org/">2026-05-29 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 03/10] nfsd: serialize nfsd4_end_grace() with atomic test-and-set</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/6ffd3f72-0642-40f3-a302-9090e794aaa1@app.fastmail.com/">2026-05-29 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 04/10] nfsd: dedup nfs4_client_to_reclaim inserts</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/5ef47df4-c9f4-4b7a-a493-71be1a95ee90@app.fastmail.com/">2026-05-29 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 08/10] nfsd: fix partial-write detection in nfsd_direct_write</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/1ab23163ff7e1b7f01326ef9f222dad25ad6a863.camel@kernel.org/">2026-05-29 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 08/10] nfsd: fix partial-write detection in nfsd_direct_write</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/a1363f45dec225d8ba59fc2ae50b206ebdd5996f.camel@kernel.org/">2026-05-29 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 03/10] nfsd: serialize nfsd4_end_grace() with atomic test-and-set</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/0f23fe53-3796-4102-ab62-f28fd53afaf7@kernel.org/">2026-05-29 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 08/10] nfsd: fix partial-write detection in nfsd_direct_write</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/c44f1ab33041c297510117903a9e48ae92bd118f.camel@kernel.org/">2026-05-29 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 08/10] nfsd: fix partial-write detection in nfsd_direct_write</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/15756486-5dbc-4d3f-b633-b8cc98d85e40@kernel.org/">2026-05-29 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 08/10] nfsd: fix partial-write detection in nfsd_direct_write</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/a7d2a218bb9cb500df1af89e1db39b69b16417af.camel@kernel.org/">2026-05-29 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 02/10] nfsd: drain callbacks and clear cl_cb_session</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/d1d41aef-0add-44d6-ac53-b78334b885a3@app.fastmail.com/">2026-05-29 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 09/10] nfsd: cap decoded POSIX ACL count to bound sort cost</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/92e21cec11e8d7482f03e090fbf6a3de0e8d67d7.camel@kernel.org/">2026-05-29 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 09/10] nfsd: cap decoded POSIX ACL count to bound sort cost</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/a2a8d609-4e48-4d28-8749-1f0654464bba@kernel.org/">2026-05-29 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 09/10] nfsd: cap decoded POSIX ACL count to bound sort cost</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/bce151c1-2575-4ab2-be20-9f022c7a2be0@app.fastmail.com/">2026-05-29 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 10/10] nfsd: validate symlink target length in NFSv4 CREATE</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAM5tNy7jHYEjaJk5t5sjr+2BZfiiVGgNqcQf1J1+1ad6WhUP0Q@mail.gmail.com/">2026-05-29 Rick Macklem <a href="mailto:rick.macklem@gmail.com">rick.macklem@gmail.com</a> — Re: [PATCH 09/10] nfsd: cap decoded POSIX ACL count to bound sort cost</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CALXu0Ud9542MSqpbKTWweoCbwJcX7gnzUW8yDT-2=YCoWLt2dQ@mail.gmail.com/">2026-05-30 Cedric Blancher <a href="mailto:cedric.blancher@gmail.com">cedric.blancher@gmail.com</a> — NFSv4.1 COMMIT of all changed areas only on flush? Re: [PATCH 06/10] NFSD: Enable return of an updated stable_how to NFS clients</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/44c811a8c768f5d1feda8ef15ad9d7ef25ec4075.camel@kernel.org/">2026-05-30 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: NFSv4.1 COMMIT of all changed areas only on flush? Re: [PATCH 06/10] NFSD: Enable return of an updated stable_how to NFS clients</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfs: support FMODE_NOWAIT on O_DIRECT reads (PATCH 0/2)</title>
+  <meta name="description" content="Type: New feature / performance improvement for the NFS client (enables non-blocking O_DIRECT reads so io_uring can avoid punting to a background worker).">
+  <meta property="og:title" content="nfs: support FMODE_NOWAIT on O_DIRECT reads (PATCH 0/2)">
+  <meta property="og:description" content="Type: New feature / performance improvement for the NFS client (enables non-blocking O_DIRECT reads so io_uring can avoid punting to a background worker).">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-04T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfs: support FMODE_NOWAIT on O_DIRECT reads (PATCH 0/2)">
+  <meta name="twitter:description" content="Type: New feature / performance improvement for the NFS client (enables non-blocking O_DIRECT reads so io_uring can avoid punting to a background worker).">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-04</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfs: support FMODE_NOWAIT on O_DIRECT reads (PATCH 0/2)</h1>
+<h2>Summary</h2>
+<h2>nfs: support FMODE_NOWAIT on O_DIRECT reads — initial patch series</h2>
+<p><strong>Type:</strong> New feature / performance improvement for the NFS client (enables non-blocking <code>O_DIRECT</code> reads so io_uring can avoid punting to a background worker).</p>
+<h3>What happened this week</h3>
+<p>On 2026-05-30, Dylan Yudaken posted a two-patch series titled "[PATCH 0/2] nfs: support FMODE_NOWAIT on O_DIRECT reads"](<a href="mailto:20260530221947.49518-1-dyudaken@gmail.com">20260530221947.49518-1-dyudaken@gmail.com</a>). The thread is self-contained for this week — all three messages (cover letter + two patches) landed in a single burst and, as of the end of the window, had <strong>no replies or review feedback</strong> from the maintainers. No prior-week history exists for this thread; it opens fresh here.</p>
+<h3>The problem</h3>
+<p>Yudaken's cover letter frames the issue around io_uring's behavior with NFS:</p>
+<blockquote>
+<p>"I had noticed that io_uring always punts O_DIRECT NFS reads to a background thread since the file does not advertise FMODE_NOWAIT."</p>
+</blockquote>
+<p>In other words, because NFS <code>O_DIRECT</code> read files do not set the <code>FMODE_NOWAIT</code> flag, io_uring cannot complete these requests inline and must offload them to a task work / async worker path — an avoidable latency cost for users who want fast, non-blocking direct reads.</p>
+<h3>The proposed fix</h3>
+<p>Yudaken is candid about his familiarity with the codebase but argues the change is small:</p>
+<blockquote>
+<p>"I am not very familiar with the NFS codebase, but looking around suggests a simple change to nfs_start_io_direct is all that is required to properly support this functionality."</p>
+</blockquote>
+<p>His reasoning for why it is safe:</p>
+<blockquote>
+<p>"On the request issue side, it seems everything in NFS is actually run in the background (post this lock change), and the completion codepaths all look to have no similar locking semantics."</p>
+</blockquote>
+<p>The series is split into two patches:</p>
+<ol>
+<li>
+<p><strong>[PATCH 1/2] nfs: add nowait version of nfs_start_io_direct](<a href="mailto:20260530221947.49518-2-dyudaken@gmail.com">20260530221947.49518-2-dyudaken@gmail.com</a>)</strong> — introduces <code>nfs_start_io_direct_nowait</code>, a non-blocking variant that "just returns -EAGAIN if locks could not be taken" rather than blocking on existing operations to the same inode. This patch alone adds an unused helper (touching <code>fs/nfs/internal.h</code> and <code>fs/nfs/io.c</code>).</p>
+</li>
+<li>
+<p><strong>[PATCH 2/2] nfs: expose FMODE_NOWAIT for O_DIRECT read files](<a href="mailto:20260530221947.49518-3-dyudaken@gmail.com">20260530221947.49518-3-dyudaken@gmail.com</a>)</strong> — wires the helper into the direct-read path and flips on <code>FMODE_NOWAIT</code>. The rationale: "O_DIRECT reads already (mostly) handle async requests, with the exception of locking the inode for direct."</p>
+</li>
+</ol>
+<p>The overall footprint is modest — 4 files changed, 53 insertions, 4 deletions (<code>fs/nfs/direct.c</code>, <code>fs/nfs/file.c</code>, <code>fs/nfs/internal.h</code>, <code>fs/nfs/io.c</code>).</p>
+<h3>Testing and motivation</h3>
+<p>Yudaken is upfront that he could not measure the performance win directly:</p>
+<blockquote>
+<p>"I unfortunately do not have the means to test the performance improvement, since even without this change my local network is the bottleneck here."</p>
+</blockquote>
+<p>He nonetheless points to a real-world demand signal — a liburing GitHub issue (<a href="https://github.com/axboe/liburing/issues/1499">axboe/liburing#1499</a>) — noting that "Applying a similar patch on that GitHub issue did give performance gains." He validated correctness functionally by tracing io_uring events:</p>
+<blockquote>
+<p>"Using a test app ... to issue O_DIRECT io_uring reads calls io_uring_queue_async_work without this patch, while with it the call is skipped and the completion is queued into io_uring directly from nfs_direct_read_completion."</p>
+</blockquote>
+<h3>Status / where things stand</h3>
+<p>As of 2026-06-04 the series has been posted but is <strong>unreviewed</strong> in this window — no maintainer (e.g. Trond Myklebust or Anna Schumaker) has weighed in on the locking-safety argument, which is the crux of the change. A follow-up "[PATCH v2 0/2]" with the same title was posted later by Yudaken on 2026-06-07 (outside this week's scope), indicating the series is actively being iterated toward a reviewable form.</p>
+<h3>Key takeaways for NFS client readers</h3>
+<ul>
+<li>This is a <strong>client-side</strong> change enabling <code>FMODE_NOWAIT</code> for <code>O_DIRECT</code> reads, directly benefiting io_uring users by avoiding the async-worker punt path.</li>
+<li>The central technical question for reviewers is whether returning <code>-EAGAIN</code> from a new non-blocking <code>nfs_start_io_direct</code> variant (instead of blocking on the inode lock) preserves correctness — Yudaken argues the rest of the direct-read request and completion paths are already background/lock-free, but that claim awaits maintainer sign-off.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260530221947.49518-1-dyudaken@gmail.com/">2026-05-30 Dylan Yudaken <a href="mailto:dyudaken@gmail.com">dyudaken@gmail.com</a> — [PATCH 0/2] nfs: support FMODE_NOWAIT on O_DIRECT reads</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260530221947.49518-2-dyudaken@gmail.com/">2026-05-30 Dylan Yudaken <a href="mailto:dyudaken@gmail.com">dyudaken@gmail.com</a> — [PATCH 1/2] nfs: add nowait version of nfs_start_io_direct</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260530221947.49518-3-dyudaken@gmail.com/">2026-05-30 Dylan Yudaken <a href="mailto:dyudaken@gmail.com">dyudaken@gmail.com</a> — [PATCH 2/2] nfs: expose FMODE_NOWAIT for O_DIRECT read files</a></li>
+</ul>
+  </main>
+</body>
+</html>

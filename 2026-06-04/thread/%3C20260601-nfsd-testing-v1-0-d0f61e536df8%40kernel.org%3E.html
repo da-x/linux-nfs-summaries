@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd locally-triggerable bugfixes: eight patches address UAFs, refcount leaks, and an unprivileged IPv6 info leak</title>
+  <meta name="description" content="This thread is part of a concentrated burst of NFS server-side hardening work in late May/early June 2026. Just days earlier, Jeff Layton posted and merged the v2 &quot;grab bag&quot; series of nine remotely-triggerable fixes (panics, UAFs, data…">
+  <meta property="og:title" content="nfsd locally-triggerable bugfixes: eight patches address UAFs, refcount leaks, and an unprivileged IPv6 info leak">
+  <meta property="og:description" content="This thread is part of a concentrated burst of NFS server-side hardening work in late May/early June 2026. Just days earlier, Jeff Layton posted and merged the v2 &quot;grab bag&quot; series of nine remotely-triggerable fixes (panics, UAFs, data…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-04T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd locally-triggerable bugfixes: eight patches address UAFs, refcount leaks, and an unprivileged IPv6 info leak">
+  <meta name="twitter:description" content="This thread is part of a concentrated burst of NFS server-side hardening work in late May/early June 2026. Just days earlier, Jeff Layton posted and merged the v2 &quot;grab bag&quot; series of nine remotely-triggerable fixes (panics, UAFs, data…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-04</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd locally-triggerable bugfixes: eight patches address UAFs, refcount leaks, and an unprivileged IPv6 info leak</h1>
+<h2>Summary</h2>
+<h1>nfsd locally-triggerable bugfixes: eight patches address UAFs, refcount leaks, and an unprivileged IPv6 info leak</h1>
+<h2>Context from prior weeks</h2>
+<p>This thread is part of a concentrated burst of NFS server-side hardening work in late May/early June 2026. Just days earlier, <a href="https://lore.kernel.org/linux-nfs/20260530-nfsd-fixes-v2-0-f27e8eb4d974@kernel.org/">Jeff Layton posted and merged the v2 "grab bag" series</a> of nine remotely-triggerable fixes (panics, UAFs, data corruption, DoS vectors), and the following day <a href="https://lore.kernel.org/linux-nfs/20260531-nfsd-testing-v1-0-7bfa481b0540@kernel.org/">posted a six-patch "medium-severity" series</a> covering remote-triggerable memory leaks and refcounting bugs. The series summarized here — posted June 1 — is the third wave, targeting a different threat class: locally-triggerable defects that require either admin access or (in one case) merely unprivileged user-level access within the network namespace.</p>
+<h2>Series overview (June 1)</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260601-nfsd-testing-v1-0-d0f61e536df8@kernel.org/">Jeff Layton posted the eight-patch series</a> on June 1, describing the threat model:</p>
+<blockquote>
+<p>"These are bugs that Claude classified as locally-triggerable. A couple can be triggered by an unprivileged user, but the rest require admin access."</p>
+</blockquote>
+<p>He also noted a design decision for the last three patches:</p>
+<blockquote>
+<p>"The last 3 patches fix one bug. I originally had a more targeted fix that kres generated, but I think it's better to simplify the filecache disposal mechanism to get rid of the bug rather than add more complexity."</p>
+</blockquote>
+<p>The series is co-authored by Chris Mason (3 patches) and Jeff Layton (5 patches), touching 8 files with 80 insertions and 94 deletions. Base commit is <code>d7203affbe85baad683cef946f661c5541966d97</code>.</p>
+<h3>Patch-by-patch highlights</h3>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260601-nfsd-testing-v1-1-d0f61e536df8@kernel.org/">PATCH 1/8: Defer vfree of compound ops to fix rpc_status UAF</a></strong> — A use-after-free on vmalloc memory in the <code>rpc_status</code> netlink dumpit. The dumpit walks in-flight <code>svc_rqst</code> entries under <code>rcu_read_lock</code> and reads opnums from <code>args-&gt;ops[]</code>, but that buffer was being freed synchronously via <code>vfree()</code> at compound completion. As Layton explains:</p>
+<blockquote>
+<p>"A concurrent compound completion can therefore free the buffer while the dumpit is reading it — a use-after-free on vmalloc memory."</p>
+</blockquote>
+<p>The fix replaces <code>vfree(args-&gt;ops)</code> with <code>kvfree_rcu_mightsleep()</code>, deferring reclamation across one RCU grace period. The tradeoff is modest: "completed compound ops buffers (up to 200 * sizeof(struct nfsd4_op)) persist in memory slightly longer, across one grace period, before being reclaimed."</p>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260601-nfsd-testing-v1-2-d0f61e536df8@kernel.org/">PATCH 2/8: Hold rcu across localio cmpxchg retry</a></strong> — Chris Mason's fix for a UAF in <code>nfsd_open_local_fh()</code>. The <code>again:</code> retry block loads a pointer with <code>cmpxchg</code> and calls <code>refcount_inc_not_zero()</code> without holding <code>rcu_read_lock</code>, while the slab backing freed <code>nfsd_file</code> objects is not <code>SLAB_TYPESAFE_BY_RCU</code>. The commit message includes a detailed two-CPU race diagram showing how a recycled slab page can contain a non-zero word at the <code>nf_ref</code> offset, making the refcount bump "appear to succeed" before the caller dereferences freed memory. The fix takes <code>rcu_read_lock()</code> immediately before the <code>cmpxchg</code>.</p>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260601-nfsd-testing-v1-3-d0f61e536df8@kernel.org/">PATCH 3/8: Fix ref leak on nfs_uuid_add_file failure</a></strong> — Another Chris Mason fix. When <code>nfs_uuid_add_file()</code> races with <code>nfs_uuid_put()</code> tearing down the net, it returns <code>-ENXIO</code> without publishing the RCU pointer, and the error path in <code>nfs_open_local_fh()</code> leaks both a caller-owned <code>nfsd_file</code> reference and an entry-time <code>nfsd_net</code> reference. The leak "pins one nfsd_file (and the underlying struct file, dentry, inode) and one nfsd_net_ref per occurrence, which blocks nfsd_net and netns teardown."</p>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260601-nfsd-testing-v1-4-d0f61e536df8@kernel.org/">PATCH 4/8: Guard nfsd_serv deref in nfsd_file_net_dispose</a></strong> — Chris Mason's fix for a NULL pointer dereference during per-net teardown. The service thread loop calls <code>nfsd_file_net_dispose()</code> which unconditionally calls <code>svc_wake_up(nn-&gt;nfsd_serv)</code>, but <code>nn-&gt;nfsd_serv</code> is cleared before the filecache laundrette shuts down. As Mason notes, "The sibling helper nfsd_file_dispose_list_delayed() already documents this ordering and caches nn-&gt;nfsd_serv into a local before testing it for NULL. nfsd_file_net_dispose() was introduced with the same raw svc_wake_up(nn-&gt;nfsd_serv) call and never picked up the guard."</p>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260601-nfsd-testing-v1-5-d0f61e536df8@kernel.org/">PATCH 5/8: Widen nfsd_genl_rqstp address fields to sockaddr_storage</a></strong> — The most security-sensitive patch in the series. <code>struct nfsd_genl_rqstp</code> declared <code>rq_daddr</code> and <code>rq_saddr</code> as plain <code>struct sockaddr</code> (16 bytes), but for IPv6 clients the code casts them to <code>struct sockaddr_in6 *</code> (28 bytes) and reads past the end into adjacent memory. As Layton describes:</p>
+<blockquote>
+<p>"The 16-byte nla_put_in6_addr then ships 8 bytes of truncated IPv6 address followed by 8 bytes of rq_flags to userspace via the NFSD_A_RPC_STATUS_SADDR6/DADDR6 netlink attributes."</p>
+</blockquote>
+<p>This is particularly notable because it's reachable by any unprivileged process: "This is reachable by any unprivileged process in the network namespace because NFSD_CMD_RPC_STATUS_GET uses GENL_CMD_CAP_DUMP without GENL_ADMIN_PERM." The fix widens the fields to <code>struct sockaddr_storage</code> and zero-initializes the stack variable.</p>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260601-nfsd-testing-v1-6-d0f61e536df8@kernel.org/">PATCH 6/8: Fix refcount leak in nfsd_file_lru_add on insertion failure</a></strong> — A latent bug where <code>nfsd_file_lru_add()</code> unconditionally increments <code>nf_ref</code> before attempting LRU insertion, and never releases it on failure. While "currently unreachable" because the sole caller operates on freshly-allocated objects, it "represents a latent bug that would become exploitable if a future change adds another call site or alters the PENDING protocol." The fix adds a compensating <code>refcount_dec()</code> and changes <code>WARN_ON(1)</code> to <code>WARN_ON_ONCE(1)</code>.</p>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260601-nfsd-testing-v1-7-d0f61e536df8@kernel.org/">PATCH 7/8: Fix fcache_disposal UAF by inlining dispose state into nfsd_net</a></strong> — The first of three patches that together fix a single UAF. The per-net <code>struct nfsd_fcache_disposal</code> (containing the spinlock and freeme list) was separately allocated and freed during net teardown, but "The global shrinker, laundrette, and fsnotify callbacks can still be inside nfsd_file_dispose_list_delayed() dereferencing that pointer, causing a use-after-free." The fix inlines the spinlock and list directly into <code>struct nfsd_net</code>, giving them the same lifetime as the net namespace itself. This eliminates 69 lines of alloc/free boilerplate.</p>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260601-nfsd-testing-v1-8-d0f61e536df8@kernel.org/">PATCH 8/8: Hold net namespace reference in nfsd_file</a></strong> — The third patch in the UAF trilogy. Without a net reference held by <code>nfsd_file</code>, "nf_net can dangle for in-flight files whose net namespace is torn down concurrently, causing a use-after-free when nfsd_file_dispose_list_delayed() calls net_generic(nf-&gt;nf_net, ...)." The fix takes <code>get_net()</code> in <code>nfsd_file_alloc()</code> and releases it in <code>nfsd_file_free()</code>, with a consequential change to <code>nfsd_file_put_local()</code> which now returns void since the net reference is managed internally.</p>
+<h2>Review discussion: Al Viro's scalability concern (June 1)</h2>
+<p>The only review comment on this series came from <a href="https://lore.kernel.org/linux-nfs/20260601175034.GI2636677@ZenIV/">Al Viro</a>, who raised a performance concern about PATCH 8/8:</p>
+<blockquote>
+<p>"That means that each nfsd_file_alloc()/nfsd_file_free() is now touching the same cacheline on kernels with netns enabled. Scalability implications might be interesting..."</p>
+</blockquote>
+<p>This is a pointed observation: <code>get_net()</code>/<code>put_net()</code> increment/decrement an atomic counter in the <code>struct net</code> object, which becomes a shared cacheline hotspot when many NFS server threads are concurrently allocating and freeing file cache entries — particularly on multi-socket systems with network namespaces enabled.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/6794fda04cf84a908b4715ad0456764e4ad18a3e.camel@kernel.org/">Jeff Layton acknowledged the concern immediately</a>:</p>
+<blockquote>
+<p>"That's a very good point. There are some alternatives. Let me play around with them and see if I can find something better."</p>
+</blockquote>
+<p>About 15 minutes later, <a href="https://lore.kernel.org/linux-nfs/51c047425b6e19f6bfe3067a2fe59676eb00380b.camel@kernel.org/">he followed up with his findings</a>:</p>
+<blockquote>
+<p>"That's definitely a valid concern. I looked at a couple of alternatives but they turned out to be pretty nasty. One thing we can do is only take a net reference for GC'ed files, since we don't need a reference for the others. That would cut down some of the get/put_net activity, but it's still likely to be substantial. I'll plan to implement that for v2. I'll keep thinking about other ways to do this, but I think we're stuck taking net references for at least some of these for now."</p>
+</blockquote>
+<p>This indicates a v2 of the series is expected, with PATCH 8/8 reworked to limit the scope of <code>get_net()</code>/<code>put_net()</code> calls to only those files that have been isolated by the garbage collector or shrinker — the subset where <code>nf_net</code> can actually dangle.</p>
+<h2>Nature of the discussion</h2>
+<p>This is a <strong>bug fix series</strong> — not a new feature or protocol change. All eight patches address locally-triggerable defects: two use-after-free vulnerabilities (rpc_status netlink dumpit, localio cmpxchg retry), one NULL pointer dereference on net teardown, three patches jointly fixing a filecache disposal UAF, two refcount leaks (localio error path, LRU insertion failure), and one unprivileged information disclosure (truncated IPv6 address + adjacent memory leaked via netlink).</p>
+<p>The series is notable for its use of AI-assisted code analysis: multiple patches carry <code>Assisted-by:</code> tags referencing Claude models (<code>claude-opus-4-6</code>, <code>kres:claude-opus-4-7</code>), and the cover letter explicitly credits "Claude" for classifying the bugs as locally-triggerable. This represents a new pattern in kernel development where AI tools are used for systematic vulnerability classification and initial fix generation, with human developers (Layton, Mason) providing architectural judgment — as evidenced by Layton's decision to replace a "more targeted fix that kres generated" with a broader simplification of the filecache disposal mechanism.</p>
+<h2>Significance for NFS client development</h2>
+<p>While all fixes are server-side, several have direct implications for NFS clients and testing:</p>
+<ul>
+<li>The <strong>rpc_status UAF</strong> (PATCH 1) is relevant to any deployment using the <code>nfsd</code> netlink interface for monitoring in-flight requests — a common practice in production NFS servers. Clients generating high compound request rates increase the race window.</li>
+<li>The <strong>localio cmpxchg UAF</strong> (PATCH 2) affects NFS re-export configurations where the local I/O path is used. A client hammering file opens on an exported filesystem could trigger the race, potentially corrupting server memory.</li>
+<li>The <strong>unprivileged IPv6 info leak</strong> (PATCH 5) is the most immediately actionable for security teams: any unprivileged user in a network namespace with an active NFSv4-over-IPv6 connection can read 8 bytes of kernel stack/adjacent struct memory via netlink. Clients connecting over IPv6 to affected servers are the trigger, though the vulnerability is entirely server-side.</li>
+<li>The <strong>filecache disposal UAF</strong> (PATCHES 7–8) is relevant to any deployment using network namespaces with NFS exports: tearing down a namespace while files are still in-flight through the GC/shrinker path could corrupt kernel memory, potentially affecting all clients on that server.</li>
+<li>The <strong>refcount leaks</strong> (PATCHES 3, 6) are slow-burn DoS vectors: each occurrence pins a file/inode/dentry or inflates a refcount permanently, eventually blocking namespace teardown or preventing LRU eviction.</li>
+</ul>
+<h2>Final conclusions and open items</h2>
+<p>As of the end of this week's window:</p>
+<ol>
+<li><strong>The series has been posted but not yet merged.</strong> No merge confirmation from Chuck Lever appears in this thread within the window.</li>
+<li><strong>PATCH 8/8 will receive a v2</strong> incorporating Al Viro's scalability feedback — limiting <code>get_net()</code>/<code>put_net()</code> to GC'ed files only, per Layton's stated plan.</li>
+<li><strong>The broader filecache disposal simplification</strong> (inlining the dispose state into <code>nfsd_net</code>) is a net reduction in complexity (-69 lines) that eliminates an entire class of lifetime bugs.</li>
+<li>The series continues the pattern established over the prior week: systematic, AI-assisted vulnerability classification followed by targeted fixes, with human reviewers providing architectural direction and performance guidance.</li>
+</ol>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601-nfsd-testing-v1-0-d0f61e536df8@kernel.org/">2026-06-01 Jeff Layton — [PATCH 0/8] nfsd: fixes for locally-triggerable bugs</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601-nfsd-testing-v1-1-d0f61e536df8@kernel.org/">2026-06-01 Jeff Layton — [PATCH 1/8] nfsd: defer vfree of compound ops to fix rpc_status UAF</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601-nfsd-testing-v1-2-d0f61e536df8@kernel.org/">2026-06-01 Jeff Layton — [PATCH 2/8] nfsd: hold rcu across localio cmpxchg retry</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601-nfsd-testing-v1-3-d0f61e536df8@kernel.org/">2026-06-01 Jeff Layton — [PATCH 3/8] nfs/localio: fix ref leak on nfs_uuid_add_file failure</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601-nfsd-testing-v1-4-d0f61e536df8@kernel.org/">2026-06-01 Jeff Layton — [PATCH 4/8] nfsd: guard nfsd_serv deref in nfsd_file_net_dispose</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601-nfsd-testing-v1-5-d0f61e536df8@kernel.org/">2026-06-01 Jeff Layton — [PATCH 5/8] nfsd: widen nfsd_genl_rqstp address fields to sockaddr_storage</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601-nfsd-testing-v1-6-d0f61e536df8@kernel.org/">2026-06-01 Jeff Layton — [PATCH 6/8] nfsd: fix refcount leak in nfsd_file_lru_add on insertion failure</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601-nfsd-testing-v1-7-d0f61e536df8@kernel.org/">2026-06-01 Jeff Layton — [PATCH 7/8] nfsd: fix fcache_disposal UAF by inlining dispose state into nfsd_net</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601-nfsd-testing-v1-8-d0f61e536df8@kernel.org/">2026-06-01 Jeff Layton — [PATCH 8/8] nfsd: hold net namespace reference in nfsd_file</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601175034.GI2636677@ZenIV/">2026-06-01 Al Viro — Re: [PATCH 8/8] (scalability concern re: shared cacheline)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/6794fda04cf84a908b4715ad0456764e4ad18a3e.camel@kernel.org/">2026-06-01 Jeff Layton — Re: [PATCH 8/8] (acknowledged, exploring alternatives)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/51c047425b6e19f6bfe3067a2fe59676eb00380b.camel@kernel.org/">2026-06-01 Jeff Layton — Re: [PATCH 8/8] (v2 plan: limit to GC'ed files)</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601-nfsd-testing-v1-0-d0f61e536df8@kernel.org/">2026-06-01 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 0/8] nfsd: fixes for locally-triggerable bugs</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601-nfsd-testing-v1-1-d0f61e536df8@kernel.org/">2026-06-01 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 1/8] nfsd: defer vfree of compound ops to fix rpc_status UAF</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601-nfsd-testing-v1-2-d0f61e536df8@kernel.org/">2026-06-01 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 2/8] nfsd: hold rcu across localio cmpxchg retry</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601-nfsd-testing-v1-3-d0f61e536df8@kernel.org/">2026-06-01 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 3/8] nfs/localio: fix ref leak on nfs_uuid_add_file failure</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601-nfsd-testing-v1-4-d0f61e536df8@kernel.org/">2026-06-01 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 4/8] nfsd: guard nfsd_serv deref in nfsd_file_net_dispose</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601-nfsd-testing-v1-5-d0f61e536df8@kernel.org/">2026-06-01 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 5/8] nfsd: widen nfsd_genl_rqstp address fields to sockaddr_storage</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601-nfsd-testing-v1-6-d0f61e536df8@kernel.org/">2026-06-01 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 6/8] nfsd: fix refcount leak in nfsd_file_lru_add on insertion failure</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601-nfsd-testing-v1-7-d0f61e536df8@kernel.org/">2026-06-01 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 7/8] nfsd: fix fcache_disposal UAF by inlining dispose state into nfsd_net</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601-nfsd-testing-v1-8-d0f61e536df8@kernel.org/">2026-06-01 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 8/8] nfsd: hold net namespace reference in nfsd_file</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601175034.GI2636677@ZenIV/">2026-06-01 Al Viro <a href="mailto:viro@zeniv.linux.org.uk">viro@zeniv.linux.org.uk</a> — Re: [PATCH 8/8] nfsd: hold net namespace reference in nfsd_file</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/6794fda04cf84a908b4715ad0456764e4ad18a3e.camel@kernel.org/">2026-06-01 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 8/8] nfsd: hold net namespace reference in nfsd_file</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/51c047425b6e19f6bfe3067a2fe59676eb00380b.camel@kernel.org/">2026-06-01 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 8/8] nfsd: hold net namespace reference in nfsd_file</a></li>
+</ul>
+  </main>
+</body>
+</html>

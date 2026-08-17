@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>svcrdma Contiguous Pages Patch Causes Major WRITE Regression on Fast RDMA</title>
+  <meta name="description" content="Classification: Bug fix / performance regression (server-side svcrdma over NFS-over-RDMA).">
+  <meta property="og:title" content="svcrdma Contiguous Pages Patch Causes Major WRITE Regression on Fast RDMA">
+  <meta property="og:description" content="Classification: Bug fix / performance regression (server-side svcrdma over NFS-over-RDMA).">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-04T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="svcrdma Contiguous Pages Patch Causes Major WRITE Regression on Fast RDMA">
+  <meta name="twitter:description" content="Classification: Bug fix / performance regression (server-side svcrdma over NFS-over-RDMA).">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-04</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>svcrdma Contiguous Pages Patch Causes Major WRITE Regression on Fast RDMA</h1>
+<h2>Summary</h2>
+<h1>svcrdma: Contiguous Pages for RDMA Read Sink Buffers — Severe WRITE Regression Reported</h1>
+<p><strong>Classification:</strong> Bug fix / performance regression (server-side <code>svcrdma</code> over NFS-over-RDMA).</p>
+<h2>This Week's Activity</h2>
+<p>The thread, dormant since Chuck Lever's <a href="https://lore.kernel.org/linux-nfs/20260319133610.2556826-1-cel@kernel.org/">v4 submission in March</a>, was re-opened on June 4 by Mike Snitzer with a serious performance regression report against the now-merged commit.</p>
+<h3>The Regression</h3>
+<p>Snitzer reports that the patch, which landed during the <strong>7.1 merge window as commit <code>18755b8c2f241</code></strong> ("svcrdma: Use contiguous pages for RDMA Read sink buffers"), causes a dramatic performance drop on very fast RDMA networking on x86_64:</p>
+<blockquote>
+<p>"This patch, which landed during the 7.1 merge window as commit 18755b8c2f241 ("svcrdma: Use contiguous pages for RDMA Read sink buffers"), severely hurts RDMA performance when testing on very fast RDMA networking on x86_64."</p>
+</blockquote>
+<p>The numbers are stark:</p>
+<blockquote>
+<p>"With this commit WRITE performance is 'only' 24.2GB/s. Without this commit WRITE performance is 60.6GB/s."</p>
+</blockquote>
+<p>That is a <strong>~60% throughput loss</strong> — roughly 36 GB/s of lost bandwidth on what appears to be a high-end RDMA fabric.</p>
+<h3>Root Cause Hypothesis: Spinlock Contention</h3>
+<p>Snitzer points to the profiling data as the key diagnostic clue:</p>
+<blockquote>
+<p>"The cpu burn due to spinlock dominates the flamegraph that was collected."</p>
+</blockquote>
+<p>This suggests the contiguous-page allocation path introduces significant lock contention — likely around the higher-order page allocator or a shared data structure in <code>svcrdma</code>'s sink buffer construction — that becomes a bottleneck at high IOPS on fast fabrics. The original patch was designed to <em>reduce</em> per-page DMA mapping overhead (16 bvecs → 1 bvec for a 64 KB READ), but the spinlock cost apparently outweighs that benefit under sustained heavy WRITE load.</p>
+<h3>Current Status and Next Steps</h3>
+<p>Snitzer indicates an immediate workaround has been identified:</p>
+<blockquote>
+<p>"We may have a window <em>now</em> on the current Hammerspace testbed to try an incremental fix, but as of now simply reverting commit 18755b8c2f241 is as far as we got."</p>
+</blockquote>
+<p>The testing was performed by <strong>Jon Flynn</strong> at Hammerspace, and Snitzer offered to share the flamegraph off-list with Chuck Lever and any interested parties. The message is addressed directly to Lever, who authored the original patch series.</p>
+<h2>Context from Prior Weeks (Brief)</h2>
+<p>The original v4 patch <a href="https://lore.kernel.org/linux-nfs/20260319133610.2556826-1-cel@kernel.org/">posted March 19</a> was a performance optimization for NFS server-side RDMA READ operations. It replaced per-page scatter-gather construction with a single higher-order contiguous page allocation, reducing DMA mappings and Work Requests from 16 to 1 for a typical 64 KB payload. The patch went through three prior review iterations (v2 on March 12, v3 on March 13) with feedback from Christoph Hellwig, who raised concerns about the size limit scaling with page size and suggested <code>min()</code> for clamping. Two companion MR pool exhaustion fixes were accepted into the RDMA subsystem tree by Leon Romanovsky. The contiguous-page optimization itself was queued for the NFS server tree (<code>nfsd-testing</code>) and subsequently merged in 7.1.</p>
+<h2>Significance</h2>
+<p>This is a textbook case of a well-intentioned micro-optimization (reducing per-page DMA mapping overhead) that backfires at scale on modern high-bandwidth RDMA fabrics. The spinlock contention in the allocation path — invisible on slower hardware or lower IOPS workloads — becomes dominant when the fabric can sustain 60+ GB/s. The regression affects <strong>WRITE</strong> performance specifically, which is notable since the patch was designed for the READ sink buffer path; this suggests the contiguous allocation mechanism may be shared or that WRITE operations also traverse the affected code path in <code>svcrdma</code>.</p>
+<p>The thread now awaits Chuck Lever's response with either an incremental fix (e.g., reducing lock scope, using per-CPU buffers, or a different allocation strategy) or confirmation of a revert for the next stable/RC cycle.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/aiHlPmeZq3WgMwoJ@kernel.org/">2026-06-04 Mike Snitzer <a href="mailto:snitzer@kernel.org">snitzer@kernel.org</a> — Re: [PATCH v4] svcrdma: Use contiguous pages for RDMA Read sink buffers</a></li>
+</ul>
+  </main>
+</body>
+</html>

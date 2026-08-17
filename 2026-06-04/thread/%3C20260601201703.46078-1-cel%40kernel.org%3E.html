@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>rpcrdma: arm rn_done before publishing the notification</title>
+  <meta name="description" content="This week&#39;s activity in this thread is a single, tightly-scoped bug fix to the NFS/RDMA client (net/sunrpc/xprtrdma/ib_client.c) posted by Chuck Lever on 2026-06-01. No replies or follow-ups landed within the reporting window (2026-05-29 →…">
+  <meta property="og:title" content="rpcrdma: arm rn_done before publishing the notification">
+  <meta property="og:description" content="This week&#39;s activity in this thread is a single, tightly-scoped bug fix to the NFS/RDMA client (net/sunrpc/xprtrdma/ib_client.c) posted by Chuck Lever on 2026-06-01. No replies or follow-ups landed within the reporting window (2026-05-29 →…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-04T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="rpcrdma: arm rn_done before publishing the notification">
+  <meta name="twitter:description" content="This week&#39;s activity in this thread is a single, tightly-scoped bug fix to the NFS/RDMA client (net/sunrpc/xprtrdma/ib_client.c) posted by Chuck Lever on 2026-06-01. No replies or follow-ups landed within the reporting window (2026-05-29 →…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-04</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>rpcrdma: arm rn_done before publishing the notification</h1>
+<h2>Summary</h2>
+<h1>rpcrdma: arm rn_done before publishing the notification</h1>
+<p>This week's activity in this thread is a single, tightly-scoped <strong>bug fix</strong> to the NFS/RDMA client (<code>net/sunrpc/xprtrdma/ib_client.c</code>) posted by Chuck Lever on 2026-06-01. No replies or follow-ups landed within the reporting window (2026-05-29 → 2026-06-05), so the discussion has not yet evolved beyond the initial patch; it sits in the queue awaiting review.</p>
+<h2>The bug</h2>
+<p>The patch targets a race in <code>rpcrdma_rn_register()</code>, which is part of the generic device-removal machinery introduced earlier by commit 7e86845a0346 ("rpcrdma: Implement generic device removal"). Lever walks through the failure mode in the cover message:</p>
+<blockquote>
+<p>"rpcrdma_rn_register() inserts @rn into rd_xa with xa_alloc() before storing the caller's callback in rn-&gt;rn_done. The xarray makes @rn reachable to rpcrdma_remove_one(), which walks rd_xa and invokes rn-&gt;rn_done(rn) for every registered notification."</p>
+</blockquote>
+<p>The consequence, as he puts it:</p>
+<blockquote>
+<p>"A device removal that races a fresh registration can therefore observe @rn with rn_done still NULL, because the notification objects are zero allocated by their owners, and call through a NULL function pointer."</p>
+</blockquote>
+<p>In other words, a hot-unplug of the RDMA device arriving just as a new transport is registering its completion notification could crash the client by dereferencing a NULL callback. This is squarely an NFS <strong>client</strong> bug fix — it affects <code>rpcrdma</code> (the RDMA transport used by the SunRPC/NFS client), not the server or the wire protocol.</p>
+<h2>The fix and its subtlety</h2>
+<p>The core change reorders the operations so the callback is armed <em>before</em> the object becomes visible in the xarray:</p>
+<blockquote>
+<p>"Store rn-&gt;rn_done before xa_alloc() publishes @rn. The xarray's store-side and load-side ordering then guarantees that any CPU which finds @rn in rd_xa also observes the armed callback."</p>
+</blockquote>
+<p>Lever is careful not to make the naive reorder, because <code>rn_done</code> doubles as a state sentinel:</p>
+<blockquote>
+<p>"rpcrdma_rn_unregister() treats a non-NULL rn_done as the sentinel for a completed registration, so the early store must not survive a failed registration. Clear rn_done again when xa_alloc() fails."</p>
+</blockquote>
+<p>He spells out the secondary hazard of getting that wrong:</p>
+<blockquote>
+<p>"Were it left set, the failed-accept cleanup path would call rpcrdma_rn_unregister() on an @rn that was never inserted, erasing an unrelated rd_xa slot and underflowing rd_kref."</p>
+</blockquote>
+<p>So the patch (19 insertions / 7 deletions in <code>ib_client.c</code>) both fixes the NULL-pointer race and preserves the unregister invariant by clearing <code>rn_done</code> on the <code>xa_alloc()</code> failure path. The commit carries a proper <code>Fixes:</code> tag pointing at 7e86845a0346.</p>
+<h2>Status / conclusions</h2>
+<ul>
+<li><strong>Type:</strong> Bug fix (race / NULL function-pointer dereference), not a new feature or protocol change.</li>
+<li><strong>Subsystem:</strong> NFS/RDMA client transport (<code>rpcrdma</code>), device-removal path.</li>
+<li><strong>Discussion state:</strong> Single patch, no in-window replies, no prior-week history for this thread root found in the archive. The technical argument is entirely self-contained in Lever's cover letter; the conclusion — arm <code>rn_done</code> before <code>xa_alloc()</code> and clear it on failure — is presented as complete and ready for review.</li>
+<li><strong>Key message:</strong> <a href="https://lore.kernel.org/linux-nfs/20260601201703.46078-1-cel@kernel.org/">the rpcrdma patch by Chuck Lever</a>.</li>
+</ul>
+<p>Watch for a reviewer ack or a <code>Reviewed-by:</code>/<code>Acked-by:</code> in the coming days; nothing further was posted this week.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260601201703.46078-1-cel@kernel.org/">2026-06-01 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH] rpcrdma: arm rn_done before publishing the notification</a></li>
+</ul>
+  </main>
+</body>
+</html>

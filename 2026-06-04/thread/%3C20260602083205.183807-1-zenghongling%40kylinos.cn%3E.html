@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>sunrpc: fix uninitialized xprt_create_args structure (v1→v2)</title>
+  <meta name="description" content="Type: Bug fix (NFS client / sunrpc transport layer), with a Cc: stable tag.">
+  <meta property="og:title" content="sunrpc: fix uninitialized xprt_create_args structure (v1→v2)">
+  <meta property="og:description" content="Type: Bug fix (NFS client / sunrpc transport layer), with a Cc: stable tag.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-04T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="sunrpc: fix uninitialized xprt_create_args structure (v1→v2)">
+  <meta name="twitter:description" content="Type: Bug fix (NFS client / sunrpc transport layer), with a Cc: stable tag.">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-04</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>sunrpc: fix uninitialized xprt_create_args structure (v1→v2)</h1>
+<h2>Summary</h2>
+<h1>sunrpc: Fix Uninitialized <code>xprt_create_args</code> Structure</h1>
+<p><strong>Type:</strong> Bug fix (NFS client / sunrpc transport layer), with a <code>Cc: stable</code> tag.</p>
+<h2>The Problem</h2>
+<p>This week, Hongling Zeng of KylinOS submitted a patch addressing an uninitialized-stack-variable bug in the sunrpc sysfs code path used to add new RPC transports at runtime. As <a href="https://lore.kernel.org/linux-nfs/20260602083205.183807-1-zenghongling@kylinos.cn/">Zeng explained</a>:</p>
+<blockquote>
+<p>"The xprt_create_args structure is allocated on the stack without initialization in <code>rpc_sysfs_xprt_switch_add_xprt_store()</code>. While some fields are manually populated, critical fields like srcaddr, bc_xps, and flags contain uninitialized stack garbage."</p>
+</blockquote>
+<p>Zeng laid out three concrete consequences of leaving those fields as stack garbage:</p>
+<blockquote>
+<p>"This can lead to:</p>
+<ol>
+<li>Kernel panic when xs_setup_xprt() dereferences garbage srcaddr</li>
+<li>Information leak if srcaddr points to sensitive stack data</li>
+<li>Unpredictable behavior if flags has random bits set"</li>
+</ol>
+</blockquote>
+<p>The original fix was a one-line change in <code>net/sunrpc/sysfs.c</code> that zero-initialized the structure after allocation, and it was marked for stable backporting.</p>
+<h2>The Review</h2>
+<p>The patch drew quick attention from both of the sunrpc maintainers on the same day.</p>
+<p><strong>Jeff Layton</strong> <a href="https://lore.kernel.org/linux-nfs/c08c6d6588111d6f60f8ec1a25756e5a8b375eea.camel@kernel.org/">endorsed the fix</a> but suggested a stylistic improvement:</p>
+<blockquote>
+<p>"Good catch. You could also just use an initializer here at declaration. A'la:
+<code>struct xprt_create xprt_create_args = {};</code>
+...but this works too, of course."</p>
+</blockquote>
+<p>He then added a formal <code>Reviewed-by</code>.</p>
+<p><strong>Anna Schumaker</strong> took a deeper look and raised a substantive design question <a href="https://lore.kernel.org/linux-nfs/c3dc789b-c8c0-43e6-ae8d-615c932f4fa1@app.fastmail.com/">in her reply</a>:</p>
+<blockquote>
+<p>"I took a look through the transport setup function to see what they do when these fields are set to NULL, and it looks like thy do their best to choose a default value which might be different than the values set to the original transport that we are trying to clone.
+Can we instead set the missing fields in the xprt_create_args based on how the main xprt is configured?"</p>
+</blockquote>
+<p>In other words, Anna was concerned that zero-initializing would silently fall back to <em>defaults</em> rather than faithfully cloning the source transport's configuration — a behavioral difference for users who add a transport via sysfs.</p>
+<h2>The Resolution</h2>
+<p>Zeng <a href="https://lore.kernel.org/linux-nfs/6A1F846C.6000405@126.com/">responded</a> with a field-by-field analysis explaining why Anna's preferred approach isn't possible under the current design:</p>
+<blockquote>
+<p>"Based on my analysis, these missing fields are not stored in struct rpc_xprt:</p>
+<ul>
+<li>srcaddr: only passed during creation, not stored in xprt</li>
+<li>bc_xps: not present in rpc_xprt (only bc_xprt is stored)</li>
+<li>flags: not stored in xprt after creation
+Since these values are not available in the main xprt, we cannot copy them. Zero-initializing is the correct approach with the current design."</li>
+</ul>
+</blockquote>
+<p>He then confirmed he had folded in Jeff's stylistic suggestion:</p>
+<blockquote>
+<p>"Updated to v2 with designated initializer as suggested by Jeff."</p>
+</blockquote>
+<h2>Outcome</h2>
+<p>The thread concluded within two days. The consensus was that zero-initialization (now written as a C99-style designated/empty initializer at declaration) is the correct fix given that the relevant fields are transient creation-time arguments and are not persisted on <code>struct rpc_xprt</code>. Anna's concern about cloning fidelity was acknowledged but determined to be unaddressable without a larger design change to store these values on the transport. The patch carries Jeff Layton's Reviewed-by and a stable Cc, positioning it for backporting to stable kernels.</p>
+<h2>Significance for NFS Client Development</h2>
+<p>This is a small but important hardening fix in the <strong>NFS client's sunrpc transport management path</strong> — specifically the sysfs interface that lets administrators hot-add RPC transports (e.g., new TCP/UDP endpoints) without remounting. The bug was latent: it only manifested when exercising the <code>xprt_switch_add_xprt_store</code> sysfs write, but its failure modes (kernel oops on a bad pointer dereference, or stack-data information leak through a crafted <code>srcaddr</code>) are serious enough to warrant stable backporting. It's a textbook example of defensive initialization in kernel code and underscores the value of maintainers like Anna pushing for the <em>right</em> fix rather than just <em>a</em> fix.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260602083205.183807-1-zenghongling@kylinos.cn/">2026-06-02 Hongling Zeng <a href="mailto:zenghongling@kylinos.cn">zenghongling@kylinos.cn</a> — [PATCH] sunrpc: fix uninitialized xprt_create_args structure</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/c08c6d6588111d6f60f8ec1a25756e5a8b375eea.camel@kernel.org/">2026-06-02 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH] sunrpc: fix uninitialized xprt_create_args structure</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/c3dc789b-c8c0-43e6-ae8d-615c932f4fa1@app.fastmail.com/">2026-06-02 "Anna Schumaker" <a href="mailto:anna@kernel.org">anna@kernel.org</a> — Re: [PATCH] sunrpc: fix uninitialized xprt_create_args structure</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/6A1F846C.6000405@126.com/">2026-06-03 Hongling Zeng <a href="mailto:zhongling0719@126.com">zhongling0719@126.com</a> — Re: [PATCH] sunrpc: fix uninitialized xprt_create_args structure</a></li>
+</ul>
+  </main>
+</body>
+</html>
