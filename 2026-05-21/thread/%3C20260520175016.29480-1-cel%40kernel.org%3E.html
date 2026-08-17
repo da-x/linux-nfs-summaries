@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>xprtrdma: Decouple RPC completion from Send completion — bug fix lands with build errors, v2 expected</title>
+  <meta name="description" content="This week&#39;s thread centers on a bug fix (with significant performance implications) for the xprtrdma transport in the Linux NFS client. Chuck Lever posted a patch on May 20 that restructures how request lifetimes are managed in the…">
+  <meta property="og:title" content="xprtrdma: Decouple RPC completion from Send completion — bug fix lands with build errors, v2 expected">
+  <meta property="og:description" content="This week&#39;s thread centers on a bug fix (with significant performance implications) for the xprtrdma transport in the Linux NFS client. Chuck Lever posted a patch on May 20 that restructures how request lifetimes are managed in the…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-21T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="xprtrdma: Decouple RPC completion from Send completion — bug fix lands with build errors, v2 expected">
+  <meta name="twitter:description" content="This week&#39;s thread centers on a bug fix (with significant performance implications) for the xprtrdma transport in the Linux NFS client. Chuck Lever posted a patch on May 20 that restructures how request lifetimes are managed in the…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-21</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>xprtrdma: Decouple RPC completion from Send completion — bug fix lands with build errors, v2 expected</h1>
+<h2>Summary</h2>
+<h1>xprtrdma: Decoupling RPC Completion from Send Completion</h1>
+<h2>Overview</h2>
+<p>This week's thread centers on a <strong>bug fix</strong> (with significant performance implications) for the <code>xprtrdma</code> transport in the Linux NFS client. Chuck Lever posted a patch on May 20 that restructures how request lifetimes are managed in the RDMA-based RPC transport, and by end of day May 21 the kernel test robot had flagged build errors, prompting Chuck to announce a v2 is forthcoming.</p>
+<h2>The Bug</h2>
+<p>The core issue is a use-after-free / data-corruption hazard in <code>xprtrdma</code>. As Lever described in the <a href="https://lore.kernel.org/linux-nfs/20260520175016.29480-1-cel@kernel.org/">patch cover letter</a>:</p>
+<blockquote>
+<p>"rl_kref currently coordinates RPC completion with both the Send carrying an RPC Call and the Receive carrying its reply. The kref_get in the marshal path is conditional on sc_unmap_count, so a Send carrying only pre-registered buffers takes no Send-side reference. When the Reply then arrives before the Send completes, rpcrdma_reply_handler() drops the kref from 1 to 0, freeing the req for reuse while the HCA may still be DMA-reading from its send buffer. A retransmission can put different data on the wire."</p>
+</blockquote>
+<p>In other words: if a reply arrives before the RDMA Send completion fires (a race that is entirely possible with unsignaled Sends), the request structure could be recycled and overwritten while the hardware was still reading from it. This is a classic DMA lifetime bug with real-world consequences — silently corrupted RPC data on the wire.</p>
+<p>The patch carries a <code>Fixes:</code> tag pointing to commit <code>0ab115237025</code> ("xprtrdma: Wake RPCs directly in rpcrdma_wc_send path"), indicating this regression was introduced when the wake-up logic was moved into the Send completion path.</p>
+<h2>The Fix — Architectural Rework</h2>
+<p>The fix is not a one-liner; it's a rethinking of the reference-counting model:</p>
+<ol>
+<li>
+<p><strong>Decouple the two lifetimes.</strong> The Receive path now completes the RPC immediately without touching <code>rl_kref</code>. The refcount gates <em>request recycling</em> (return to <code>rb_send_bufs</code>), not RPC completion.</p>
+</li>
+<li>
+<p><strong>Two explicit owners.</strong> An <code>rpc_rqst</code> holds one reference; <code>rpcrdma_prepare_send_sges()</code> takes a second for the prepared Send. Both must release before the req is recycled.</p>
+</li>
+<li>
+<p><strong>Preserve unsignaled batching.</strong> Lever explicitly rejected the naïve fix:</p>
+<blockquote>
+<p>"Forcing a kref_get on every Send is not viable: xprtrdma leaves most Sends unsignaled, relying on the strong ordering of Send completions to limit interrupt rate."</p>
+</blockquote>
+<p>Unconditionally gating RPC completion on Send completion would deadlock NFS callers waiting on an RPC whose Send completion never fires.</p>
+</li>
+<li>
+<p><strong>Teardown drain.</strong> Because Send-side references can now outlive RPC completion, <code>rpcrdma_sendctxs_destroy()</code> walks the active ring range and calls <code>rpcrdma_sendctx_unmap()</code> on each entry to release held krefs before freeing the ring.</p>
+</li>
+<li>
+<p><strong>Buffer headroom.</strong> To avoid regressing effective concurrency: "Allocate one-eighth more reqs than max_reqs so the transport does not regress the effective concurrency advertised by the SUNRPC slot table."</p>
+</li>
+<li>
+<p><strong>Performance win.</strong> The patch removes a cache-cold atomic <code>kref_put</code> from the hot reply path and eliminates the now-obsolete <code>reply_waits_for_send</code> counter. Lever notes this "brings xprtrdma into alignment with the two other in-kernel RDMA ULPs that batch Sends into groups where only one is signaled."</p>
+</li>
+</ol>
+<p>The patch touches six files under <code>net/sunrpc/xprtrdma/</code> with 93 insertions and 36 deletions.</p>
+<h2>Build Failures and v2</h2>
+<p>Within hours of posting, the <a href="https://lore.kernel.org/linux-nfs/202605211828.lbkVyryr-lkp@intel.com/">kernel test robot reported build errors</a> on <code>nios2-randconfig</code> (GCC 8.5.0) and a <a href="https://lore.kernel.org/linux-nfs/202605211923.fDxJ0j7x-lkp@intel.com/">second report on riscv with clang 23</a>. Both flagged the same issue: in <code>rpcrdma_req_release()</code>, the code references <code>xprt-&gt;bc_pa_lock</code>, <code>rqst-&gt;rq_bc_pa_list</code>, and <code>xprt-&gt;bc_pa_list</code> — members that do not exist in <code>struct rpc_xprt</code> / <code>struct rpc_rqst</code> on the tested trees. This appears to be a stale reference to backchannel preallocation infrastructure that has since been removed or renamed upstream.</p>
+<p>Chuck acknowledged the situation succinctly in his <a href="https://lore.kernel.org/linux-nfs/0fc28e0d-423c-47c3-a7b0-d5c668e9796f@app.fastmail.com/">reply</a>:</p>
+<blockquote>
+<p>"Bots and LLM review have found issues with this patch, so expect a v2."</p>
+</blockquote>
+<h2>Significance for NFS Client Development</h2>
+<p>This is an important fix for NFS-over-RDMA deployments. The bug could silently corrupt RPC data in production environments using RDMA transports (common in high-performance storage clusters). The architectural change also improves the hot path by removing an atomic operation from every reply, and aligns <code>xprtrdma</code> with the design patterns used by other in-kernel RDMA ULPs. The v2 is expected to address the build errors around the removed backchannel preallocation fields while preserving the core decoupling logic.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260520175016.29480-1-cel@kernel.org/">2026-05-20 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH] xprtrdma: Decouple RPC completion from Send completion</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/202605211828.lbkVyryr-lkp@intel.com/">2026-05-21 kernel test robot <a href="mailto:lkp@intel.com">lkp@intel.com</a> — Re: [PATCH] xprtrdma: Decouple RPC completion from Send completion</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/202605211923.fDxJ0j7x-lkp@intel.com/">2026-05-21 kernel test robot <a href="mailto:lkp@intel.com">lkp@intel.com</a> — Re: [PATCH] xprtrdma: Decouple RPC completion from Send completion</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/0fc28e0d-423c-47c3-a7b0-d5c668e9796f@app.fastmail.com/">2026-05-21 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH] xprtrdma: Decouple RPC completion from Send completion</a></li>
+</ul>
+  </main>
+</body>
+</html>

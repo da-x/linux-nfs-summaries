@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>rpcbind: Three memory leak fixes identified by valgrind</title>
+  <meta name="description" content="On May 21, Red Hat&#39;s Scott Mayhew posted a compact three-patch series to the linux-nfs list addressing memory leaks in the rpcbind daemon — the user-space service that maps RPC program numbers to network addresses and is a critical…">
+  <meta property="og:title" content="rpcbind: Three memory leak fixes identified by valgrind">
+  <meta property="og:description" content="On May 21, Red Hat&#39;s Scott Mayhew posted a compact three-patch series to the linux-nfs list addressing memory leaks in the rpcbind daemon — the user-space service that maps RPC program numbers to network addresses and is a critical…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-21T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="rpcbind: Three memory leak fixes identified by valgrind">
+  <meta name="twitter:description" content="On May 21, Red Hat&#39;s Scott Mayhew posted a compact three-patch series to the linux-nfs list addressing memory leaks in the rpcbind daemon — the user-space service that maps RPC program numbers to network addresses and is a critical…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-21</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>rpcbind: Three memory leak fixes identified by valgrind</h1>
+<h2>Summary</h2>
+<h1>rpcbind: Three Memory Leak Fixes Identified by Valgrind</h1>
+<h2>Overview</h2>
+<p>On May 21, Red Hat's Scott Mayhew posted a compact three-patch series to the linux-nfs list addressing memory leaks in the <strong>rpcbind</strong> daemon — the user-space service that maps RPC program numbers to network addresses and is a critical dependency for NFS clients and servers. The patches are straightforward bug fixes (not new features or protocol changes), each accompanied by valgrind output demonstrating the leak.</p>
+<blockquote>
+<p>"Fix a handful of leaks reported by valgrind."
+— <a href="https://lore.kernel.org/linux-nfs/20260521234720.818996-1-smayhew@redhat.com/">Scott Mayhew, cover letter</a></p>
+</blockquote>
+<p>The series touches three files (<code>src/rpcbind.c</code>, <code>src/util.c</code>, <code>src/warmstart.c</code>) with a combined addition of just 10 lines — a testament to how surgical these fixes are.</p>
+<h2>Patch-by-Patch Breakdown</h2>
+<h3>Patch 1/3: Memory leak in <code>init_transport()</code></h3>
+<blockquote>
+<p>"Once a service registration has been added to list_rbl via rbllist_add(), we no longer need the value stored in taddr.addr.buf. Free it before we leave init_transport()."
+— <a href="https://lore.kernel.org/linux-nfs/20260521234720.818996-2-smayhew@redhat.com/">Scott Mayhew</a></p>
+</blockquote>
+<p>The valgrind trace shows a 19-byte definite loss in <code>init_transport.isra.0</code> at <code>rpcbind.c:726</code>. The fix adds a <code>free()</code> call for the transport address buffer after it has been consumed by the registration list, preventing a small but persistent leak each time a service is registered.</p>
+<h3>Patch 2/3: Memory leaks in <code>network_init()</code></h3>
+<p>This patch addresses <strong>two</strong> distinct leaks in the network initialization path:</p>
+<ol>
+<li>
+<p><strong><code>getaddrinfo()</code> result not freed before reuse:</strong></p>
+<blockquote>
+<p>"Before reusing res in another getaddrinfo() call, we need to free the previous value stored there."
+— <a href="https://lore.kernel.org/linux-nfs/20260521234720.818996-3-smayhew@redhat.com/">Scott Mayhew</a></p>
+</blockquote>
+<p>Valgrind reported 128 bytes (64 direct, 64 indirect) definitely lost in <code>generate_addrinfo</code> → <code>gaih_inet</code> → <code>getaddrinfo</code>, called from <code>network_init</code> at <code>util.c:316</code>.</p>
+</li>
+<li>
+<p><strong><code>getifaddrs()</code> not paired with <code>freeifaddrs()</code>:</strong></p>
+<blockquote>
+<p>"getifaddrs() needs to be paired with freeifaddrs()."
+— <a href="https://lore.kernel.org/linux-nfs/20260521234720.818996-3-smayhew@redhat.com/">Scott Mayhew</a></p>
+</blockquote>
+<p>This one leaked 1,296 bytes via <code>calloc</code> in <code>getifaddrs_internal</code>, called from <code>network_init</code> at <code>util.c:347</code>.</p>
+</li>
+</ol>
+<p>Both are classic resource-management oversights that accumulate over the daemon's lifetime, particularly relevant for long-running rpcbind instances on NFS servers.</p>
+<h3>Patch 3/3: Memory leak in <code>read_warmstart()</code></h3>
+<blockquote>
+<p>"struct rpcblist contains a struct rpcb, which has pointers to 3 strings. We need to free those before freeing the struct rpcblist or we leak memory."
+— <a href="https://lore.kernel.org/linux-nfs/20260521234720.818996-4-smayhew@redhat.com/">Scott Mayhew</a></p>
+</blockquote>
+<p>The valgrind trace shows 56 bytes in 12 blocks lost through the XDR decoding path (<code>xdr_string</code> → <code>xdr_rpcb</code> → <code>xdr_reference</code> → <code>xdr_rpcblist_ptr</code>), called from <code>read_struct</code> at <code>warmstart.c:122</code>. This leak occurs when rpcbind reads its warmstart file at startup to restore previously registered services.</p>
+<h2>Discussion and Outcome</h2>
+<p>Within the current week's window, no replies or review comments were posted — the thread consisted solely of Mayhew's four messages (cover letter + three patches). However, looking just beyond the window, NFS maintainer Steve Dickson confirmed on May 27 that the series was accepted:</p>
+<blockquote>
+<p>"Committed...(tag: rpcbind-1_2_9-rc1)"
+— <a href="https://lore.kernel.org/linux-nfs/b810304f-0e42-4ca3-8746-7d8323e35e70@redhat.com/">Steve Dickson</a></p>
+</blockquote>
+<p>The patches landed in the <strong>rpcbind 1.2.9-rc1</strong> release cycle, indicating they were considered low-risk and appropriate for a stable release candidate.</p>
+<h2>Significance for NFS Ecosystem</h2>
+<p>While rpcbind is user-space rather than kernel code, it sits squarely on the critical path for every NFS mount operation. Memory leaks in a long-running daemon like rpcbind can degrade system performance over time, especially on heavily utilized NFS servers where services are frequently registered and unregistered. These fixes, though small, improve the robustness of the entire NFS stack by ensuring that the portmapper does not silently consume memory across its lifetime.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260521234720.818996-3-smayhew@redhat.com/">2026-05-21 Scott Mayhew <a href="mailto:smayhew@redhat.com">smayhew@redhat.com</a> — [PATCH 2/3] rpcbind: fix memory leaks in network_init()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260521234720.818996-1-smayhew@redhat.com/">2026-05-21 Scott Mayhew <a href="mailto:smayhew@redhat.com">smayhew@redhat.com</a> — [PATCH 0/3] rpcbind: fix a few memory leaks</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260521234720.818996-2-smayhew@redhat.com/">2026-05-21 Scott Mayhew <a href="mailto:smayhew@redhat.com">smayhew@redhat.com</a> — [PATCH 1/3] rpcbind: fix memory leak in init_transport()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260521234720.818996-4-smayhew@redhat.com/">2026-05-21 Scott Mayhew <a href="mailto:smayhew@redhat.com">smayhew@redhat.com</a> — [PATCH 3/3] rpcbind: fix memory leak in read_warmstart()</a></li>
+</ul>
+  </main>
+</body>
+</html>

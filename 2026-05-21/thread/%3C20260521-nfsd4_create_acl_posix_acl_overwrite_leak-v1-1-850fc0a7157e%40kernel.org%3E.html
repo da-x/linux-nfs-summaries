@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd: Fix dead ACL conflict guard leaking posix_acl slabs in nfsd4_create</title>
+  <meta name="description" content="This week&#39;s thread is short but consequential — a one-line bug fix on the NFS server (nfsd) side that plugs an unbounded slab leak triggered by a specific client encoding pattern. It landed quickly, with Chuck Lever applying it to…">
+  <meta property="og:title" content="nfsd: Fix dead ACL conflict guard leaking posix_acl slabs in nfsd4_create">
+  <meta property="og:description" content="This week&#39;s thread is short but consequential — a one-line bug fix on the NFS server (nfsd) side that plugs an unbounded slab leak triggered by a specific client encoding pattern. It landed quickly, with Chuck Lever applying it to…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-21T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd: Fix dead ACL conflict guard leaking posix_acl slabs in nfsd4_create">
+  <meta name="twitter:description" content="This week&#39;s thread is short but consequential — a one-line bug fix on the NFS server (nfsd) side that plugs an unbounded slab leak triggered by a specific client encoding pattern. It landed quickly, with Chuck Lever applying it to…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-21</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd: Fix dead ACL conflict guard leaking posix_acl slabs in nfsd4_create</h1>
+<h2>Summary</h2>
+<h2>Bug fix: Dead ACL conflict guard in <code>nfsd4_create</code> leaks two <code>posix_acl</code> objects per request</h2>
+<p>This week's thread is short but consequential — a one-line bug fix on the <strong>NFS server (nfsd)</strong> side that plugs an unbounded slab leak triggered by a specific client encoding pattern. It landed quickly, with Chuck Lever applying it to <code>nfsd-testing</code> within hours of submission.</p>
+<h3>The bug</h3>
+<p>Jeff Layton <a href="https://lore.kernel.org/linux-nfs/20260521-nfsd4_create_acl_posix_acl_overwrite_leak-v1-1-850fc0a7157e@kernel.org/">submitted a patch</a> on May 21 fixing a subtle but nasty memory leak in <code>nfsd4_create()</code>. The function "steals" the POSIX ACL pointers (<code>create-&gt;cr_dpacl</code> / <code>create-&gt;cr_pacl</code>) into a local <code>nfsd_attrs</code> struct via a designated initializer, then immediately NULLs out the source fields. The problem:</p>
+<blockquote>
+<p>"The subsequent conflict guard tests the already-nilled source fields, making it permanently dead code:</p>
+<pre><code class="language-c">if (create-&gt;cr_acl) {
+    if (create-&gt;cr_dpacl || create-&gt;cr_pacl)  /* always false */
+```"
+</code></pre>
+</blockquote>
+<p>Because the guard could never fire, a client that encoded <strong>both</strong> <code>FATTR4_WORD0_ACL</code> and <code>FATTR4_WORD2_POSIX_{DEFAULT,ACCESS}_ACL</code> in the same CREATE fattr bitmap would cause <code>nfsd4_acl_to_attr()</code> to overwrite <code>attrs.na_pacl</code>/<code>na_dpacl</code> without releasing the originals. As Layton put it:</p>
+<blockquote>
+<p>"leaking two posix_acl slab objects per request. Repeated requests cause unbounded slab exhaustion."</p>
+</blockquote>
+<p>The fix is a one-line change: check <code>attrs.na_dpacl</code>/<code>attrs.na_pacl</code> (the stolen values) instead of the already-nilled <code>create-&gt;cr_dpacl</code>/<code>create-&gt;cr_pacl</code>, matching the pattern already used correctly in <code>nfsd4_setattr()</code>.</p>
+<h3>Context and provenance</h3>
+<ul>
+<li><strong>Reported-by:</strong> Chris Mason (<code>clm@meta.com</code>) — suggesting this was found during Meta's internal NFS testing.</li>
+<li><strong>Fixes tag:</strong> points to commit <code>d2ca50606f5f</code> ("NFSD: Add support for POSIX draft ACLs for file creation"), meaning the bug has been present since that feature landed.</li>
+<li>The patch is a single-line change in <code>fs/nfsd/nfs4proc.c</code>.</li>
+</ul>
+<h3>Resolution</h3>
+<p>Chuck Lever <a href="https://lore.kernel.org/linux-nfs/177937807664.146125.12699537327417112468.b4-ty@b4/">applied the patch to <code>nfsd-testing</code></a> the same day, confirming:</p>
+<blockquote>
+<p>"Applied to nfsd-testing, thanks!"</p>
+</blockquote>
+<p>The commit landed as <code>e18fa5137111b7d2ab7002d041c05ee7c52694ef</code>.</p>
+<h3>Assessment</h3>
+<p>This is a textbook <strong>bug fix</strong> (not a new feature or protocol change) with real operational impact: any NFSv4 client that sends both the XDR-encoded ACL attribute and the POSIX draft ACL attributes in a single CREATE would trigger the leak. The unbounded nature of the slab exhaustion makes this a stability concern for long-running servers under such workloads. The quick turnaround — same-day review and application — reflects the straightforwardness of the fix once the dead-code path was identified.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260521-nfsd4_create_acl_posix_acl_overwrite_leak-v1-1-850fc0a7157e@kernel.org/">2026-05-21 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH] nfsd: fix dead ACL conflict guard in nfsd4_create</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177937807664.146125.12699537327417112468.b4-ty@b4/">2026-05-21 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH] nfsd: fix dead ACL conflict guard in nfsd4_create</a></li>
+</ul>
+  </main>
+</body>
+</html>

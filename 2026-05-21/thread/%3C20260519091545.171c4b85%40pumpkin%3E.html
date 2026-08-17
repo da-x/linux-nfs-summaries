@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>netfs: bvecq design follow-up – structure layout, traversal, and file position semantics</title>
+  <meta name="description" content="This thread represents a brief but technically dense follow-up to David Howells&#39; 21-patch series transitioning the network filesystem library (netfslib) from folio_queue to segmented bio_vec[] chains (bvecq). The prior week&#39;s summary…">
+  <meta property="og:title" content="netfs: bvecq design follow-up – structure layout, traversal, and file position semantics">
+  <meta property="og:description" content="This thread represents a brief but technically dense follow-up to David Howells&#39; 21-patch series transitioning the network filesystem library (netfslib) from folio_queue to segmented bio_vec[] chains (bvecq). The prior week&#39;s summary…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-21T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="netfs: bvecq design follow-up – structure layout, traversal, and file position semantics">
+  <meta name="twitter:description" content="This thread represents a brief but technically dense follow-up to David Howells&#39; 21-patch series transitioning the network filesystem library (netfslib) from folio_queue to segmented bio_vec[] chains (bvecq). The prior week&#39;s summary…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-21</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>netfs: bvecq design follow-up – structure layout, traversal, and file position semantics</h1>
+<h2>Summary</h2>
+<h1>netfs: Follow-up discussion on bvecq chain design details</h1>
+<h2>Summary</h2>
+<p>This thread represents a brief but technically dense follow-up to David Howells' 21-patch series transitioning the network filesystem library (netfslib) from <code>folio_queue</code> to segmented <code>bio_vec[]</code> chains (<code>bvecq</code>). The prior week's summary <a href="https://lore.kernel.org/linux-nfs/20260518222959.488126-1-dhowells@redhat.com/">covered the initial submission and broad feedback</a>. This week, only one message was posted: a detailed reply from David Howells addressing structural concerns raised by reviewer David Laight regarding the <code>struct bvecq</code> design.</p>
+<p>This is an <strong>infrastructure feature/refactoring</strong> discussion with implications for NFS, AFS, and CIFS clients, rather than a specific bug fix. However, the changes aim to reduce complexity and potential bugs in buffered I/O paths shared by all network filesystems.</p>
+<h3>Key Technical Arguments</h3>
+<p>David Laight had previously questioned several aspects of the <code>bvecq</code> structure, including the use of bitfields, the necessity of a backward (<code>prev</code>) pointer, and the type used for file position tracking. In his reply <a href="https://lore.kernel.org/linux-nfs/586308.1779180995@warthog.procyon.org.uk/">on May 19</a>, Howells addressed each point:</p>
+<p><strong>Memory Layout and Bitfields</strong></p>
+<p>Laight noted that "There is a massive hole here anyway" in the structure's memory layout. Howells clarified the actual footprint:</p>
+<blockquote>
+<p>"On a 64-bit machine, the whole thing fits into 48 bytes - 6 words (or 3 bio_vec slots). next, prev, fpos, bv and ref+priv take up 5 of those words; nr_segs and max_segs take up half of the 6th, leaving a 4 byte hole."</p>
+</blockquote>
+<p>He conceded that Laight was right about the bitfields:</p>
+<blockquote>
+<p>"You're right, though, I could make them all non-bitfields as the enum is marked mode(byte)."</p>
+</blockquote>
+<p><strong>Backward Traversal (<code>prev</code> pointer)</strong></p>
+<p>Laight asked whether backward traversal of the segment list was ever necessary. Howells acknowledged the desire to eliminate it:</p>
+<blockquote>
+<p>"iov_iter_revert() exists, unfortunately, but yes, I would like to avoid having a prev pointer."</p>
+</blockquote>
+<p>He indicated that ideas exist to remove the <code>prev</code> pointer or at least store the start in <code>struct iov_iter</code> and always work forwards, though he had not yet implemented them.</p>
+<p><strong>File Position Tracking (<code>fpos</code>)</strong></p>
+<p>Laight suggested using <code>off_t</code> or <code>u64</code> for the file position field rather than <code>long long</code>. Howells corrected the type usage:</p>
+<blockquote>
+<p>"It's not 'long long' and off_t is actually 'long' in asm-generic. Actually, I should probably switch to using uoff_t. Note that this file position should never be seen as negative; I think loff_t should only really be used in llseek."</p>
+</blockquote>
+<p><strong>Rationale for File Position in the Chain</strong></p>
+<p>Laight admitted, "At this point you lose me :-)" regarding the discontiguity and file position semantics. Howells apologized and provided a more coherent explanation of why file position tracking is embedded directly in the <code>bvecq</code> chain rather than derived from folios:</p>
+<ol>
+<li><strong>Unified buffered and DIO writeback:</strong> "I can treat buffered writeback and DIO write more similarly if there's no requirement to access the folios in the list to get file position information."</li>
+<li><strong>Efficient cleanup:</strong> "When cleaning up lists of folios in buffered writeback, the file position is needed to access the i_pages xarray in order to clean up the marks on it. This means I don't need to go from my list to access each folio, but can look them up through the xarray instead."</li>
+<li><strong>Sparse writes for network filesystems:</strong> "Some network filesystems, e.g. ceph, allow discontiguous (sparse) writes to be made to the server in a single RPC operation. This gives a means to convey that information to them, but then allows the data to be conveyed in a single blob to the socket (the mapping between blob offsets and file regions is tabulated separately within the RPC call)."</li>
+</ol>
+<p>He also clarified that network filesystems typically do not require block-size alignment:</p>
+<blockquote>
+<p>"Network filesystems don't typically require any block alignment, doing RMW locally on the server. I should really have separated that from the discontiguity bit."</p>
+</blockquote>
+<h3>Impact on NFS Client Development</h3>
+<p>While this thread does not introduce new patches, it clarifies design decisions in the <code>bvecq</code> infrastructure that will directly affect the NFS client:</p>
+<ul>
+<li><strong>Cachefiles integration:</strong> The file position tracking enables more efficient cache cleanup and lookup via the xarray, benefiting NFS clients using fscache/cachefiles for page caching.</li>
+<li><strong>TCP send efficiency:</strong> The broader series aims to enable single-call <code>kernel_sendmsg()</code> for entire RPC messages, improving NFS over TCP performance by eliminating socket corking overhead.</li>
+<li><strong>Sparse write support:</strong> Although Howells cited Ceph as the primary beneficiary of discontiguous write support, the infrastructure is shared across netfslib and could benefit NFS clients in scenarios where servers support sparse or non-contiguous writes.</li>
+</ul>
+<h3>Final Conclusions</h3>
+<p>This week's activity was limited to a single design clarification message from David Howells. No new patches were submitted, and no critical bugs were fixed. The discussion refined the understanding of <code>bvecq</code> internals, particularly around memory layout, traversal semantics, and file position tracking. Howells acknowledged several points for improvement in future iterations (removing bitfields, potentially eliminating the <code>prev</code> pointer, switching to <code>uoff_t</code>).</p>
+<p>The broader 21-patch series remains under review, with minor stylistic feedback from Stefan Metzmacher regarding CIFS commit messages also pending resolution. The infrastructure changes represent a significant step toward unifying I/O buffer management across network filesystems, with NFS clients expected to benefit from improved performance and reduced code complexity.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/586308.1779180995@warthog.procyon.org.uk/">2026-05-19 David Howells <a href="mailto:dhowells@redhat.com">dhowells@redhat.com</a> — Re: [PATCH v2 00/21] netfs: Keep track of folios in a segmented bio_vec[] chain</a></li>
+</ul>
+  </main>
+</body>
+</html>

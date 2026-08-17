@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd: posix_acl leak fix on SETACL decode failure</title>
+  <meta name="description" content="Type: Bug fix (memory leak in NFSv2/NFSv3 server-side ACL handling)">
+  <meta property="og:title" content="nfsd: posix_acl leak fix on SETACL decode failure">
+  <meta property="og:description" content="Type: Bug fix (memory leak in NFSv2/NFSv3 server-side ACL handling)">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-21T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd: posix_acl leak fix on SETACL decode failure">
+  <meta name="twitter:description" content="Type: Bug fix (memory leak in NFSv2/NFSv3 server-side ACL handling)">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-21</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd: posix_acl leak fix on SETACL decode failure</h1>
+<h2>Summary</h2>
+<h2>nfsd: posix_acl leak fix on SETACL decode failure</h2>
+<p><strong>Type:</strong> Bug fix (memory leak in NFSv2/NFSv3 server-side ACL handling)</p>
+<h3>Overview</h3>
+<p>On Thursday, May 21, Jeff Layton posted a one-patch series fixing a long-standing memory leak in the Linux NFS server (nfsd) that could cause <code>posix_acl</code> objects to be orphaned for the lifetime of the server whenever a SETACL request failed during argument decoding. The patch was accepted within roughly two hours by nfsd maintainer Chuck Lever.</p>
+<h3>The Bug</h3>
+<p>Layton's <a href="https://lore.kernel.org/linux-nfs/20260521-nfsd3_setacl_decode_failure_acl_leak-v1-1-8165ee755b48@kernel.org/">patch submission</a> describes the problem in precise terms. Both <code>nfsaclsvc_decode_setaclargs()</code> (NFSv2 ACL extension) and <code>nfs3svc_decode_setaclargs()</code> (NFSv3 ACLs) call <code>nfs_stream_decode_acl()</code> twice — first for the access ACL (<code>NFS_ACL</code>) and then for the default ACL (<code>NFS_DFACL</code>). Each successful decode allocates a fresh <code>posix_acl</code> and transfers ownership into <code>argp-&gt;acl_access</code> or <code>argp-&gt;acl_default</code>. The critical failure mode:</p>
+<blockquote>
+<p>"If the first call succeeds but the second fails, the decoder returns false and argp-&gt;acl_access is left dangling."</p>
+</blockquote>
+<p>The existing cleanup path was unreachable in this scenario. Layton traced the exact flow through <code>svc_process_common()</code>:</p>
+<blockquote>
+<pre><code>svc_process_common()
+  pc_decode()                  /* decode_setaclargs: false */
+  /* pc_func skipped */
+  pc_release()                 /* fh_put only — ACLs leaked */
+</code></pre>
+</blockquote>
+<p>The <code>pc_release</code> handlers were wired to generic functions (<code>nfssvc_release_attrstat</code> and <code>nfs3svc_release_fhandle</code>) that only called <code>fh_put()</code> with no awareness of the ACL fields. The <code>posix_acl_release()</code> calls lived at <code>out:</code> labels inside the proc functions themselves, but <code>svc_process()</code> skips <code>pc_func</code> entirely when <code>pc_decode</code> returns false — making that cleanup dead code on the decode-failure path.</p>
+<blockquote>
+<p>"The orphaned posix_acl is leaked for the lifetime of the server."</p>
+</blockquote>
+<h3>The Fix</h3>
+<p>Layton's solution introduces two new release functions — <code>nfsaclsvc_release_setacl()</code> and <code>nfs3svc_release_setacl()</code> — which release both <code>argp-&gt;acl_access</code> and <code>argp-&gt;acl_default</code> in addition to calling <code>fh_put()</code>. These are wired as the <code>pc_release</code> handlers for their respective SETACL procedures. Because <code>pc_release</code> runs on every path <code>svc_process()</code> takes after decode (including decode failure), the redundant <code>posix_acl_release()</code> pairs are removed from the proc functions' <code>out:</code> labels, consolidating ownership in a single place.</p>
+<blockquote>
+<p>"This matches the existing release_getacl() pattern used by the sibling GETACL procedures."</p>
+</blockquote>
+<p>The patch touches two files (<code>fs/nfsd/nfs2acl.c</code> and <code>fs/nfsd/nfs3acl.c</code>) with 24 insertions and 10 deletions. It carries a <code>Fixes:</code> tag pointing to commit <code>a257cdd0e217</code> ("[PATCH] NFSD: Add server support for NFSv3 ACLs."), indicating the bug has been present since NFSv3 ACL server support was first added.</p>
+<h3>Acceptance</h3>
+<p>Chuck Lever <a href="https://lore.kernel.org/linux-nfs/177939228457.181423.3822888386168533752.b4-ty@b4/">responded</a> just over an hour and a half later, applying the patch to the <code>nfsd-testing</code> tree:</p>
+<blockquote>
+<p>"Applied to nfsd-testing, thanks!"</p>
+<p>commit: c5d94697918a13dd9cd5a288f5b3b8dbecd4a783</p>
+</blockquote>
+<h3>Significance for NFS Server Development</h3>
+<p>This is a classic resource-management bug in the kernel's RPC service dispatch layer. The leak is triggered by malformed or truncated SETACL requests — exactly the kind of input an untrusted client (or network corruption) could produce, making it relevant to server robustness and DoS resistance. The fix aligns the SETACL cleanup pattern with the already-correct GETACL pattern, reducing future maintenance risk in this area. While not a protocol or feature change, it is a meaningful correctness fix for long-running NFS servers that handle ACL operations.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260521-nfsd3_setacl_decode_failure_acl_leak-v1-1-8165ee755b48@kernel.org/">2026-05-21 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH] nfsd: fix posix_acl leak on SETACL decode failure</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177939228457.181423.3822888386168533752.b4-ty@b4/">2026-05-21 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH] nfsd: fix posix_acl leak on SETACL decode failure</a></li>
+</ul>
+  </main>
+</body>
+</html>

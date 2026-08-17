@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>[RFC] knfsd: per-client fair scheduling to prevent single-client starvation</title>
+  <meta name="description" content="This week, Benjamin Coddington (Hammerspace) opened a new RFC thread on the linux-nfs list proposing a per-client fair-queueing scheduler for knfsd to stop one aggressive client from starving everyone else. The discussion is squarely about…">
+  <meta property="og:title" content="[RFC] knfsd: per-client fair scheduling to prevent single-client starvation">
+  <meta property="og:description" content="This week, Benjamin Coddington (Hammerspace) opened a new RFC thread on the linux-nfs list proposing a per-client fair-queueing scheduler for knfsd to stop one aggressive client from starving everyone else. The discussion is squarely about…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-21T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="[RFC] knfsd: per-client fair scheduling to prevent single-client starvation">
+  <meta name="twitter:description" content="This week, Benjamin Coddington (Hammerspace) opened a new RFC thread on the linux-nfs list proposing a per-client fair-queueing scheduler for knfsd to stop one aggressive client from starving everyone else. The discussion is squarely about…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-21</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>[RFC] knfsd: per-client fair scheduling to prevent single-client starvation</h1>
+<h2>Summary</h2>
+<h1>[RFC] knfsd: per-client fair scheduling to prevent single-client starvation</h1>
+<p>This week, Benjamin Coddington (Hammerspace) opened a new RFC thread on the linux-nfs list proposing a <strong>per-client fair-queueing scheduler</strong> for knfsd to stop one aggressive client from starving everyone else. The discussion is squarely about <strong>NFS server-side scheduling and fairness</strong>, with implications for how clients configure <code>nconnect</code> and slot tables — i.e., it touches both the server dispatch path and the practical behavior of NFSv3/v4.1 clients on shared infrastructure.</p>
+<h2>The problem: connection-count-based unfairness</h2>
+<p>Coddington's <a href="https://lore.kernel.org/linux-nfs/D33770A1-9098-4F1A-93EF-590E6C0B7638@hammerspace.com/">opening post</a> describes a structural starvation bug in the current knfsd dispatch:</p>
+<blockquote>
+<p>"NFS clients that opens many TCP connections (for example with nconnect=N) combined with a large NFSv4.1 slot table can keep enough requests in flight to saturate the entire nfsd thread pool, starving other clients sharing the same server."</p>
+</blockquote>
+<p>He quantifies it concretely: <strong>8 connections × 128 slots ≈ 1000 potentially-concurrent ops from one host</strong> against a default 640-thread server. The root cause, he argues, is that <code>svc_xprt_enqueue()</code> and <code>svc_recv()</code> schedule fairly <em>across xprts</em>, so a client with N sockets gets N times the service share of a single-socket client — "the xprt is the unit of fairness" and there is no notion of client identity in the dispatch path.</p>
+<p>His proposed fix is an <strong>opt-in fair-queueing scheduler</strong> that groups ready xprts by client identity (NFSv4 <code>clientid</code> where available, source address as fallback for NFSv3) and round-robins across identities rather than sockets. Default behavior would be unchanged; the new policy would be selectable per service or per pool. He explicitly asked whether the community wanted this on the server side vs. solved purely on the client side, what the right layer was for classification (sunrpc is "clean but identity-blind", nfsd knows clientid only later in the path), and whether a simpler per-client concurrency cap might suffice.</p>
+<h2>Chuck Lever: well-known shortcoming, but a different class of problem</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/473e337b-fabc-4884-a6c4-0f04b6874d0b@app.fastmail.com/">Chuck Lever's first reply</a> was welcoming — "We're very open to discussing this. It's a well-known shortcoming of NFSD, currently." But he pushed back on making the client (or network namespace) the unit of fairness:</p>
+<blockquote>
+<p>"A single client is known to encounter the same class of deadlock that you describe above, for instance."</p>
+</blockquote>
+<p>He then laid out the deeper structural problem: the current design assumes each request completes in milliseconds or less, and the send/receive buffers are tightly coupled to the threading model — "Once a request has been received, the consumed receive buffer ties up a thread." He listed specific cases where long delays happen <em>after</em> the network layer has handed control to NFSD (delegation/layout recall stalls, glacially slow I/O in NFS re-export when a client is partitioned), and noted that "we've been playing whack-a-mole to try to break these deadlocks one at a time, because resolving the buffer-to-thread coupling issue will be long-horizon work."</p>
+<p>Coddington <a href="https://lore.kernel.org/linux-nfs/3AB7EB6A-B207-4B91-A695-66C4704D0E31@hammerspace.com/">pushed back firmly</a> that he was describing a <em>different</em> problem class:</p>
+<blockquote>
+<p>"Just to be clear - the issue I'm exploring isn't the same as when all the kNFSD threads are slow due to their workload. This is very much a multi-client dynamic where one client (or a group of automated client instances) are able to easily starve another simply because they create the most connections."</p>
+</blockquote>
+<p>He emphasized: "This is not so much a deadlock issue as it is an issue of per-client fairness. I think this problem is in a different class."</p>
+<h2>Narrowing the design space</h2>
+<p>Lever <a href="https://lore.kernel.org/linux-nfs/4c5dbb98-0209-4572-8eac-1578536bbd78@app.fastmail.com/">probed further</a>, asking whether dynamic svc thread creation had any impact and whether "fairer request scheduling across transports" might be the answer. Coddington <a href="https://lore.kernel.org/linux-nfs/AED22AED-E97D-40E3-9839-BF8307EF8B65@hammerspace.com/">clarified</a> that he hadn't tested dynamic thread creation ("I think it would just pin to max-threads for the workload in question") and restated his fairness model:</p>
+<blockquote>
+<p>"fair would look like prioritizing each client's request queue equally, no matter how many xprts each client has."</p>
+</blockquote>
+<p>Lever <a href="https://lore.kernel.org/linux-nfs/1a5c70d8-e7f4-4671-a29a-023be7c107fc@app.fastmail.com/">responded</a> with a key design suggestion: if the aggregate workload consumes all threads, "that doesn't sound like xprt scheduling is the bottleneck." He asked whether Coddington was seeing connection loss, and then proposed an alternative mechanism for NFSv4.1+:</p>
+<blockquote>
+<p>"Then for NFSv4.1 and later, NFSD might schedule work on the session, and manage each session's workload by raising and lowering the number of slots in its slot table."</p>
+</blockquote>
+<p>Coddington <a href="https://lore.kernel.org/linux-nfs/D56AF5A6-3419-4164-8FCD-D818500ED0D3@hammerspace.com/">confirmed</a> the real-world scenario: no connection loss, but "certain clients that see a dramatically-reduced level of service when other clients that have many, many more connections start loading the server." He described his environment as having "a small army of data-moving clients that compete with .. how do I say this .. 'interactive' clients," where the data movers open as many connections as they can and push operations aggressively. He endorsed Lever's session/slot-table idea ("Indeed, sounds good") but asked: <strong>"What about v3?"</strong> — an open question at the end of the thread.</p>
+<h2>Real-world corroboration from Daire Byrne</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/CAPt2mGPoDF0s0zuFJcyjt7YU-4bZBpzEpEQ1UTFp=_-+rtwkBQ@mail.gmail.com/">Daire Byrne (brahma.io)</a> chimed in with production evidence that this is a widespread, long-standing pain point:</p>
+<blockquote>
+<p>"We currently set svc_rpc_per_connection_limit = 4 on a lot of our NFS(v3) servers that get hit by a large farm of 10G clients, just to try and limit the damage that 'greedy' clients can do."</p>
+</blockquote>
+<p>He noted this tunable was effectively 1 back in RHEL7.3 days, got added around RHEL7.4, and "suddenly our NFS storage servers kept hanging due to that single change." With the move from 1GigE to 10GigE clients, they now use values of 4 or 8 with ~512 knfsd threads per server — a crude, per-connection cap that's clearly a stopgap rather than true fairness.</p>
+<h2>Status and open questions</h2>
+<p>This is an <strong>RFC-stage feature proposal</strong> (not a bug fix in the traditional sense, though it addresses a structural scheduling defect). The thread ended with several unresolved design questions:</p>
+<ol>
+<li><strong>NFSv3 handling</strong>: Coddington's final question — "What about v3?" — remains unanswered. Lever's slot-table mechanism is inherently NFSv4.1+; v3 would need the source-address fallback or a different mechanism.</li>
+<li><strong>Layer for client classification</strong>: sunrpc vs. nfsd, and whether identity-blind scheduling at the xprt level can be augmented without a major refactor.</li>
+<li><strong>Fair queueing vs. concurrency cap</strong>: Whether a simpler per-client cap (like the existing <code>svc_rpc_per_connection_limit</code>) is "good enough" or whether true deficit-round-robin across client identities is warranted.</li>
+<li><strong>Interaction with dynamic thread pools</strong>: Coddington suspects it just pins to max-threads; Lever wants numbers before speculating further.</li>
+</ol>
+<p>The community's reaction so far is positive but cautious — the problem is acknowledged as real and well-known, but the solution space is broader than per-client fair queueing alone, and the buffer-to-thread coupling issue remains a long-horizon constraint that any new scheduler must work within.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/D33770A1-9098-4F1A-93EF-590E6C0B7638@hammerspace.com/">2026-05-19 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — [RFC] knfsd: per-client fair scheduling to prevent single-client starvation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/473e337b-fabc-4884-a6c4-0f04b6874d0b@app.fastmail.com/">2026-05-19 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [RFC] knfsd: per-client fair scheduling to prevent single-client starvation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/3AB7EB6A-B207-4B91-A695-66C4704D0E31@hammerspace.com/">2026-05-19 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — Re: [RFC] knfsd: per-client fair scheduling to prevent single-client starvation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/4c5dbb98-0209-4572-8eac-1578536bbd78@app.fastmail.com/">2026-05-19 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [RFC] knfsd: per-client fair scheduling to prevent single-client starvation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/AED22AED-E97D-40E3-9839-BF8307EF8B65@hammerspace.com/">2026-05-19 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — Re: [RFC] knfsd: per-client fair scheduling to prevent single-client starvation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/1a5c70d8-e7f4-4671-a29a-023be7c107fc@app.fastmail.com/">2026-05-20 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [RFC] knfsd: per-client fair scheduling to prevent single-client starvation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/D56AF5A6-3419-4164-8FCD-D818500ED0D3@hammerspace.com/">2026-05-20 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — Re: [RFC] knfsd: per-client fair scheduling to prevent single-client starvation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAPt2mGPoDF0s0zuFJcyjt7YU-4bZBpzEpEQ1UTFp=_-+rtwkBQ@mail.gmail.com/">2026-05-20 Daire Byrne <a href="mailto:daire@brahma.io">daire@brahma.io</a> — Re: [RFC] knfsd: per-client fair scheduling to prevent single-client starvation</a></li>
+</ul>
+  </main>
+</body>
+</html>

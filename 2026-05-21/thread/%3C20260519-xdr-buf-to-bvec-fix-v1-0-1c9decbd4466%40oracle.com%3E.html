@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SUNRPC: Fix xdr_buf_to_bvec() bio_vec array overflow (2-patch hardening)</title>
+  <meta name="description" content="Type: Bug fix / hardening (NFS server-side, SUNRPC layer) Week ending: 2026-05-21 Status this week: Patches posted and both received Reviewed-by from Jeff Layton; no further discussion in the window.">
+  <meta property="og:title" content="SUNRPC: Fix xdr_buf_to_bvec() bio_vec array overflow (2-patch hardening)">
+  <meta property="og:description" content="Type: Bug fix / hardening (NFS server-side, SUNRPC layer) Week ending: 2026-05-21 Status this week: Patches posted and both received Reviewed-by from Jeff Layton; no further discussion in the window.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-21T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="SUNRPC: Fix xdr_buf_to_bvec() bio_vec array overflow (2-patch hardening)">
+  <meta name="twitter:description" content="Type: Bug fix / hardening (NFS server-side, SUNRPC layer) Week ending: 2026-05-21 Status this week: Patches posted and both received Reviewed-by from Jeff Layton; no further discussion in the window.">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-21</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>SUNRPC: Fix xdr_buf_to_bvec() bio_vec array overflow (2-patch hardening)</h1>
+<h2>Summary</h2>
+<h1>SUNRPC: Fix xdr_buf_to_bvec() bio_vec array overflow</h1>
+<p><strong>Type:</strong> Bug fix / hardening (NFS server-side, SUNRPC layer)
+<strong>Week ending:</strong> 2026-05-21
+<strong>Status this week:</strong> Patches posted and both received Reviewed-by from Jeff Layton; no further discussion in the window.</p>
+<h2>Overview</h2>
+<p>On Tuesday 2026-05-19, Oracle's Chuck Lever posted a two-patch series titled [PATCH 0/2] SUNRPC: Fix xdr_buf_to_bvec() bio_vec array overflow](https://lore.kernel.org/linux-nfs/20260519-xdr-buf-to-bvec-fix-v1-0-1c9decbd4466@oracle.com/) targeting a latent out-of-bounds write in the kernel's XDR-to-bio_vec conversion helper, <code>xdr_buf_to_bvec()</code>. The function sits on the NFS server's WRITE-decode and TCP/UDP send hot paths, so even though the bug is not currently reachable from a remote client, it represents a serious hardening gap.</p>
+<h2>The technical problem</h2>
+<p>In the cover letter, Lever frames the issue precisely:</p>
+<blockquote>
+<p>"xdr_buf_to_bvec() lives on the NFS server's WRITE-decode and TCP/UDP send hot paths, and the array it writes into is sized exactly to the budget the caller passes -- no slack."</p>
+</blockquote>
+<p>He identifies <strong>two halves of the same overflow hazard</strong>:</p>
+<ol>
+<li><strong>Store-before-check:</strong> The head, page-loop, and tail branches write a <code>bio_vec</code> slot <em>before</em> testing whether that slot is in range. When the budget is exactly consumed, the next store lands one element past the end of the array.</li>
+<li><strong>Silent short return on overflow:</strong> The overflow label returns a foreshortened slot count rather than failing. Callers feed that count into <code>iov_iter_bvec()</code> with the original byte length, and because <code>iterate_bvec()</code> walks by byte count, "the bvec pointer steps past nr_segs into adjacent slab and dereferences it as bv_page/bv_offset/bv_len, handing the result to sock_sendmsg() or the file's iter_write path."</li>
+</ol>
+<p>The second patch's description makes the client-visible consequence explicit:</p>
+<blockquote>
+<p>"For an NFS WRITE the server reports the truncated transfer to the client as full success."</p>
+</blockquote>
+<h2>Why this is hardening, not a confirmed regression fix</h2>
+<p>Lever is careful to note that the current in-tree callers all size their bvec arrays via <code>svc_serv_maxpages()</code>, whose formula "reserves slack above the maximum decoded-WRITE footprint." So:</p>
+<blockquote>
+<p>"a WRITE payload extracted from rq_arg by xdr_stream_subsegment() therefore fits within the budget that nfsd_vfs_write() passes, and the overflow path is not reachable from a remote NFS WRITE today."</p>
+</blockquote>
+<p>However, because <code>xdr_buf_to_bvec()</code> has been <code>EXPORT_SYMBOL_GPL</code> since commit 62bf165c04bf, the bound also covers any future caller that does not replicate the same accounting. The issue was reported by Chris Mason (Meta) and carries a <code>Fixes:</code> tag pointing at 2eb2b9358181 ("SUNRPC: Convert svc_tcp_sendmsg to use bio_vecs directly").</p>
+<h2>Patch-by-patch breakdown</h2>
+<h3>PATCH 1/2 — Bound-check before writing</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260519-xdr-buf-to-bvec-fix-v1-1-1c9decbd4466@oracle.com/">Bound-check xdr_buf_to_bvec() stores before writing</a> reorders the in-range check ahead of the store in all three branches (head, page-loop, tail). With the check at the top, <code>count</code> is incremented only after a successful store, so the overflow label can return <code>count</code> directly. This patch is deliberately self-contained with no API change, making it safe for stable-tree backport.</p>
+<h3>PATCH 2/2 — Return -ESERVERFAULT on overflow</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260519-xdr-buf-to-bvec-fix-v1-2-1c9decbd4466@oracle.com/">Return an error from xdr_buf_to_bvec() on overflow</a> changes the function signature to return a signed int, with the overflow label now returning <code>-ESERVERFAULT</code>. The three callers are updated:</p>
+<ul>
+<li><code>nfsd_vfs_write()</code> folds the error into <code>host_err</code>, which <code>nfserrno()</code> translates to <code>nfserr_serverfault</code> for the WRITE reply.</li>
+<li><code>svc_udp_sendto()</code> and <code>svc_tcp_sendmsg()</code> propagate the error out of the send path.</li>
+</ul>
+<p>Lever explains the rationale: "The overflow represents an internal invariant violation: a higher layer reserved a bvec budget too small for the xdr_buf it then asked the encoder to convert. That is a server-side fault, not a media I/O failure and not a malformed client argument." He also notes the signature change "is not appropriate for stable trees," which is why it was split from the first patch.</p>
+<h2>Adjacent hazard deliberately left alone</h2>
+<p>Lever flags one related concern he chose <em>not</em> to fix: <code>svc_tcp_sendmsg()</code> passes <code>rqstp-&gt;rq_maxpages</code> as the budget for a write into <code>svsk-&gt;sk_bvec</code>, which is sized at socket creation. Static analysis flagged the two snapshots as a potential divergence if <code>sv_max_mesg</code> changes mid-flight. However, "in current code sv_max_mesg has exactly one writer (__svc_create()) and is never mutated thereafter, so the values cannot diverge." After this series, any future breakage of that invariant would surface loudly via <code>-ESERVERFAULT</code>.</p>
+<h2>Review and outcome</h2>
+<p>Jeff Layton (Red Hat) reviewed both patches within hours of posting:</p>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/06b102b050a5065fe2074c4f61206c8acc7d70f2.camel@kernel.org/">Reviewed-by on PATCH 1/2</a> at 13:54 UTC (~20 minutes after posting)</li>
+<li><a href="https://lore.kernel.org/linux-nfs/cedc5b4159b50265f87810116d1e622c97700c9a.camel@kernel.org/">Reviewed-by on PATCH 2/2</a> at 16:38 UTC</li>
+</ul>
+<p>No objections, design debates, or alternative approaches were raised. The thread closed cleanly with both patches carrying a Reviewed-by tag, positioning them for merge into the mainline and (for patch 1) backport to stable trees.</p>
+<h2>Significance for NFS development</h2>
+<p>This is a textbook example of proactive hardening in the NFS server stack: a latent OOB write identified through static analysis (reported by Chris Mason at Meta), carefully split into a backportable bounds-check fix and a forward-looking API change, with clear documentation of why the bug is not currently exploitable from the network. The two-patch structure ensures stable trees get the critical memory-safety fix without the signature churn, while mainline gains the louder error path that will catch any future budget-accounting mistakes.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260519-xdr-buf-to-bvec-fix-v1-0-1c9decbd4466@oracle.com/">2026-05-19 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 0/2] SUNRPC: Fix xdr_buf_to_bvec() bio_vec array overflow</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260519-xdr-buf-to-bvec-fix-v1-1-1c9decbd4466@oracle.com/">2026-05-19 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 1/2] SUNRPC: Bound-check xdr_buf_to_bvec() stores before writing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260519-xdr-buf-to-bvec-fix-v1-2-1c9decbd4466@oracle.com/">2026-05-19 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 2/2] SUNRPC: Return an error from xdr_buf_to_bvec() on overflow</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/06b102b050a5065fe2074c4f61206c8acc7d70f2.camel@kernel.org/">2026-05-19 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 1/2] SUNRPC: Bound-check xdr_buf_to_bvec() stores before writing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/cedc5b4159b50265f87810116d1e622c97700c9a.camel@kernel.org/">2026-05-19 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 2/2] SUNRPC: Return an error from xdr_buf_to_bvec() on overflow</a></li>
+</ul>
+  </main>
+</body>
+</html>

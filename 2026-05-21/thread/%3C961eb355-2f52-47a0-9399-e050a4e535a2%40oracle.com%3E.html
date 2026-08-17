@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>XFS pNFS LAYOUTGET: Extent merge mechanics and v2 patch finalization</title>
+  <meta name="description" content="This thread concerns a bug fix for overlapping extents returned by XFS during pNFS LAYOUTGET operations. The issue causes ambiguity for NFS clients when selecting device layouts and managing data states. This week&#39;s messages (May 19)…">
+  <meta property="og:title" content="XFS pNFS LAYOUTGET: Extent merge mechanics and v2 patch finalization">
+  <meta property="og:description" content="This thread concerns a bug fix for overlapping extents returned by XFS during pNFS LAYOUTGET operations. The issue causes ambiguity for NFS clients when selecting device layouts and managing data states. This week&#39;s messages (May 19)…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-21T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="XFS pNFS LAYOUTGET: Extent merge mechanics and v2 patch finalization">
+  <meta name="twitter:description" content="This thread concerns a bug fix for overlapping extents returned by XFS during pNFS LAYOUTGET operations. The issue causes ambiguity for NFS clients when selecting device layouts and managing data states. This week&#39;s messages (May 19)…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-21</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>XFS pNFS LAYOUTGET: Extent merge mechanics and v2 patch finalization</h1>
+<h2>Summary</h2>
+<h1>XFS pNFS LAYOUTGET: Extent Merge Mechanics and Locking Scrutiny in v2 Patch Planning</h1>
+<h2>Classification</h2>
+<p>This thread concerns a <strong>bug fix</strong> for overlapping extents returned by XFS during pNFS <code>LAYOUTGET</code> operations. The issue causes ambiguity for NFS clients when selecting device layouts and managing data states. This week's messages (May 19) represent the final exchanges in this thread, where Dai Ngo provided a detailed mechanical explanation of how extent merging produces overlaps, and Darrick J. Wong raised three targeted review questions that shaped the v2 patch plan.</p>
+<h2>Bridging Prior Weeks</h2>
+<p>As summarized in prior weeks, Dai Ngo's original patch proposed replacing the <code>XFS_BMAPI_ENTIRE</code> flag with <code>0</code> in <code>xfs_fs_map_blocks()</code> to prevent overlapping extents when multiple calls are made within a single <code>LAYOUTGET</code> request. Christoph Hellwig identified both the core overlap bug and a separate race condition in the NFS server code where layouts are inserted only after calling into <code>-&gt;proc_layoutget</code>. Over May 15–20, Darrick J. Wong raised three specific review questions on locking adequacy, multi-map API design, and reflink/realtime inode check placement; Christoph Hellwig responded affirmatively to each concern; and Dai Ngo outlined a pragmatic path forward for v2.</p>
+<h2>This Week's Activity (May 19)</h2>
+<h3>Darrick J. Wong's Three-Point Review</h3>
+<p>Darrick J. Wong, acknowledging his limited familiarity with NFS layouts ("<code>/me has no idea about nfs layouts but has thoughts anyway :)</code>"), posed three incisive questions <a href="https://lore.kernel.org/linux-nfs/20260519145949.GH9555@frogsfrogsfrogs/">in his May 19 message</a>:</p>
+<ol>
+<li>
+<p><strong>Locking adequacy:</strong> <code>xfs_fs_map_blocks()</code> only takes <code>i_rwsem</code> and <code>XFS_ILOCK</code>, not the mmap invalidation lock. Could page faults interfere with layout construction? He hypothesized:</p>
+<blockquote>
+<p>"I think the race that Christoph is referring to here is that any other thread can wander in and change the mapping after a -&gt;map_blocks call returns, because nfs isn't holding any kind of lock on the inode"</p>
+</blockquote>
+</li>
+<li>
+<p><strong>Multi-map API:</strong> With NFS now capable of serving multiple mappings at once, should <code>-&gt;map_blocks</code> accept an array element count to return multiple iomaps in a single lock cycle?</p>
+</li>
+<li>
+<p><strong>Reflink/realtime checks:</strong> Do reflink and realtime inode checks need re-assessment after acquiring the inode lock, since these properties can change concurrently?</p>
+</li>
+</ol>
+<h3>Dai Ngo's Mechanical Explanation of the Overlap Bug</h3>
+<p>Dai Ngo responded <a href="https://lore.kernel.org/linux-nfs/0e67fc75-382d-4698-ba93-39464e112e30@oracle.com/">on May 19</a> with a detailed step-by-step walkthrough of how the overlap bug manifests, confirming Darrick's race hypothesis:</p>
+<blockquote>
+<p>"I think this is what happened."</p>
+</blockquote>
+<p>He illustrated the scenario using a file with three segments:</p>
+<ul>
+<li><code>0000-4095</code>: IOMAP_UNWRITTEN (preallocated)</li>
+<li><code>4096-8191</code>: IOMAP_HOLE (no block allocated)</li>
+<li><code>8192-12287</code>: IOMAP_UNWRITTEN (preallocated)</li>
+</ul>
+<p>With <code>XFS_BMAPI_ENTIRE</code> set and <code>nimaps</code> limited to 1, three successive calls from nfsd produced the following sequence:</p>
+<ol>
+<li><strong>First call</strong> (offset 0, length 12288): Returns the first unwritten extent at offset 0, length 4096.</li>
+<li><strong>Second call</strong> (offset 4096, length 8192): Allocates a new unwritten extent to fill the hole at 4096. This allocation causes the three segments to merge into a single contiguous extent (<code>br_startoff = 0</code>, <code>br_blockcount = 3</code>).</li>
+<li><strong>Third call</strong> (offset 8192, length 4096): Looks up the range starting at 8192 and finds the merged single extent. Because <code>XFS_BMAPI_ENTIRE</code> is set, <code>xfs_bmapi_trim_map()</code> bypasses trimming and returns the full extent:
+<blockquote>
+<p>"Because XFS_BMAPI_ENTIRE is set, xfs_bmapi_trim_map() bypasses trimming and returns the full extent to xfs_bmbt_to_iomap()."</p>
+</blockquote>
+</li>
+</ol>
+<p>The result: the third call returns an extent spanning offset 0–12287, which overlaps with the extents returned by the first two calls. This explains why removing <code>XFS_BMAPI_ENTIRE</code> (replacing it with <code>0</code>) resolves the issue — without the flag, trimming occurs and only the requested subrange is returned.</p>
+<h2>Final Conclusions</h2>
+<p>This week's exchange solidified the technical understanding of the bug and reinforced the v2 patch plan agreed upon in prior days:</p>
+<ol>
+<li><strong>Core fix:</strong> Replace <code>XFS_BMAPI_ENTIRE</code> with <code>0</code> in <code>xfs_fs_map_blocks()</code> to prevent overlapping extents — now fully explained by Dai Ngo's mechanical walkthrough.</li>
+<li><strong>Locking improvements:</strong> Move reflink and realtime inode checks inside the inode lock, as these properties can change concurrently.</li>
+<li><strong>Deferred work:</strong> Multi-map API enhancements (returning multiple iomaps in a single call) are acknowledged as desirable but deferred to future coordinated changes between nfsd and XFS.</li>
+</ol>
+<h2>Implications for NFS Client Development</h2>
+<p>The fix has direct relevance for NFS client robustness. As Christoph Hellwig noted in prior weeks:</p>
+<blockquote>
+<p>"And the client should probably also validate that extents of the same kind do not overlap (read vs write extents are allowed to overlap)."</p>
+</blockquote>
+<p>With the server-side fix progressing toward v2, clients will encounter fewer malformed <code>LAYOUTGET</code> responses. However, defensive validation on the client side remains advisable as a belt-and-suspenders approach against future regressions or edge cases. Dai Ngo's detailed explanation of how extent merging produces overlaps provides valuable context for client developers who may need to handle similar scenarios in their layout processing code.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260519145949.GH9555@frogsfrogsfrogs/">2026-05-19 "Darrick J. Wong" <a href="mailto:djwong@kernel.org">djwong@kernel.org</a> — Re: [PATCH 1/1] xfs: fix overlapping extents returned for pNFS LAYOUTGET</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/0e67fc75-382d-4698-ba93-39464e112e30@oracle.com/">2026-05-19 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — Re: [PATCH 1/1] xfs: fix overlapping extents returned for pNFS LAYOUTGET</a></li>
+</ul>
+  </main>
+</body>
+</html>

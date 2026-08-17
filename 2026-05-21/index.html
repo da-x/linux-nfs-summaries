@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS client: writeback UAF and delegation-size fixes land; xprtrdma DMA-lifetime rework awaits v2; knfsd per-client fairness RFC opens</title>
+  <meta name="description" content="A busy week for the Linux NFS client, dominated by memory-safety fixes in the writeback and pNFS paths, an architectural rework of the xprtrdma transport that hit build errors and is awaiting a v2, and a new RFC on per-client fairness in…">
+  <meta property="og:title" content="NFS client: writeback UAF and delegation-size fixes land; xprtrdma DMA-lifetime rework awaits v2; knfsd per-client fairness RFC opens">
+  <meta property="og:description" content="A busy week for the Linux NFS client, dominated by memory-safety fixes in the writeback and pNFS paths, an architectural rework of the xprtrdma transport that hit build errors and is awaiting a v2, and a new RFC on per-client fairness in…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-21T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS client: writeback UAF and delegation-size fixes land; xprtrdma DMA-lifetime rework awaits v2; knfsd per-client fairness RFC opens">
+  <meta name="twitter:description" content="A busy week for the Linux NFS client, dominated by memory-safety fixes in the writeback and pNFS paths, an architectural rework of the xprtrdma transport that hit build errors and is awaiting a v2, and a new RFC on per-client fairness in…">
+  <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../index.html">Summaries</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS client: writeback UAF and delegation-size fixes land; xprtrdma DMA-lifetime rework awaits v2; knfsd per-client fairness RFC opens</h1>
+<p><em>Week ending 2026-05-21</em></p>
+<h1>Week in NFS (ending 2026-05-21)</h1>
+<p>A busy week for the Linux NFS client, dominated by memory-safety fixes in the writeback and pNFS paths, an architectural rework of the xprtrdma transport that hit build errors and is awaiting a v2, and a new RFC on per-client fairness in knfsd. On the server side, a flurry of same-day bug fixes landed in nfsd-testing, including a SUNRPC double-free hardening, several posix_acl leak fixes, and an async-copy TTL inversion. The netfslib bvecq refactoring (v2) continues to shape the client I/O path for the next merge window.</p>
+<h2>NFS Client: Critical Bug Fixes</h2>
+<h3>Writeback use-after-free in <code>nfs_write_completion()</code></h3>
+<p>Dave Jones posted a one-line fix for a slab-use-after-free caught by KASAN under heavy NFSv3 writeback (an <code>rsync</code> workload on 7.1-rc4). The regression came from commit 5d3869a41f36, which dereferenced <code>hdr-&gt;req-&gt;wb_lock_context</code> inside the per-request loop; when a single pgio header spans multiple page groups, a parallel COMMIT can free <code>hdr-&gt;req</code> while the outer loop is still iterating. The fix swaps in the loop-local <code>req</code>, which is pinned by its writeback kref for the duration of that iteration. Jeff Layton has already issued a Reviewed-by. See <a href="thread/%253CagtehErxs5HVJJb0%2540codemonkey.org.uk%253E.html">thread</a>.</p>
+<h3>pNFS layout-update UAF (tracepoint ordering)</h3>
+<p>Wentao Liang (ISCAS) posted a one-line reorder in <code>pnfs_update_layout()</code> moving <code>trace_pnfs_update_layout()</code> before <code>pnfs_put_layout_hdr(lo)</code> on the <code>NFS_LAYOUT_RETURN</code> branch. The original ordering — introduced by 2c8d5fc37fe2 — let the tracepoint read from an already-freed layout header. Marked for stable backport; no in-window review yet, but a follow-up from Markus Elfring landed just after the window. See <a href="thread/%253C20260518131036.1337001-1-vulab%2540iscas.ac.cn%253E.html">thread</a>.</p>
+<h3>Don't trust server inode size under a write delegation (v2)</h3>
+<p>Dai Ngo posted v2 of a small <code>fs/nfs/inode.c</code> fix to <code>nfs_wcc_update_inode()</code>: while the client holds a write delegation, the server's GETATTR size may legitimately lag the locally-buffered size, so it must not be treated as authoritative. The patch gates the WCC size update on either "no write delegation" or "NFS_INO_INVALID_SIZE set." Awaiting review. See <a href="thread/%253C20260521201354.3294507-1-dai.ngo%2540oracle.com%253E.html">thread</a>.</p>
+<h3><code>nfs_access_calc_mask()</code> corner cases for special files</h3>
+<p>Ondrej Mosnacek (Red Hat) fixed two inconsistencies in the NFS client's access-permission calculation that caused <code>access(2, X_OK)</code> on FIFOs/char/block devices to <em>always</em> fail regardless of UNIX permissions — a clear divergence from local-filesystem behavior. The fix unifies regular and special-file handling and corrects a bare bitwise AND into the proper equality pattern used elsewhere. Regression from ecbb903c5674. See <a href="thread/%253C20260521132410.1072478-1-omosnace%2540redhat.com%253E.html">thread</a>.</p>
+<h3>NFSv4.1 client hang in <code>nfs4_drain_slot_tbl</code> (ongoing)</h3>
+<p>The long-running bug report from 郭玲兴 advanced this week: Rick Macklem flagged the reporter's <code>soft</code> mount option as the likely culprit ("Whenever an RPC times out and doesn't wait for a reply from the server, it will leave a session slot messed up"), and the reporter followed up with full environment details (Windows Server 2022, AUTH_SYS, x86_64) plus lease-expiry evidence showing <code>lease_expired ≈ age - lease_time</code> on both hung clients — strong signal that session state was corrupted well before the visible hang. The reporter is now retesting with a hard mount and has explicitly reframed the question toward client-side robustness: <em>should</em> a single timed-out RPC on a soft mount be able to leave the slot table permanently stuck? This will likely drive the next phase of the thread, potentially toward a concrete <code>nfs4_drain_slot_tbl</code> hardening patch. See <a href="thread/%253C45ca6e57.1a1cc.19dfc4104df.Coremail.guolingxing%2540supcon.com%253E.html">thread</a> and <a href="thread/%253CCAM5tNy4A-a4q-t_z7v_sHFW0VeyPLu_yEJ4RQ4DxXVAF-5kROg%2540mail.gmail.com%253E.html">follow-up</a>.</p>
+<h2>NFS Client: Major Infrastructure &amp; Security</h2>
+<h3>xprtrdma: Decouple RPC completion from Send completion (v2 expected)</h3>
+<p>Chuck Lever posted a significant architectural rework of the RDMA transport's reference-counting model to fix a DMA-lifetime bug: when a reply arrives before an unsignaled Send completes, <code>rpcrdma_reply_handler()</code> could drop the last kref and recycle the request while the HCA is still DMA-reading from its send buffer — silently corrupting RPC data on the wire. The fix decouples RPC completion (Receive path) from request recycling (kref), introduces two explicit owners, adds a teardown drain, and removes a cache-cold atomic from the hot reply path. However, the kernel test robot flagged build errors on nios2/riscv referencing removed backchannel preallocation fields, and Chuck confirmed "Bots and LLM review have found issues with this patch, so expect a v2." See <a href="thread/%253C20260520175016.29480-1-cel%2540kernel.org%253E.html">thread</a>.</p>
+<h3>netfslib: bvecq refactoring (v2)</h3>
+<p>David Howells posted v2 of his 21-patch series replacing netfslib's <code>folio_queue</code>/<code>rolling_buffer</code> with segmented <code>bio_vec[]</code> chains (<code>bvecq</code>). The goals are consolidation (one buffering scheme for buffered and DIO), performance (single <code>kernel_sendmsg()</code> per RPC, no corking), and simplification (merged prepare/issue ops). For NFS clients the key wins are unified buffer management, a cachefiles optimization that avoids per-read <code>SEEK_DATA</code>/<code>SEEK_HOLE</code> on contiguous files, and reduced TCP overhead. Feedback was minor: David Laight questioned bitfield usage and suggested a tail queue; Stefan Metzmacher acked the CIFS/SMBDirect patches with commit-message nits. See <a href="thread/%253C20260518222959.488126-1-dhowells%2540redhat.com%253E.html">thread</a>.</p>
+<h3>rpcsec_gss_krb5 → crypto/krb5 migration: client ack received</h3>
+<p>Anna Schumaker (NFS client maintainer) tested Chuck Lever's 18-patch series migrating <code>rpcsec_gss_krb5</code> to the common <code>crypto/krb5</code> library and provided her Acked-by. Combined with Jeff Layton's earlier Reviewed-by, the series now has full maintainer approval for upstream integration. This removes over 4,000 lines of duplicated crypto code from the NFS client and reduces the audit surface for Kerberos operations. See <a href="thread/%253C20260427-crypto-krb5-api-v1-0-1fc1253b64c0%2540oracle.com%253E.html">thread</a>.</p>
+<h3>rxrpc/RxGK pre-decrypt length check (v4)</h3>
+<p>David Howells posted v4 of the <code>crypto/krb5</code> + <code>rxrpc</code> fix adding a pre-decrypt/pre-verify length-check facility. The patch is marked for stable backport and CC'd to linux-nfs, signaling its relevance to any NFS client path that shares the Kerberos crypto API. The series has stabilized after three weeks of revisions. See <a href="thread/%253C20260515230516.2718212-1-dhowells%2540redhat.com%253E.html">thread</a>.</p>
+<h2>NFS Server: Bug Fixes &amp; Merges</h2>
+<h3>NFSD fixes merged into v7.1-rc</h3>
+<p>Chuck Lever's <a href="thread/%253C20260515141426.357776-1-cel%2540kernel.org%253E.html">GIT PULL</a> landed in mainline within hours, bringing six commits: an infinite-loop fix in pNFS layout state revocation (Lever), three delegated-attribute correctness fixes for CLONE/COPY/GET_DIR_DELEGATION (Kornievskaia), a CB_GETATTR change-detection fix (Mayhew), and a sunrpc cache netlink seqno off-by-one (Layton). Three are flagged for expedient stable backports.</p>
+<h3>SUNRPC <code>rq_procinfo</code> double-free hardening (v1 → v2 merged)</h3>
+<p>The week saw the full lifecycle of this fix: Ren Wei posted v1 on May 20, Chuck Lever requested a broader hardening (clear <code>rq_procinfo</code> at all entry points), and v2 landed on May 21 with those refinements. Jeff Layton reviewed; Lever applied to nfsd-testing the same day (commit 2739a03). The four-line change closes a stale-hook double-free/UAF reachable via malformed or early-failing RPCs. See <a href="thread/%253Ccover.1779253342.git.rakukuip%2540gmail.com%253E.html">v1 thread</a> and <a href="thread/%253C20260521070636.900264-1-n05ec%2540lzu.edu.cn%253E.html">v2 thread</a>.</p>
+<h3>SUNRPC <code>xdr_buf_to_bvec()</code> bio_vec array overflow</h3>
+<p>Chuck Lever posted a two-patch hardening series fixing a latent OOB write in the XDR-to-bio_vec conversion helper on the NFS server's WRITE-decode and send hot paths. Patch 1 (backportable) reorders bound-checks before stores; patch 2 changes the return type to propagate <code>-ESERVERFAULT</code> on overflow. Jeff Layton reviewed both within hours. Reported by Chris Mason (Meta). See <a href="thread/%253C20260519-xdr-buf-to-bvec-fix-v1-0-1c9decbd4466%2540oracle.com%253E.html">thread</a>.</p>
+<h3>nfsd: drain backchannel callbacks before freeing a session</h3>
+<p>Chris Mason (Meta) posted a two-patch UAF fix for the race between <code>DESTROY_SESSION</code> and in-flight CB RPCs on rpciod. Jeff Layton validated both problems but flagged a busy-spin in <code>nfsd41_cb_get_slot()</code> when the session is NULL (the new early-return path doesn't sleep or set an error, causing <code>__rpc_execute()</code> to loop). Bruce Fields questioned whether the explicit drain is redundant with <code>rpc_shutdown_client()</code>. Layton granted a conditional Reviewed-by pending reordering and the spin fix. Both patches carry <code>Assisted-by: kres (claude-opus-4-7)</code>. See <a href="thread/%253C20260519180032.1852793-2-clm%2540meta.com%253E.html">thread</a>.</p>
+<h3>nfsd: release layout stid on setlease failure</h3>
+<p>Chris Mason fixed a dangling IDR pointer in the pNFS layout stateid teardown path: a failed <code>nfsd4_layout_setlease()</code> freed the stateid without calling <code>idr_remove()</code>, leaving any subsequent IDR walker to dereference freed slab. The fix hoists <code>INIT_DELAYED_WORK</code> above the setlease call and replaces manual cleanup with <code>nfs4_put_stid()</code>. Applied to nfsd-testing within an hour; Layton reviewed. See <a href="thread/%253C20260518201647.3383242-1-clm%2540meta.com%253E.html">thread</a>.</p>
+<h3>Batch of same-day nfsd fixes (May 21)</h3>
+<p>A cluster of small, surgical fixes landed on the final day of the week, all applied to nfsd-testing within hours:</p>
+<ul>
+<li><strong>posix_acl leak on SETACL decode failure</strong> — Layton wired proper <code>pc_release</code> handlers for NFSv2/v3 SETACL so orphaned ACLs are freed even when decode fails. <a href="thread/%253C20260521-nfsd3_setacl_decode_failure_acl_leak-v1-1-8165ee755b48%2540kernel.org%253E.html">Thread</a></li>
+<li><strong>Dead ACL conflict guard in <code>nfsd4_create</code></strong> — a one-line fix for an unbounded slab leak when a client encodes both XDR ACL and POSIX draft ACL attributes. <a href="thread/%253C20260521-nfsd4_create_acl_posix_acl_overwrite_leak-v1-1-850fc0a7157e%2540kernel.org%253E.html">Thread</a></li>
+<li><strong>posix_acl leak + ignored error in <code>nfsd4_create_file</code></strong> — fixes a silently discarded <code>nfsd4_acl_to_attr()</code> return and an early-error path that skipped <code>nfsd_attrs_free()</code>. <a href="thread/%253C20260521-nfsd4_create_file_leaks_attrs_on_start_creating_err-v1-1-646697806453%2540kernel.org%253E.html">Thread</a></li>
+<li><strong>Inverted <code>cp_ttl</code> check in async copy reaper</strong> — a one-character negation fixing spurious <code>NFS4ERR_BAD_STATEID</code> on <code>OFFLOAD_STATUS</code>. <a href="thread/%253C20260521-async_copy_reaper_cp_ttl_inverted-v1-1-66b87cb1bf64%2540kernel.org%253E.html">Thread</a></li>
+<li><strong>Unchecked <code>get_user()</code> of <code>princhashlen</code></strong> — a missing return-value check in the v2 upcall path that could drive <code>memdup_user()</code> with garbage. <a href="thread/%253C20260521154656.63861-1-stalion%2540gmail.com%253E.html">Thread</a></li>
+</ul>
+<h3>Rejected / dropped patches</h3>
+<ul>
+<li><strong>nfsd UAF in <code>nfsd4_lock()</code></strong> — Wentao Liang's proposed fix was rejected by Layton within an hour: the stateid already holds two references at that point, so the UAF cannot occur. <a href="thread/%253C20260518153048.1343021-1-vulab%2540iscas.ac.cn%253E.html">Thread</a></li>
+<li><strong>sunrpc <code>kref_get_unless_zero</code> in <code>auth_domain_lookup</code></strong> — Layton's own patch was dropped after sashiko (automated review) correctly identified that the described race window doesn't exist under the current locking. <a href="thread/%253C20260520-nfsd-fixes-v1-1-664ba702d698%2540kernel.org%253E.html">Thread</a></li>
+</ul>
+<h3>NFSD export cleanup revert: tested and queued</h3>
+<p>The multi-week saga of reverting "Defer sub-object cleanup in export put callbacks" reached its final step: Calum Mackay (Oracle) confirmed all three regression symptoms are resolved ("no crashes, sosreport no longer hangs, no seq_file warnings"), and Chuck Lever marked it for the next nfsd-testing push. See <a href="thread/%253C20260513024252.3681597-1-yangerkun%2540huawei.com%253E.html">thread</a>.</p>
+<h2>Ongoing Debates &amp; RFCs</h2>
+<h3>knfsd: per-client fair scheduling (new RFC)</h3>
+<p>Benjamin Coddington (Hammerspace) opened a new RFC proposing a per-client fair-queueing scheduler to prevent one aggressive client (e.g., 8 connections × 128 slots ≈ 1000 concurrent ops) from starving others. Chuck Lever acknowledged the problem as "a well-known shortcoming" but pushed back on making the client the unit of fairness, noting the deeper buffer-to-thread coupling issue. Lever proposed managing per-session slot tables for NFSv4.1+; Coddington's open question — "What about v3?" — remains unanswered. Daire Byrne (brahma.io) corroborated with production evidence of using <code>svc_rpc_per_connection_limit = 4</code> as a crude stopgap. See <a href="thread/%253CD33770A1-9098-4F1A-93EF-590E6C0B7638%2540hammerspace.com%253E.html">thread</a>.</p>
+<h3>CB_NOTIFY directory delegations: VFS half merged</h3>
+<p>Christian Brauner merged the VFS-specific patches (01–07) of Layton's 28-patch <code>CB_NOTIFY</code> series into <code>vfs-7.2.directory.delegations</code>. Chuck Lever confirmed the remaining NFSD patches (08–28) are ready but gated on the VFS branch landing in <code>vfs.all</code> (expected end of this week or early next). The client-side implementation is still pending; full integration testing will follow. See <a href="thread/%253C20260428-dir-deleg-v3-0-5a0780ba9def%2540kernel.org%253E.html">thread</a>.</p>
+<h3>Case folding v14: post-merge triage</h3>
+<p>The case-folding series is confirmed for Linux 7.2. This week's activity centered on an LTP statx04 regression on vfat: the new <code>fileattr_get</code> implementation makes <code>FS_IOC_GETFLAGS</code> succeed on directories, converting previously-skipped test cases into failures for attributes FAT doesn't support (COMPRESSED, NODUMP). Lever proposed the narrowest fix (<code>generic_fill_statx_attr</code> in <code>fat_getattr()</code>) and is awaiting vfat maintainer sign-off. See <a href="thread/%253C20260507-case-sensitivity-v14-0-e62cc8200435%2540oracle.com%253E.html">thread</a>.</p>
+<h3><code>try_break_deleg()</code> and <code>atomic_open()</code>: closed</h3>
+<p>The design discussion between Neil Brown and Jeff Layton reached a natural conclusion: no current filesystem (NFSv4, CIFS) combines directory leases with <code>-&gt;atomic_open</code>, so the theoretical race is not exploitable today. The NFSv4 client's local lease handling appears correct for intra-client conflicts; empirical testing is recommended but not blocking. See <a href="thread/%253C177853810078.2788210.11836979435758859096%2540noble.neil.brown.name%253E.html">thread</a>.</p>
+<h2>XFS pNFS Server Fixes (client-impacting)</h2>
+<p>Dai Ngo's two-patch series correcting XFS pNFS layout mappings was reviewed and approved by Christoph Hellwig the same day. Patch 1 fixes use of an uninitialized <code>imap</code> in the error path of <code>xfs_fs_map_blocks()</code>; patch 2 removes <code>XFS_BMAPI_ENTIRE</code> to eliminate overlapping extents in LAYOUTGET replies — a server-side source of malformed layout data that could cause client-side data corruption or protocol violations. A broader nfsd race condition (layout insertion after <code>-&gt;proc_layoutget</code>) remains an open item. See <a href="thread/%253C20260520003503.2399326-1-dai.ngo%2540oracle.com%253E.html">thread</a>.</p>
+<h2>User-Space &amp; Ecosystem</h2>
+<ul>
+<li><strong>rpcbind memory leaks</strong>: Scott Mayhew posted three valgrind-identified leak fixes (transport address buffer, <code>getaddrinfo</code>/<code>getifaddrs</code>, warmstart XDR strings). Committed to rpcbind 1.2.9-rc1. <a href="thread/%253C20260521234720.818996-1-smayhew%2540redhat.com%253E.html">Thread</a></li>
+<li><strong>exportfs cleanup</strong>: Layton's dead-parameter removal from <code>xtab_read()</code>/<code>xtab_write()</code> was committed to nfs-utils 2.9.2-rc3 by Steve Dickson. <a href="thread/%253C20260514-exportd-v1-1-be603d7fac41%2540kernel.org%253E.html">Thread</a></li>
+</ul>
+<h2>Notable Process Observations</h2>
+<p>AI-assisted development and review is now a visible part of the workflow: multiple patches this week carry <code>Assisted-by: kres (claude-opus-4-7)</code> or similar tags, and the automated sashiko reviewer effectively caught a lock-ordering misunderstanding in Layton's own <code>auth_domain_lookup</code> patch before it could enter the tree. Layton's "Dueling agent review" remark on the backchannel drain thread highlights this trend. The same-day turnaround for small nfsd fixes (patch → Reviewed-by → applied within hours) remains the norm, reflecting the maturity of the review pipeline.</p>
+<h2>Discussions this week</h2>
+<ul>
+<li><a href="thread/%253C20260512172238.2495085-1-dai.ngo%2540oracle.com%253E.html">Re: [PATCH 1/1] xfs: fix overlapping extents returned for pNFS LAYOUTGET</a></li>
+<li><a href="thread/%253C06d9b1ae-e46f-459c-bcb4-1a5ca4ded4b0%2540oracle.com%253E.html">Re: [PATCH 1/1] xfs: fix overlapping extents returned for pNFS LAYOUTGET</a></li>
+<li><a href="thread/%253C26365a46-bdac-4e8a-a951-de904c3e5606%2540oracle.com%253E.html">Re: [PATCH 1/1] xfs: fix overlapping extents returned for pNFS LAYOUTGET</a></li>
+<li><a href="thread/%253C961eb355-2f52-47a0-9399-e050a4e535a2%2540oracle.com%253E.html">Re: [PATCH 1/1] xfs: fix overlapping extents returned for pNFS LAYOUTGET</a></li>
+<li><a href="thread/%253Cb9860332-7b1e-448e-869a-ad59d8d5b7c0%2540oracle.com%253E.html">Re: [PATCH 1/1] xfs: fix overlapping extents returned for pNFS LAYOUTGET</a></li>
+<li><a href="thread/%253C20260520003503.2399326-1-dai.ngo%2540oracle.com%253E.html">[PATCH 0/2] xfs: correct pNFS layout mappings</a></li>
+<li><a href="thread/%253C20260518222959.488126-1-dhowells%2540redhat.com%253E.html">[PATCH v2 00/21] netfs: Keep track of folios in a segmented bio_vec[] chain</a></li>
+<li><a href="thread/%253C20260519091545.171c4b85%2540pumpkin%253E.html">Re: [PATCH v2 00/21] netfs: Keep track of folios in a segmented bio_vec[] chain</a></li>
+<li><a href="thread/%253C20260427-crypto-krb5-api-v1-0-1fc1253b64c0%2540oracle.com%253E.html">Re: [PATCH 00/18] Migrate rpcsec_gss_krb5 to the crypto/krb5 library</a></li>
+<li><a href="thread/%253C20260515230516.2718212-1-dhowells%2540redhat.com%253E.html">[PATCH net v4 1/3] crypto/krb5, rxrpc: Fix lack of pre-decrypt/pre-verify length checks</a></li>
+<li><a href="thread/%253C45ca6e57.1a1cc.19dfc4104df.Coremail.guolingxing%2540supcon.com%253E.html">Re: [BUG] NFSv4.1 client hang in nfs4_drain_slot_tbl under concurrent workload against Windows NFS server</a></li>
+<li><a href="thread/%253CCAM5tNy4A-a4q-t_z7v_sHFW0VeyPLu_yEJ4RQ4DxXVAF-5kROg%2540mail.gmail.com%253E.html">Re: Re: [BUG] NFSv4.1 client hang in nfs4_drain_slot_tbl under concurrent workload against Windows NFS server</a></li>
+<li><a href="thread/%253Ccover.1779253342.git.rakukuip%2540gmail.com%253E.html">[PATCH 1/1] sunrpc: clear rq_procinfo in svc_release_rqst to prevent double-free</a></li>
+<li><a href="thread/%253C20260521070636.900264-1-n05ec%2540lzu.edu.cn%253E.html">[PATCH v2 1/1] sunrpc: harden rq_procinfo lifecycle to prevent double-free</a></li>
+<li><a href="thread/%253C20260518201647.3383242-1-clm%2540meta.com%253E.html">[PATCH] nfsd: release layout stid on setlease failure</a></li>
+<li><a href="thread/%253C20260519180032.1852793-2-clm%2540meta.com%253E.html">[PATCH] nfsd: drain backchannel callbacks before freeing a session</a></li>
+<li><a href="thread/%253C20260518153048.1343021-1-vulab%2540iscas.ac.cn%253E.html">[PATCH] nfsd: fix use-after-free in nfsd4_lock() when releasing new lock stateid</a></li>
+<li><a href="thread/%253C20260518131036.1337001-1-vulab%2540iscas.ac.cn%253E.html">[PATCH] pNFS: Fix use-after-free in pnfs_update_layout()</a></li>
+<li><a href="thread/%253C20260521-nfsd3_setacl_decode_failure_acl_leak-v1-1-8165ee755b48%2540kernel.org%253E.html">[PATCH] nfsd: fix posix_acl leak on SETACL decode failure</a></li>
+<li><a href="thread/%253C20260521-nfsd4_create_acl_posix_acl_overwrite_leak-v1-1-850fc0a7157e%2540kernel.org%253E.html">[PATCH] nfsd: fix dead ACL conflict guard in nfsd4_create</a></li>
+<li><a href="thread/%253C20260521-nfsd4_create_file_leaks_attrs_on_start_creating_err-v1-1-646697806453%2540kernel.org%253E.html">[PATCH] nfsd: fix posix_acl leak and ignored error in nfsd4_create_file</a></li>
+<li><a href="thread/%253C20260521-async_copy_reaper_cp_ttl_inverted-v1-1-66b87cb1bf64%2540kernel.org%253E.html">[PATCH] nfsd: fix inverted cp_ttl check in async copy reaper</a></li>
+<li><a href="thread/%253C20260521154656.63861-1-stalion%2540gmail.com%253E.html">[PATCH] nfsd: check get_user() return when reading princhashlen</a></li>
+<li><a href="thread/%253C20260520-nfsd-fixes-v1-1-664ba702d698%2540kernel.org%253E.html">[PATCH] sunrpc: use kref_get_unless_zero in auth_domain_lookup</a></li>
+<li><a href="thread/%253C20260521234720.818996-1-smayhew%2540redhat.com%253E.html">[PATCH 2/3] rpcbind: fix memory leaks in network_init()</a></li>
+<li><a href="thread/%253C20260519-xdr-buf-to-bvec-fix-v1-0-1c9decbd4466%2540oracle.com%253E.html">[PATCH 0/2] SUNRPC: Fix xdr_buf_to_bvec() bio_vec array overflow</a></li>
+<li><a href="thread/%253C20260520175016.29480-1-cel%2540kernel.org%253E.html">[PATCH] xprtrdma: Decouple RPC completion from Send completion</a></li>
+<li><a href="thread/%253C20260513024252.3681597-1-yangerkun%2540huawei.com%253E.html">Re: [PATCH v2] Revert "NFSD: Defer sub-object cleanup in export put callbacks"</a></li>
+<li><a href="thread/%253C20260514-exportd-v1-1-be603d7fac41%2540kernel.org%253E.html">Re: [PATCH] exportfs: drop unused is_export parameter from xtab_read() and xtab_write()</a></li>
+<li><a href="thread/%253C20260515141426.357776-1-cel%2540kernel.org%253E.html">[GIT PULL] NFSD fixes for v7.1-rc</a></li>
+<li><a href="thread/%253C20260507-case-sensitivity-v14-0-e62cc8200435%2540oracle.com%253E.html">Re: [PATCH v14 00/15] Exposing case folding behavior</a></li>
+<li><a href="thread/%253C20260428-dir-deleg-v3-0-5a0780ba9def%2540kernel.org%253E.html">Re: (subset) [PATCH v3 00/28] vfs/nfsd: add support for CB_NOTIFY callbacks in directory delegations</a></li>
+<li><a href="thread/%253C20260512053625.2950900-1-hch%2540lst.de%253E.html">Re: improve the swap_activate interface</a></li>
+<li><a href="thread/%253C20260328172314.45807-1-dorjoychy111%2540gmail.com%253E.html">Re: [PATCH v6 0/4] OPENAT2_REGULAR flag support for openat2</a></li>
+<li><a href="thread/%253C20260408173535.3992116-1-giulio.benetti%2540benettiengineering.com%253E.html">Re: [PATCH v2 2/3] Introduce compat.h file to deal with old Linux api and fix build failure due to missing NETLINK_EXT_ACK</a></li>
+<li><a href="thread/%253C177853810078.2788210.11836979435758859096%2540noble.neil.brown.name%253E.html">Re: try_break_deleg() and atomic_open()</a></li>
+<li><a href="thread/%253CD33770A1-9098-4F1A-93EF-590E6C0B7638%2540hammerspace.com%253E.html">[RFC] knfsd: per-client fair scheduling to prevent single-client starvation</a></li>
+<li><a href="thread/%253C20260521132410.1072478-1-omosnace%2540redhat.com%253E.html">[PATCH] nfs: fix nfs_access_calc_mask() corner cases</a></li>
+<li><a href="thread/%253CagtehErxs5HVJJb0%2540codemonkey.org.uk%253E.html">[PATCH] NFS: write_completion: dereference loop-local req, not hdr-&gt;req</a></li>
+<li><a href="thread/%253C20260521201354.3294507-1-dai.ngo%2540oracle.com%253E.html">[PATCH v2 1/1] NFS: Don't always trust server inode size while client holds write delegation</a></li>
+</ul>
+  </main>
+</body>
+</html>

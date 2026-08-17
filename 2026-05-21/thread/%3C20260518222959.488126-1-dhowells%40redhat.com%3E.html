@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>netfs: Transition from folio_queue to segmented bio_vec[] chains (bvecq)</title>
+  <meta name="description" content="David Howells submitted a significant 21-patch series (PATCH v2 00/21) aimed at modernizing the network filesystem library (netfslib) by replacing its internal buffer management structures. This is a protocol-agnostic infrastructure change…">
+  <meta property="og:title" content="netfs: Transition from folio_queue to segmented bio_vec[] chains (bvecq)">
+  <meta property="og:description" content="David Howells submitted a significant 21-patch series (PATCH v2 00/21) aimed at modernizing the network filesystem library (netfslib) by replacing its internal buffer management structures. This is a protocol-agnostic infrastructure change…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-21T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="netfs: Transition from folio_queue to segmented bio_vec[] chains (bvecq)">
+  <meta name="twitter:description" content="David Howells submitted a significant 21-patch series (PATCH v2 00/21) aimed at modernizing the network filesystem library (netfslib) by replacing its internal buffer management structures. This is a protocol-agnostic infrastructure change…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-21</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>netfs: Transition from folio_queue to segmented bio_vec[] chains (bvecq)</h1>
+<h2>Summary</h2>
+<h2>netfs: Transition from folio_queue to segmented bio_vec[] chains (bvecq)</h2>
+<p>David Howells submitted a significant 21-patch series (<a href="https://lore.kernel.org/linux-nfs/20260518222959.488126-1-dhowells@redhat.com/">PATCH v2 00/21</a>) aimed at modernizing the network filesystem library (netfslib) by replacing its internal buffer management structures. This is a <strong>protocol-agnostic infrastructure change</strong> with implications for NFS, AFS, and CIFS clients, focusing on performance optimization and code consolidation rather than fixing a specific bug.</p>
+<h3>Key Technical Arguments</h3>
+<p>The primary motivation for this series is to align netfslib with the kernel's broader trend toward using <code>bio_vec</code> arrays for I/O operations. Howells outlined three main goals:</p>
+<ol>
+<li><strong>Consolidation:</strong> Move netfslib from its custom <code>folio_queue</code> and <code>rolling_buffer</code> constructs to a segmented chain of <code>bio_vec</code> arrays (<code>bvecq</code>). This reduces the number of buffering schemes in the kernel, as unbuffered/Direct I/O (DIO) already uses <code>bio_vec</code>.</li>
+<li><strong>Performance:</strong> Enable sending entire filesystem RPC request messages via a single <code>kernel_sendmsg()</code> call. Howells noted this is "faster, more efficient and doesn't require the use of corking as it puts the entire transmission loop inside of a single tcp_sendmsg()."</li>
+<li><strong>Simplification:</strong> Merge the <code>-&gt;prepare_read()</code>/<code>-&gt;issue_read()</code> operations (and their write counterparts) to simplify subrequest setup.</li>
+</ol>
+<p>The new <code>struct bvecq</code> introduces a linked list of segments, each containing an array of <code>bio_vec</code> entries. Key features include:</p>
+<ul>
+<li>File position tracking (<code>fpos</code>) per segment to allow folio lookup by file offset.</li>
+<li>A reference count (<code>ref</code>) to facilitate sharing slices of the chain.</li>
+<li>Memory type indicators (<code>mem_type</code>) to handle different memory sources (pagecache, GUP-pinned, allocated).</li>
+</ul>
+<p>Howells also introduced a new iterator type, <code>ITER_BVECQ</code>, allowing these chains to be passed directly to <code>sendmsg()</code> or block-based DIO operations.</p>
+<h3>Evolution of the Discussion</h3>
+<p>The series was met with minor stylistic and structural feedback from reviewers:</p>
+<ul>
+<li>
+<p><strong>David Laight</strong> <a href="https://lore.kernel.org/linux-nfs/20260519091545.171c4b85@pumpkin/">questioned the use of bitfields</a> in the <code>bvecq</code> structure, noting that "There doesn't seem to be any point using bitfields" given the existing padding. He also suggested using <code>off_t</code> or <code>u64</code> for <code>fpos</code> instead of <code>long long</code> and asked if backward traversal of the list was ever necessary, proposing a tail queue alternative if not.</p>
+</li>
+<li>
+<p><strong>Stefan Metzmacher</strong> provided an <a href="https://lore.kernel.org/linux-nfs/682a2d95-60d7-4303-a9ea-7dbd16f20b48@samba.org/">Acked-by</a> for the CIFS/SMBDirect patches but requested minor commit message updates. Specifically, he asked that references to <code>cifs:</code> and <code>smb_extract_iter_to_rdma</code> be changed to <code>smbdirect:</code> and <code>smbdirect_map_sges_from_iter</code> respectively, to better reflect the code's location and function. He repeated this request <a href="https://lore.kernel.org/linux-nfs/83ade7bf-9117-400d-b120-ed15401d09ff@samba.org/">for the removal of ITER_FOLIOQ support</a>.</p>
+</li>
+</ul>
+<h3>Impact on NFS Client Development</h3>
+<p>While the series affects multiple network filesystems, its impact on the NFS client is primarily through the <strong>netfs library abstraction</strong>. The NFS client relies on netfslib for buffered I/O and caching (via fscache/cachefiles). By switching to <code>bvecq</code>:</p>
+<ol>
+<li><strong>Cachefiles Optimization:</strong> The series includes significant changes to cachefiles, reducing reliance on <code>SEEK_DATA</code>/<code>SEEK_HOLE</code> calls for contiguous files. Howells introduced a <code>CACHEFILES_CONTENT_ALL</code> type for files written progressively without holes, which "speeds things up enormously" by avoiding per-read seek operations.</li>
+<li><strong>Unified Buffering:</strong> NFS clients will benefit from the unified buffering scheme, where both buffered and unbuffered I/O use the same underlying <code>bvecq</code> structure. This simplifies the codebase and reduces potential for bugs related to divergent buffer management paths.</li>
+<li><strong>Improved TCP Efficiency:</strong> The ability to send entire RPC messages in a single <code>kernel_sendmsg()</code> call should improve network throughput and reduce CPU overhead for NFS over TCP, as it eliminates the need for socket corking.</li>
+</ol>
+<h3>Final Conclusions</h3>
+<p>The series represents a major refactoring of the netfs library's I/O path. While no critical bugs were fixed, the changes are designed to improve performance and maintainability. The feedback received was minor, focusing on code style and commit message accuracy. Howells indicated that further work is planned to allow filesystems to "splice" TCP receive queues into <code>bvecq</code> chains, which would further reduce lock contention during data copying.</p>
+<p>The series is targeted for inclusion in the VFS tree, pending the requested minor adjustments to commit messages.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260518222959.488126-1-dhowells@redhat.com/">2026-05-18 David Howells <a href="mailto:dhowells@redhat.com">dhowells@redhat.com</a> — [PATCH v2 00/21] netfs: Keep track of folios in a segmented bio_vec[] chain</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260518222959.488126-2-dhowells@redhat.com/">2026-05-18 David Howells <a href="mailto:dhowells@redhat.com">dhowells@redhat.com</a> — [PATCH v2 01/21] cachefiles: Don't rely on backing fs storage map for most use cases</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260518222959.488126-3-dhowells@redhat.com/">2026-05-18 David Howells <a href="mailto:dhowells@redhat.com">dhowells@redhat.com</a> — [PATCH v2 02/21] netfs: Add the cache object ID to netfs_read/write tracepoints</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260518222959.488126-4-dhowells@redhat.com/">2026-05-18 David Howells <a href="mailto:dhowells@redhat.com">dhowells@redhat.com</a> — [PATCH v2 03/21] mm: Make readahead store folio count in readahead_control</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260518222959.488126-5-dhowells@redhat.com/">2026-05-18 David Howells <a href="mailto:dhowells@redhat.com">dhowells@redhat.com</a> — [PATCH v2 04/21] netfs: Bulk load the readahead-provided folios up front</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260518222959.488126-6-dhowells@redhat.com/">2026-05-18 David Howells <a href="mailto:dhowells@redhat.com">dhowells@redhat.com</a> — [PATCH v2 05/21] Add a function to kmap one page of a multipage bio_vec</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260518222959.488126-7-dhowells@redhat.com/">2026-05-18 David Howells <a href="mailto:dhowells@redhat.com">dhowells@redhat.com</a> — [PATCH v2 06/21] iov_iter: Make iov_iter_get_pages*() wrap iov_iter_extract_pages()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260518222959.488126-8-dhowells@redhat.com/">2026-05-18 David Howells <a href="mailto:dhowells@redhat.com">dhowells@redhat.com</a> — [PATCH v2 07/21] iov_iter: Add a segmented queue of bio_vec[]</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260518222959.488126-9-dhowells@redhat.com/">2026-05-18 David Howells <a href="mailto:dhowells@redhat.com">dhowells@redhat.com</a> — [PATCH v2 08/21] netfs: Add some tools for managing bvecq chains</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260518222959.488126-10-dhowells@redhat.com/">2026-05-18 David Howells <a href="mailto:dhowells@redhat.com">dhowells@redhat.com</a> — [PATCH v2 09/21] netfs: Add a function to extract from an iter into a bvecq</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260518222959.488126-11-dhowells@redhat.com/">2026-05-18 David Howells <a href="mailto:dhowells@redhat.com">dhowells@redhat.com</a> — [PATCH v2 10/21] afs: Use a bvecq to hold dir content rather than folioq</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260518222959.488126-12-dhowells@redhat.com/">2026-05-18 David Howells <a href="mailto:dhowells@redhat.com">dhowells@redhat.com</a> — [PATCH v2 11/21] cifs: Use a bvecq for buffering instead of a folioq</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260518222959.488126-13-dhowells@redhat.com/">2026-05-18 David Howells <a href="mailto:dhowells@redhat.com">dhowells@redhat.com</a> — [PATCH v2 12/21] cifs: Support ITER_BVECQ in smb_extract_iter_to_rdma()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260518222959.488126-14-dhowells@redhat.com/">2026-05-18 David Howells <a href="mailto:dhowells@redhat.com">dhowells@redhat.com</a> — [PATCH v2 13/21] netfs: Switch to using bvecq rather than folio_queue and rolling_buffer</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260518222959.488126-16-dhowells@redhat.com/">2026-05-18 David Howells <a href="mailto:dhowells@redhat.com">dhowells@redhat.com</a> — [PATCH v2 15/21] netfs: Remove netfs_alloc/free_folioq_buffer()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260518222959.488126-17-dhowells@redhat.com/">2026-05-18 David Howells <a href="mailto:dhowells@redhat.com">dhowells@redhat.com</a> — [PATCH v2 16/21] netfs: Remove netfs_extract_user_iter()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260518222959.488126-15-dhowells@redhat.com/">2026-05-18 David Howells <a href="mailto:dhowells@redhat.com">dhowells@redhat.com</a> — [PATCH v2 14/21] cifs: Remove support for ITER_FOLIOQ from smb_extract_iter_to_rdma()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260518222959.488126-18-dhowells@redhat.com/">2026-05-18 David Howells <a href="mailto:dhowells@redhat.com">dhowells@redhat.com</a> — [PATCH v2 17/21] iov_iter: Remove ITER_FOLIOQ</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260518222959.488126-19-dhowells@redhat.com/">2026-05-18 David Howells <a href="mailto:dhowells@redhat.com">dhowells@redhat.com</a> — [PATCH v2 18/21] netfs: Remove folio_queue and rolling_buffer</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260518222959.488126-20-dhowells@redhat.com/">2026-05-18 David Howells <a href="mailto:dhowells@redhat.com">dhowells@redhat.com</a> — [PATCH v2 19/21] netfs: Check for too much data being read</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260518222959.488126-21-dhowells@redhat.com/">2026-05-18 David Howells <a href="mailto:dhowells@redhat.com">dhowells@redhat.com</a> — [PATCH v2 20/21] netfs: Limit the minimum trigger for progress reporting</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260518222959.488126-22-dhowells@redhat.com/">2026-05-18 David Howells <a href="mailto:dhowells@redhat.com">dhowells@redhat.com</a> — [PATCH v2 21/21] netfs: Combine prepare and issue ops and grab the buffers on request</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260519091545.171c4b85@pumpkin/">2026-05-19 David Laight <a href="mailto:david.laight.linux@gmail.com">david.laight.linux@gmail.com</a> — Re: [PATCH v2 00/21] netfs: Keep track of folios in a segmented bio_vec[] chain</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/682a2d95-60d7-4303-a9ea-7dbd16f20b48@samba.org/">2026-05-19 Stefan Metzmacher <a href="mailto:metze@samba.org">metze@samba.org</a> — Re: [PATCH v2 12/21] cifs: Support ITER_BVECQ in smb_extract_iter_to_rdma()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/83ade7bf-9117-400d-b120-ed15401d09ff@samba.org/">2026-05-19 Stefan Metzmacher <a href="mailto:metze@samba.org">metze@samba.org</a> — Re: [PATCH v2 14/21] cifs: Remove support for ITER_FOLIOQ from smb_extract_iter_to_rdma()</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd: drain backchannel callbacks before freeing a session (UAF fix)</title>
+  <meta name="description" content="Type: Bug fix — a use-after-free in the NFSv4 server (nfsd) backchannel callback path, triggered by DESTROY_SESSION racing with an in-flight CB RPC on rpciod.">
+  <meta property="og:title" content="nfsd: drain backchannel callbacks before freeing a session (UAF fix)">
+  <meta property="og:description" content="Type: Bug fix — a use-after-free in the NFSv4 server (nfsd) backchannel callback path, triggered by DESTROY_SESSION racing with an in-flight CB RPC on rpciod.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-21T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd: drain backchannel callbacks before freeing a session (UAF fix)">
+  <meta name="twitter:description" content="Type: Bug fix — a use-after-free in the NFSv4 server (nfsd) backchannel callback path, triggered by DESTROY_SESSION racing with an in-flight CB RPC on rpciod.">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-21</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd: drain backchannel callbacks before freeing a session (UAF fix)</h1>
+<h2>Summary</h2>
+<h2>nfsd: drain backchannel callbacks before freeing a session</h2>
+<p><strong>Type:</strong> Bug fix — a use-after-free in the NFSv4 server (<code>nfsd</code>) backchannel callback path, triggered by <code>DESTROY_SESSION</code> racing with an in-flight CB RPC on <code>rpciod</code>.</p>
+<p>This is a two-patch series posted by Chris Mason (Meta) on May 19, drawing quick review from both J. Bruce Fields and Jeff Layton within a few hours. The discussion is squarely about <strong>NFS server-side callback teardown safety</strong>, not the client — though the backchannel is the mechanism by which the server pings NFS <em>clients</em> for delegation recalls and layout-return notifications, so the fix protects the integrity of that client-facing RPC path.</p>
+<h3>The bug</h3>
+<p>Mason's <a href="https://lore.kernel.org/linux-nfs/20260519180032.1852793-2-clm@meta.com/">cover letter</a> frames the problem concisely:</p>
+<blockquote>
+<p>"DESTROY_SESSION can free an nfsd4_session while a backchannel callback for the same client is still live on rpciod, leaving clp-&gt;cl_cb_session as a dangling pointer."</p>
+</blockquote>
+<p>The detailed <a href="https://lore.kernel.org/linux-nfs/20260519180032.1852793-4-clm@meta.com/">PATCH 2/2</a> lays out the race with an ASCII two-CPU diagram: <code>nfsd4_probe_callback_sync()</code> only flushes <code>cl_callback_wq</code>, which drains the work_struct that <em>submits</em> CB RPCs but returns before the rpciod-side completion tail (<code>rpc_call_done -&gt; rpc_release -&gt; nfsd41_destroy_cb</code>) has run. A CB RPC submitted just before teardown can therefore still be executing on rpciod, with <code>clp-&gt;cl_cb_session</code> pointing at the session about to be freed.</p>
+<p>Mason pinpoints why the existing reference-count gate doesn't help:</p>
+<blockquote>
+<p>"The se_ref gate in nfsd4_put_session_locked() does not close this window: the backchannel dispatch path does not take a se_ref via nfsd4_get_session_locked(), so se_ref can already be zero while a CB RPC is still in flight against the session."</p>
+</blockquote>
+<p>The fix is to wait on <code>cl_cb_inflight</code> — a counter introduced years earlier by commit 2bbfed98a4d8 ("nfsd: Fix races between nfsd4_cb_release() and nfsd4_shutdown_callback()") — after the workqueue flush, so every queued CB RPC has reached its <code>rpc_release</code> before the caller proceeds to free the session. Mason notes that <code>nfsd4_shutdown_callback()</code> already does this for exactly this reason; <code>nfsd4_probe_callback_sync()</code> was simply never updated when <code>cl_cb_inflight</code> was introduced. The patch carries a <code>Fixes:</code> tag pointing at that original commit, and — notably — an <code>Assisted-by: kres (claude-opus-4-7)</code> line indicating AI-assisted development.</p>
+<h3>The second half: clearing the stale pointer</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260519180032.1852793-3-clm@meta.com/">PATCH 1/2</a> addresses a secondary hazard that survives even after the drain: <code>clp-&gt;cl_cb_session</code> still <em>caches</em> the freed pointer, because no destroy, expire, or shutdown path clears it — the stale value lingers until the next <code>CREATE_SESSION</code> overwrites it. Mason identifies three helpers that dereference the cached session and could hit a use-after-free in that window:</p>
+<blockquote>
+<p>"A backchannel dispatch that races in during that window dereferences the freed session through one of three helpers: nfsd41_cb_get_slot(), nfsd41_cb_release_slot(), nfsd4_cb_sequence_done()."</p>
+</blockquote>
+<p>The fix clears the cached pointer under <code>clp-&gt;cl_lock</code> (using a <code>WRITE_ONCE</code> store) and pairs it with <code>READ_ONCE</code> loads plus NULL checks in the three helpers so each takes its early-return/requeue path. The encode/decode helpers are argued to be safe because they only read <code>cl_cb_session</code> from in-flight RPCs that <code>nfsd4_probe_callback_sync()</code> has already quiesced.</p>
+<h3>Review: Bruce Fields questions whether the drain is even needed</h3>
+<p>The first reply came from <a href="https://lore.kernel.org/linux-nfs/agyvpO10GIaWtziX@parkour.fieldses.org/">J. Bruce Fields</a>, who pushed back on the premise of patch 2/2 — suggesting the existing <code>rpc_shutdown_client()</code> path may already guarantee completion:</p>
+<blockquote>
+<p>"nfsd4_probe_callback_sync()-&gt;nfsd4_probe_callback() sets NFSD4_CLIENT_CB_UPDATE and calls nfsd4_run_cb(), which should ensure work is queued that will run nfsd4_run_cb_work and call nfsd4_process_cb_update()-&gt;setup_callback_client(), which calls rpc_shutdown_client()--and I <em>think</em> that isn't supposed to return until any rpc callbacks have run? And since that's called from the workqueue, the flush should do it."</p>
+</blockquote>
+<p>He was candid about his uncertainty: "I may not have thought about this in 4 years, but you did cc me, so if I'm raving, well, you get what you deserve...." This is an open question rather than a rejection — Fields is asking whether the explicit <code>cl_cb_inflight</code> wait is redundant with the workqueue flush already exercising <code>rpc_shutdown_client()</code>.</p>
+<h3>Review: Jeff Layton validates both problems and spots a spin-loop</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/92813369f8e3e62960c21be4822b1b7c97b9729b.camel@kernel.org/">Jeff Layton's reply</a> to patch 1/2 is the most substantive technical contribution. He opens with a wry observation about the AI-assisted review process:</p>
+<blockquote>
+<p>"Dueling agent review. Looks like both problems are valid:"</p>
+</blockquote>
+<p>Layton flags two issues:</p>
+<ol>
+<li>
+<p><strong>Series ordering / commit message.</strong> The cover letter and patch 1/2 say "The parent commit drains in-flight backchannel callbacks," but the drain is actually added by patch <em>2/2</em>, which applies <em>after</em> patch 1/2. He asks: "Should 'The parent commit drains' be rephrased, or should the series order be swapped so the drain lands first?"</p>
+</li>
+<li>
+<p><strong>A busy-spin in <code>nfsd41_cb_get_slot()</code>.</strong> When <code>ses</code> is NULL (the new early-return path), the function returns <code>false</code> without calling <code>rpc_sleep_on()</code>. Layton traces through the RPC state machine to show this creates a livelock: because <code>nfsd41_cb_get_slot</code> is the <code>rpc_call_prepare</code> callback, and it returns without either starting the call or sleeping the task, <code>__rpc_execute()</code> loops back and calls prepare again indefinitely. He walks through the exact loop:</p>
+</li>
+</ol>
+<blockquote>
+<p>"When prepare returns without calling rpc_call_start() and without sleeping the task, __rpc_execute() loops back and calls prepare again because tk_action is unchanged and the task is not queued."</p>
+</blockquote>
+<p>He confirms the path is reachable — after <code>nfsd4_destroy_session()</code> clears <code>cl_cb_session</code> but before <code>cl_cb_client</code> is torn down, another client's delegation recall can queue a new CB RPC that enters this spin. His suggested fix sets an error status to break the loop:</p>
+<blockquote>
+<p>"Would something like the following avoid the spin? <code>if (!ses) { task-&gt;tk_rpc_status = -EIO; return false; }</code> That would route the task through rpc_exit_task -&gt; nfsd4_cb_sequence_done (which already handles NULL session via goto requeue) and on to nfsd4_cb_release, breaking the loop."</p>
+</blockquote>
+<h3>Final status: Reviewed-by granted with caveats</h3>
+<p>Layton's <a href="https://lore.kernel.org/linux-nfs/36129760a31644ac98678b1d77f3acd9f27f502f.camel@kernel.org/">reply to the cover letter</a> closes the thread with a conditional approval:</p>
+<blockquote>
+<p>"Assuming you want to reverse the order, you can add this: Reviewed-by: Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a>"</p>
+<p>"The other review comment from Claude sounds reasonable too, but harder to hit in practice."</p>
+</blockquote>
+<p>So the series has a <code>Reviewed-by</code> from one of the core nfsd maintainers, contingent on reordering (drain first, then NULL-clear) or at minimum fixing the commit-message wording. The spin-loop fix for <code>nfsd41_cb_get_slot()</code> is acknowledged as valid but "harder to hit in practice." Bruce Fields' question about whether <code>rpc_shutdown_client()</code> already covers the drain remains open and would need Mason's response before the series is fully settled.</p>
+<h3>Key takeaways</h3>
+<ul>
+<li><strong>Bug class:</strong> Use-after-free on session teardown, a classic NFSv4 backchannel race that has been partially addressed before (commit 2bbfed98a4d8) but with a gap in <code>nfsd4_probe_callback_sync()</code>.</li>
+<li><strong>Fix strategy:</strong> Two-layer defense — wait on <code>cl_cb_inflight</code> to drain the rpciod completion tail, <em>and</em> NULL out the cached <code>cl_cb_session</code> pointer so any future regression is caught by early-return guards rather than silently dereferencing freed memory.</li>
+<li><strong>Open items for v2:</strong> (a) reorder or reword the series; (b) add <code>-EIO</code> status to the NULL-session path in <code>nfsd41_cb_get_slot()</code> to avoid a prepare-loop spin; (c) resolve Bruce Fields' question about whether the explicit drain is redundant with <code>rpc_shutdown_client()</code>.</li>
+<li><strong>Notable process detail:</strong> Both patches carry <code>Assisted-by: kres (claude-opus-4-7)</code> tags, and Layton's "Dueling agent review" remark highlights the growing role of AI in kernel patch preparation and review.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260519180032.1852793-2-clm@meta.com/">2026-05-19 Chris Mason <a href="mailto:clm@meta.com">clm@meta.com</a> — [PATCH] nfsd: drain backchannel callbacks before freeing a session</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260519180032.1852793-4-clm@meta.com/">2026-05-19 Chris Mason <a href="mailto:clm@meta.com">clm@meta.com</a> — [PATCH 2/2] nfsd: drain inflight callbacks in probe_callback_sync</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260519180032.1852793-3-clm@meta.com/">2026-05-19 Chris Mason <a href="mailto:clm@meta.com">clm@meta.com</a> — [PATCH 1/2] nfsd: clear cl_cb_session on DESTROY_SESSION</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/agyvpO10GIaWtziX@parkour.fieldses.org/">2026-05-19 "J. Bruce Fields" <a href="mailto:bfields@fieldses.org">bfields@fieldses.org</a> — Re: [PATCH 2/2] nfsd: drain inflight callbacks in probe_callback_sync</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/92813369f8e3e62960c21be4822b1b7c97b9729b.camel@kernel.org/">2026-05-19 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 1/2] nfsd: clear cl_cb_session on DESTROY_SESSION</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/36129760a31644ac98678b1d77f3acd9f27f502f.camel@kernel.org/">2026-05-19 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH] nfsd: drain backchannel callbacks before freeing a session</a></li>
+</ul>
+  </main>
+</body>
+</html>

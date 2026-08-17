@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd: one-line fix for inverted cp_ttl check in async copy reaper</title>
+  <meta name="description" content="This week&#39;s thread is a compact, same-day bug-fix cycle on the NFS server side (nfsd), touching the NFSv4.2 asynchronous copy (COPY / OFFLOAD_STATUS) machinery. It is squarely a bug fix, not a new feature or protocol change: a one-line…">
+  <meta property="og:title" content="nfsd: one-line fix for inverted cp_ttl check in async copy reaper">
+  <meta property="og:description" content="This week&#39;s thread is a compact, same-day bug-fix cycle on the NFS server side (nfsd), touching the NFSv4.2 asynchronous copy (COPY / OFFLOAD_STATUS) machinery. It is squarely a bug fix, not a new feature or protocol change: a one-line…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-21T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd: one-line fix for inverted cp_ttl check in async copy reaper">
+  <meta name="twitter:description" content="This week&#39;s thread is a compact, same-day bug-fix cycle on the NFS server side (nfsd), touching the NFSv4.2 asynchronous copy (COPY / OFFLOAD_STATUS) machinery. It is squarely a bug fix, not a new feature or protocol change: a one-line…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-21</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd: one-line fix for inverted cp_ttl check in async copy reaper</h1>
+<h2>Summary</h2>
+<h1>nfsd: Fix Inverted <code>cp_ttl</code> Check in Async Copy Reaper</h1>
+<h2>Overview</h2>
+<p>This week's thread is a compact, same-day bug-fix cycle on the <strong>NFS server</strong> side (nfsd), touching the NFSv4.2 asynchronous copy (<code>COPY</code> / <code>OFFLOAD_STATUS</code>) machinery. It is squarely a <strong>bug fix</strong>, not a new feature or protocol change: a one-line predicate inversion in <code>nfsd4_async_copy_reaper()</code> was causing completed async-copy state to be freed far too early, breaking the client's ability to query results via <code>OFFLOAD_STATUS</code>.</p>
+<p>The thread ran from patch posting through review and merge into <code>nfsd-testing</code> within roughly two and a half hours on Thursday, 2026-05-21 — a textbook quick turnaround for a small, well-understood fix.</p>
+<h2>The Bug</h2>
+<p>Jeff Layton opened the thread <a href="https://lore.kernel.org/linux-nfs/20260521-async_copy_reaper_cp_ttl_inverted-v1-1-66b87cb1bf64@kernel.org/">with the original patch</a>, explaining the intended behavior of the reaper:</p>
+<blockquote>
+<p>"nfsd4_async_copy_reaper() is supposed to keep completed async copy state around for NFSD_COPY_INITIAL_TTL (10) laundromat ticks so that OFFLOAD_STATUS can report the result, then reap the state once the countdown expires."</p>
+</blockquote>
+<p>The problem was a classic inverted test. As Layton described:</p>
+<blockquote>
+<p>"The TTL predicate is inverted: <code>if (--copy-&gt;cp_ttl)</code> is true while ticks remain and false when the counter reaches zero. This causes the copy to be reaped on the very first tick (cp_ttl goes from 10 to 9, which is non-zero) instead of after all 10 ticks elapse."</p>
+</blockquote>
+<p>The practical consequence for NFS clients was direct:</p>
+<blockquote>
+<p>"Once reaped, OFFLOAD_STATUS returns NFS4ERR_BAD_STATEID because the copy state has already been freed."</p>
+</blockquote>
+<p>Layton also flagged a latent secondary hazard that the current initial value of 10 happens to mask:</p>
+<blockquote>
+<p>"A secondary consequence: if cp_ttl ever reached zero (not possible with the current initial value of 10 since the copy is reaped at 9), the copy would never be added to the reaplist and would leak indefinitely on clp-&gt;async_copies."</p>
+</blockquote>
+<p>The fix itself is a one-character negation in <code>fs/nfsd/nfs4proc.c</code> (1 insertion, 1 deletion). The bug was <a href="https://lore.kernel.org/linux-nfs/20260521-async_copy_reaper_cp_ttl_inverted-v1-1-66b87cb1bf64@kernel.org/">reported by Chris Mason</a> at Meta.</p>
+<h2>Self-Corrections During Review</h2>
+<p>In a follow-up minutes after posting, Layton <a href="https://lore.kernel.org/linux-nfs/7b881d9562d78821c56f68b0d17b8e5bf09350f7.camel@kernel.org/">walked back two details</a>:</p>
+<blockquote>
+<p>"Mea culpa. This doesn't need to go to stable so we can drop that tag. It's a bug, but not one that results in a crash or data corruption or anything."</p>
+</blockquote>
+<p>He also noted the patch should have carried an <code>Assisted-by:</code> tag crediting an AI assistant (<code>kres:claude-opus-4-6</code>), an increasingly common convention on the list for AI-assisted patches.</p>
+<p>Paulo Alcantara then <a href="https://lore.kernel.org/linux-nfs/5967be753a797fa05c00cd76d20d37c8@manguebit.org/">caught a subtle metadata error</a> in the <code>Fixes:</code> tag:</p>
+<blockquote>
+<p>"Wouldn't aa0ebd21df9c be the correct commit id?"</p>
+</blockquote>
+<p>Layton <a href="https://lore.kernel.org/linux-nfs/96c5286c68aa8d2e6e2528e1a8522ff3a90f4990.camel@kernel.org/">confirmed</a>:</p>
+<blockquote>
+<p>"Thanks, yes it would. The other commit id is correct for a copy in my tree, but aa0ebd21df9c is the correct upstream one."</p>
+</blockquote>
+<p>This is a small but important detail for stable-tree tooling: the <code>Fixes:</code> hash must reference the upstream commit, not a local variant.</p>
+<h2>Merge</h2>
+<p>NFS server maintainer Chuck Lever <a href="https://lore.kernel.org/linux-nfs/177937807665.146125.2838077605492493468.b4-ty@b4/">applied the patch to <code>nfsd-testing</code></a> the same day:</p>
+<blockquote>
+<p>"Applied to nfsd-testing, thanks!"</p>
+</blockquote>
+<p>The merged commit is <code>14ba3b4b7cb4d05a070c77226d10dfc332898421</code>.</p>
+<h2>Significance for NFS Clients</h2>
+<p>Although the fix lives in nfsd, its impact is felt on the <strong>client</strong> side of the wire: any NFSv4.2 client issuing an asynchronous <code>COPY</code> and then polling <code>OFFLOAD_STATUS</code> would have been receiving spurious <code>NFS4ERR_BAD_STATEID</code> responses because the server was discarding the copy state on the first laundromat tick rather than after the full 10-tick TTL window. The fix restores the intended contract of the async-copy API and removes a latent memory-leak path should the initial TTL ever be changed to zero in the future.</p>
+<h2>Conclusions</h2>
+<ul>
+<li><strong>Type:</strong> Bug fix (one-line predicate negation), not a feature or protocol change.</li>
+<li><strong>Root cause:</strong> Inverted <code>if (--copy-&gt;cp_ttl)</code> test reaped async-copy state on tick 1 instead of after all 10 TTL ticks.</li>
+<li><strong>User-visible symptom:</strong> <code>OFFLOAD_STATUS</code> returning <code>NFS4ERR_BAD_STATEID</code> for still-valid async copies.</li>
+<li><strong>Latent risk:</strong> Memory leak on <code>clp-&gt;async_copies</code> if <code>cp_ttl</code> were ever initialized to zero.</li>
+<li><strong>Outcome:</strong> Patch corrected (drop stable tag, fix <code>Fixes:</code> hash to upstream <code>aa0ebd21df9c</code>, add <code>Assisted-by:</code>), and merged into <code>nfsd-testing</code> as <code>14ba3b4b7cb4</code> within hours of posting.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260521-async_copy_reaper_cp_ttl_inverted-v1-1-66b87cb1bf64@kernel.org/">2026-05-21 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH] nfsd: fix inverted cp_ttl check in async copy reaper</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/7b881d9562d78821c56f68b0d17b8e5bf09350f7.camel@kernel.org/">2026-05-21 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH] nfsd: fix inverted cp_ttl check in async copy reaper</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/5967be753a797fa05c00cd76d20d37c8@manguebit.org/">2026-05-21 Paulo Alcantara <a href="mailto:pc@manguebit.org">pc@manguebit.org</a> — Re: [PATCH] nfsd: fix inverted cp_ttl check in async copy reaper</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/96c5286c68aa8d2e6e2528e1a8522ff3a90f4990.camel@kernel.org/">2026-05-21 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH] nfsd: fix inverted cp_ttl check in async copy reaper</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177937807665.146125.2838077605492493468.b4-ty@b4/">2026-05-21 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH] nfsd: fix inverted cp_ttl check in async copy reaper</a></li>
+</ul>
+  </main>
+</body>
+</html>

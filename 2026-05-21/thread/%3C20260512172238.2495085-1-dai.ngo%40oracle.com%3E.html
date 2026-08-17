@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>XFS pNFS: Deepening investigation into overlapping extents and race conditions in LAYOUTGET</title>
+  <meta name="description" content="This week&#39;s discussion continued the review of Dai Ngo&#39;s patch to fix overlapping extents returned by XFS during pNFS LAYOUTGET operations. While the previous week established consensus on removing the XFS_BMAPI_ENTIRE flag from…">
+  <meta property="og:title" content="XFS pNFS: Deepening investigation into overlapping extents and race conditions in LAYOUTGET">
+  <meta property="og:description" content="This week&#39;s discussion continued the review of Dai Ngo&#39;s patch to fix overlapping extents returned by XFS during pNFS LAYOUTGET operations. While the previous week established consensus on removing the XFS_BMAPI_ENTIRE flag from…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-21T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="XFS pNFS: Deepening investigation into overlapping extents and race conditions in LAYOUTGET">
+  <meta name="twitter:description" content="This week&#39;s discussion continued the review of Dai Ngo&#39;s patch to fix overlapping extents returned by XFS during pNFS LAYOUTGET operations. While the previous week established consensus on removing the XFS_BMAPI_ENTIRE flag from…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-21</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>XFS pNFS: Deepening investigation into overlapping extents and race conditions in LAYOUTGET</h1>
+<h2>Summary</h2>
+<h1>XFS pNFS: Deepening investigation into overlapping extents and race conditions in LAYOUTGET</h1>
+<h2>Summary</h2>
+<p>This week's discussion continued the review of Dai Ngo's patch to fix overlapping extents returned by XFS during pNFS <code>LAYOUTGET</code> operations. While the previous week established consensus on removing the <code>XFS_BMAPI_ENTIRE</code> flag from <code>xfs_fs_map_blocks()</code>, this week's exchange revealed deeper concerns about the root cause of the overlaps and potential race conditions in the NFS server code.</p>
+<h3>Bug Fix Context</h3>
+<p>The patch addresses a regression where multiple calls to <code>xfs_fs_map_blocks()</code> within a single <code>LAYOUTGET</code> operation could return overlapping extents due to the use of the <code>XFS_BMAPI_ENTIRE</code> flag. This caused ambiguity for NFS clients when selecting device layouts and handling data states.</p>
+<h3>Key Technical Arguments</h3>
+<p><strong>Christoph Hellwig's Skepticism About Overlaps</strong></p>
+<p>Christoph Hellwig questioned why overlapping extents appeared at all, suggesting a hidden bug in the nfsd code:</p>
+<blockquote>
+<p>"Now that is really weird. How do we end up not using the remainder of the previous extent from a previous nfsd4_block_map_extent call in nfsd4_block_proc_layoutget? Looks like there is another bug hiding in the nfsd code somewhere."</p>
+</blockquote>
+<p>He also reiterated the need for client-side validation:</p>
+<blockquote>
+<p>"And the client should probably also validate that extents of the same kind do not overlap (read vs write extents are allowed to overlap)."</p>
+</blockquote>
+<p><strong>Dave Chinner's Proposed Optimization</strong></p>
+<p>Dave Chinner proposed a more nuanced solution that would preserve performance benefits while avoiding overlaps:</p>
+<blockquote>
+<p>"The problem is not the use of XFS_BMAPI_ENTIRE on the first mapping call, it's the use of it on the -second- after the first call didn't return a range that mapped the -entire- request range."</p>
+</blockquote>
+<p>He suggested keeping <code>XFS_BMAPI_ENTIRE</code> for the initial call to minimize pNFS client mapping calls, but dropping the flag and trimming ranges for subsequent calls:</p>
+<blockquote>
+<p>"That was we get large extents reported most of the time, and in the corner cases where we have a race like this one or an extent boundary lies in the middle of the requested range, we will get correct, non-overlapping behaviour. Best of both worlds, yes?"</p>
+</blockquote>
+<p><strong>Dai Ngo's API Limitation Argument</strong></p>
+<p>Dai Ngo countered that the current <code>map_blocks()</code> API between NFS server and XFS does not distinguish between first and subsequent calls:</p>
+<blockquote>
+<p>"Currently the map_blocks() API between the NFS server and XFS does not provide a way to specify whether XFS should use XFS_BMAPI_ENTIRE or '0'. xfs_fs_map_blocks() just uses XFS_BMAPI_ENTIRE."</p>
+</blockquote>
+<p>He argued that since the first call always requests the entire file range from the client, using <code>XFS_BMAPI_ENTIRE</code> makes no practical difference if it cannot return the full range:</p>
+<blockquote>
+<p>"So if xfs_fs_map_blocks() can not return the requested mapping range with '0' on the first mapping call then I think using XFS_BMAPI_ENTIRE in the first mapping call makes any different."</p>
+</blockquote>
+<p>Christoph Hellwig agreed with this assessment:</p>
+<blockquote>
+<p>"And that is a good thing."</p>
+</blockquote>
+<h3>Discovery of Potential Race Condition</h3>
+<p>Dai Ngo provided debug output showing that file extent mappings changed during the <code>LAYOUTGET</code> operation, with two entries merging into one:</p>
+<blockquote>
+<p>"As shown, the file map changes. Entry# 7 and 8 before the NFSD calls merged into entry#7 after the calls. So there must be some activities that cause the map to change."</p>
+</blockquote>
+<p>This led Christoph Hellwig to identify a potential race condition in the NFS server code:</p>
+<blockquote>
+<p>"Hmm. We only insert layouts (and search for conflicts) after calling -&gt;proc_layoutget. So this might be racy against unwritten extent conversion, or other writers, which is a bit of an issue. I guess we need to fix nfsd4_layoutget to insert an in-progress layout before calling into -&gt;layouget."</p>
+</blockquote>
+<p>Dai Ngo requested clarification on the race condition but acknowledged the need for the fix:</p>
+<blockquote>
+<p>"I can't quite see the race condition regarding layoutget here. Could you please explain?"</p>
+</blockquote>
+<h3>Final Conclusions</h3>
+<p>The discussion concluded with agreement on two fronts:</p>
+<ol>
+<li><strong>Immediate Fix:</strong> Dai Ngo will resubmit the patch series combining the removal of <code>XFS_BMAPI_ENTIRE</code> (replaced with <code>0</code>) and a fix for uninitialized imap handling in the error path:</li>
+</ol>
+<blockquote>
+<p>"I'll resubmit the patch series with both fixes combined: the uninitialized imap handling in the error path and the replacement of XFS_BMAPI_ENTIRE with 0."</p>
+</blockquote>
+<ol start="2">
+<li><strong>Deeper nfsd Fix:</strong> Christoph Hellwig identified a separate issue requiring <code>nfsd4_layoutget</code> to insert an "in-progress" layout before calling into the filesystem's <code>layoutget</code> handler, to prevent races against unwritten extent conversions or concurrent writers. This remains an open item for future work.</li>
+</ol>
+<h3>Classification</h3>
+<p>This discussion centers on a <strong>bug fix</strong> for pNFS LAYOUTGET operations in XFS, with implications for NFS client development regarding robustness against malformed server responses. The exchange also uncovered a potential race condition in the NFS server code that warrants separate attention.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/agcIUYJE6a93seLc@infradead.org/">2026-05-15 Christoph Hellwig <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [PATCH 1/1] xfs: fix overlapping extents returned for pNFS LAYOUTGET</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/agcIm53ZQ8-P7dX6@infradead.org/">2026-05-15 Christoph Hellwig <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [PATCH 1/1] xfs: fix overlapping extents returned for pNFS LAYOUTGET</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ageSguSyf2kBY33a@dread/">2026-05-15 Dave Chinner <a href="mailto:dgc@kernel.org">dgc@kernel.org</a> — Re: [PATCH 1/1] xfs: fix overlapping extents returned for pNFS LAYOUTGET</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/b9860332-7b1e-448e-869a-ad59d8d5b7c0@oracle.com/">2026-05-16 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — Re: [PATCH 1/1] xfs: fix overlapping extents returned for pNFS LAYOUTGET</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/agqfBPRWXQDR2ImG@infradead.org/">2026-05-18 Christoph Hellwig <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [PATCH 1/1] xfs: fix overlapping extents returned for pNFS LAYOUTGET</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/606c4cea-70d2-4601-9db2-611cd35c3687@oracle.com/">2026-05-18 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — Re: [PATCH 1/1] xfs: fix overlapping extents returned for pNFS LAYOUTGET</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/agwDhixPAAA0-cTa@infradead.org/">2026-05-19 Christoph Hellwig <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [PATCH 1/1] xfs: fix overlapping extents returned for pNFS LAYOUTGET</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/55c7c22a-8edb-4833-be3f-1f6555ba90ed@oracle.com/">2026-05-19 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — Re: [PATCH 1/1] xfs: fix overlapping extents returned for pNFS LAYOUTGET</a></li>
+</ul>
+  </main>
+</body>
+</html>

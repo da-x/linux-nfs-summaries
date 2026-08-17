@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>sunrpc: kref_get_unless_zero patch for auth_domain_lookup dropped after review</title>
+  <meta name="description" content="Type: Bug fix (proposed, ultimately withdrawn) Subsystem: NFS server / SUNRPC authentication (net/sunrpc/svcauth.c)">
+  <meta property="og:title" content="sunrpc: kref_get_unless_zero patch for auth_domain_lookup dropped after review">
+  <meta property="og:description" content="Type: Bug fix (proposed, ultimately withdrawn) Subsystem: NFS server / SUNRPC authentication (net/sunrpc/svcauth.c)">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-21T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="sunrpc: kref_get_unless_zero patch for auth_domain_lookup dropped after review">
+  <meta name="twitter:description" content="Type: Bug fix (proposed, ultimately withdrawn) Subsystem: NFS server / SUNRPC authentication (net/sunrpc/svcauth.c)">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-21</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>sunrpc: kref_get_unless_zero patch for auth_domain_lookup dropped after review</h1>
+<h2>Summary</h2>
+<h2>sunrpc: kref_get_unless_zero in auth_domain_lookup — Patch Proposed, Reviewed, and Dropped</h2>
+<p><strong>Type:</strong> Bug fix (proposed, ultimately withdrawn)
+<strong>Subsystem:</strong> NFS server / SUNRPC authentication (<code>net/sunrpc/svcauth.c</code>)</p>
+<h3>Background</h3>
+<p>On Wednesday, May 20, Jeff Layton posted a small patch to the linux-nfs list as part of his nfsd-fixes series. The change targeted <code>auth_domain_lookup()</code> in the SUNRPC server-side authentication code, proposing a switch from plain <code>kref_get()</code> to <code>kref_get_unless_zero()</code> when acquiring a reference on an auth_domain hash entry.</p>
+<p>Layton's cover description painted a vivid race-condition scenario:</p>
+<blockquote>
+<p>"auth_domain_put() uses kref_put_lock(), which atomically decrements the refcount before acquiring auth_domain_lock. This creates a window where an auth_domain entry is still linked on the hash list with refcount == 0."</p>
+</blockquote>
+<p>He argued that if <code>auth_domain_lookup()</code> encountered such a transient zero-refcount entry, the plain <code>kref_get()</code> would trigger a WARN (saturating refcount_t semantics) yet still return the pointer, leaving the caller with a dangling reference that could be freed by the concurrent <code>auth_domain_put()</code>. The fix was to mirror what the sibling function <code>auth_domain_find()</code> already does: treat a zero-refcount entry as absent and continue searching.</p>
+<p>The patch carried a <code>Reported-by:</code> tag for Chris Mason (Meta) and an unusual <code>Assisted-by: kres:claude-opus-4-6</code> line, indicating AI-assisted development.</p>
+<h3>Review and Rebuttal</h3>
+<p>Chuck Lever responded within about an hour with a brief note supplying the appropriate <code>Fixes:</code> tag:</p>
+<blockquote>
+<p>"Fixes: 608a0ab2f54a ("SUNRPC: Add lockless lookup of the server's auth domain")"</p>
+</blockquote>
+<p>A second reply from Lever, roughly half an hour later, forwarded results from <strong>sashiko</strong> (an automated code-review tool) that raised two high-severity objections:</p>
+<blockquote>
+<p>"[Severity: High] Is this description of kref_put_lock() accurate? Looking at kref_put_lock(), it uses refcount_dec_and_lock() which acquires the spinlock before the 1-&gt;0 transition is completed. Since auth_domain_lookup() holds the same auth_domain_lock, is it actually possible for it to encounter a 0-refcount entry under normal conditions?"</p>
+</blockquote>
+<p>The second concern was equally pointed:</p>
+<blockquote>
+<p>"[Severity: High] If a 0-refcount entry is encountered here, wouldn't it indicate a severe underlying refcount imbalance or use-after-free rather than a normal race? By using kref_get_unless_zero() and continuing the search, might this silently mask the root cause of the WARN instead of resolving it?"</p>
+</blockquote>
+<p>Sashiko also flagged a potential functional regression: if the loop skipped a zero-refcount entry and fell through to the end of the function, it could insert a duplicate auth_domain with the same name into the hash list.</p>
+<h3>Resolution</h3>
+<p>Layton conceded quickly, agreeing with the automated reviewer's analysis:</p>
+<blockquote>
+<p>"Sashiko is correct. This codepath can't see a 0 refcount here. The patch won't break anything, but it's not fixing anything either. Let's just drop this one."</p>
+</blockquote>
+<p>The key technical insight was that <code>kref_put_lock()</code> internally uses <code>refcount_dec_and_lock()</code>, which acquires the spinlock <em>before</em> completing the 1→0 transition. Since <code>auth_domain_lookup()</code> already holds that same lock while walking the hash, it can never observe an entry in a zero-refcount state — the race window Layton described does not actually exist.</p>
+<h3>Significance for NFS Client/Server Development</h3>
+<p>Although this particular patch was withdrawn, the thread is instructive on several fronts:</p>
+<ol>
+<li><strong>AI-assisted kernel development:</strong> The <code>Assisted-by: kres:claude-opus-4-6</code> tag marks one of the more visible instances of AI tooling contributing to mainline kernel patches. The automated sashiko review effectively caught a subtle misunderstanding of lock ordering in <code>kref_put_lock()</code>, preventing a no-op (or worse, masking) patch from entering the tree.</li>
+<li><strong>SUNRPC auth_domain locking:</strong> The discussion clarified the precise semantics of the lockless lookup path introduced by commit 608a0ab2f54a, reinforcing that the existing <code>kref_get()</code> in <code>auth_domain_lookup()</code> is safe under the current locking scheme.</li>
+<li><strong>nfsd-fixes series context:</strong> This patch was message 1 of a larger nfsd-fixes v1 series from Layton; its withdrawal does not affect the remaining fixes in the set.</li>
+</ol>
+<p>The thread concluded within roughly two hours of the initial posting, with no further activity.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260520-nfsd-fixes-v1-1-664ba702d698@kernel.org/">2026-05-20 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH] sunrpc: use kref_get_unless_zero in auth_domain_lookup</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/cd159ccb-f1e6-4af0-96a3-3902dac86c58@app.fastmail.com/">2026-05-20 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH] sunrpc: use kref_get_unless_zero in auth_domain_lookup</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/42fc0eda-111c-43ec-9413-53d42bf758c7@app.fastmail.com/">2026-05-20 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH] sunrpc: use kref_get_unless_zero in auth_domain_lookup</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/62a7f19f02ea65774d8b24e97dc17443202ba4bc.camel@kernel.org/">2026-05-20 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH] sunrpc: use kref_get_unless_zero in auth_domain_lookup</a></li>
+</ul>
+  </main>
+</body>
+</html>

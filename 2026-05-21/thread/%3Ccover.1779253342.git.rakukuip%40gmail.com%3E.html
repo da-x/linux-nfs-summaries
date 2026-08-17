@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>sunrpc: clear rq_procinfo in svc_release_rqst to prevent double-free</title>
+  <meta name="description" content="A compact but security-relevant bug-fix thread landed on the linux-nfs list this week, with all three messages posted on 2026-05-20. The discussion centers on a stale-pointer hazard in the kernel&#39;s NFS server-side RPC layer (sunrpc) that…">
+  <meta property="og:title" content="sunrpc: clear rq_procinfo in svc_release_rqst to prevent double-free">
+  <meta property="og:description" content="A compact but security-relevant bug-fix thread landed on the linux-nfs list this week, with all three messages posted on 2026-05-20. The discussion centers on a stale-pointer hazard in the kernel&#39;s NFS server-side RPC layer (sunrpc) that…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-21T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="sunrpc: clear rq_procinfo in svc_release_rqst to prevent double-free">
+  <meta name="twitter:description" content="A compact but security-relevant bug-fix thread landed on the linux-nfs list this week, with all three messages posted on 2026-05-20. The discussion centers on a stale-pointer hazard in the kernel&#39;s NFS server-side RPC layer (sunrpc) that…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-21</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>sunrpc: clear rq_procinfo in svc_release_rqst to prevent double-free</h1>
+<h2>Summary</h2>
+<h1>sunrpc: Clearing <code>rq_procinfo</code> in <code>svc_release_rqst()</code> to Prevent Double-Free</h1>
+<p>A compact but security-relevant bug-fix thread landed on the linux-nfs list this week, with all three messages posted on 2026-05-20. The discussion centers on a stale-pointer hazard in the kernel's NFS <strong>server-side</strong> RPC layer (sunrpc) that can be triggered by a reused <code>svc_rqst</code> and ultimately lead to a double-free or use-after-free.</p>
+<h2>Nature of the change: bug fix (security hardening)</h2>
+<p>This is squarely a <strong>bug fix</strong>, not a new feature or protocol change. The patch is marked with a <code>Fixes:</code> tag pointing at commit <code>d9adbb6e10bf</code> ("sunrpc: delay pc_release callback until after the reply is sent") and carries <code>Cc: stable@kernel.org</code>, signaling that it is intended for backporting to stable trees.</p>
+<h2>The vulnerability, as described by the author</h2>
+<p>Ren Wei posted the patch <a href="https://lore.kernel.org/linux-nfs/8c4cfe3656a817a64da9cf62e42282a1f308b9dd.1779253342.git.rakukuip@gmail.com/">on behalf of Luxiao Xu</a>, explaining the root cause:</p>
+<blockquote>
+<p>"The svc_release_rqst() function unconditionally calls rqstp-&gt;rq_procinfo-&gt;pc_release. However, svc_process_common() does not clear rq_procinfo when a worker thread starts processing a new request."</p>
+</blockquote>
+<p>The failure scenario, in the author's words:</p>
+<blockquote>
+<p>"If a previous RPC selected a procedure with a non-idempotent release hook, and the subsequent RPC takes an early error path before a new rq_procinfo is installed (e.g., due to an oversized RPC fragment, bad auth, or unknown program), the stale release hook will run against reused state from the earlier RPC. This leads to a double-free or use-after-free vulnerability."</p>
+</blockquote>
+<p>The minimal fix proposed is to set <code>rqstp-&gt;rq_procinfo</code> to NULL immediately after running the release hook inside <code>svc_release_rqst()</code>. The patch touches only <code>net/sunrpc/svc.c</code> (3 insertions, 1 deletion). Four reporters are credited in the commit message: Yuan Tan, Yifan Wu, Juefei Pu, and Xin Liu.</p>
+<h2>Review response</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/2b28abdf244109c7ce13841df4cdd57a6fd94341.camel@kernel.org/">Jeff Layton</a> responded a couple of hours later with a brief:</p>
+<blockquote>
+<p>"Reviewed-by: Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a>"</p>
+</blockquote>
+<h2>Chuck Lever asks for a hardened respin</h2>
+<p>The most substantive technical input came from <a href="https://lore.kernel.org/linux-nfs/1aa329c3-d77a-410b-92d2-2cc03e737267@app.fastmail.com/">Chuck Lever</a>, who endorsed the direction but asked that the fix be broadened to make the lifecycle of <code>rq_procinfo</code> explicit across all entry points:</p>
+<blockquote>
+<p>"We should harden this fix a bit by extending it so that:</p>
+<ul>
+<li>svc_release_rqst() /always/ clears rq_procinfo after the optional pc_release() call, not only when pc_release exists.</li>
+<li>svc_process() clears rq_procinfo at request entry before early decode/drop paths.</li>
+<li>svc_process_bc() does the same before its early backchannel decode return."</li>
+</ul>
+</blockquote>
+<p>Lever framed the rationale in terms of making the invariant obvious to future readers:</p>
+<blockquote>
+<p>"That makes the lifecycle explicit: each request starts with no selected proc, pg_init_request() installs one, svc_release_rqst() consumes it. It guarantees that the error flows in svc_process() won't encounter a non-NULL rq_procinfo pointer when there is nothing to release."</p>
+</blockquote>
+<p>He closed by asking the author to respin: "Can you respin your patch with those changes?"</p>
+<h2>Status and outlook</h2>
+<p>The thread ends here for this week — no v2 has been posted yet. The consensus is clear: the underlying bug (a stale <code>rq_procinfo</code> triggering a non-idempotent <code>pc_release</code> on early-error paths of <code>svc_process()</code> / <code>svc_process_bc()</code>) is real, the minimal fix is correct but narrow, and the maintainers want a slightly broader patch that nulls the pointer at every request entry point so the lifecycle invariant holds by construction. Expect a v2 from Luxiao Xu / Ren Wei in the coming days, after which the change should be straightforward to merge and backport to stable.</p>
+<h2>Relevance to NFS client development</h2>
+<p>While this fix lives on the <strong>server-side</strong> sunrpc path (<code>net/sunrpc/svc.c</code>), it is worth flagging for client developers because the same <code>sunrpc</code> subsystem underpins both directions of an NFS mount, and the early-error paths called out (oversized fragment, bad auth, unknown program) are exactly the conditions a misbehaving or hostile peer can induce against an in-kernel NFS server. Hardening the release-hook lifecycle here reduces the attack surface for any host that runs <code>nfsd</code> alongside its client stack.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/8c4cfe3656a817a64da9cf62e42282a1f308b9dd.1779253342.git.rakukuip@gmail.com/">2026-05-20 Ren Wei <a href="mailto:n05ec@lzu.edu.cn">n05ec@lzu.edu.cn</a> — [PATCH 1/1] sunrpc: clear rq_procinfo in svc_release_rqst to prevent double-free</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/2b28abdf244109c7ce13841df4cdd57a6fd94341.camel@kernel.org/">2026-05-20 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 1/1] sunrpc: clear rq_procinfo in svc_release_rqst to prevent double-free</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/1aa329c3-d77a-410b-92d2-2cc03e737267@app.fastmail.com/">2026-05-20 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 1/1] sunrpc: clear rq_procinfo in svc_release_rqst to prevent double-free</a></li>
+</ul>
+  </main>
+</body>
+</html>

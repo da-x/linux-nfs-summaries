@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS writeback UAF fix: dereference loop-local req in nfs_write_completion</title>
+  <meta name="description" content="This week&#39;s activity on this thread is a single, self-contained patch from Dave Jones that plugs a slab-use-after-free in the NFS client&#39;s write-completion path. It is squarely a bug fix — no new feature, no protocol change — and it lands…">
+  <meta property="og:title" content="NFS writeback UAF fix: dereference loop-local req in nfs_write_completion">
+  <meta property="og:description" content="This week&#39;s activity on this thread is a single, self-contained patch from Dave Jones that plugs a slab-use-after-free in the NFS client&#39;s write-completion path. It is squarely a bug fix — no new feature, no protocol change — and it lands…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-21T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS writeback UAF fix: dereference loop-local req in nfs_write_completion">
+  <meta name="twitter:description" content="This week&#39;s activity on this thread is a single, self-contained patch from Dave Jones that plugs a slab-use-after-free in the NFS client&#39;s write-completion path. It is squarely a bug fix — no new feature, no protocol change — and it lands…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-21</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS writeback UAF fix: dereference loop-local req in nfs_write_completion</h1>
+<h2>Summary</h2>
+<h2>NFS writeback use-after-free: a one-line fix for a multi-page-group race</h2>
+<p>This week's activity on this thread is a single, self-contained patch from Dave Jones that plugs a slab-use-after-free in the NFS client's write-completion path. It is squarely a <strong>bug fix</strong> — no new feature, no protocol change — and it lands as a one-line correction to <code>fs/nfs/write.c</code>.</p>
+<h3>The bug</h3>
+<p>The regression was introduced by commit 5d3869a41f36 ("NFS: fix writeback in presence of errors"), which added a dereference of <code>hdr-&gt;req-&gt;wb_lock_context</code> inside the per-request loop of <code>nfs_write_completion()</code>. As Jones explains in <a href="https://lore.kernel.org/linux-nfs/agtehErxs5HVJJb0@codemonkey.org.uk/">the patch submission</a>:</p>
+<blockquote>
+<p>"hdr-&gt;req is set once at nfs_pgheader_init() time and is not refcount-protected for the lifetime of the loop; when hdr aggregates requests from multiple page groups (common under heavy NFSv3 writeback), a parallel COMMIT on hdr-&gt;req's group can drop the last reference and free it while the outer loop is still iterating requests from other groups."</p>
+</blockquote>
+<p>In other words, <code>hdr-&gt;req</code> is a stale pointer that outlives its own refcount. The race window opens whenever a single pgio header spans multiple page groups — which, per Jones, is "common under heavy NFSv3 writeback" — and a concurrent COMMIT releases the first group's pages while the completion loop is still walking later groups.</p>
+<p>KASAN caught it as an 8-byte read at offset +24 of a freed <code>nfs_page</code> slab object (the <code>wb_lock_context</code> field):</p>
+<blockquote>
+<p>"BUG: KASAN: slab-use-after-free in nfs_write_completion+0x8f8/0xa50 [nfs]"</p>
+</blockquote>
+<p>The full report, reproduced in the patch, shows the allocation coming from an <code>rsync</code> write path (<code>nfs_update_folio</code> → <code>nfs_page_create</code>) and the free coming from a parallel COMMIT (<code>nfs_commit_release_pages</code> → <code>nfs_unlock_and_release_request</code> → <code>nfs_page_group_destroy</code>). The reproducer was running on 7.1.0-rc4+ with KASAN enabled.</p>
+<h3>The fix</h3>
+<p>The correction exploits an invariant Jones calls out:</p>
+<blockquote>
+<p>"All requests in a given pgio share the same open_context, so reading the loop-local req's wb_lock_context yields the same value and is safe -- req is still on hdr-&gt;pages and holds its writeback kref through the commit branch."</p>
+</blockquote>
+<p>So the patch simply swaps <code>hdr-&gt;req</code> for the loop-local <code>req</code>, which is guaranteed to be alive for the duration of that iteration because it is still linked into <code>hdr-&gt;pages</code> and pinned by its writeback kref. The diff is one insertion, one deletion in <code>fs/nfs/write.c</code>.</p>
+<h3>Review and status</h3>
+<p>The patch carries a <code>Reviewed-by</code> from Jeff Layton (<code>jlayton@kernel.org</code>) and a <code>Fixes:</code> tag pointing at 5d3869a41f36. It is Cc'd to the NFS maintainers — Olga Kornievskaia, Trond Myklebust, Anna Schumaker — and to linux-nfs@vger.kernel.org. Jones also credits AI assistance:</p>
+<blockquote>
+<p>"Assisted-by: Claude:claude-opus-4-7"</p>
+</blockquote>
+<p>No replies or further discussion have appeared in the thread as of this week's window; the submission stands on its own with a reviewer already on board, making it a strong candidate for merge into the current development cycle.</p>
+<h3>Why it matters</h3>
+<p>This is a textbook example of why refcount discipline in the NFS writeback path is so delicate: the pgio header deliberately aggregates work across page groups to amortize COMMIT overhead, but that aggregation means any per-header pointer must be either refcount-protected for the whole loop or replaced by a per-iteration reference. The original "fix writeback in presence of errors" commit took the latter route incorrectly; Jones's patch restores it with minimal churn. For NFSv3 users running heavy writeback (the KASAN trace shows an <code>rsync</code> workload), this eliminates a real use-after-free that could corrupt slab memory or, in principle, be exploited.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/agtehErxs5HVJJb0@codemonkey.org.uk/">2026-05-18 Dave Jones <a href="mailto:davej@codemonkey.org.uk">davej@codemonkey.org.uk</a> — [PATCH] NFS: write_completion: dereference loop-local req, not hdr-&gt;req</a></li>
+</ul>
+  </main>
+</body>
+</html>

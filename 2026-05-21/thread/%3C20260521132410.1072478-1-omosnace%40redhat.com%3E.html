@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PATCH: Fix nfs_access_calc_mask() corner cases for special files</title>
+  <meta name="description" content="This week, Red Hat&#39;s Ondrej Mosnacek submitted a bug-fix patch targeting the NFS client&#39;s access-permission calculation logic. The patch addresses two inconsistencies in nfs_access_calc_mask() in fs/nfs/dir.c that caused incorrect behavior…">
+  <meta property="og:title" content="PATCH: Fix nfs_access_calc_mask() corner cases for special files">
+  <meta property="og:description" content="This week, Red Hat&#39;s Ondrej Mosnacek submitted a bug-fix patch targeting the NFS client&#39;s access-permission calculation logic. The patch addresses two inconsistencies in nfs_access_calc_mask() in fs/nfs/dir.c that caused incorrect behavior…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-21T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="PATCH: Fix nfs_access_calc_mask() corner cases for special files">
+  <meta name="twitter:description" content="This week, Red Hat&#39;s Ondrej Mosnacek submitted a bug-fix patch targeting the NFS client&#39;s access-permission calculation logic. The patch addresses two inconsistencies in nfs_access_calc_mask() in fs/nfs/dir.c that caused incorrect behavior…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-21</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>PATCH: Fix nfs_access_calc_mask() corner cases for special files</h1>
+<h2>Summary</h2>
+<h1>NFS client: Fix <code>nfs_access_calc_mask()</code> corner cases for special files</h1>
+<h2>Overview</h2>
+<p>This week, Red Hat's Ondrej Mosnacek submitted a <a href="https://lore.kernel.org/linux-nfs/20260521132410.1072478-1-omosnace@redhat.com/">bug-fix patch</a> targeting the NFS client's access-permission calculation logic. The patch addresses two inconsistencies in <code>nfs_access_calc_mask()</code> in <code>fs/nfs/dir.c</code> that caused incorrect behavior when calling <code>access(2)</code> with <code>X_OK</code> on special files (FIFOs, block devices, character devices).</p>
+<h2>Key Technical Arguments</h2>
+<p>The patch identifies <strong>two distinct bugs</strong> in the existing code:</p>
+<ol>
+<li>
+<p><strong>Inconsistent special-file handling</strong>: The special case for files that are neither regular files nor directories was inconsistent with the permissions actually requested by <code>nfs_do_access()</code>. Mosnacek notes:</p>
+<blockquote>
+<p>"The special case for special files (neither regular file nor directory) is inconsistent with the perms requested in nfs_do_access()"</p>
+</blockquote>
+</li>
+<li>
+<p><strong>Incorrect MAY_WRITE condition</strong>: The check used a bare bitwise AND rather than the full equality comparison pattern used elsewhere:</p>
+<blockquote>
+<p>"the MAY_WRITE condition seems incorrect (checks just <code>access_result &amp; NFS_MAY_WRITE</code> instead of <code>(access_result &amp; NFS_MAY_WRITE) == NFS_MAY_WRITE</code> as is the pattern for the other cases)"</p>
+</blockquote>
+</li>
+</ol>
+<p>The fix unifies the treatment of regular and special files, since <code>nfs_access_calc_mask()</code> already requests the same access bits for both:</p>
+<blockquote>
+<p>"Since nfs_access_calc_mask() requests the same access bits for regular and special files, we end up with nfs_access_calc_mask() that treats both the same as well."</p>
+</blockquote>
+<h2>User-Visible Impact</h2>
+<p>The most significant consequence is a <strong>behavioral inconsistency between NFS and classic local filesystems</strong>. On local filesystems, <code>access("...", X_OK)</code> on a FIFO, block device, or character device depends on the file's UNIX permission bits. On NFS, it would <em>always fail</em> regardless of permissions:</p>
+<blockquote>
+<p>"On classic filesystems the result of that call depends on the UNIX permissions of the file, while on NFS it would always fail."</p>
+</blockquote>
+<p>Mosnacek included a comprehensive test script in the commit message demonstrating the difference by creating a FIFO, a character device (<code>c 1 3</code>), and a block device (<code>b 7 0</code>), then comparing <code>os.access(..., os.X_OK)</code> results between the local export directory and the NFS mount—both before and after applying <code>chmod u+x</code>.</p>
+<p>He also noted a practical caveat for Fedora/RHEL users:</p>
+<blockquote>
+<p>"on some Fedora/RHEL systems you may need to also do <code>setenforce 0</code> before running the script, because the SELinux policy could block the execute permission for the special files on the server side - this bug will be fixed independently in the policy."</p>
+</blockquote>
+<h2>Classification &amp; Provenance</h2>
+<ul>
+<li><strong>Type</strong>: Bug fix (not a new feature or protocol change).</li>
+<li><strong>Fixes tag</strong>: <code>ecbb903c5674</code> ("NFS: Be more careful about mapping file permissions") — indicating this is a regression introduced by an earlier permission-mapping hardening commit.</li>
+<li><strong>Scope</strong>: 1 file changed, 5 insertions(+), 7 deletions(-) in <code>fs/nfs/dir.c</code>.</li>
+</ul>
+<h2>Discussion Status</h2>
+<p>As of the end of this reporting window (2026-05-21), the patch was freshly posted with no replies yet. A follow-up reply from Mosnacek himself is visible later in the thread (2026-05-25, outside this week's window), suggesting further discussion or a v2 may have followed. No reviewer objections or alternative approaches were raised within this week.</p>
+<h2>Significance for NFS Client Development</h2>
+<p>This patch is a small but important correctness fix that aligns NFS client semantics with POSIX expectations for <code>access(2)</code>. The fact that it was triggered by testing special-file execute permissions—likely as part of broader filesystem compatibility testing—underscores the ongoing effort to close behavioral gaps between NFS and local filesystems. The regression trace back to <code>ecbb903c5674</code> also highlights how permission-mapping changes in the NFS client can have subtle side effects on edge-case file types.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260521132410.1072478-1-omosnace@redhat.com/">2026-05-21 Ondrej Mosnacek <a href="mailto:omosnace@redhat.com">omosnace@redhat.com</a> — [PATCH] nfs: fix nfs_access_calc_mask() corner cases</a></li>
+</ul>
+  </main>
+</body>
+</html>

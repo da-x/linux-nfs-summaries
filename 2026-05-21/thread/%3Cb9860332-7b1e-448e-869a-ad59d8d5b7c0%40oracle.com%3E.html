@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>XFS pNFS LAYOUTGET: Sergey Bashirov weighs in on race conditions and multi-map API direction</title>
+  <meta name="description" content="This thread concerns a bug fix for overlapping extents returned by XFS during pNFS LAYOUTGET operations — a regression that causes ambiguity for NFS clients when selecting device layouts and managing data states. This week&#39;s single message…">
+  <meta property="og:title" content="XFS pNFS LAYOUTGET: Sergey Bashirov weighs in on race conditions and multi-map API direction">
+  <meta property="og:description" content="This thread concerns a bug fix for overlapping extents returned by XFS during pNFS LAYOUTGET operations — a regression that causes ambiguity for NFS clients when selecting device layouts and managing data states. This week&#39;s single message…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-21T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="XFS pNFS LAYOUTGET: Sergey Bashirov weighs in on race conditions and multi-map API direction">
+  <meta name="twitter:description" content="This thread concerns a bug fix for overlapping extents returned by XFS during pNFS LAYOUTGET operations — a regression that causes ambiguity for NFS clients when selecting device layouts and managing data states. This week&#39;s single message…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-21</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>XFS pNFS LAYOUTGET: Sergey Bashirov weighs in on race conditions and multi-map API direction</h1>
+<h2>Summary</h2>
+<h1>XFS pNFS LAYOUTGET: Sergey Bashirov weighs in on race conditions and multi-map API direction</h1>
+<h2>Classification</h2>
+<p>This thread concerns a <strong>bug fix</strong> for overlapping extents returned by XFS during pNFS <code>LAYOUTGET</code> operations — a regression that causes ambiguity for NFS clients when selecting device layouts and managing data states. This week's single message represents the closing contribution from Sergey Bashirov, author of the original multi-mapping code, who was added to the thread by Christoph Hellwig on May 20.</p>
+<h2>Bridging Prior Weeks</h2>
+<p>As detailed in four prior summary files covering this same subject across multiple threads:</p>
+<ul>
+<li>Dai Ngo's patch proposed replacing the <code>XFS_BMAPI_ENTIRE</code> flag with <code>0</code> in <code>xfs_fs_map_blocks()</code> to prevent overlapping extents when multiple calls are made within a single <code>LAYOUTGET</code> request.</li>
+<li>Christoph Hellwig identified both the core overlap bug and a separate race condition in the NFS server code where layouts are inserted only after calling into <code>-&gt;proc_layoutget</code>.</li>
+<li>Darrick J. Wong raised three targeted review questions on locking adequacy, multi-map API design, and reflink/realtime inode check placement.</li>
+<li>Dai Ngo provided a detailed mechanical walkthrough of how extent merging produces overlaps: when hole-filling during a second <code>xfs_fs_map_blocks()</code> call causes segments to merge, a third call with <code>XFS_BMAPI_ENTIRE</code> returns the full merged extent, overlapping prior results.</li>
+<li>Consensus emerged on a v2 patch plan: replace <code>XFS_BMAPI_ENTIRE</code> with <code>0</code>, move reflink/realtime checks inside the inode lock, and defer multi-map API enhancements to future work.</li>
+</ul>
+<h2>This Week's Activity (May 20)</h2>
+<p>Sergey Bashirov, the author of the original pNFS multi-mapping infrastructure in XFS, was added to the thread by Christoph Hellwig and provided his perspective on two key open questions: whether a revert of the multi-mapping code is necessary, and whether race conditions involving concurrent <code>LAYOUTGET</code> requests are a realistic concern.</p>
+<h3>Endorsement of the Forward Path — No Revert Needed</h3>
+<p>Sergey affirmed Dai Ngo's detailed explanation of the extent merge mechanics <a href="https://lore.kernel.org/linux-nfs/c5dgxtly3l66e6ukv7isresztq5le5mtyoyk4wqldolu5x3hqo@dx62gtu6o2w6/">in his May 20 message</a>:</p>
+<blockquote>
+<p>"Great job! I think so too."</p>
+</blockquote>
+<p>He then weighed in on Christoph Hellwig's suggestion that a revert of the multi-mapping code might be warranted, agreeing with Dai Ngo's position to defer such changes:</p>
+<blockquote>
+<p>"Agree with Dai. I believe that a revert is unnecessary as the upcoming patchset should fix the issue."</p>
+</blockquote>
+<p>However, Sergey endorsed the longer-term architectural improvement of passing an array element count to XFS to find all iomaps in one lock cycle:</p>
+<blockquote>
+<p>"At the same time, passing the array element count to the XFS code to find all iomaps in one lock cycle is a great direction for further improvement."</p>
+</blockquote>
+<h3>Race Condition Analysis — pNFS Protocol Guarantees</h3>
+<p>The most substantive contribution from Sergey was his analysis of whether race conditions involving concurrent <code>LAYOUTGET</code> requests are a realistic concern. Christoph Hellwig had previously expressed worry that:</p>
+<blockquote>
+<p>"We only insert layouts (and search for conflicts) after calling -&gt;proc_layoutget. So this might be racy against unwritten extent conversion, or other writers, which is a bit of an issue."</p>
+</blockquote>
+<p>Sergey provided a detailed protocol-level argument explaining why such races are effectively prevented by the pNFS specification:</p>
+<blockquote>
+<p>"During LAYOUTGET processing, before extents are mapped, the nfsd server allocates a layout stateid and takes a lease on the file. Consequently, it is impossible for multiple clients to acquire layouts to the same file simultaneously. The server will first recall the layout from one client and then grant it to another."</p>
+</blockquote>
+<p>He further noted that even within a single client, concurrent <code>LAYOUTGET</code> requests are serialized:</p>
+<blockquote>
+<p>"Additionally, two LAYOUTGET requests to the same file from a single client cannot be processed simultaneously as well, they are strictly ordered by the seqid. Thus, I do not know a race condition with two processes/threads accessing the same file via pNFS."</p>
+</blockquote>
+<p>Sergey added an important caveat regarding direct XFS access on the metadata server:</p>
+<blockquote>
+<p>"And direct access to XFS on the MDS server, bypassing pNFS, is strictly discouraged, since it may have unexpected side effects regardless of this issue."</p>
+</blockquote>
+<h2>Evolution of the Discussion</h2>
+<p>The thread's trajectory over the past week can be summarized as follows:</p>
+<ol>
+<li>
+<p><strong>May 15–19:</strong> Intense technical debate among Christoph Hellwig, Dave Chinner, Darrick J. Wong, and Dai Ngo on the root cause of overlapping extents, locking adequacy, and API design questions. Dai Ngo's mechanical walkthrough of extent merging solidified understanding of the bug.</p>
+</li>
+<li>
+<p><strong>May 20 (morning):</strong> Christoph Hellwig added Sergey Bashirov to the thread for his expertise on the multi-mapping code. Darrick J. Wong and Dai Ngo reached consensus on the v2 patch plan, including deferring multi-map API enhancements.</p>
+</li>
+<li>
+<p><strong>May 20 (evening):</strong> Sergey Bashirov's contribution provided protocol-level reassurance that pNFS layout state management prevents concurrent <code>LAYOUTGET</code> races, while endorsing the forward path of fixing the bug without reverting the multi-mapping infrastructure.</p>
+</li>
+</ol>
+<h2>Final Conclusions</h2>
+<p>The discussion concluded with clear alignment on all open items:</p>
+<ol>
+<li><strong>No revert needed:</strong> The multi-mapping code should remain; the v2 patch series will fix the overlapping extents bug by replacing <code>XFS_BMAPI_ENTIRE</code> with <code>0</code>.</li>
+<li><strong>v2 action items confirmed:</strong> Replace <code>XFS_BMAPI_ENTIRE</code> with <code>0</code>, move reflink/realtime inode checks inside the inode lock, and address uninitialized imap handling in the error path.</li>
+<li><strong>Multi-map API deferred but endorsed:</strong> Passing an array element count to XFS for multi-iomap retrieval in a single lock cycle is acknowledged as "a great direction for further improvement" but requires coordinated nfsd/XFS changes.</li>
+<li><strong>Race condition concerns contextualized:</strong> Sergey Bashirov's protocol-level analysis suggests that pNFS layout state management (lease acquisition, seqid ordering) effectively prevents the concurrent <code>LAYOUTGET</code> races that Christoph Hellwig had worried about — though direct XFS access on the MDS remains discouraged.</li>
+</ol>
+<h2>Implications for NFS Client Development</h2>
+<p>This fix has direct relevance for NFS client robustness. As Christoph Hellwig noted in prior weeks:</p>
+<blockquote>
+<p>"And the client should probably also validate that extents of the same kind do not overlap (read vs write extents are allowed to overlap)."</p>
+</blockquote>
+<p>With the server-side fix progressing toward v2, clients will encounter fewer malformed <code>LAYOUTGET</code> responses. Dai Ngo's detailed explanation of how extent merging produces overlaps provides valuable context for client developers who may need to handle similar scenarios in their layout processing code. Sergey Bashirov's confirmation that pNFS protocol guarantees prevent concurrent layout races also reassures client developers that the server-side fix addresses the core issue without requiring compensatory logic on the client side.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/c5dgxtly3l66e6ukv7isresztq5le5mtyoyk4wqldolu5x3hqo@dx62gtu6o2w6/">2026-05-20 Sergey Bashirov <a href="mailto:sergeybashirov@gmail.com">sergeybashirov@gmail.com</a> — Re: [PATCH 1/1] xfs: fix overlapping extents returned for pNFS LAYOUTGET</a></li>
+</ul>
+  </main>
+</body>
+</html>

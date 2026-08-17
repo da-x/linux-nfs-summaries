@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>sunrpc: rq_procinfo lifecycle hardening (double-free fix) applied to nfsd-testing</title>
+  <meta name="description" content="A compact but consequential bug-fix thread landed on the linux-nfs list on Thursday, 2026-05-21. Luxiao Xu&#39;s patch — posted by Ren Wei as v2 — closes a double-free / use-after-free hole in the SUNRPC server-side request path, and it was…">
+  <meta property="og:title" content="sunrpc: rq_procinfo lifecycle hardening (double-free fix) applied to nfsd-testing">
+  <meta property="og:description" content="A compact but consequential bug-fix thread landed on the linux-nfs list on Thursday, 2026-05-21. Luxiao Xu&#39;s patch — posted by Ren Wei as v2 — closes a double-free / use-after-free hole in the SUNRPC server-side request path, and it was…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-21T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="sunrpc: rq_procinfo lifecycle hardening (double-free fix) applied to nfsd-testing">
+  <meta name="twitter:description" content="A compact but consequential bug-fix thread landed on the linux-nfs list on Thursday, 2026-05-21. Luxiao Xu&#39;s patch — posted by Ren Wei as v2 — closes a double-free / use-after-free hole in the SUNRPC server-side request path, and it was…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-21</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>sunrpc: rq_procinfo lifecycle hardening (double-free fix) applied to nfsd-testing</h1>
+<h2>Summary</h2>
+<h1>sunrpc: rq_procinfo lifecycle hardening (double-free fix) applied to nfsd-testing</h1>
+<h2>What happened this week</h2>
+<p>A compact but consequential bug-fix thread landed on the linux-nfs list on Thursday, 2026-05-21. Luxiao Xu's patch — posted by Ren Wei as v2 — closes a double-free / use-after-free hole in the SUNRPC server-side request path, and it was picked up by nfsd maintainer Chuck Lever within hours of posting.</p>
+<h2>The bug (v2 submission)</h2>
+<p>Ren Wei <a href="https://lore.kernel.org/linux-nfs/20260521070636.900264-1-n05ec@lzu.edu.cn/">posted the v2 patch</a>, authored by Luxiao Xu, which describes the underlying defect in terms that matter for NFS server maintainers:</p>
+<blockquote>
+<p>"The svc_release_rqst() function executes the callback inside rqstp-&gt;rq_procinfo-&gt;pc_release. However, if a worker thread begins processing a new request and encounters an early error path (e.g., unsupported protocol, short frame, or bad auth) before a valid rq_procinfo is installed, a stale release hook can be re-triggered against reused state from the previous RPC, resulting in a double-free or use-after-free vulnerability."</p>
+</blockquote>
+<p>The proposed fix hardens the lifecycle of <code>rq_procinfo</code> in three places:</p>
+<ol>
+<li><code>svc_release_rqst()</code> now <em>always</em> clears <code>rq_procinfo</code> after the optional <code>pc_release()</code> call, regardless of whether the hook exists.</li>
+<li><code>svc_process()</code> explicitly clears <code>rq_procinfo</code> at request entry, before any early decode or drop path can run.</li>
+<li><code>svc_process_bc()</code> does the same at backchannel entry.</li>
+</ol>
+<p>The patch carries a <code>Fixes:</code> tag pointing at d9adbb6e10bf ("sunrpc: delay pc_release callback until after the reply is sent") and a <code>Cc: stable@kernel.org</code> line, plus four <code>Reported-by:</code> tags (Yuan Tan, Yifan Wu, Juefei Pu, Xin Liu) and a <code>Suggested-by: Chuck Lever &lt;cel@kernel.org&gt;</code> — an indication that this is the second iteration of a fix that has already been through at least one review cycle. The v2 changelog notes the two refinements made since v1:</p>
+<blockquote>
+<p>"Extended the fix to clear rq_procinfo at request entries (both in svc_process and svc_process_bc) before early decode/drop paths."
+"Moved the pointer clearing in svc_release_rqst outside the conditional block to ensure it always clears, as suggested by Chuck."</p>
+</blockquote>
+<p>The diff itself is small — four insertions in <code>net/sunrpc/svc.c</code> — but it touches a code path that every NFS server request traverses, which is why the stable Cc matters.</p>
+<h2>Review and acceptance</h2>
+<p>Chuck Lever <a href="https://lore.kernel.org/linux-nfs/177937018686.113875.15243798649112680633.b4-ty@b4/">responded within roughly six hours</a>, quoting the patch's own description of the stale-hook hazard and then confirming acceptance:</p>
+<blockquote>
+<p>"Applied to nfsd-testing, thanks!
+[1/1] sunrpc: harden rq_procinfo lifecycle to prevent double-free
+commit: 2739a03352101a0f6b3b185bc6c9e983129cbd49"</p>
+</blockquote>
+<p>Jeff Layton <a href="https://lore.kernel.org/linux-nfs/ea91256dbd03ed9f039550a8c022fa9d51cce887.camel@kernel.org/">followed minutes later</a> with a formal <code>Reviewed-by: Jeff Layton &lt;jlayton@kernel.org&gt;</code>, after quoting the relevant hunks (including the backchannel-side change that sets <code>rqstp-&gt;rq_bc_net = req-&gt;rq_xprt-&gt;xprt_net</code>).</p>
+<h2>Significance for NFS server development</h2>
+<ul>
+<li><strong>Classification:</strong> This is a <em>bug fix</em> — specifically a memory-safety hardening of the SUNRPC server request lifecycle. It is not a protocol change and not a new feature; it does not alter wire format or client-visible behavior, but it does close a class of exploitable double-free/UAF on the server side reachable via malformed or early-failing RPCs (bad auth, short frames, unsupported protocols).</li>
+<li><strong>Why it matters for NFS:</strong> The <code>rq_procinfo</code>/<code>pc_release</code> machinery is shared by every NFSD program (NFSv2/v3/v4.x, NLM, mountd, etc.), so a stale hook here can corrupt kernel state across requests. Clearing the pointer at both entry points (<code>svc_process</code> and <code>svc_process_bc</code>) plus on release makes the lifecycle robust against any future early-exit path being added to <code>svc.c</code>.</li>
+<li><strong>Process note:</strong> The patch went from v2 posting to nfsd-testing merge in under a day, with an independent Reviewed-by from Layton — a clean example of how small, well-scoped SUNRPC fixes flow through the NFS server tree.</li>
+</ul>
+<h2>Bottom line</h2>
+<p>A four-line lifecycle hardening in <code>net/sunrpc/svc.c</code>, fixing a stale-<code>rq_procinfo</code> double-free/UAF introduced by the delayed <code>pc_release</code> callback work, was submitted as v2 on 2026-05-21, reviewed by Jeff Layton, and applied to nfsd-testing by Chuck Lever the same day (commit 2739a0335210). Stable backport is requested.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260521070636.900264-1-n05ec@lzu.edu.cn/">2026-05-21 Ren Wei <a href="mailto:n05ec@lzu.edu.cn">n05ec@lzu.edu.cn</a> — [PATCH v2 1/1] sunrpc: harden rq_procinfo lifecycle to prevent double-free</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177937018686.113875.15243798649112680633.b4-ty@b4/">2026-05-21 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v2 1/1] sunrpc: harden rq_procinfo lifecycle to prevent double-free</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ea91256dbd03ed9f039550a8c022fa9d51cce887.camel@kernel.org/">2026-05-21 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v2 1/1] sunrpc: harden rq_procinfo lifecycle to prevent double-free</a></li>
+</ul>
+  </main>
+</body>
+</html>

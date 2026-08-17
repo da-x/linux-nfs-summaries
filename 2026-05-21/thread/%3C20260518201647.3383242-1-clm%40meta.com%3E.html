@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd: fix dangling layout stid on setlease failure</title>
+  <meta name="description" content="Type: Bug fix (use-after-free / dangling IDR pointer) in the NFS server (nfsd) pNFS layout code.">
+  <meta property="og:title" content="nfsd: fix dangling layout stid on setlease failure">
+  <meta property="og:description" content="Type: Bug fix (use-after-free / dangling IDR pointer) in the NFS server (nfsd) pNFS layout code.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-21T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd: fix dangling layout stid on setlease failure">
+  <meta name="twitter:description" content="Type: Bug fix (use-after-free / dangling IDR pointer) in the NFS server (nfsd) pNFS layout code.">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-21</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd: fix dangling layout stid on setlease failure</h1>
+<h2>Summary</h2>
+<h2>nfsd: release layout stid on setlease failure — quick turnaround fixes a use-after-free in pNFS layout stateids</h2>
+<p><strong>Type:</strong> Bug fix (use-after-free / dangling IDR pointer) in the NFS server (nfsd) pNFS layout code.</p>
+<h3>The bug</h3>
+<p>On Monday, May 18, Chris Mason posted a single-patch fix to the linux-nfs list describing a subtle but dangerous teardown path in the NFSv4 server's pNFS layout stateid handling. As Mason laid out:</p>
+<blockquote>
+<p>"nfs4_alloc_stid() publishes the new stid into cl-&gt;cl_stateids via idr_alloc_cyclic() under cl_lock before returning to nfsd4_alloc_layout_stateid(). When nfsd4_layout_setlease() then fails, the error path frees the layout stateid directly with kmem_cache_free() without ever calling idr_remove(), leaving the IDR slot pointing at freed slab memory. Any subsequent IDR walker (states_show, client teardown) dereferences the dangling pointer."</p>
+</blockquote>
+<p>In other words, a failed <code>SETATTR</code>/lease setup on a pNFS layout would leave a stale IDR entry that any later walk of the client's stateid table — for example via <code>/proc/fs/nfsd/clients/*/states</code> or during client disconnect — could follow into freed slab memory. The patch carries a <code>Fixes:</code> tag pointing at c5c707f96fc9 ("nfsd: implement pNFS layout recalls"), so the latent bug has been present since layout recalls were first implemented.</p>
+<h3>The fix and its wrinkle</h3>
+<p>The correct teardown for an IDR-published stateid is <code>nfs4_put_stid()</code>, which removes the IDR slot under <code>cl_lock</code> and dispatches the proper destructor. But Mason noted a second, blocking issue:</p>
+<blockquote>
+<p>"nfsd4_free_layout_stateid() unconditionally inspects ls-&gt;ls_fence_work via delayed_work_pending() under ls_lock, but INIT_DELAYED_WORK(&amp;ls-&gt;ls_fence_work, ...) currently runs only after the setlease call. On the setlease-failure path the destructor would touch an uninitialized delayed_work."</p>
+</blockquote>
+<p>The fix therefore does two things in <code>fs/nfsd/nfs4layouts.c</code> (a net +5/−7 lines): it hoists the <code>ls_fenced</code> / <code>ls_fence_delay</code> / <code>INIT_DELAYED_WORK()</code> initialization above the <code>nfsd4_layout_setlease()</code> call, and replaces the manual <code>nfsd_file_put</code> + <code>put_nfs4_file</code> + <code>kmem_cache_free</code> cleanup with a single <code>nfs4_put_stid(stp)</code>. Mason also credited AI assistance in the commit metadata ("Assisted-by: kres (claude-opus-4-7)").</p>
+<h3>Review and merge — same-day</h3>
+<p>The patch drew an immediate, clean response. Chuck Lever applied it to his nfsd-testing tree within an hour of posting:</p>
+<blockquote>
+<p>"Applied to nfsd-testing, thanks!" — <a href="https://lore.kernel.org/linux-nfs/177913913704.616396.8759447922203596578.b4-ty@b4/">Chuck Lever's reply</a>, landing as commit 9e93f8c13374d21254f8dcd0010103da346bc1f3.</p>
+</blockquote>
+<p>Jeff Layton followed with a brief review endorsement:</p>
+<blockquote>
+<p>"Reviewed-by: Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a>" — <a href="https://lore.kernel.org/linux-nfs/2a7cded8ee6ea1960f7069f6a6150605ea67222e.camel@kernel.org/">Layton's reply</a>.</p>
+</blockquote>
+<h3>Takeaway</h3>
+<p>This is a textbook example of the kind of bug that only surfaces under rare error paths: the happy-path layout allocation was fine, but the setlease-failure branch skipped IDR removal and would have crashed (or corrupted state) on any subsequent stateid walk. The fix is small, surgical, and already in the nfsd-testing tree for the upcoming merge window. For NFS server maintainers running pNFS with layout recalls enabled, this one will be worth picking up as soon as it lands upstream.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260518201647.3383242-1-clm@meta.com/">2026-05-18 Chris Mason <a href="mailto:clm@meta.com">clm@meta.com</a> — [PATCH] nfsd: release layout stid on setlease failure</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177913913704.616396.8759447922203596578.b4-ty@b4/">2026-05-18 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH] nfsd: release layout stid on setlease failure</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/2a7cded8ee6ea1960f7069f6a6150605ea67222e.camel@kernel.org/">2026-05-18 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH] nfsd: release layout stid on setlease failure</a></li>
+</ul>
+  </main>
+</body>
+</html>

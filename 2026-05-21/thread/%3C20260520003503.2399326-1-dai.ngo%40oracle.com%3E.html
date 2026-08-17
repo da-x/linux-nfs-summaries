@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>XFS pNFS: Correcting layout mappings and uninitialized imap handling</title>
+  <meta name="description" content="This week, Dai Ngo submitted a two-patch series to address critical bugs in the XFS pNFS export implementation. The patches fix issues exposed by running xfstests generic/075 against an NFSv4.2 block layout export. Christoph Hellwig…">
+  <meta property="og:title" content="XFS pNFS: Correcting layout mappings and uninitialized imap handling">
+  <meta property="og:description" content="This week, Dai Ngo submitted a two-patch series to address critical bugs in the XFS pNFS export implementation. The patches fix issues exposed by running xfstests generic/075 against an NFSv4.2 block layout export. Christoph Hellwig…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-21T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="XFS pNFS: Correcting layout mappings and uninitialized imap handling">
+  <meta name="twitter:description" content="This week, Dai Ngo submitted a two-patch series to address critical bugs in the XFS pNFS export implementation. The patches fix issues exposed by running xfstests generic/075 against an NFSv4.2 block layout export. Christoph Hellwig…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-21</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>XFS pNFS: Correcting layout mappings and uninitialized imap handling</h1>
+<h2>Summary</h2>
+<h1>XFS pNFS: Correcting layout mappings and uninitialized imap handling</h1>
+<h2>Summary</h2>
+<p>This week, Dai Ngo submitted a two-patch series to address critical bugs in the XFS pNFS export implementation. The patches fix issues exposed by running <code>xfstests generic/075</code> against an NFSv4.2 block layout export. Christoph Hellwig reviewed and approved both patches on the same day they were posted.</p>
+<p>This submission represents the formalization of fixes discussed at length in prior weeks, where concerns about overlapping extents in <code>LAYOUTGET</code> replies and potential race conditions in the NFS server code were debated. As noted in last week's summary, Dai Ngo had committed to resubmitting a combined series addressing both the <code>XFS_BMAPI_ENTIRE</code> flag issue and an uninitialized mapping record bug.</p>
+<h3>Bug Fix Classification</h3>
+<p>This thread is squarely focused on <strong>bug fixes</strong> for the XFS pNFS server-side implementation, with direct implications for NFS client stability. The two patches address:</p>
+<ol>
+<li>A use of uninitialized memory in the error path of <code>xfs_fs_map_blocks()</code>.</li>
+<li>Overlapping extents returned to clients during <code>LAYOUTGET</code> operations, which can cause data corruption or protocol violations on the client side.</li>
+</ol>
+<h3>Key Technical Arguments</h3>
+<p><strong>Patch 1: Uninitialized imap in Error Path</strong></p>
+<p>The first patch addresses a subtle but dangerous bug where <code>xfs_fs_map_blocks()</code> would fall through to <code>xfs_bmbt_to_iomap()</code> even after <code>xfs_bmapi_read()</code> failed, consuming an uninitialized <code>imap</code> record. Dai Ngo explained:</p>
+<blockquote>
+<p>"If xfs_bmapi_read() fails, the function currently still falls through to xfs_bmbt_to_iomap(), which consumes an uninitialized imap record and may return invalid data to the caller."</p>
+</blockquote>
+<p>The fix releases the data map lock and returns immediately upon error, preventing the propagation of garbage data to the NFS server layer. This patch fixes a regression introduced by commit <code>527851124d10f</code> ("xfs: implement pNFS export operations").</p>
+<p><strong>Patch 2: Overlapping Extents in LAYOUTGET</strong></p>
+<p>The second patch removes the <code>XFS_BMAPI_ENTIRE</code> flag from the call to <code>xfs_bmapi_read()</code> within <code>xfs_fs_map_blocks()</code>. As Dai Ngo detailed:</p>
+<blockquote>
+<p>"A single LAYOUTGET request from the client can cause the server to issue multiple calls to xfs_fs_map_blocks() for different offsets within the same extent. Because the use of XFS_BMAPI_ENTIRE flag, these calls can produce overlapping mappings."</p>
+</blockquote>
+<p>The consequences for NFS clients are severe:</p>
+<blockquote>
+<p>"This creates ambiguity in extent selection for a given file range, which can lead to incorrect device selection, inconsistent handling of datastate, and ultimately data corruption or protocol violations on the client side."</p>
+</blockquote>
+<p>By replacing <code>XFS_BMAPI_ENTIRE</code> with <code>0</code>, each request returns only the mapping for the explicitly requested range, eliminating overlaps. This patch fixes a regression from commit <code>cc6c40e09d7b1</code> ("NFSD/blocklayout: Support multiple extents per LAYOUTGET").</p>
+<h3>Evolution of the Discussion</h3>
+<p>The path to this two-patch series was paved by extensive debate in prior weeks (see previous summary). Key developments included:</p>
+<ul>
+<li><strong>Christoph Hellwig's skepticism</strong> about why overlaps occurred at all, suggesting a hidden bug in nfsd code rather than solely an XFS issue.</li>
+<li><strong>Dave Chinner's proposal</strong> to conditionally use <code>XFS_BMAPI_ENTIRE</code> — keeping it for the first mapping call but dropping it for subsequent calls. However, Dai Ngo countered that the current <code>map_blocks()</code> API does not distinguish between first and subsequent calls, making this optimization impractical without API changes.</li>
+<li><strong>Discovery of a potential race condition</strong> in nfsd where layout insertion happens after <code>-&gt;proc_layoutget</code>, creating a window for races against unwritten extent conversions or concurrent writers. Christoph Hellwig noted:</li>
+</ul>
+<blockquote>
+<p>"We only insert layouts (and search for conflicts) after calling -&gt;proc_layoutget. So this might be racy against unwritten extent conversion, or other writers, which is a bit of an issue."</p>
+</blockquote>
+<p>This race condition remains an open item for future work and is not addressed by the current patch series.</p>
+<h3>Final Conclusions</h3>
+<p>Christoph Hellwig provided swift review approvals for both patches:</p>
+<blockquote>
+<p>"Looks good: Reviewed-by: Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a>"</p>
+</blockquote>
+<p>The two-patch series is now ready for integration, addressing two distinct but related bugs in the XFS pNFS implementation. For NFS client developers, these fixes are significant because they eliminate server-side sources of malformed layout responses that could trigger client-side data corruption or protocol violations. The broader nfsd race condition identified during this discussion remains unresolved and warrants separate attention in future development cycles.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260520003503.2399326-1-dai.ngo@oracle.com/">2026-05-20 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — [PATCH 0/2] xfs: correct pNFS layout mappings</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260520003503.2399326-2-dai.ngo@oracle.com/">2026-05-20 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — [PATCH 1/2] xfs: fix use of uninitialized imap in xfs_fs_map_blocks error path</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260520003503.2399326-3-dai.ngo@oracle.com/">2026-05-20 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — [PATCH 2/2] xfs: fix overlapping extents returned for pNFS LAYOUTGET</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ag1vAySwz518n56h@infradead.org/">2026-05-20 Christoph Hellwig <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [PATCH 1/2] xfs: fix use of uninitialized imap in xfs_fs_map_blocks error path</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ag1vFHyBx_FaDqtT@infradead.org/">2026-05-20 Christoph Hellwig <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [PATCH 2/2] xfs: fix overlapping extents returned for pNFS LAYOUTGET</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260520003503.2399326-1-dai.ngo@oracle.com/">2026-05-20 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — [PATCH 0/2] xfs: correct pNFS layout mappings</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260520003503.2399326-2-dai.ngo@oracle.com/">2026-05-20 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — [PATCH 1/2] xfs: fix use of uninitialized imap in xfs_fs_map_blocks error path</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260520003503.2399326-3-dai.ngo@oracle.com/">2026-05-20 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — [PATCH 2/2] xfs: fix overlapping extents returned for pNFS LAYOUTGET</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ag1vAySwz518n56h@infradead.org/">2026-05-20 Christoph Hellwig <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [PATCH 1/2] xfs: fix use of uninitialized imap in xfs_fs_map_blocks error path</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ag1vFHyBx_FaDqtT@infradead.org/">2026-05-20 Christoph Hellwig <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [PATCH 2/2] xfs: fix overlapping extents returned for pNFS LAYOUTGET</a></li>
+</ul>
+  </main>
+</body>
+</html>
