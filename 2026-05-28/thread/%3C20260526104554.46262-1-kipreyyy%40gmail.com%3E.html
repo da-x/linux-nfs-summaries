@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>One-line UAF fix in nfsd delegation laundromat lands same-day via Layton review and Lever apply</title>
+  <meta name="description" content="A compact, single-patch thread closed the loop in under three hours on Tuesday, May 26. Zhenghang Xiao submitted a one-line patch to fix a use-after-free in the NFSv4 server&#39;s delegation laundromat, Jeff Layton reviewed it within an hour…">
+  <meta property="og:title" content="One-line UAF fix in nfsd delegation laundromat lands same-day via Layton review and Lever apply">
+  <meta property="og:description" content="A compact, single-patch thread closed the loop in under three hours on Tuesday, May 26. Zhenghang Xiao submitted a one-line patch to fix a use-after-free in the NFSv4 server&#39;s delegation laundromat, Jeff Layton reviewed it within an hour…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-28T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="One-line UAF fix in nfsd delegation laundromat lands same-day via Layton review and Lever apply">
+  <meta name="twitter:description" content="A compact, single-patch thread closed the loop in under three hours on Tuesday, May 26. Zhenghang Xiao submitted a one-line patch to fix a use-after-free in the NFSv4 server&#39;s delegation laundromat, Jeff Layton reviewed it within an hour…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-28</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>One-line UAF fix in nfsd delegation laundromat lands same-day via Layton review and Lever apply</h1>
+<h2>Summary</h2>
+<h1>nfsd: SC_STATUS_FREED missing on admin-revoked delegation FREE_STATEID — one-line UAF fix applied to nfsd-testing</h1>
+<h2>Overview</h2>
+<p>A compact, single-patch thread closed the loop in under three hours on Tuesday, May 26. Zhenghang Xiao submitted <a href="https://lore.kernel.org/linux-nfs/20260526104554.46262-1-kipreyyy@gmail.com/">a one-line patch</a> to fix a use-after-free in the NFSv4 server's delegation laundromat, Jeff Layton reviewed it within an hour (catching an incorrect <code>Fixes:</code> tag on the way), and Chuck Lever applied it to <code>nfsd-testing</code> later that afternoon. It is squarely a <strong>bug fix</strong> — not a feature or protocol change — in the NFSD state-management code path around admin-revoked delegations, and it lands against the same delegation-lifecycle machinery that has been under heavy work this week (see the CB_NOTIFY directory-delegation series below).</p>
+<h2>The bug</h2>
+<p>The patch description lays out the failure mode with surgical precision:</p>
+<blockquote>
+<p>"nfsd4_drop_revoked_stid() handles FREE_STATEID for admin-revoked delegations but does not set SC_STATUS_FREED before releasing cl_lock. revoke_delegation() uses this flag to detect whether FREE_STATEID has already processed the delegation — without it, the freed delegation is added to cl_revoked via list_add(), producing a use-after-free when cl_revoked is later traversed in __release_client()."</p>
+</blockquote>
+<p>The author frames the fix as restoring symmetry with an existing code path:</p>
+<blockquote>
+<p>"The SC_STATUS_REVOKED path in nfsd4_free_stateid() (line 7590) already sets SC_STATUS_FREED correctly. Apply the same pattern to the SC_STATUS_ADMIN_REVOKED path in nfsd4_drop_revoked_stid()."</p>
+</blockquote>
+<p>The diff is a single insertion in <code>fs/nfsd/nfs4state.c</code> — one line changed, zero deletions. The original (incorrect) <code>Fixes:</code> tag pointed at <code>8be12e0cf211</code> ("nfsd: convert global state_lock to per-net deleg_lock"), the locking-conversion commit that restructured this area but did not itself introduce the flag-omission bug.</p>
+<h2>Review and landing</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/b830d59259c6de2fb011ae5d586caaacbaf05844.camel@kernel.org/">Jeff Layton's reply</a> arrived roughly fifty minutes after the posting. He endorsed the fix but corrected the provenance:</p>
+<blockquote>
+<p>"The Fixes tag doesn't look right. I think it should be:
+Fixes: 8dd91e8d31fe ("nfsd: fix race between laundromat and free_stateid")
+The patch looks OK though.
+Reviewed-by: Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a>"</p>
+</blockquote>
+<p>That's a meaningful correction — <code>8dd91e8d31fe</code> is the commit that introduced the laundromat/free_stateid race machinery, i.e., the code path where the missing <code>SC_STATUS_FREED</code> actually bites. The corrected tag will matter for stable backporters when this lands upstream.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/177980261417.33125.9531553145341006369.b4-ty@b4/">Chuck Lever's application note</a> came about two hours after Layton's review:</p>
+<blockquote>
+<p>"Applied to nfsd-testing, thanks!
+[1/1] nfsd: set SC_STATUS_FREED in nfsd4_drop_revoked_stid for delegations
+commit: a1da502807b6b63963f2b1064df76e0a58fb3479"</p>
+</blockquote>
+<h2>Context within this week's delegation work</h2>
+<p>This fix is small but lands in the same <code>nfs4state.c</code> neighborhood that has dominated linux-nfs traffic all week. <a href="https://lore.kernel.org/linux-nfs/20260522-dir-deleg-v4-0-2acb883ac6bc@kernel.org/">Jeff Layton's 21-patch CB_NOTIFY directory-delegation series (v4)</a> — the server-side counterpart to Christian Brauner's already-merged VFS patches — was posted earlier this week and continues to touch delegation lifecycle, <code>cl_lock</code> semantics, and the laundromat-adjacent state-management code. A UAF in the admin-revoked FREE_STATEID path is exactly the kind of latent hazard that becomes more reachable as new callback-driven delegation flows (CB_NOTIFY) add more workqueue-side traversal of client state. The fix removes one such landmine ahead of that feature's eventual merge, which Layton has noted will await a complete client-side implementation:</p>
+<blockquote>
+<p>"I don't think we'll want to merge these until we have a complete client-side implementation to test against."</p>
+</blockquote>
+<h2>Client-side relevance</h2>
+<p>This is an <strong>NFSD (server)</strong> fix rather than an NFS client change — the UAF lives in <code>__release_client()</code>'s traversal of <code>cl_revoked</code> on the server. The practical impact for clients is indirect but real: a server hitting this UAF during admin-revoked delegation teardown can corrupt its own state or crash, which from the client's perspective looks like a sudden server-side loss of session/delegation state. Closing the bug reduces one class of spurious client-visible failures on NFSv4 servers that have been administering delegations (e.g., via <code>nfsdctl</code>-style tooling or <code>nfsd_state.sh</code> admin operations).</p>
+<h2>Status</h2>
+<ul>
+<li><strong>Patch applied</strong> to <code>nfsd-testing</code> as commit <code>a1da502807b6b63963f2b1064df76e0a58fb3479</code>.</li>
+<li><strong>Reviewed-by:</strong> Jeff Layton.</li>
+<li><strong>Fixes tag correction</strong> (to <code>8dd91e8d31fe</code>) noted in-thread; the applied commit may or may not carry the corrected tag depending on whether Lever amended at apply time — worth watching when this reaches Linus's tree and stable.</li>
+<li><strong>No further discussion</strong> within this week's window; the thread is closed.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260526104554.46262-1-kipreyyy@gmail.com/">2026-05-26 Zhenghang Xiao <a href="mailto:kipreyyy@gmail.com">kipreyyy@gmail.com</a> — [PATCH nfsd] nfsd: set SC_STATUS_FREED in nfsd4_drop_revoked_stid for delegations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/b830d59259c6de2fb011ae5d586caaacbaf05844.camel@kernel.org/">2026-05-26 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH nfsd] nfsd: set SC_STATUS_FREED in nfsd4_drop_revoked_stid for delegations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177980261417.33125.9531553145341006369.b4-ty@b4/">2026-05-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH nfsd] nfsd: set SC_STATUS_FREED in nfsd4_drop_revoked_stid for delegations</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260526104554.46262-1-kipreyyy@gmail.com/">2026-05-26 Zhenghang Xiao <a href="mailto:kipreyyy@gmail.com">kipreyyy@gmail.com</a> — [PATCH nfsd] nfsd: set SC_STATUS_FREED in nfsd4_drop_revoked_stid for delegations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/b830d59259c6de2fb011ae5d586caaacbaf05844.camel@kernel.org/">2026-05-26 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH nfsd] nfsd: set SC_STATUS_FREED in nfsd4_drop_revoked_stid for delegations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177980261417.33125.9531553145341006369.b4-ty@b4/">2026-05-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH nfsd] nfsd: set SC_STATUS_FREED in nfsd4_drop_revoked_stid for delegations</a></li>
+</ul>
+  </main>
+</body>
+</html>

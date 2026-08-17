@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD callback channel fixes: two small patches prevent permanent CALLBACK_RUNNING latch</title>
+  <meta name="description" content="On May 26, Jeff Layton posted a two-patch series targeting the NFSv4 server&#39;s callback channel machinery. Both patches are bug fixes — small, surgical corrections (5 insertions, 3 deletions total in fs/nfsd/nfs4state.c) that address…">
+  <meta property="og:title" content="NFSD callback channel fixes: two small patches prevent permanent CALLBACK_RUNNING latch">
+  <meta property="og:description" content="On May 26, Jeff Layton posted a two-patch series targeting the NFSv4 server&#39;s callback channel machinery. Both patches are bug fixes — small, surgical corrections (5 insertions, 3 deletions total in fs/nfsd/nfs4state.c) that address…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-28T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSD callback channel fixes: two small patches prevent permanent CALLBACK_RUNNING latch">
+  <meta name="twitter:description" content="On May 26, Jeff Layton posted a two-patch series targeting the NFSv4 server&#39;s callback channel machinery. Both patches are bug fixes — small, surgical corrections (5 insertions, 3 deletions total in fs/nfsd/nfs4state.c) that address…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-28</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD callback channel fixes: two small patches prevent permanent CALLBACK_RUNNING latch</h1>
+<h2>Summary</h2>
+<h1>NFSD Callback Channel Fixes: Two Small Patches Prevent Permanent CALLBACK_RUNNING Latch</h1>
+<h2>Overview</h2>
+<p>On May 26, Jeff Layton posted a <a href="https://lore.kernel.org/linux-nfs/20260526-cb_recall_any_callback_running_stuck-v1-0-310011a028f3@kernel.org/">two-patch series</a> targeting the NFSv4 server's callback channel machinery. Both patches are <strong>bug fixes</strong> — small, surgical corrections (5 insertions, 3 deletions total in <code>fs/nfsd/nfs4state.c</code>) that address scenarios where the <code>NFSD4_CALLBACK_RUNNING</code> bit gets stuck set, permanently disabling delegation recall for an affected client.</p>
+<p>Layton noted the discovery method with a nod to modern tooling:</p>
+<blockquote>
+<p>"Some fixes for the callback channel machinery. These problems were mostly found via agentic scans."</p>
+</blockquote>
+<p>The patches were applied to <code>nfsd-testing</code> by Chuck Lever within two hours of posting, confirming:</p>
+<blockquote>
+<p>"Applied to nfsd-testing, thanks!"</p>
+</blockquote>
+<h2>The Two Bugs in Detail</h2>
+<h3>Patch 1/2: Defer setting NFSD4_CALLBACK_RUNNING in deleg_reaper</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260526-cb_recall_any_callback_running_stuck-v1-1-310011a028f3@kernel.org/">This patch</a> fixes a logic ordering issue in <code>deleg_reaper()</code>. The function was setting the <code>NFSD4_CALLBACK_RUNNING</code> bit <em>before</em> checking two early-exit gates: a 5-second rate limit and a <code>cl_cb_state</code> check. When either gate fired, the loop would <code>continue</code> without queuing callback work — but the bit had already been set. Since the only code path that clears the bit is <code>nfsd41_destroy_cb()</code> (which runs from the workqueue after a callback completes), the bit remained latched forever.</p>
+<blockquote>
+<p>"When either gate fires the loop continues without queuing callback work, so the bit's only clear site in nfsd41_destroy_cb() is never reached and RECALL_ANY dispatch is permanently disabled for the affected client."</p>
+</blockquote>
+<p>The fix moves the <code>test_and_set_bit()</code> call below both non-queueing gates so the bit is only taken when <code>nfsd4_run_cb()</code> will actually be invoked. The <code>Fixes:</code> tag points to commit 424dd3df1f99 ("nfsd: eliminate cl_ra_cblist and NFSD4_CLIENT_CB_RECALL_ANY").</p>
+<h3>Patch 2/2: Clear CALLBACK_RUNNING on failed delegation recall queue</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260526-cb_recall_any_callback_running_stuck-v1-2-310011a028f3@kernel.org/">This patch</a> addresses a related but distinct failure mode in <code>nfsd_break_one_deleg()</code>. This function sets <code>NFSD4_CALLBACK_RUNNING</code> via <code>test_and_set_bit</code> at entry to serialize recall work, then calls <code>nfsd4_run_cb()</code> to queue the callback. If the queue attempt fails (e.g., the client's callback channel is unavailable), the refcount bump is undone but the RUNNING bit is left set.</p>
+<blockquote>
+<p>"The bit becomes a permanent latch on dp-&gt;dl_recall.cb_flags: every subsequent break_lease() on the same delegation hits the early-return guard in nfsd_break_one_deleg() and silently skips the recall, so the delegation is never broken and the conflicting open or lock stalls."</p>
+</blockquote>
+<p>This is particularly dangerous from a client perspective: a stuck delegation means any subsequent <code>OPEN</code> or <code>LOCK</code> operation targeting the same file will hang indefinitely on the server side. The fix clears <code>NFSD4_CALLBACK_RUNNING</code> on the <code>!queued</code> error path alongside the existing <code>refcount_dec</code>. The <code>Fixes:</code> tag points to commit 1054e8ffc5c4 ("nfsd: prevent callback tasks running concurrently").</p>
+<h2>Discussion Evolution</h2>
+<p>The thread was extremely short and efficient — a hallmark of well-understood, low-risk fixes:</p>
+<ol>
+<li><strong>May 26, 16:39 UTC</strong> — Layton posts the two-patch series.</li>
+<li><strong>May 26, 18:39 UTC</strong> — Chuck Lever applies both patches to <code>nfsd-testing</code> (exactly two hours later).</li>
+</ol>
+<p>No review comments, no objections, no design debates. The fixes are small enough and the failure modes well-described that they sailed through without discussion.</p>
+<h2>Significance for NFS Client Development</h2>
+<p>While these are server-side fixes, they have direct implications for client behavior:</p>
+<ul>
+<li>
+<p><strong>Patch 1</strong> prevents a scenario where a client's delegation recall mechanism is silently disabled after a rate-limit or state gate fires. Without this fix, a client could hold a stale delegation indefinitely because the server would never send a <code>CB_RECALL</code> — leading to data consistency issues on the client side that are very difficult to diagnose.</p>
+</li>
+<li>
+<p><strong>Patch 2</strong> prevents a scenario where a conflicting <code>OPEN</code> or <code>LOCK</code> request from a <em>different</em> client stalls forever because the server cannot break the existing delegation. This is a denial-of-service vector: any workload pattern that triggers callback queue failures (e.g., transient network issues on the callback channel) could wedge an entire file for all clients.</p>
+</li>
+</ul>
+<p>Both bugs are in the "silent failure" category — no error is logged, no RPC failure is returned to the client. The server simply stops functioning correctly for the affected delegation or client. This makes them particularly insidious in production environments.</p>
+<h2>Context: Broader NFSD Callback Work This Week</h2>
+<p>This thread sits alongside other significant NFSD callback-related activity this week. The <a href="https://lore.kernel.org/linux-nfs/20260522-dir-deleg-v4-0-2acb883ac6bc@kernel.org/">CB_NOTIFY directory delegation series (v4)</a> was posted May 22 and applied to <code>nfsd-testing</code> on May 23, followed by a <a href="https://lore.kernel.org/linux-nfs/20260523-dir-deleg-fixes-v1-0-142c884f85ce@kernel.org/">four-patch follow-on fix series</a> also applied quickly. The callback channel fixes in this thread are complementary — they harden the existing <code>CB_RECALL</code> machinery that predates the new <code>CB_NOTIFY</code> feature, ensuring the foundational recall path is robust before the more complex notification infrastructure builds on top of it.</p>
+<h2>Status</h2>
+<ul>
+<li><strong>Both patches:</strong> Applied to <code>nfsd-testing</code>.</li>
+<li><strong>Commits:</strong> 02b9bb6ab68a (patch 1/2), e02bd0e5a983 (patch 2/2).</li>
+<li><strong>No client-side action required</strong> — these are pure server correctness fixes.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260526-cb_recall_any_callback_running_stuck-v1-0-310011a028f3@kernel.org//">2026-05-26 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 0/2] nfsd: callback channel fixes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260526-cb_recall_any_callback_running_stuck-v1-1-310011a028f3@kernel.org//">2026-05-26 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 1/2] nfsd: defer setting NFSD4_CALLBACK_RUNNING in deleg_reaper</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260526-cb_recall_any_callback_running_stuck-v1-2-310011a028f3@kernel.org//">2026-05-26 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 2/2] nfsd: clear CALLBACK_RUNNING on failed delegation recall queue</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177982071777.99111.11306650283701065645.b4-ty@b4/">2026-05-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 0/2] nfsd: callback channel fixes</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260526-cb_recall_any_callback_running_stuck-v1-0-310011a028f3@kernel.org/">2026-05-26 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 0/2] nfsd: callback channel fixes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260526-cb_recall_any_callback_running_stuck-v1-1-310011a028f3@kernel.org/">2026-05-26 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 1/2] nfsd: defer setting NFSD4_CALLBACK_RUNNING in deleg_reaper</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260526-cb_recall_any_callback_running_stuck-v1-2-310011a028f3@kernel.org/">2026-05-26 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 2/2] nfsd: clear CALLBACK_RUNNING on failed delegation recall queue</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177982071777.99111.11306650283701065645.b4-ty@b4/">2026-05-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 0/2] nfsd: callback channel fixes</a></li>
+</ul>
+  </main>
+</body>
+</html>

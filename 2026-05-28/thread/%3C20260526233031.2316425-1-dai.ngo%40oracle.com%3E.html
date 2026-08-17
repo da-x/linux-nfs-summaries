@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>pNFS client: defer return_range callbacks to fix &quot;scheduling while atomic&quot; on unmount</title>
+  <meta name="description" content="This is a bug fix in the NFSv4 pNFS client, not a new feature or protocol change. It corrects a locking-ordering defect in the layout-return path that can fire a BUG: scheduling while atomic warning when an NFS filesystem with pNFS SCSI…">
+  <meta property="og:title" content="pNFS client: defer return_range callbacks to fix &quot;scheduling while atomic&quot; on unmount">
+  <meta property="og:description" content="This is a bug fix in the NFSv4 pNFS client, not a new feature or protocol change. It corrects a locking-ordering defect in the layout-return path that can fire a BUG: scheduling while atomic warning when an NFS filesystem with pNFS SCSI…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-28T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="pNFS client: defer return_range callbacks to fix &quot;scheduling while atomic&quot; on unmount">
+  <meta name="twitter:description" content="This is a bug fix in the NFSv4 pNFS client, not a new feature or protocol change. It corrects a locking-ordering defect in the layout-return path that can fire a BUG: scheduling while atomic warning when an NFS filesystem with pNFS SCSI…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-28</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>pNFS client: defer return_range callbacks to fix "scheduling while atomic" on unmount</h1>
+<h2>Summary</h2>
+<h1>pNFS client: defer <code>return_range</code> callbacks to fix "scheduling while atomic" on unmount</h1>
+<h2>Classification</h2>
+<p>This is a <strong>bug fix</strong> in the NFSv4 pNFS client, not a new feature or protocol change. It corrects a locking-ordering defect in the layout-return path that can fire a <code>BUG: scheduling while atomic</code> warning when an NFS filesystem with pNFS SCSI (block) layouts is unmounted.</p>
+<h2>This week's activity</h2>
+<p>The thread consists of a single message this week: Dai Ngo's patch submission on 2026-05-26, [PATCH 1/1] NFSv4/pnfs: defer return_range callbacks until after inode unlock](https://lore.kernel.org/linux-nfs/20260526233031.2316425-1-dai.ngo@oracle.com/). No replies, reviews, or follow-ups had landed by the end of the reporting window (2026-05-29), so the discussion is still in its opening phase.</p>
+<h2>The bug</h2>
+<p>Dai Ngo opened with a concrete failure scenario:</p>
+<blockquote>
+<p>"Sometimes unmounting an NFS filesystem mounted with pNFS SCSI layouts triggers the following warning: BUG: scheduling while atomic: umount.nfs4/..."</p>
+</blockquote>
+<p>The attached stack trace walks through the entire problem path in one breath: <code>umount</code> → <code>nfs_kill_super</code> → <code>evict_inodes</code> → <code>nfs4_evict_inode</code> → <code>_pnfs_return_layout</code> → <code>ext_tree_remove</code> (blocklayoutdriver) → <code>nfs4_put_deviceid_node</code> → <code>bl_free_deviceid_node</code> → <code>bl_free_device</code> → <code>bl_unregister_dev</code> → <code>bl_unregister_scsi</code> → <code>sd_pr_out_command</code> → <code>scsi_execute_cmd</code> → <code>blk_execute_rq</code> → <code>io_schedule_timeout</code> → <code>schedule</code>.</p>
+<p>The root cause, as Dai Ngo explains:</p>
+<blockquote>
+<p>"The warning occurs because the block layout driver unregisters the SCSI device while the inode lock is still held. Device unregistration issues a SCSI PR command, which may sleep, resulting in a 'scheduling while atomic' warning."</p>
+</blockquote>
+<p>More specifically:</p>
+<blockquote>
+<p>"During layout return, ext_tree_remove() invokes the layout driver's return_range callback while holding the inode lock. For block layouts, this callback eventually calls bl_unregister_scsi(), which may block in scsi_execute_cmd() while issuing PR commands to the device."</p>
+</blockquote>
+<p>This is a classic sleeping-in-atomic-context bug: the pNFS extent-tree removal code calls back into the layout driver while still under the inode's truncation lock (a non-sleepable context), but the block layout driver's <code>return_range</code> implementation needs to issue SCSI Persistent Reservation commands that can block.</p>
+<h2>The fix</h2>
+<p>The patch defers the <code>return_range</code> callbacks until after the inode lock has been released:</p>
+<blockquote>
+<p>"Fix this by deferring the return_range callbacks until after the inode lock has been released. The layout header reference count is incremented before invoking return_range(), ensuring that the layout header remains valid while the layout driver removes extents from the extent tree."</p>
+</blockquote>
+<p>The diffstat is minimal — <code>fs/nfs/callback_proc.c</code> (9 lines changed) and <code>fs/nfs/pnfs.c</code> (4 lines changed), 7 insertions, 6 deletions total. The key design decision is bumping the layout header's reference count before dropping the lock, so the layout structure cannot be freed out from under the deferred callback while it is still manipulating the extent tree.</p>
+<p>The <code>Fixes:</code> tag points at commit <code>c88953d87f5c8</code> ("pnfs: add return_range method"), identifying the original introduction of the <code>return_range</code> callback as the point where this locking-ordering hazard was introduced.</p>
+<h2>Why this matters for NFS client development</h2>
+<p>This bug affects any Linux NFSv4.2 client using pNFS with SCSI block layouts — a configuration common in high-performance storage deployments (e.g., Oracle ZFS Storage, NetApp ONTAP with block layout, or custom RDMA-based backends). The "scheduling while atomic" warning is not merely cosmetic:</p>
+<ul>
+<li>It indicates the kernel attempted to sleep while holding a spinlock or in an RCU/atomic section, which can corrupt lock state on some architectures.</li>
+<li>In production systems with <code>panic_on_warn</code> enabled (common in cloud and HPC environments), this would trigger a full kernel panic during unmount.</li>
+<li>The bug is intermittent ("Sometimes unmounting..."), making it particularly insidious — it depends on whether the SCSI PR command actually needs to wait for I/O completion.</li>
+</ul>
+<p>The fix is squarely in client-side code (<code>fs/nfs/pnfs.c</code> and <code>fs/nfs/callback_proc.c</code>), addressing a core pNFS layout lifecycle issue that any block-layout user would encounter during filesystem teardown.</p>
+<h2>Context: Dai Ngo's recent pNFS work</h2>
+<p>This patch fits into a broader pattern of pNFS reliability fixes from Dai Ngo (Oracle) this month. Earlier in the same reporting week, his two-patch XFS pNFS layout-mapping series received <code>Reviewed-by</code> tags from both Christoph Hellwig and Carlos Maiolino, fixing server-side bugs that produced malformed <code>LAYOUTGET</code> replies to clients. The current patch addresses the complementary client-side problem: what happens when a client tears down its block layouts during unmount.</p>
+<h2>Evolution and status</h2>
+<p>As of the end of this reporting window, the patch is awaiting review. No maintainer (Trond Myklebust or Anna Schumaker) has yet responded with an <code>Acked-by</code>, <code>Reviewed-by</code>, or application notice. Given the minimal scope and the clear <code>Fixes:</code> tag, this is likely a candidate for the next NFS client fixes window if it receives a clean review.</p>
+<h2>Key messages</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260526233031.2316425-1-dai.ngo@oracle.com/">2026-05-26 Dai Ngo — PATCH 1/1: NFSv4/pnfs: defer return_range callbacks until after inode unlock</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260526233031.2316425-1-dai.ngo@oracle.com/">2026-05-26 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — [PATCH 1/1] NFSv4/pnfs: defer return_range callbacks until after inode unlock</a></li>
+</ul>
+  </main>
+</body>
+</html>

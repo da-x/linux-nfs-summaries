@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd: XDR padding fix in flexfile GETDEVICEINFO encoder</title>
+  <meta name="description" content="Type: Bug fix (NFS server / NFSv4.1+ flexfiles layout)">
+  <meta property="og:title" content="nfsd: XDR padding fix in flexfile GETDEVICEINFO encoder">
+  <meta property="og:description" content="Type: Bug fix (NFS server / NFSv4.1+ flexfiles layout)">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-28T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd: XDR padding fix in flexfile GETDEVICEINFO encoder">
+  <meta name="twitter:description" content="Type: Bug fix (NFS server / NFSv4.1+ flexfiles layout)">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-28</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd: XDR padding fix in flexfile GETDEVICEINFO encoder</h1>
+<h2>Summary</h2>
+<h2>nfsd: Fix XDR Padding Calculation in <code>ff_encode_getdeviceinfo</code></h2>
+<p><strong>Type:</strong> Bug fix (NFS server / NFSv4.1+ flexfiles layout)</p>
+<h3>The Problem</h3>
+<p>Jeff Layton opened the thread on May 27 with a patch addressing a subtle but persistent encoding bug in the NFSv4.1 flexfiles server-side XDR code. The function <code>nfsd4_ff_encode_getdeviceinfo()</code> was computing its <code>da_addr_body</code> length field incorrectly:</p>
+<blockquote>
+<p>"nfsd4_ff_encode_getdeviceinfo() computes the da_addr_body reservation as 16 + netid_len + addr_len, but the subsequent xdr_encode_opaque() calls emit 8 + round_up(netid_len, 4) + round_up(addr_len, 4) bytes."</p>
+</blockquote>
+<p>The practical consequence was twofold:</p>
+<blockquote>
+<p>"The mismatch means the declared da_addr_body length exceeds the actual encoded data by 2-8 bytes on every flexfile GETDEVICEINFO reply, leaking stale reply-page content to the client and mis-aligning the subsequent version list decode."</p>
+</blockquote>
+<p>In other words, every single flexfiles <code>GETDEVICEINFO</code> reply was over-declaring its address body by a few bytes. Clients would read garbage (stale page contents) in those trailing bytes, and the misalignment would cascade into the version-list decoding that follows. The fix is straightforward: use <code>xdr_align_size()</code> for each string length to match what <code>xdr_encode_opaque()</code> actually writes.</p>
+<p>The patch carries a <code>Fixes:</code> tag pointing at commit <code>efcae97fa425</code> ("NFSD: da_addr_body field missing in some GETDEVICEINFO replies"), and an "Assisted-by: kres:claude-opus-4-6" line, indicating LLM-assisted code review contributed to the analysis.</p>
+<h3>Review Discussion</h3>
+<p>Chuck Lever responded within an hour with two points of interest:</p>
+<ol>
+<li>
+<p><strong>Fixes tag uncertainty:</strong> He suggested the correct <code>Fixes:</code> target might instead be commit <code>9b9960a0ca47</code>, noting that "LLM reviews vary on this." This highlights the ongoing challenge of attributing fixes to the right upstream commit, particularly when LLM-assisted review is in the loop.</p>
+</li>
+<li>
+<p><strong>A related bug in the same file:</strong> Lever spotted an analogous unaligned-length pattern elsewhere:</p>
+<blockquote>
+<p>"nfsd4_ff_encode_layoutget at fs/nfsd/flexfilelayoutxdr.c:40-41 has the same unaligned pattern for UID/GID strings: 8 + uid.len + 8 + gid.len. Do you intend to address that calculation as well?"</p>
+</blockquote>
+</li>
+</ol>
+<p>He also floated a longer-term architectural preference:</p>
+<blockquote>
+<p>"My preference here is to convert to xdrgen instead, but that's a much bigger and less back-portable change."</p>
+</blockquote>
+<p>Layton confirmed he would handle the second bug separately:</p>
+<blockquote>
+<p>"Yep, I just saw the Sashiko review for it. I'll fix that one up in a separate patch."</p>
+</blockquote>
+<p>This reference to "Sashiko" (another automated/LLM review tool) underscores how LLM-assisted code review is becoming a routine part of the NFS development workflow — both for finding bugs and for generating patches.</p>
+<h3>Resolution</h3>
+<p>The following day (May 28), Chuck Lever applied the patch to his <code>nfsd-testing</code> tree:</p>
+<blockquote>
+<p>"Applied to nfsd-testing, thanks!"
+commit: d53136757d4192934ad67d4c5c58eb9bc99daf4b</p>
+</blockquote>
+<h3>Significance for NFS Client Development</h3>
+<p>While this is a server-side fix, the impact is directly felt by NFS clients. Flexfiles (NFSv4.1+) is an advanced layout type used in high-performance storage deployments. A mis-encoded <code>GETDEVICEINFO</code> reply would cause any conforming client to:</p>
+<ul>
+<li>Interpret 2–8 bytes of stale memory as valid data in the address body, and</li>
+<li>Mis-decode the device version list that follows, potentially selecting wrong or invalid devices for I/O.</li>
+</ul>
+<p>The fix ensures byte-exact XDR encoding per the RFC, restoring correct client behavior for all flexfiles <code>GETDEVICEINFO</code> exchanges. The companion fix for the UID/GID padding in <code>ff_encode_layoutget</code> (promised as a follow-up) will close out the last known instances of this class of bug in the flexfiles XDR encoder.</p>
+<h3>Key Messages</h3>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260527-pnfs-fixes-v1-1-784f39dc1eca@kernel.org/">Original patch by Jeff Layton</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/e73a448b-5117-4dc6-b05d-7c9e95fa0734@app.fastmail.com/">Chuck Lever's review with related-bug finding</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ac0f6eeb37576986bbdb484877f411a2ba9ecc90.camel@kernel.org/">Jeff Layton confirming follow-up patch</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177998122996.340259.15377525881232211349.b4-ty@b4/">Chuck Lever applying to nfsd-testing</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260527-pnfs-fixes-v1-1-784f39dc1eca@kernel.org/">2026-05-27 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH] nfsd: fix XDR padding calculation in ff_encode_getdeviceinfo</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/e73a448b-5117-4dc6-b05d-7c9e95fa0734@app.fastmail.com/">2026-05-27 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH] nfsd: fix XDR padding calculation in ff_encode_getdeviceinfo</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ac0f6eeb37576986bbdb484877f411a2ba9ecc90.camel@kernel.org/">2026-05-27 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH] nfsd: fix XDR padding calculation in ff_encode_getdeviceinfo</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177998122996.340259.15377525881232211349.b4-ty@b4/">2026-05-28 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH] nfsd: fix XDR padding calculation in ff_encode_getdeviceinfo</a></li>
+</ul>
+  </main>
+</body>
+</html>

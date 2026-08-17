@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VFS/NFSd: dentry_create() error-pointer fix for nfsd4_create_file() unlock failure applied</title>
+  <meta name="description" content="This week a focused, well-received bug-fix thread landed on linux-nfs. NeilBrown posted a small patch to fs/namei.c that corrects an unfortunate interaction between the VFS dentry-creation helpers and the NFSv4 server&#39;s file-creation path…">
+  <meta property="og:title" content="VFS/NFSd: dentry_create() error-pointer fix for nfsd4_create_file() unlock failure applied">
+  <meta property="og:description" content="This week a focused, well-received bug-fix thread landed on linux-nfs. NeilBrown posted a small patch to fs/namei.c that corrects an unfortunate interaction between the VFS dentry-creation helpers and the NFSv4 server&#39;s file-creation path…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-28T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="VFS/NFSd: dentry_create() error-pointer fix for nfsd4_create_file() unlock failure applied">
+  <meta name="twitter:description" content="This week a focused, well-received bug-fix thread landed on linux-nfs. NeilBrown posted a small patch to fs/namei.c that corrects an unfortunate interaction between the VFS dentry-creation helpers and the NFSv4 server&#39;s file-creation path…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-28</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>VFS/NFSd: dentry_create() error-pointer fix for nfsd4_create_file() unlock failure applied</h1>
+<h2>Summary</h2>
+<h1>VFS/NFSd: <code>dentry_create()</code> error-pointer bug fixed and applied</h1>
+<p>This week a focused, well-received <strong>bug-fix</strong> thread landed on linux-nfs. NeilBrown posted a small patch to <code>fs/namei.c</code> that corrects an unfortunate interaction between the VFS dentry-creation helpers and the NFSv4 server's file-creation path — one that could leave a parent inode permanently locked. The patch drew quick Reviewed-bys from the NFS maintainers, sparked a brief performance discussion, and was applied to the <code>vfs.fixes</code> branch by Christian Brauner within three days.</p>
+<h2>The bug: an error pointer where a dentry is required</h2>
+<p>NeilBrown opened the thread <a href="https://lore.kernel.org/linux-nfs/177969022571.3379282.16448744624428323496@noble.neil.brown.name/">with the patch</a> and a careful root-cause analysis. The chain of events he traced:</p>
+<blockquote>
+<p>"atomic_create() in fs/namei.c drops the reference to the dentry when it returns an error."</p>
+</blockquote>
+<p>That behavior was carried into <code>dentry_create()</code>, so on an error from <code>atomic_create()</code> it would leave <code>path-&gt;dentry</code> as an <strong>error pointer</strong> rather than a counted dentry. The caller, <code>nfsd4_create_file()</code>, distinguishes the two cases by inspecting <code>path-&gt;dentry</code>. But NeilBrown pointed out the trap:</p>
+<blockquote>
+<p>"The change to use start_creating()/end_creating() ... means that nfsd4_create_file() <em>needs</em> a valid dentry so that it can unlock the parent."</p>
+</blockquote>
+<p>So when an exported filesystem uses <code>-&gt;atomic_create</code> and that call fails, <code>nfsd4_create_file()</code> hands the error pointer to <code>end_creating()</code>:</p>
+<blockquote>
+<p>"the net result is that if NFSD exports a filesystem which uses -&gt;atomic_create, and if a call to -&gt;atomic_create returns an error, then nfsd4_create_file() will pass an error pointer to end_creating() and the parent will not be unlocked."</p>
+</blockquote>
+<p>The fix keeps <code>path-&gt;dentry</code> always a valid dentry (the real error is already returned through a separate channel), adding a <code>dget(orig_dentry)</code> to compensate for <code>atomic_open()</code>'s <code>dput</code> on error. NeilBrown noted an edge case: if <code>-&gt;atomic_create()</code> ever returns a <em>different</em> dentry, it is guaranteed (via <code>d_spliace_alias()</code>) to share the same <code>d_parent</code>, so passing it to <code>end_creating()</code> has identical effect. The patch carries <code>Fixes: 64a989dbd144 ("VFS/knfsd: Teach dentry_create() to use atomic_open()")</code>.</p>
+<h2>Fast, positive review from the NFS maintainers</h2>
+<p>The NFS side moved quickly. <a href="https://lore.kernel.org/linux-nfs/0a9fd2bb1cb7b1190d177034832277169d8d1359.camel@kernel.org/">Jeff Layton</a> confirmed "the patch itself looks correct" and granted a Reviewed-by, while flagging that an automated review (Sashiko) had spotted two additional problems in nearby code worth examining. <a href="https://lore.kernel.org/linux-nfs/D21CFD27-5D06-4CB2-AC48-B79F3C6A287A@hammerspace.com/">Benjamin Coddington</a> added a second Reviewed-by the same day.</p>
+<p>NeilBrown took the Sashiko findings seriously but assessed them as low-risk, <a href="https://lore.kernel.org/linux-nfs/177977275746.3379282.16167323157026052413@noble.neil.brown.name/">explaining</a> that one would "require a remote server that is seriously misbehaving" (returning a directory filehandle for an OPEN), and the other "appears to be impossible with in-kernel filesystems." He promised follow-up patches for those nfsd-side issues, while making clear his near-term intent:</p>
+<blockquote>
+<p>"I'm working on a rewrite of nfsd4_create_file and lookup_open() so that nfsd can use a better interface which will improve the code and fix some minor edge-case behavioural issues. So I'm just focusing on simple fixes at this stage, not necessarily best fixes."</p>
+</blockquote>
+<h2>A performance objection — and why it didn't stick</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/36bvv2anew3cegsd374uzwdgue2txpgnzo2357ye5pldqi4by6@lafavyjgevqo/">Mateusz Guzik</a> raised a performance concern with the added <code>dget()</code>:</p>
+<blockquote>
+<p>"atomic_open() is a static func with only 2 callers. perhaps it would be better to change its semantics instead? I'm asking because the vfs layer is very slow single-threaded and this here just adds even more slowdown due to avoidable 2 rmw atomics."</p>
+</blockquote>
+<p>NeilBrown's <a href="https://lore.kernel.org/linux-nfs/177979574027.3379282.15340720667866455874@noble.neil.brown.name/">reply</a> settled it: optimizing the helper was pointless because</p>
+<blockquote>
+<p>"My plan is to get rid of dentry_create() completely so I don't think there is any point trying to optimise it."</p>
+</blockquote>
+<p>He said he had patches ready to give <code>lookup_open()</code> a cleaner interface and route nfsd through it, and offered to include Guzik on the cc list.</p>
+<h2>A parallel discovery from Jori Koolstra</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/ahVXG28wpqDwZpFT@lt-jori.localdomain/">Jori Koolstra</a> revealed he had independently hit the same bug:</p>
+<blockquote>
+<p>"I found this same bug and submitted a patch on the same day."</p>
+</blockquote>
+<p>He agreed that <code>atomic_open()</code> dput-ing the dentry on failure is awkward (noting <code>vfs_create()</code> doesn't do so), but accepted NeilBrown's approach for now. He added his Reviewed-by, <a href="https://lore.kernel.org/linux-nfs/1393975057.2602302.1779803002070@kpc.webmail.kpnmail.nl/">offered</a> to review the upcoming <code>lookup_open()</code> rework, and noted his own in-flight O_CREAT|O_DIRECTORY proposal touches that same code. NeilBrown <a href="https://lore.kernel.org/linux-nfs/177979585120.3379282.15888962273037831904@noble.neil.brown.name/">responded</a> that he would "rather no big changes to atomic_open just now" and would welcome Koolstra's review of the rearrangement patches.</p>
+<h2>Applied</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260528-pritsche-verknallen-frisieren-5c6ea172ecb5@brauner/">Christian Brauner</a> applied the patch to the <code>vfs.fixes</code> branch of vfs/vfs.git, noting it should appear in linux-next soon. In a <a href="https://lore.kernel.org/linux-nfs/20260528-flohmarkt-leiharbeit-vielzahl-797524281a0f@brauner/">separate note</a> he acknowledged the nature of the bug:</p>
+<blockquote>
+<p>"Ugh, that's an unfortunate interaction."</p>
+</blockquote>
+<h2>Takeaways for NFS client/server development</h2>
+<ul>
+<li><strong>Classification:</strong> Bug fix (not a new feature or protocol change), targeting the NFSv4 <em>server</em> (<code>nfsd</code>) file-creation path and the shared VFS <code>dentry_create()</code> helper.</li>
+<li><strong>Impact:</strong> Prevents a parent-inode lock leak when an <code>-&gt;atomic_create</code>-based filesystem returns an error during an NFSv4 create — a correctness fix that protects against hung/stuck exports.</li>
+<li><strong>Follow-on work in flight:</strong> NeilBrown is preparing a rewrite of <code>nfsd4_create_file()</code> and <code>lookup_open()</code> to give nfsd a cleaner interface, plus simple fixes for the two Sashiko-flagged edge cases; Jori Koolstra's O_CREAT|O_DIRECTORY work will need rework against those changes.</li>
+</ul>
+<p>This thread is a tidy example of a low-level VFS/NFSd interaction bug being caught, reviewed by both NFS maintainers within hours, and merged into the fixes branch in under a week.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/177969022571.3379282.16448744624428323496@noble.neil.brown.name/">2026-05-25 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH] VFS: fix possible failure to unlock in nfsd4_create_file()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/0a9fd2bb1cb7b1190d177034832277169d8d1359.camel@kernel.org/">2026-05-25 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH] VFS: fix possible failure to unlock in nfsd4_create_file()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/D21CFD27-5D06-4CB2-AC48-B79F3C6A287A@hammerspace.com/">2026-05-25 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — Re: [PATCH] VFS: fix possible failure to unlock in nfsd4_create_file()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177977275746.3379282.16167323157026052413@noble.neil.brown.name/">2026-05-26 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> —  Re: [PATCH] VFS: fix possible failure to unlock in nfsd4_create_file()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/36bvv2anew3cegsd374uzwdgue2txpgnzo2357ye5pldqi4by6@lafavyjgevqo/">2026-05-26 Mateusz Guzik <a href="mailto:mjguzik@gmail.com">mjguzik@gmail.com</a> — Re: [PATCH] VFS: fix possible failure to unlock in nfsd4_create_file()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ahVXG28wpqDwZpFT@lt-jori.localdomain/">2026-05-26 Jori Koolstra <a href="mailto:jkoolstra@xs4all.nl">jkoolstra@xs4all.nl</a> — Re: [PATCH] VFS: fix possible failure to unlock in nfsd4_create_file()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177979574027.3379282.15340720667866455874@noble.neil.brown.name/">2026-05-26 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> —  Re: [PATCH] VFS: fix possible failure to unlock in nfsd4_create_file()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177979585120.3379282.15888962273037831904@noble.neil.brown.name/">2026-05-26 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> —  Re: [PATCH] VFS: fix possible failure to unlock in nfsd4_create_file()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/1393975057.2602302.1779803002070@kpc.webmail.kpnmail.nl/">2026-05-26 Jori Koolstra <a href="mailto:jkoolstra@xs4all.nl">jkoolstra@xs4all.nl</a> — Re: [PATCH] VFS: fix possible failure to unlock in nfsd4_create_file()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260528-pritsche-verknallen-frisieren-5c6ea172ecb5@brauner/">2026-05-28 Christian Brauner <a href="mailto:brauner@kernel.org">brauner@kernel.org</a> — Re: [PATCH] VFS: fix possible failure to unlock in nfsd4_create_file()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260528-flohmarkt-leiharbeit-vielzahl-797524281a0f@brauner/">2026-05-28 Christian Brauner <a href="mailto:brauner@kernel.org">brauner@kernel.org</a> — Re: [PATCH] VFS: fix possible failure to unlock in nfsd4_create_file()</a></li>
+</ul>
+  </main>
+</body>
+</html>

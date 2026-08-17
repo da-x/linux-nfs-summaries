@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD: ssc_expire_umount() use-after-free fix gets Reviewed-by, v2 requested on comment wording</title>
+  <meta name="description" content="Type: Bug fix (NFS server / NFSv4.2 inter-server copy) — slab use-after-free in nfsd4_ssc_expire_umount(), with a stable backport requested. This is the second of several same-day submissions from Michael Bommarito this week, sitting…">
+  <meta property="og:title" content="NFSD: ssc_expire_umount() use-after-free fix gets Reviewed-by, v2 requested on comment wording">
+  <meta property="og:description" content="Type: Bug fix (NFS server / NFSv4.2 inter-server copy) — slab use-after-free in nfsd4_ssc_expire_umount(), with a stable backport requested. This is the second of several same-day submissions from Michael Bommarito this week, sitting…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-28T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSD: ssc_expire_umount() use-after-free fix gets Reviewed-by, v2 requested on comment wording">
+  <meta name="twitter:description" content="Type: Bug fix (NFS server / NFSv4.2 inter-server copy) — slab use-after-free in nfsd4_ssc_expire_umount(), with a stable backport requested. This is the second of several same-day submissions from Michael Bommarito this week, sitting…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-28</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD: ssc_expire_umount() use-after-free fix gets Reviewed-by, v2 requested on comment wording</h1>
+<h2>Summary</h2>
+<h1>NFSD: restart ssc_expire_umount walk after dropping nfsd_ssc_lock</h1>
+<p><strong>Type:</strong> Bug fix (NFS server / NFSv4.2 inter-server copy) — slab use-after-free in <code>nfsd4_ssc_expire_umount()</code>, with a stable backport requested. This is the second of several same-day submissions from Michael Bommarito this week, sitting alongside his <a href="https://lore.kernel.org/linux-nfs/20260523014203.2462827-1-michael.bommarito@gmail.com/">lockd UAF series</a> (v1→v3) and a third patch thread on the same day; it is the first of the set to receive a clean <code>Reviewed-by</code> from Jeff Layton within hours.</p>
+<h2>The bug and the proposed fix</h2>
+<p>Bommarito opened the thread on Saturday, May 23 with <a href="https://lore.kernel.org/linux-nfs/20260523014107.2460863-1-michael.bommarito@gmail.com/">a single-patch submission</a> targeting <code>fs/nfsd/nfs4state.c</code> (26 insertions, 19 deletions). The patch carries <code>Cc: stable@vger.kernel.org</code>, a <code>Fixes:</code> tag pointing at the original delayed-unmount commit (<code>f4e44b393389</code>, "NFSD: delay unmount source's export after inter-server copy completed."), and an <code>Assisted-by: Claude:claude-opus-4-7</code> trailer — making it one of several prominently AI-assisted submissions this week.</p>
+<p>The race, in Bommarito's words:</p>
+<blockquote>
+<p>"nfsd4_ssc_expire_umount() walks nn-&gt;nfsd_ssc_mount_list with list_for_each_entry_safe(ni, tmp, ...). For each expired entry it sets nsui_busy = true, drops nfsd_ssc_lock to run mntput() on the source vfsmount, then reacquires the lock to list_del + kfree the entry and continue iterating via the macro's saved tmp pointer."</p>
+</blockquote>
+<blockquote>
+<p>"The nsui_busy flag protects the current ni from concurrent nfsd4_ssc_setup_dul() finders during the lock-drop window, but it does not pin tmp. Another nfsd RPC thread that fails its source-server mount and reaches nfsd4_ssc_cancel_dul() will, during that same window, take nfsd_ssc_lock, list_del + kfree its own ssc_umount item, and release the lock. If that item is the saved tmp of the expire walk, the next iteration dereferences a freed nfsd4_ssc_umount_item."</p>
+</blockquote>
+<p>The chosen remedy is to <strong>restart the walk from the head after each mntput() unlock window</strong> so no saved next pointer survives the lock-drop:</p>
+<blockquote>
+<p>"Restart the walk from the head after the mntput() unlock window so no saved next pointer survives the lock-drop. The list is bounded by the number of active inter-server source mounts (typically small) and the expire delayed-work runs periodically rather than per-IO, so the restart is cheap."</p>
+</blockquote>
+<h2>Reachability — opt-in only</h2>
+<p>Bommarito is careful to scope the bug's blast radius: it requires an authenticated NFSv4.2 client issuing <code>OP_COPY</code> with <code>cna_src.nl4_type = NL4_SERVER</code> against a destination nfsd built with <code>CONFIG_NFSD_V4_2_INTER_SSC=y</code> and started with <code>inter_copy_offload_enable=Y</code>. The client chooses the source-server netaddr and can pick one that fails <code>vfs_kern_mount()</code> (unreachable, RST after EXCHANGE_ID, etc.) to drive <code>nfsd4_ssc_cancel_dul()</code> into the laundromat's lock-drop window:</p>
+<blockquote>
+<p>"Default Linux nfsd ships with inter_copy_offload_enable=N, so the bug is reachable only on servers where the administrator has explicitly opted into inter-SSC offload."</p>
+</blockquote>
+<p>He also notes the patch closes a sibling of an earlier fix — "The same primitive class was previously addressed by the OPEN-error path fix in <code>__nfs42_ssc_open()</code>; this patch closes the corresponding hole in the laundromat-driven delayed-unmount path."</p>
+<h2>Reproduction evidence</h2>
+<p>Bommarito reports a concrete KASAN reproduction, which is notable for an inter-SSC code path that is off by default:</p>
+<blockquote>
+<p>"Reproduced under QEMU/KVM with KASAN, three nfsd network namespaces on a single host so the kernel client treats them as distinct servers, and Linux fault injection forcing vfs_kern_mount allocations inside the destination nfsd to fail. This drives nfsd4_ssc_cancel_dul into a tight loop concurrent with the laundromat workqueue."</p>
+</blockquote>
+<blockquote>
+<p>"BUG: KASAN: slab-use-after-free in laundromat_main+0x1756/0x1be0 — Read of size 8 at addr ffff88800ce9b200 by task kworker/u16:3 / Workqueue: nfsd4 laundromat_main"</p>
+</blockquote>
+<p>The allocation/free stacks point cleanly at <code>nfsd4_interssc_connect()</code> (the inlined <code>nfsd4_ssc_setup_dul</code>/<code>nfsd4_ssc_cancel_dul</code> helpers) called from <code>nfsd4_copy()</code>. The patched kernel "ran the equivalent workload to completion with the inter-SSC code path exercised 21–22 times per run and no KASAN report." He emphasizes that "the fault-injection knobs are standard Linux testing infrastructure … exercising the existing failure path in nfsd; no kernel source was modified."</p>
+<h2>Review: Reviewed-by from Layton, comment nit from both maintainers</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/8793ba93d173b82bd210a223a91664ee245b66dd.camel@kernel.org/">Jeff Layton replied</a> within roughly nine hours and signed off:</p>
+<blockquote>
+<p>"The bug and patch look correct to me though. Reviewed-by: Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a>"</p>
+</blockquote>
+<p>His only objection was a documentation nit: the new in-code comment references <code>list_for_each_entry_safe()</code>, but the patched code uses plain <code>list_for_each_entry()</code> — so a reader looking at the post-patch source sees no <code>_safe</code> iterator anywhere and has to reconstruct the bug history to make sense of the comment.</p>
+<p>Bommarito <a href="https://lore.kernel.org/linux-nfs/CAJJ9bXxc1C2coYCkxWYSk-ojq=XatuA_rje3NCA-s3e=NHhbpQ@mail.gmail.com/">acknowledged</a> it was a leftover from an earlier patch attempt and proposed a cleaner wording:</p>
+<blockquote>
+<p>"Concurrent nfsd4_ssc_cancel_dul() can free an item while spinlock is dropped for mntput() above, so restart the walk from the head so no stale pointer is followed."</p>
+</blockquote>
+<p>Layton <a href="https://lore.kernel.org/linux-nfs/4d035995bef0f035eae2b613ed09f02f9920d18a.camel@kernel.org/">approved</a> the rewording and added a useful framing note:</p>
+<blockquote>
+<p>"Sure, looks good. FWIW, the 'restart the loop after dropping the lock' pattern is pretty common across the kernel, but it is good to lay out the rationale in a comment."</p>
+</blockquote>
+<p><a href="https://lore.kernel.org/linux-nfs/1bdc4121-71a9-4f01-8a12-d6f86b28b4f1@app.fastmail.com/">Chuck Lever then weighed in</a> later that afternoon, reinforcing the same point from a reader's-eye perspective:</p>
+<blockquote>
+<p>"Same observation as Jeff's: The comment references list_for_each_entry_safe(), but the patched code uses plain list_for_each_entry(). A reader looking only at the post-patch source sees no _safe iterator anywhere in the function and has to reconstruct the bug history to make sense of the comment."</p>
+<p>"The past-tense framing ('was not pinned') reinforces this: it describes a removed code state rather than the current one. Please send a v2 with this comment corrected."</p>
+</blockquote>
+<h2>Status / outlook</h2>
+<ul>
+<li><strong>v1 functionally accepted, v2 requested on comment wording only.</strong> Layton's <code>Reviewed-by</code> is already in place; both maintainers agree the bug analysis and the restart-from-head fix are correct. The only outstanding item is the comment rewording Bommarito has already proposed — a v2 that drops the stale <code>_safe</code> reference should clear review quickly.</li>
+<li><strong>Stable backport pending.</strong> The UAF is clearly stable-worthy (a classic list-walk use-after-free in the nfsd laundromat path), so the eventual clean version should land in -stable alongside mainline given the <code>Cc: stable</code> and <code>Fixes:</code> tags.</li>
+<li><strong>Client-side relevance:</strong> this is server-side code, but it directly affects NFSv4.2 clients that issue <code>OP_COPY</code> with <code>NL4_SERVER</code> against a Linux nfsd configured for inter-server copy offload — exactly the workload where a misbehaving source-server netaddr can drive the destination into the race window. Until the fix lands, such servers are exposed to a KASAN-confirmed slab UAF in <code>laundromat_main()</code> triggered by an authenticated client; default configurations (inter_copy_offload_enable=N) are unaffected.</li>
+<li><strong>Notable pattern:</strong> this is the first of Bommarito's same-day submissions to land a clean <code>Reviewed-by</code> within hours, in contrast to his <a href="https://lore.kernel.org/linux-nfs/20260523014203.2462827-1-michael.bommarito@gmail.com/">lockd series</a> which needed three rounds (Sashiko on v1, Codex/Sashiko on v2) before Chuck Lever applied v3 to nfsd-testing. The contrast highlights how the simpler "restart after lock-drop" pattern — already familiar to kernel maintainers per Layton's note — is far less likely to trip automated reviewers than the more intricate dual-cursor pinning in the lockd fix.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260523014107.2460863-1-michael.bommarito@gmail.com/">2026-05-23 Michael Bommarito <a href="mailto:michael.bommarito@gmail.com">michael.bommarito@gmail.com</a> — [PATCH] NFSD: restart ssc_expire_umount walk after dropping nfsd_ssc_lock</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/8793ba93d173b82bd210a223a91664ee245b66dd.camel@kernel.org/">2026-05-23 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH] NFSD: restart ssc_expire_umount walk after dropping nfsd_ssc_lock</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAJJ9bXxc1C2coYCkxWYSk-ojq=XatuA_rje3NCA-s3e=NHhbpQ@mail.gmail.com/">2026-05-23 Michael Bommarito <a href="mailto:michael.bommarito@gmail.com">michael.bommarito@gmail.com</a> — Re: [PATCH] NFSD: restart ssc_expire_umount walk after dropping nfsd_ssc_lock</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/4d035995bef0f035eae2b613ed09f02f9920d18a.camel@kernel.org/">2026-05-23 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH] NFSD: restart ssc_expire_umount walk after dropping nfsd_ssc_lock</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/1bdc4121-71a9-4f01-8a12-d6f86b28b4f1@app.fastmail.com/">2026-05-23 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH] NFSD: restart ssc_expire_umount walk after dropping nfsd_ssc_lock</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260523014107.2460863-1-michael.bommarito@gmail.com/">2026-05-23 Michael Bommarito <a href="mailto:michael.bommarito@gmail.com">michael.bommarito@gmail.com</a> — [PATCH] NFSD: restart ssc_expire_umount walk after dropping nfsd_ssc_lock</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/8793ba93d173b82bd210a223a91664ee245b66dd.camel@kernel.org/">2026-05-23 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH] NFSD: restart ssc_expire_umount walk after dropping nfsd_ssc_lock</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAJJ9bXxc1C2coYCkxWYSk-ojq=XatuA_rje3NCA-s3e=NHhbpQ@mail.gmail.com/">2026-05-23 Michael Bommarito <a href="mailto:michael.bommarito@gmail.com">michael.bommarito@gmail.com</a> — Re: [PATCH] NFSD: restart ssc_expire_umount walk after dropping nfsd_ssc_lock</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/4d035995bef0f035eae2b613ed09f02f9920d18a.camel@kernel.org/">2026-05-23 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH] NFSD: restart ssc_expire_umount walk after dropping nfsd_ssc_lock</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/1bdc4121-71a9-4f01-8a12-d6f86b28b4f1@app.fastmail.com/">2026-05-23 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH] NFSD: restart ssc_expire_umount walk after dropping nfsd_ssc_lock</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd: a pile of fixes for random bugs — 10-patch grab bag lands with early scrutiny on ACL cap and layout BUG_ON</title>
+  <meta name="description" content="On May 28, Jeff Layton posted a 10-patch series titled &quot;nfsd: a pile of fixes for random bugs&quot;, describing the collection as covering &quot;remotely-triggerable panics, UAFs, DoS&#39;s, etc., but they aren&#39;t reliable. There are also a few protocol…">
+  <meta property="og:title" content="nfsd: a pile of fixes for random bugs — 10-patch grab bag lands with early scrutiny on ACL cap and layout BUG_ON">
+  <meta property="og:description" content="On May 28, Jeff Layton posted a 10-patch series titled &quot;nfsd: a pile of fixes for random bugs&quot;, describing the collection as covering &quot;remotely-triggerable panics, UAFs, DoS&#39;s, etc., but they aren&#39;t reliable. There are also a few protocol…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-28T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd: a pile of fixes for random bugs — 10-patch grab bag lands with early scrutiny on ACL cap and layout BUG_ON">
+  <meta name="twitter:description" content="On May 28, Jeff Layton posted a 10-patch series titled &quot;nfsd: a pile of fixes for random bugs&quot;, describing the collection as covering &quot;remotely-triggerable panics, UAFs, DoS&#39;s, etc., but they aren&#39;t reliable. There are also a few protocol…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-28</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd: a pile of fixes for random bugs — 10-patch grab bag lands with early scrutiny on ACL cap and layout BUG_ON</h1>
+<h2>Summary</h2>
+<h2>Jeff Layton drops a ten-patch "grab bag" of nfsd bug fixes</h2>
+<p>On May 28, Jeff Layton posted <a href="https://lore.kernel.org/linux-nfs/20260528-nfsd-fixes-v1-0-e78708eff77d@kernel.org/">a 10-patch series titled "nfsd: a pile of fixes for random bugs"</a>, describing the collection as covering "remotely-triggerable panics, UAFs, DoS's, etc., but they aren't reliable. There are also a few protocol fixes in here too, etc. It's a grab bag." The set spans 12 files with 142 insertions and 43 deletions, and credits three authors: Chris Mason (6 patches), Chuck Lever (2), and Layton himself (2).</p>
+<p>Notably, one of the patches — <a href="https://lore.kernel.org/linux-nfs/20260528-nfsd-fixes-v1-6-e78708eff77d@kernel.org/">PATCH 06/10 "NFSD: Enable return of an updated stable_how to NFS clients"</a> — was originally submitted by Chuck Lever "a couple of years ago" but is being resubmitted now because, as Layton put it, "Claude believes that this fixes a real bug and isn't optional." The series passed basic pynfs smoke testing.</p>
+<h2>Key technical arguments per patch</h2>
+<h3>PATCH 01: BUG_ON on racing delegation revoke (Layton)</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260528-nfsd-fixes-v1-1-e78708eff77d@kernel.org/">The first patch</a> fixes a client-reachable race in <code>nfsd4_alloc_layout_stateid()</code>. When the parent stateid is a delegation, the code reads <code>fp-&gt;fi_deleg_file</code> without holding <code>fi_lock</code>. A concurrent laundromat revoke can clear that pointer, causing <code>nfsd_file_get()</code> to return NULL and triggering a BUG_ON. The fix takes <code>fi_lock</code> around the read and replaces the BUG_ON with a graceful error return.</p>
+<p>NeilBrown quickly pushed back on the locking approach in <a href="https://lore.kernel.org/linux-nfs/178001164345.3379282.16920221845834080481@noble.neil.brown.name/">his reply</a>:</p>
+<blockquote>
+<p>"Replacing the BUG_ON with a graceful error is certainly sensible and probably all that is needed to fix the problem."</p>
+<p>"I cannot see how the spinlock achieves anything. If -&gt;fi_deleg_file could become NULL at this point, it can become NULL just before we take the spinlock."</p>
+</blockquote>
+<p>NeilBrown also flagged the <code>rcu_dereference_protected(fp-&gt;fi_deleg_file, 1)</code> call as "a warning sign" and questioned what the <code>'1'</code> argument means, suggesting a comment is called for. He speculated that "<code>fi_delegees &gt; 0</code> guarantees stability" and asked why a spinlock would be needed in addition. His verdict: "Confused."</p>
+<h3>PATCH 02: Drain callbacks and clear cl_cb_session (Mason)</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260528-nfsd-fixes-v1-2-e78708eff77d@kernel.org/">This patch</a> addresses a use-after-free in the session teardown path. After <code>DESTROY_SESSION</code>, the per-session teardown can free a session while rpciod still holds an inflight callback <code>rpc_task</code> that dereferences <code>clp-&gt;cl_cb_session</code>. The fix mirrors the two-stage drain already used by <code>nfsd4_shutdown_callback()</code>: calling <code>nfsd41_cb_inflight_wait_complete()</code> after <code>flush_workqueue()</code> so rpciod-side decrements are observed before the caller releases the final session reference. A second window in <code>nfsd4_process_cb_update()</code> is closed by unconditionally clearing <code>clp-&gt;cl_cb_session</code> on error return.</p>
+<h3>PATCH 03: Serialize nfsd4_end_grace() (Mason)</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260528-nfsd-fixes-v1-3-e78708eff77d@kernel.org/">This patch</a> replaces a plain bool read/write pair guarding the grace-end drain path with <code>try_cmpxchg()</code>. Without it, two concurrent callers (laundromat kworker and RECLAIM_COMPLETE compound handler) can both observe <code>grace_ended == false</code>, both proceed into <code>nfsd4_record_grace_done()</code>, and double-free every <code>nfs4_client_reclaim</code> entry while corrupting the reclaim hash table.</p>
+<h3>PATCH 04: Dedup nfs4_client_to_reclaim inserts (Mason)</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260528-nfsd-fixes-v1-4-e78708eff77d@kernel.org/">This patch</a> fixes a bookkeeping bug where <code>nfs4_client_to_reclaim()</code> unconditionally allocates and prepends a new entry without checking for an existing one. After a reboot with a populated recovery directory, the counter inflates to 2N, making the fast end-of-grace path dead — "the grace period always runs out the full 90-second laundromat timer." The fix looks up the name first and folds in the principal hash if needed, using <code>smp_store_release()</code>/<code>smp_load_acquire()</code> to prevent torn reads of the (data, len) pair.</p>
+<h3>PATCH 05: Gate nfs3 setacl by argp-&gt;mask (Mason)</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260528-nfsd-fixes-v1-5-e78708eff77d@kernel.org/">This patch</a> fixes a protocol correctness bug: <code>nfsd3_proc_setacl()</code> called <code>set_posix_acl()</code> unconditionally for both ACL types, but the decoder only populates those pointers when the corresponding mask bit is set. A NULL pointer meaning "client did not send this arm" was indistinguishable from "client asked to remove this ACL." As Mason noted in the commit message: "A SETACL with mask=NFS_ACL silently drops the directory's default ACL; mask=0 drops both."</p>
+<h3>PATCH 06: Return updated stable_how (Lever)</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260528-nfsd-fixes-v1-6-e78708eff77d@kernel.org/">This patch</a> is a refactoring that allows <code>nfsd_vfs_write()</code> to return a possibly modified <code>stable_how</code> value, paving the way for promoting an UNSTABLE WRITE to FILE_SYNC and saving the client a COMMIT round trip. Layton highlighted this as a patch originally submitted by Chuck "a couple of years ago" that is now being resubmitted because it "fixes a real bug and isn't optional."</p>
+<h3>PATCH 07: Check truncate permission under inode lock (Lever)</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260528-nfsd-fixes-v1-7-e78708eff77d@kernel.org/">This patch</a> closes a TOCTOU window for append-only files. The original code checked whether a size update needed <code>NFSD_MAY_TRUNC</code> using an unlocked file-size sample, but the actual <code>ATTR_SIZE</code> update was applied later under <code>inode_lock()</code>. A concurrent append could extend the file in between, causing <code>notify_change()</code> to apply a real truncation without the append-only check. The fix rechecks the size after acquiring the lock.</p>
+<h3>PATCH 08: Fix partial-write detection in nfsd_direct_write (Mason)</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260528-nfsd-fixes-v1-8-e78708eff77d@kernel.org/">This patch</a> fixes a subtle off-by-half bug. After <code>vfs_iocb_iter_write()</code>, the iterator's <code>count</code> field is already decremented by the bytes written, so the partial-write check <code>host_err &lt; segments[i].iter.count</code> was actually comparing against the <em>residual</em>, not the original length. The condition only fired when less than half the segment was written; short writes between 50% and 99% slipped through, causing the next segment to be written at the wrong offset.</p>
+<h3>PATCH 09: Cap decoded POSIX ACL count (Mason) — sparks discussion</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260528-nfsd-fixes-v1-9-e78708eff77d@kernel.org/">This patch</a> rejects a wire-supplied ACL entry count greater than <code>NFS_ACL_MAX_ENTRIES</code> before allocation, bounding the O(n²) bubble sort cost. The encoder side already had this check; the decoder introduced in 2014 did not.</p>
+<p>This patch drew the most discussion. <a href="https://lore.kernel.org/linux-nfs/CAM5tNy7sSXFUWFVkKEYVt9nLPOCT_-+7KfgZeoZ2UCv_eLMvrQ@mail.gmail.com/">Rick Macklem</a> raised a historical objection:</p>
+<blockquote>
+<p>"My recollection is that Chuck didn't like this limit. He argued that it was specific to the NFSv3 ACL protocol and that the limit on the size of a NFSv4 RPC message was sufficient. I, personally, think that 1024 is a reasonable limit for # of ACEs."</p>
+</blockquote>
+<p>Rick also offered a mitigating observation: "The good news w.r.t. the sort is that they are normally already sorted, so the bubble sort is normally just a single pass, I think?"</p>
+<p><a href="https://lore.kernel.org/linux-nfs/bffd1333-a65e-40d9-9553-7de4401a55bd@app.fastmail.com/">Chuck Lever</a> confirmed and refined his earlier position:</p>
+<blockquote>
+<p>"The NFSACL protocol limits the number of ACEs in an ACL to NFS_ACL_MAX_ENTRIES (1024). It's a limit that is defined in the protocol itself. The NFSv4 protocol sets no similar limit."</p>
+<p>"Using NFS_ACL_MAX_ENTRIES to cap the number of ACEs in NFSv4 ACLs is a convenience, but it adds technical debt (slight though it may be)."</p>
+</blockquote>
+<p>Chuck proposed a compromise: define an NFSD implementation-specific constant (e.g., <code>NFSD4_MAX_...</code>) rather than reusing the NFSv3 protocol constant, and check whether the Linux POSIX ACL implementation already defines a similar limit. He closed with characteristic humor: "Then prepare for an onslaught of complaints that 1024 is just too small :-)"</p>
+<h3>PATCH 10: Validate symlink target length in NFSv4 CREATE (Layton)</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260528-nfsd-fixes-v1-10-e78708eff77d@kernel.org/">The final patch</a> rejects <code>cr_datalen == 0</code> or <code>cr_datalen &gt;= PATH_MAX</code> early with <code>nfserr_nametoolong</code>, bounding a per-COMPOUND kmalloc that could otherwise reach the RPC-max size (~1 MiB). The VFS would eventually reject oversized targets with ENAMETOOLONG, but "the allocation has already occurred."</p>
+<h2>Discussion evolution and status</h2>
+<p>The thread is in its earliest stage — all 14 messages landed on May 28 within roughly two hours of each other. Three substantive replies have appeared so far:</p>
+<ul>
+<li><strong>NeilBrown</strong> questioned the locking strategy in PATCH 01, suggesting the spinlock may be unnecessary and that RCU (with a clarifying comment) is the more appropriate synchronization primitive.</li>
+<li><strong>Rick Macklem</strong> and <strong>Chuck Lever</strong> debated the correctness of using <code>NFS_ACL_MAX_ENTRIES</code> as an NFSv4 implementation cap in PATCH 09, with Chuck proposing a rename to make the implementation-vs-protocol distinction explicit.</li>
+</ul>
+<p>No merge decision or final ack has been posted yet within this week's window. The series is primarily a <strong>bug fix</strong> collection (with one protocol-correctness fix in PATCH 05 and one performance-enabling refactor in PATCH 06), targeting remotely-triggerable panics, use-after-frees, data corruption, and DoS vectors in the NFS server.</p>
+<h2>Significance for NFS client development</h2>
+<p>While this series targets the <strong>server</strong> side, several fixes have direct implications for client behavior:</p>
+<ul>
+<li>The stable_how return (PATCH 06) will allow clients to skip COMMIT round trips once the follow-up patch lands.</li>
+<li>The partial-write detection fix (PATCH 08) prevents silent data corruption at wrong offsets on direct I/O writes.</li>
+<li>The delegation revoke race (PATCH 01) is explicitly "client-reachable" — two NFS clients can trigger it by having one hold a delegation while another opens the same file.</li>
+<li>The append-only TOCTOU fix (PATCH 07) ensures server-side enforcement of append-only semantics that clients may rely on for data integrity guarantees.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260528-nfsd-fixes-v1-0-e78708eff77d@kernel.org/">2026-05-28 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 00/10] nfsd: a pile of fixes for random bugs</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260528-nfsd-fixes-v1-1-e78708eff77d@kernel.org/">2026-05-28 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 01/10] nfsd: fix BUG_ON in nfsd4_alloc_layout_stateid on racing delegation revoke</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260528-nfsd-fixes-v1-2-e78708eff77d@kernel.org/">2026-05-28 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 02/10] nfsd: drain callbacks and clear cl_cb_session</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260528-nfsd-fixes-v1-3-e78708eff77d@kernel.org/">2026-05-28 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 03/10] nfsd: serialize nfsd4_end_grace() with atomic test-and-set</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260528-nfsd-fixes-v1-4-e78708eff77d@kernel.org/">2026-05-28 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 04/10] nfsd: dedup nfs4_client_to_reclaim inserts</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260528-nfsd-fixes-v1-5-e78708eff77d@kernel.org/">2026-05-28 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 05/10] nfsd: gate nfs3 setacl by argp-&gt;mask</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260528-nfsd-fixes-v1-6-e78708eff77d@kernel.org/">2026-05-28 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 06/10] NFSD: Enable return of an updated stable_how to NFS clients</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260528-nfsd-fixes-v1-7-e78708eff77d@kernel.org/">2026-05-28 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 07/10] NFSD: check truncate permission under inode lock</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260528-nfsd-fixes-v1-8-e78708eff77d@kernel.org/">2026-05-28 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 08/10] nfsd: fix partial-write detection in nfsd_direct_write</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260528-nfsd-fixes-v1-9-e78708eff77d@kernel.org/">2026-05-28 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 09/10] nfsd: cap decoded POSIX ACL count to bound sort cost</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260528-nfsd-fixes-v1-10-e78708eff77d@kernel.org/">2026-05-28 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 10/10] nfsd: validate symlink target length in NFSv4 CREATE</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAM5tNy7sSXFUWFVkKEYVt9nLPOCT_-+7KfgZeoZ2UCv_eLMvrQ@mail.gmail.com/">2026-05-28 Rick Macklem <a href="mailto:rick.macklem@gmail.com">rick.macklem@gmail.com</a> — Re: [PATCH 09/10] nfsd: cap decoded POSIX ACL count to bound sort cost</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/bffd1333-a65e-40d9-9553-7de4401a55bd@app.fastmail.com/">2026-05-28 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 09/10] nfsd: cap decoded POSIX ACL count to bound sort cost</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178001164345.3379282.16920221845834080481@noble.neil.brown.name/">2026-05-28 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH 01/10] nfsd: fix BUG_ON in nfsd4_alloc_layout_stateid on racing delegation revoke</a></li>
+</ul>
+  </main>
+</body>
+</html>

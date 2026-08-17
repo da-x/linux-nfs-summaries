@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>svcrdma: Harden parsed chunk list against malformed wire values</title>
+  <meta name="description" content="This thread is a bug-fix series (not a new feature or protocol change) targeting the NFS/RPC server-side RDMA transport (svcrdma). Chuck Lever posted a 6-patch series on 2026-05-26, with three patches authored by Chris Mason (Meta) and…">
+  <meta property="og:title" content="svcrdma: Harden parsed chunk list against malformed wire values">
+  <meta property="og:description" content="This thread is a bug-fix series (not a new feature or protocol change) targeting the NFS/RPC server-side RDMA transport (svcrdma). Chuck Lever posted a 6-patch series on 2026-05-26, with three patches authored by Chris Mason (Meta) and…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-28T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="svcrdma: Harden parsed chunk list against malformed wire values">
+  <meta name="twitter:description" content="This thread is a bug-fix series (not a new feature or protocol change) targeting the NFS/RPC server-side RDMA transport (svcrdma). Chuck Lever posted a 6-patch series on 2026-05-26, with three patches authored by Chris Mason (Meta) and…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-28</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>svcrdma: Harden parsed chunk list against malformed wire values</h1>
+<h2>Summary</h2>
+<h1>svcrdma: Harden Parsed Chunk List Against Malformed Wire Values</h1>
+<h2>Overview</h2>
+<p>This thread is a <strong>bug-fix series</strong> (not a new feature or protocol change) targeting the NFS/RPC server-side RDMA transport (<code>svcrdma</code>). Chuck Lever posted a 6-patch series on 2026-05-26, with three patches authored by Chris Mason (Meta) and three by Lever himself (Oracle). The work addresses a family of input-validation defects in the "parsed chunk list" (PCL) data structure, where wire-supplied values from an NFS client are stored verbatim and later consumed by unsigned arithmetic that can underflow.</p>
+<p>The series was <strong>acknowledged within 24 hours</strong> by Jeff Layton, who replied on 2026-05-27 with:</p>
+<blockquote>
+<p>"Acked-by: Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a>"</p>
+</blockquote>
+<p>No objections or technical pushback were raised in the thread. The discussion is short and decisive — a clean ack from the NFS maintainer within a day of posting.</p>
+<h2>The Core Problem</h2>
+<p>As Lever described in the cover letter <a href="https://lore.kernel.org/linux-nfs/20260526-rpc-kernel-bugs-v1-0-e251306ccca9@oracle.com/">PATCH 0/6</a>:</p>
+<blockquote>
+<p>"The RPC/RDMA transport stores wire-supplied chunk positions, lengths, and segment counts verbatim in the parsed chunk list. Consumer functions compute gap lengths and sub-range offsets from these values using unsigned subtraction. A malicious or buggy peer can supply values that cause these subtractions to underflow, exposing slab memory to the Reply channel or driving oversized allocations."</p>
+</blockquote>
+<p>The fix proceeds in two layers: consumer-side bounds checks (immediately backportable) and decoder-side validation at the wire boundary (defense in depth).</p>
+<h2>Patch-by-Patch Breakdown</h2>
+<h3>PATCH 1/6 — Validate Read chunk positions before reconstruction</h3>
+<p>Lever's first patch addresses the most direct information-disclosure path. The <code>ch_position</code> field in a Read chunk is client-supplied, and <code>xdr_count_read_segments()</code> only checked 4-byte alignment — it never compared the position against the actual inline body length received on the wire.</p>
+<blockquote>
+<p>"In the single-chunk path, svc_rdma_read_complete_one() splits the head and tail kvecs at ch_position. A position past the inline body underflows the tail length, exposing adjacent slab memory to the upper XDR decoder."</p>
+</blockquote>
+<p>In the multi-chunk path, overlapping Read chunks cause unsigned subtractions of gap lengths to underflow, and <code>svc_rdma_copy_inline_range()</code> then copies past the receive buffer into request pages that are returned to the client through the Reply channel. The fix bounds inline-range copies against <code>rc_saved_arg</code> and rejects positions beyond the body or overlapping chunk lists.</p>
+<p><strong>Fixes:</strong> d96962e6d0e2 ("svcrdma: Use the new parsed chunk list when pulling Read chunks")</p>
+<h3>PATCH 2/6 — Fix offset arithmetic in read_chunk_range (Chris Mason)</h3>
+<p>This patch, authored by Chris Mason at Meta and assisted by an AI tool ("Assisted-by: kres (claude-opus-4-7)"), fixes two subtle arithmetic defects in <code>svc_rdma_read_chunk_range()</code>:</p>
+<ol>
+<li>The skip predicate used <code>&gt;</code> instead of <code>&gt;=</code>, so a fully-consumed segment was not skipped, causing a u32 underflow to near-UINT_MAX.</li>
+<li>The length formula subtracted <code>offset</code> from the <code>min_t()</code> result rather than from <code>segment-&gt;rs_length</code> before the cap, "silently dropping offset bytes from the rebuilt chunk."</li>
+</ol>
+<blockquote>
+<p>"Combined with the boundary case above it also enables the u32 underflow path, which propagates a huge nr_bvec into svc_rdma_build_read_segment() and a multi-MiB kmalloc_array_node() in svc_rdma_get_rw_ctxt()."</p>
+</blockquote>
+<p>The patch also handles the edge case where <code>length == 0</code> (last Read chunk ends exactly at the end of the Call chunk), returning success immediately rather than <code>-EINVAL</code>.</p>
+<p><strong>Fixes:</strong> d7cc73972661 ("svcrdma: support multiple Read chunks per RPC")</p>
+<h3>PATCH 3/6 — Reject oversized Read segments at decode time</h3>
+<p>Lever's second patch caps segment lengths against the receive context's page budget during Read list decoding, consistent with how <code>xdr_check_write_chunk()</code> already bounds Write segment counts. It also fixes a resource leak: the existing post-allocation page-overrun guard in <code>svc_rdma_build_read_segment()</code> fired but did not return the freshly acquired rw context.</p>
+<blockquote>
+<p>"An oversized rs_length reaches svc_rdma_build_read_segment(), which derives nr_bvec from it and can drive a large dynamic bvec allocation before verifying that enough rq_pages remain."</p>
+</blockquote>
+<p><strong>Fixes:</strong> 5ee62b4a9113 ("svcrdma: use bvec-based RDMA read/write API")</p>
+<h3>PATCH 4/6 — Fix pcl_for_each_segment for empty chunks (Chris Mason)</h3>
+<p>This is arguably the most dramatic bug in the series. When <code>ch_segcount</code> is zero, the macro's inclusive upper bound computes <code>&amp;chunk-&gt;ch_segments[0u - 1u]</code>, which wraps to index <code>0xFFFFFFFF</code>:</p>
+<blockquote>
+<p>"The loop body then walks unrelated memory at sizeof(struct svc_rdma_segment) stride until it faults."</p>
+</blockquote>
+<p>A zero-segcount chunk is reachable from the wire because <code>xdr_check_write_chunk()</code> only rejects segcount values <em>greater than</em> <code>rc_maxpages</code>, and <code>pcl_alloc_write()</code> links a freshly allocated chunk onto the list before its segment-fill loop runs. When Send-With-Invalidate is negotiated, <code>svc_rdma_get_inv_rkey()</code> iterates all four PCLs and dereferences <code>segment-&gt;rs_handle</code> on each iteration, turning the underflow into an out-of-bounds read and a general protection fault.</p>
+<p>The fix switches the macro to a half-open upper bound using <code>ch_segcount</code> directly — for zero segments, loop start equals loop end and the body is skipped. All six existing call sites remain correct with no changes needed.</p>
+<p><strong>Fixes:</strong> 78147ca8b4a9 ("svcrdma: Add a 'parsed chunk list' data structure")</p>
+<h3>PATCH 5/6 — Reject Write/Reply chunks with segcount 0 (Chris Mason)</h3>
+<p>Building on the macro fix, this patch adds decoder-side rejection of zero-segment Write and Reply chunks as defense in depth. As Mason explained:</p>
+<blockquote>
+<p>"RFC 8166 has no meaning for a Write/Reply chunk that describes no remote buffer, so no legitimate client is affected."</p>
+</blockquote>
+<p>The patch also reorders <code>pcl_alloc_write()</code> so that <code>list_add_tail()</code> follows the segment fill loop, ensuring only fully-populated chunks appear on the list — protecting against future regressions where an incomplete chunk might be visible to consumers during the fill loop.</p>
+<p><strong>Fixes:</strong> 78147ca8b4a9 ("svcrdma: Add a 'parsed chunk list' data structure")</p>
+<h3>PATCH 6/6 — Validate Read chunk positions at decode time (consolidation)</h3>
+<p>The final patch is a consolidation pass. Lever noted that position and length validation was "scattered across three consumer functions" with each independently guarding against the same class of underflow. The new <code>pcl_check_read_chunk_positions()</code> function performs a single post-decode pass verifying:</p>
+<ul>
+<li>Each Read chunk's inline-body offset falls within the inline body (or Call chunk) length</li>
+<li>Adjacent Read chunk positions do not overlap</li>
+<li>Each chunk length does not exceed the receive context's page budget</li>
+</ul>
+<blockquote>
+<p>"Malformed frames are rejected before reaching any consumer. The existing consumer-side guards remain as defense in depth."</p>
+</blockquote>
+<p>This ensures future PCL consumers inherit the guarantee without replicating per-site checks.</p>
+<h2>Discussion and Outcome</h2>
+<p>The thread was brief by mailing-list standards. After Lever posted the series on Tuesday afternoon (UTC), Jeff Layton — the long-time NFS maintainer — replied the following day with a clean ack, quoting the cover letter in full before his sign-off. No other participants weighed in during this week's window.</p>
+<p>The series is notable for several reasons:</p>
+<ul>
+<li><strong>Security relevance</strong>: The bugs are exploitable by a malicious or buggy NFS client, with impacts ranging from slab memory disclosure to kernel crashes (GPF) and multi-MiB allocation DoS.</li>
+<li><strong>Collaborative authorship</strong>: Three patches came from Chris Mason at Meta, three from Chuck Lever at Oracle — a cross-industry collaboration on server-side hardening.</li>
+<li><strong>AI-assisted development</strong>: Two of Mason's patches carry an "Assisted-by: kres (claude-opus-4-7)" tag, reflecting the growing use of AI tools in kernel development.</li>
+<li><strong>Backportability</strong>: Lever explicitly designed the consumer-side fixes to be independently backportable, and noted that the macro fix "remains as defense in depth and is safe to backport to trees without the decoder change."</li>
+</ul>
+<p>The series modifies four files with 113 insertions and 20 deletions, based on commit <code>887d478bb2115cec0be8caae58bad4d4b3109b1a</code>.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260526-rpc-kernel-bugs-v1-0-e251306ccca9@oracle.com/">2026-05-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 0/6] svcrdma: harden parsed chunk list against malformed wire values</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260526-rpc-kernel-bugs-v1-1-e251306ccca9@oracle.com/">2026-05-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 1/6] svcrdma: validate Read chunk positions before reconstruction</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260526-rpc-kernel-bugs-v1-2-e251306ccca9@oracle.com/">2026-05-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 2/6] svcrdma: Fix offset arithmetic in read_chunk_range</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260526-rpc-kernel-bugs-v1-4-e251306ccca9@oracle.com/">2026-05-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 4/6] svcrdma: fix pcl_for_each_segment for empty chunks</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260526-rpc-kernel-bugs-v1-3-e251306ccca9@oracle.com/">2026-05-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 3/6] svcrdma: reject oversized Read segments at decode time</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260526-rpc-kernel-bugs-v1-5-e251306ccca9@oracle.com/">2026-05-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 5/6] svcrdma: reject Write/Reply chunks with segcount 0</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260526-rpc-kernel-bugs-v1-6-e251306ccca9@oracle.com/">2026-05-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 6/6] svcrdma: Validate Read chunk positions at decode time</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/e770cd7628d87611fc924d396e75feff342f4a5b.camel@kernel.org/">2026-05-27 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 0/6] svcrdma: harden parsed chunk list against malformed wire values</a></li>
+</ul>
+  </main>
+</body>
+</html>

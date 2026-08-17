@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>lockd: v2 of nlm_traverse_files() UAF fix lands, but Codex/Sashiko both flag a new leak in the skip path</title>
+  <meta name="description" content="Type: Bug fix (NFS server / lockd) — slab use-after-free in nlm_traverse_files(), with a stable backport requested. This is the v2 follow-up to Michael Bommarito&#39;s v1 submission earlier in the week, which was held up after Sashiko flagged…">
+  <meta property="og:title" content="lockd: v2 of nlm_traverse_files() UAF fix lands, but Codex/Sashiko both flag a new leak in the skip path">
+  <meta property="og:description" content="Type: Bug fix (NFS server / lockd) — slab use-after-free in nlm_traverse_files(), with a stable backport requested. This is the v2 follow-up to Michael Bommarito&#39;s v1 submission earlier in the week, which was held up after Sashiko flagged…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-28T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="lockd: v2 of nlm_traverse_files() UAF fix lands, but Codex/Sashiko both flag a new leak in the skip path">
+  <meta name="twitter:description" content="Type: Bug fix (NFS server / lockd) — slab use-after-free in nlm_traverse_files(), with a stable backport requested. This is the v2 follow-up to Michael Bommarito&#39;s v1 submission earlier in the week, which was held up after Sashiko flagged…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-28</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>lockd: v2 of nlm_traverse_files() UAF fix lands, but Codex/Sashiko both flag a new leak in the skip path</h1>
+<h2>Summary</h2>
+<h1>lockd: v2 of nlm_traverse_files() use-after-free fix posts; reviewers flag a fresh reference-count leak</h1>
+<p><strong>Type:</strong> Bug fix (NFS server / lockd) — slab use-after-free in <code>nlm_traverse_files()</code>, with a stable backport requested. This is the <strong>v2</strong> follow-up to <a href="https://lore.kernel.org/linux-nfs/20260523014203.2462827-1-michael.bommarito@gmail.com/">Michael Bommarito's v1 submission</a> earlier in the week, which was held up after Sashiko flagged a predicate-check regression (see <a href="https://lore.kernel.org/linux-nfs/20260523014203.2462827-1-michael.bommarito@gmail.com/">last week's summary</a> for the v1 backstory).</p>
+<h2>The bug and the v2 fix</h2>
+<p>Bommarito posted <a href="https://lore.kernel.org/linux-nfs/20260523123053.3480369-1-michael.bommarito@gmail.com/">the v2 patch</a> on Saturday, May 23, again targeting <code>fs/lockd/svcsubs.c</code> (44 insertions, 20 deletions) and carrying the same <code>Cc: stable@vger.kernel.org</code> and <code>Fixes: 01df9c5e918a ("LOCKD: Fix a deadlock in nlm_traverse_files()")</code> tags as v1. The underlying race is unchanged from v1:</p>
+<blockquote>
+<p>"nlm_traverse_files() pins the current file with f_count++ across a mutex_unlock for nlm_inspect_file(), but nothing pins the saved next pointer. A concurrent nlm_release_file() can kfree the next file during the unlock window, and the iterator dereferences freed memory on the next loop step."</p>
+</blockquote>
+<p>The fix walks each hash bucket with two locally-pinned cursors:</p>
+<blockquote>
+<p>"Pin both current and next before the lock-drop. Advance by swapping the pinned cursors at the end of each iteration so next is always held alive across the unlock."</p>
+</blockquote>
+<h2>What changed since v1</h2>
+<p>The v2 cover letter explicitly addresses the regression Sashiko had flagged on v1, which Bommarito had <a href="https://lore.kernel.org/linux-nfs/CAJJ9bXzjm=-CezSy5x=sHAmsersT6osb9rCk7x39xg=CLU42Nw@mail.gmail.com/">acknowledged and promised to fix</a> in the prior thread:</p>
+<blockquote>
+<p>"Fixed premature kfree of non-matching files: nlm_file_release() is now called only for files that matched the predicate and were inspected. Non-matching files just get f_count-- to undo the iteration pin."</p>
+</blockquote>
+<p>The rationale is spelled out in the commit message:</p>
+<blockquote>
+<p>"Only call nlm_file_release() for files that matched the predicate and were inspected. Skipped files just get f_count-- to undo the iteration pin; their f_locks is stale and must not drive cleanup."</p>
+</blockquote>
+<p>Bommarito credits Sashiko's automated review for catching this one ("Spotted by sashiko.dev automated review"), and the patch again carries an <code>Assisted-by: Claude:claude-opus-4-7</code> trailer. The KASAN reproduction harness from v1 is unchanged — UML + KASAN with 768 concurrent POSIX holders and parallel <code>/proc/fs/nfsd/unlock_filesystem</code> writes — and the patched v2 kernel reportedly "ran the same harness silently."</p>
+<h2>Chuck Lever's review: a new leak in the skip path</h2>
+<p>NFS maintainer <a href="https://lore.kernel.org/linux-nfs/b30903a7-6edc-457b-8099-5242f26d9e42@app.fastmail.com/">Chuck Lever replied</a> within three hours, this time relaying a finding from an AI code review (Codex / gpt-5.5 xhigh) rather than a human reviewer:</p>
+<blockquote>
+<p>"When nlmsvc_unlock_all_by_sb() skips a file from another superblock, this branch can be handling an entry that was already pinned as the previous file's saved next. If that entry's last real nlm_release_file() ran while the traversal pin was held, it saw f_count &gt; 0 and skipped nlm_file_inuse()/deletion; this decrement then takes f_count to zero without any cleanup, leaving the nlm_file and its open f_file references hashed indefinitely."</p>
+</blockquote>
+<p>In other words, the very <code>f_count--</code>-only path that v2 introduced for non-matching files can strand an <code>nlm_file</code> entry in the hash table forever: the real release was suppressed by the traversal pin, and then the iteration's decrement drives the count to zero without ever calling the cleanup helpers. Lever notes this is not a novel observation — Sashiko had flagged the same issue on the v2 patchset itself (linked at sashiko.dev).</p>
+<h2>Status / outlook</h2>
+<ul>
+<li><strong>v2 not yet accepted.</strong> The Codex/Sashiko finding on the cross-superblock skip path blocks merge as posted; expect a v3 that handles the case where a skipped entry's last real release was already deferred by the traversal pin.</li>
+<li><strong>Stable backport still pending.</strong> The original UAF remains clearly stable-worthy, so the eventual clean version should land in -stable alongside mainline.</li>
+<li><strong>Client-side relevance:</strong> although this is server/lockd code, it directly affects NFSv3 clients holding many concurrent POSIX locks (<code>fcntl(F_SETLKW)</code>) against a Linux NFS server during <code>nlmsvc_unlock_all_by_sb()</code> / failover sweeps — the exact workload the KASAN harness exercises.</li>
+<li><strong>Notable pattern:</strong> both v1 and v2 of this patch were caught by automated reviewers (Sashiko, and now Codex) before human sign-off — an increasingly common workflow on linux-nfs this week.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260523123053.3480369-1-michael.bommarito@gmail.com/">2026-05-23 Michael Bommarito <a href="mailto:michael.bommarito@gmail.com">michael.bommarito@gmail.com</a> — [PATCH v2] lockd: pin next file across nlm_inspect_file lock-drop</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/b30903a7-6edc-457b-8099-5242f26d9e42@app.fastmail.com/">2026-05-23 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v2] lockd: pin next file across nlm_inspect_file lock-drop</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260523123053.3480369-1-michael.bommarito@gmail.com/">2026-05-23 Michael Bommarito <a href="mailto:michael.bommarito@gmail.com">michael.bommarito@gmail.com</a> — [PATCH v2] lockd: pin next file across nlm_inspect_file lock-drop</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/b30903a7-6edc-457b-8099-5242f26d9e42@app.fastmail.com/">2026-05-23 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v2] lockd: pin next file across nlm_inspect_file lock-drop</a></li>
+</ul>
+  </main>
+</body>
+</html>

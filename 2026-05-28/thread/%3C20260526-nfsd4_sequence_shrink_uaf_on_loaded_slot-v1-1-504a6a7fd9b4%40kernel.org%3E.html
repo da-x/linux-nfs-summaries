@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd: Fix remotely triggerable use-after-free in session slot shrinker</title>
+  <meta name="description" content="Type: Bug fix (security-relevant, NFSv4.1+ server-side) Status this week: Patch posted; reviewer raised a follow-up concern about concurrent in-use slots; no resolution yet within the window.">
+  <meta property="og:title" content="nfsd: Fix remotely triggerable use-after-free in session slot shrinker">
+  <meta property="og:description" content="Type: Bug fix (security-relevant, NFSv4.1+ server-side) Status this week: Patch posted; reviewer raised a follow-up concern about concurrent in-use slots; no resolution yet within the window.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-28T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd: Fix remotely triggerable use-after-free in session slot shrinker">
+  <meta name="twitter:description" content="Type: Bug fix (security-relevant, NFSv4.1+ server-side) Status this week: Patch posted; reviewer raised a follow-up concern about concurrent in-use slots; no resolution yet within the window.">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-28</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd: Fix remotely triggerable use-after-free in session slot shrinker</h1>
+<h2>Summary</h2>
+<h1>nfsd: Fix remotely triggerable use-after-free in session slot shrinker</h1>
+<p><strong>Type:</strong> Bug fix (security-relevant, NFSv4.1+ server-side)
+<strong>Status this week:</strong> Patch posted; reviewer raised a follow-up concern about concurrent in-use slots; no resolution yet within the window.</p>
+<h2>The vulnerability</h2>
+<p>On Tuesday, May 26, Red Hat's Jeff Layton published a one-line fix for what he describes as a serious latent bug in the NFSv4 server's session-slot management: [PATCH] nfsd: don't free session slots that are still in use.</p>
+<p>Layton walks through the failure mode with characteristic precision. When the kernel's memory shrinker kicks in and reduces <code>se_target_maxslots</code> below <code>se_fchannel.maxreqs</code>, the SEQUENCE handler checks three conditions before calling <code>free_session_slots()</code>:</p>
+<blockquote>
+<p>"1. se_target_maxslots &lt; maxreqs (shrink was advertised)
+2. slot-&gt;sl_generation == se_slot_gen (slot is up-to-date)
+3. seq-&gt;maxslots &lt;= se_target_maxslots (client acknowledges)"</p>
+</blockquote>
+<p>The missing fourth condition, he notes, is the bug: "However, seq-&gt;slotid is never checked against se_target_maxslots." A client using a slot in the range <code>[se_target_maxslots, maxreqs)</code> can satisfy all three checks — its slot carries the current generation from a prior SEQUENCE, and it simply reports <code>sa_highest_slotid &lt;= se_target_maxslots</code> to acknowledge the reduction.</p>
+<p>The consequences are severe. Layton explains: "free_session_slots() then kfrees every slot at index &gt;= se_target_maxslots, including the caller's own slot. The function continues to write sl_seqid, sl_flags, sl_generation, and stores the dangling pointer in cstate-&gt;slot." Worse still, the freed memory is later reused for the reply cache: "Later, nfsd4_store_cache_entry() copies up to maxresp_cached bytes of the compound reply into the freed sl_data[] array, corrupting whatever slab object now occupies that address."</p>
+<p>He classifies the bug bluntly: "This is a remotely triggerable heap use-after-free from any authenticated NFSv4.1+ client with an established session, requiring only that the kernel memory shrinker has run against nfsd session slots (a normal occurrence under memory pressure)."</p>
+<p>The fix itself is minimal — a 2-insertion/1-deletion change in <code>fs/nfsd/nfs4state.c</code> adding a check that the current request's slotid is below the shrink boundary before allowing the reduction to proceed. It carries a <code>Fixes:</code> tag pointing at commit 8fb77d12c76e ("nfsd: add support for freeing unused session-DRC slots"), the original commit that introduced the shrink path.</p>
+<h2>Reviewer pushback</h2>
+<p>Just over half an hour later, Trond Myklebust's long-time colleague Chuck Lever replied with a pointed observation that the patch may not close the hole entirely:</p>
+<blockquote>
+<p>"The patch guards only against the caller freeing its own slot. It doesn't guard against freeing a different slot that is concurrently in use by another thread."</p>
+</blockquote>
+<p>Lever then floated two possible directions for a more complete fix: "Perhaps free_session_slots() should skip any slot with NFSD4_SLOT_INUSE set. Or the shrink could be deferred until no high-numbered slots are in use?"</p>
+<h2>Where things stand</h2>
+<p>As of the end of this reporting window, Layton has not replied to Lever's concern, and no v2 of the patch has appeared on the list. The thread is therefore still open: the immediate self-freeing UAF is addressed by the posted patch, but the broader question of whether <code>free_session_slots()</code> can race with concurrent in-flight requests on <em>other</em> slots remains unresolved. Given that this is a remotely triggerable heap corruption reachable from any authenticated NFSv4.1+ client under ordinary memory pressure, expect this thread to see further activity — either a v2 that incorporates Lever's suggestion or a detailed explanation of why the existing locking already covers the concurrent case.</p>
+<h2>Context</h2>
+<p>This week on linux-nfs has been dominated by Michael Bommarito's directory-delegation series and its follow-up fix patches (see the related threads summarized this week). The Layton patch is a standalone, security-motivated bug fix with no dependency on that work, but it lands in the same <code>fs/nfsd/nfs4state.c</code> territory and underscores how subtle the session-slot lifecycle can be under memory pressure.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260526-nfsd4_sequence_shrink_uaf_on_loaded_slot-v1-1-504a6a7fd9b4@kernel.org/">2026-05-26 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH] nfsd: don't free session slots that are still in use</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/f0c2c3ce-cb3b-4156-a2ad-6730e34c403f@app.fastmail.com/">2026-05-26 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH] nfsd: don't free session slots that are still in use</a></li>
+</ul>
+  </main>
+</body>
+</html>

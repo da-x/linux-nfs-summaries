@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd: fix use-after-free when shrinking session slots still in use</title>
+  <meta name="description" content="This week brought a focused, single-patch bug-fix thread on the NFS server side (nfsd) addressing a serious memory-safety flaw in how NFSv4.1+ session slots are reclaimed. The discussion was short but dense: one well-documented patch from…">
+  <meta property="og:title" content="nfsd: fix use-after-free when shrinking session slots still in use">
+  <meta property="og:description" content="This week brought a focused, single-patch bug-fix thread on the NFS server side (nfsd) addressing a serious memory-safety flaw in how NFSv4.1+ session slots are reclaimed. The discussion was short but dense: one well-documented patch from…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-28T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd: fix use-after-free when shrinking session slots still in use">
+  <meta name="twitter:description" content="This week brought a focused, single-patch bug-fix thread on the NFS server side (nfsd) addressing a serious memory-safety flaw in how NFSv4.1+ session slots are reclaimed. The discussion was short but dense: one well-documented patch from…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-28</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd: fix use-after-free when shrinking session slots still in use</h1>
+<h2>Summary</h2>
+<h1>nfsd: don't free session slots that are still in use</h1>
+<p>This week brought a focused, single-patch bug-fix thread on the NFS server side (nfsd) addressing a serious memory-safety flaw in how NFSv4.1+ session slots are reclaimed. The discussion was short but dense: one well-documented patch from Jeff Layton and an immediate application by nfsd maintainer Chuck Lever.</p>
+<h2>The bug: use-after-free in the session slot shrink path</h2>
+<p>The thread is squarely about a <strong>bug fix</strong> (not a new feature or protocol change), targeting a flaw introduced by commit 8fb77d12c76e ("nfsd: add support for freeing unused session-DRC slots"). Layton's <a href="https://lore.kernel.org/linux-nfs/20260526-nfsd4_sequence_shrink_uaf_on_loaded_slot-v2-1-74a89db0639e@kernel.org/">v2 patch</a> opens with the core observation:</p>
+<blockquote>
+<p>"nfsd4_sequence() can free the very slot it is currently processing."</p>
+</blockquote>
+<p>Layton walks through the shrink logic in detail. When the session shrinker has lowered <code>se_target_maxslots</code> below <code>se_fchannel.maxreqs</code>, the code checks three conditions before calling <code>free_session_slots()</code>:</p>
+<blockquote>
+<p>"1. se_target_maxslots &lt; maxreqs (shrink was advertised)
+2. slot-&gt;sl_generation == se_slot_gen (slot is up-to-date)
+3. seq-&gt;maxslots &lt;= se_target_maxslots (client acknowledges)"</p>
+</blockquote>
+<p>The missing fourth check is the crux of the bug:</p>
+<blockquote>
+<p>"However, seq-&gt;slotid is never checked against se_target_maxslots."</p>
+</blockquote>
+<p>A client using a slot in the range <code>[se_target_maxslots, maxreqs)</code> can satisfy all three existing conditions — its slot carries the current generation from a prior SEQUENCE, and it acknowledges the reduction by sending <code>sa_highest_slotid &lt;= se_target_maxslots</code>. The result is that <code>free_session_slots()</code> "kfrees every slot at index &gt;= se_target_maxslots, including the caller's own slot."</p>
+<p>Layton then describes the concrete corruption path:</p>
+<blockquote>
+<p>"The function continues to write sl_seqid, sl_flags, sl_generation, and stores the dangling pointer in cstate-&gt;slot. Later, nfsd4_store_cache_entry() copies up to maxresp_cached bytes of the compound reply into the freed sl_data[] array, corrupting whatever slab object now occupies that address."</p>
+</blockquote>
+<p>A second, concurrency-related hole is also documented: a parallel thread processing SEQUENCE on another high-numbered slot can have its slot yanked out from under it. Layton notes that "NFSD4_SLOT_INUSE is set under nn-&gt;client_lock before the lock is released, so any concurrent thread past SEQUENCE will have its slot marked. However, free_session_slots() does not check NFSD4_SLOT_INUSE before freeing."</p>
+<h2>The fix</h2>
+<p>The patch addresses both problems with a small change (16 insertions, 1 deletion in <code>fs/nfsd/nfs4state.c</code>):</p>
+<blockquote>
+<p>"Fix both problems by:</p>
+<ol>
+<li>Checking that the current request's slotid is below the shrink boundary.</li>
+<li>Scanning slots in the to-be-freed range for NFSD4_SLOT_INUSE and deferring the shrink if any are active."</li>
+</ol>
+</blockquote>
+<p>The v2 revision specifically added the second safeguard — "Skip doing the shrink if any potential victims have NFSD4_SLOT_INUSE set" — building on a <a href="https://lore.kernel.org/r/20260526-nfsd4_sequence_shrink_uaf_on_loaded_slot-v1-1-504a6a7fd9b4@kernel.org">v1 posted earlier the same day</a>. The patch carries a <code>Fixes:</code> tag pointing at 8fb77d12c76e, and notably an "Assisted-by: Claude:claude-opus-4-6" trailer, marking it as AI-assisted work.</p>
+<h2>Resolution</h2>
+<p>The thread closed quickly with no objections or further back-and-forth. nfsd maintainer Chuck Lever <a href="https://lore.kernel.org/linux-nfs/177982071776.99111.17005396297864560686.b4-ty@b4/">applied the patch</a> to <code>nfsd-testing</code> just over two hours after it landed on the list:</p>
+<blockquote>
+<p>"Applied to nfsd-testing, thanks!
+[1/1] nfsd: don't free session slots that are still in use
+commit: 6085718398d83e16ccdc864c209493671f3c5998"</p>
+</blockquote>
+<h2>Takeaway</h2>
+<p>This is a classic, high-severity server-side memory-safety fix: a use-after-free in the NFSv4.1+ session slot shrink path that could corrupt slab objects and potentially be triggered by an ordinary client acknowledging a slot reduction. The fix tightens the preconditions for freeing slots (verify the caller's own slotid is below the boundary) and adds a concurrency guard (defer the shrink if any victim slot is marked in-use). With Chuck Lever's prompt application to <code>nfsd-testing</code>, the patch is now queued for the next merge window.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260526-nfsd4_sequence_shrink_uaf_on_loaded_slot-v2-1-74a89db0639e@kernel.org/">2026-05-26 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v2] nfsd: don't free session slots that are still in use</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177982071776.99111.17005396297864560686.b4-ty@b4/">2026-05-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v2] nfsd: don't free session slots that are still in use</a></li>
+</ul>
+  </main>
+</body>
+</html>

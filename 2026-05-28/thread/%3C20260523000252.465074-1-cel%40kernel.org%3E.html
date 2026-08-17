@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>xprtrdma: v2 decouples request recycling from RPC completion to fix DMA race</title>
+  <meta name="description" content="On 2026-05-23, Chuck Lever posted a three-patch v2 series, [PATCH v2 0/3] xprtrdma: Decouple req recycling from RPC completion](https://lore.kernel.org/linux-nfs/20260523000252.465074-1-cel@kernel.org/), to the linux-nfs list. This is a…">
+  <meta property="og:title" content="xprtrdma: v2 decouples request recycling from RPC completion to fix DMA race">
+  <meta property="og:description" content="On 2026-05-23, Chuck Lever posted a three-patch v2 series, [PATCH v2 0/3] xprtrdma: Decouple req recycling from RPC completion](https://lore.kernel.org/linux-nfs/20260523000252.465074-1-cel@kernel.org/), to the linux-nfs list. This is a…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-28T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="xprtrdma: v2 decouples request recycling from RPC completion to fix DMA race">
+  <meta name="twitter:description" content="On 2026-05-23, Chuck Lever posted a three-patch v2 series, [PATCH v2 0/3] xprtrdma: Decouple req recycling from RPC completion](https://lore.kernel.org/linux-nfs/20260523000252.465074-1-cel@kernel.org/), to the linux-nfs list. This is a…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-28</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>xprtrdma: v2 decouples request recycling from RPC completion to fix DMA race</h1>
+<h2>Summary</h2>
+<h1>xprtrdma: Decouple req recycling from RPC completion (v2)</h1>
+<h2>What happened this week</h2>
+<p>On 2026-05-23, Chuck Lever posted a three-patch v2 series, [PATCH v2 0/3] xprtrdma: Decouple req recycling from RPC completion](https://lore.kernel.org/linux-nfs/20260523000252.465074-1-cel@kernel.org/), to the linux-nfs list. This is a <strong>bug fix</strong> for the NFS/RDMA client (<code>xprtrdma</code>): it corrects a use-after-free in which an <code>rpcrdma_req</code> could be recycled back to its free pool while the HCA was still DMA-reading from its send buffer, risking corrupted retransmissions.</p>
+<p>The thread contains only Lever's four postings (cover letter + three patches) this week — no reviewer replies landed within the window. It is the second revision of work first sent as a single patch on 2026-05-20.</p>
+<h2>The bug being fixed</h2>
+<p>The core defect, described in the cover letter, is that <code>rl_kref</code> was conflating two distinct lifetimes through one refcount:</p>
+<blockquote>
+<p>"rl_kref currently conflates two lifetimes through one refcount: it gates when a Reply can wake its RPC task, and it gates when an rpcrdma_req can return to its free pool."</p>
+</blockquote>
+<p>The marshal path only took the Send-side reference when <code>sc_unmap_count &gt; 0</code>. A Send carrying only pre-registered buffers therefore took no Send-side reference. Lever explains the consequence:</p>
+<blockquote>
+<p>"When the Reply for such an RPC arrives before its Send completes, the Reply handler drops rl_kref from 1 to 0 and frees the req while the HCA may still be DMA-reading from its send buffer. A retransmission can put different bytes on the wire."</p>
+</blockquote>
+<p>The fix narrows <code>rl_kref</code>'s job so a request returns to the free pool only after <strong>both</strong> owners release it — the RPC layer (slot allocation) and the Send side (DMA unmap). The patch carries <code>Fixes: 0ab115237025 ("xprtrdma: Wake RPCs directly in rpcrdma_wc_send path")</code>.</p>
+<h2>Evolution from v1 to v2</h2>
+<p>This is a revision, not a fresh submission. The <a href="https://lore.kernel.org/linux-nfs/20260520175016.29480-1-cel@kernel.org/">v1 single-patch series</a> was posted on 2026-05-20 and immediately drew two kernel test robot build-failure reports (nios2 and riscv randconfigs), both flagging the same problem: <code>struct rpc_xprt</code> has no member named <code>bc_pa_lock</code> / <code>bc_pa_list</code>, and <code>struct rpc_rqst</code> has no <code>rq_bc_pa_list</code>. Those backchannel-prealloc symbols only exist under <code>CONFIG_SUNRPC_BACKCHANNEL</code>.</p>
+<p>Lever acknowledged the trouble in a short reply on 2026-05-21:</p>
+<blockquote>
+<p>"Bots and LLM review have found issues with this patch, so expect a v2."</p>
+</blockquote>
+<p>The cover letter's "Changes since v1" section maps those findings onto concrete revisions:</p>
+<ul>
+<li><strong>Split into three patches</strong> — a prep patch converts the Send-signaling test from a <code>kref_read</code> to <code>sc_unmap_count</code>, and a separate patch names the request-pool slack at its allocation site.</li>
+<li><strong>Wrap the bc_prealloc release branch in <code>CONFIG_SUNRPC_BACKCHANNEL</code></strong> — this directly addresses the kernel test robot build break on configs without the backchannel.</li>
+<li><strong>Order <code>rpcrdma_sendctxs_destroy()</code> ahead of <code>rpcrdma_reqs_reset()</code></strong> in <code>rpcrdma_xprt_disconnect()</code> so the drain runs against pre-reset reqs.</li>
+<li><strong>Run <code>xprt_rdma_bc_destroy()</code> a second time</strong> from <code>xprt_rdma_destroy()</code> to reclaim bc_prealloc reqs returned by the disconnect's drain.</li>
+<li><strong>Add <code>rpcrdma_sendctx_cancel()</code></strong> for the marshal-failure path; sendctx ring walkers skip entries with <code>sc_req == NULL</code>.</li>
+</ul>
+<h2>The three patches</h2>
+<p><strong>[1/3] Use sendctx DMA state for Send signaling](https://lore.kernel.org/linux-nfs/20260523000252.465074-2-cel@kernel.org/)</strong> is the preparatory patch. It splits the SGE DMA-unmap loop into its own helper and uses <code>sc_unmap_count</code> directly for the signaling decision, removing one dependency on the old <code>rl_kref</code> semantics before the lifetime rules change:</p>
+<blockquote>
+<p>"This keeps the current behavior but removes one dependency on the old rl_kref semantics before the request lifetime rules are changed."</p>
+</blockquote>
+<p><strong>[2/3] Decouple req recycling from RPC completion](https://lore.kernel.org/linux-nfs/20260523000252.465074-3-cel@kernel.org/)</strong> is the heart of the series. It moves <code>kref_init</code> out of the marshal path and into the slot-allocation paths (<code>xprt_rdma_alloc_slot</code>, <code>rpcrdma_bc_rqst_get</code>), with the release callback re-arming <code>rl_kref</code> before a req returns to a free pool. Lever lays out three invariants, including:</p>
+<blockquote>
+<p>"Any rpcrdma_req held by an rpc_rqst has rl_kref &gt;= 1."</p>
+</blockquote>
+<p>Without that invariant, he warns, "an RPC task that aborts between slot allocation and marshal (gss_refresh failure or signal during call_connect, for example) would drive xprt_release() -&gt; xprt_rdma_free_slot() -&gt; kref_put against a refcount of zero, saturating refcount_t and stranding the slot."</p>
+<p>Replies now complete the RPC directly — <code>rpcrdma_reply_handler()</code> calls <code>rpcrdma_complete_rqst()</code> instead of performing a <code>kref_put</code>. Because Send-side references can outlive RPC completion, connection teardown must drain sendctx entries whose unsignaled Sends never had a later signaled completion to walk the ring. The patch also fixes a backchannel teardown-ordering hazard: releasing a bc_prealloc req re-adds it to <code>bc_pa_list</code>, which <code>xprt_destroy_backchannel()</code> has already emptied, so <code>xprt_rdma_destroy()</code> runs <code>xprt_rdma_bc_destroy(xprt, 0)</code> a second time to reclaim them.</p>
+<p><strong>[3/3] Add request-pool slack for delayed recycling](https://lore.kernel.org/linux-nfs/20260523000252.465074-4-cel@kernel.org/)</strong> addresses the side effect of gating recycling on Send completion: a completed RPC's req can stay pinned by the sendctx ring until the next signaled Send completes. Lever bounds the headroom and explains why the pool must be enlarged:</p>
+<blockquote>
+<p>"The req pool, however, must exceed max_reqs by enough that this recycle delay does not stall a slot allocation that the credit window would admit."</p>
+</blockquote>
+<p>Since <code>re_send_batch</code> is set to <code>re_max_requests &gt;&gt; 3</code> (one in eight Sends is signaled), at most <code>max_reqs / 8</code> reqs can be held. The patch allocates <code>max_reqs + DIV_ROUND_UP(max_reqs, 8)</code> request objects and names the slack calculation at the allocation site "so the 1/8 bound stays tied to the Send-signaling batch size."</p>
+<h2>Conclusions and significance</h2>
+<p>This is a correctness fix for the NFS/RDMA client that preserves xprtrdma's performance model — most Sends remain unsignaled, relying on strong ordering of Send completions to limit interrupt rate. As Lever framed it in v1, unconditionally gating RPC completion on Send completion "deadlocks NFS callers waiting on an RPC whose Send completion never fires," so the design instead lets replies complete the RPC immediately while <code>rl_kref</code> alone governs when a request may be recycled. The net effect: the send buffer stays stable until the HCA is done with it, and the reply path no longer performs a cache-cold atomic <code>kref_put</code> on every reply.</p>
+<p>The series touches six files (124 insertions, 49 deletions). No reviewer feedback had arrived within this week's window; a v3 of the work was subsequently posted later in the cycle, so this v2 remains an intermediate revision rather than a landed conclusion.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260523000252.465074-1-cel@kernel.org/">2026-05-23 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 0/3] xprtrdma: Decouple req recycling from RPC completion</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260523000252.465074-3-cel@kernel.org/">2026-05-23 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 2/3] xprtrdma: Decouple req recycling from RPC completion</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260523000252.465074-2-cel@kernel.org/">2026-05-23 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 1/3] xprtrdma: Use sendctx DMA state for Send signaling</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260523000252.465074-4-cel@kernel.org/">2026-05-23 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 3/3] xprtrdma: Add request-pool slack for delayed recycling</a></li>
+</ul>
+  </main>
+</body>
+</html>

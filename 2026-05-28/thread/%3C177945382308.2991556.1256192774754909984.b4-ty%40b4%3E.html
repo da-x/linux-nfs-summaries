@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>tmpfs &quot;security.foo&quot; xattr series: boot-time NULL deref reported, diagnosed, and fixed with a Tested-by</title>
+  <meta name="description" content="This week&#39;s activity in this thread is a bug fix cycle for Miklos Szeredi&#39;s three-patch VFS/tmpfs cleanup series titled &quot;tmpfs: simplify constructing &#39;security.foo&#39; xattr names&quot; (root message…">
+  <meta property="og:title" content="tmpfs &quot;security.foo&quot; xattr series: boot-time NULL deref reported, diagnosed, and fixed with a Tested-by">
+  <meta property="og:description" content="This week&#39;s activity in this thread is a bug fix cycle for Miklos Szeredi&#39;s three-patch VFS/tmpfs cleanup series titled &quot;tmpfs: simplify constructing &#39;security.foo&#39; xattr names&quot; (root message…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-28T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="tmpfs &quot;security.foo&quot; xattr series: boot-time NULL deref reported, diagnosed, and fixed with a Tested-by">
+  <meta name="twitter:description" content="This week&#39;s activity in this thread is a bug fix cycle for Miklos Szeredi&#39;s three-patch VFS/tmpfs cleanup series titled &quot;tmpfs: simplify constructing &#39;security.foo&#39; xattr names&quot; (root message…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-28</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>tmpfs "security.foo" xattr series: boot-time NULL deref reported, diagnosed, and fixed with a Tested-by</h1>
+<h2>Summary</h2>
+<h1>tmpfs "security.foo" xattr series: boot-time NULL deref reported, diagnosed, and fixed</h1>
+<h2>What this thread is about</h2>
+<p>This week's activity in this thread is a <strong>bug fix</strong> cycle for Miklos Szeredi's three-patch VFS/tmpfs cleanup series titled <em>"tmpfs: simplify constructing 'security.foo' xattr names"</em> (root message <a href="https://lore.kernel.org/linux-nfs/177945382308.2991556.1256192774754909984.b4-ty@b4/">177945382308.2991556.1256192774754909984.b4-ty@b4</a>, posted 2026-05-19). Although the series lives in <code>linux-fsdevel</code>/VFS, it landed on the linux-nfs list because the breakage was discovered while exercising NFS server (nfsd) test trees that pull in VFS changes. The week's arc: a reproducible kernel panic is reported → the root cause is identified in one line of reasoning → a follow-up fix patch is posted and verified by the reporter.</p>
+<h2>Monday: Calum Mackay reports a reliable boot crash</h2>
+<p>Oracle's <a href="https://lore.kernel.org/linux-nfs/5386153f-9112-4971-98fc-de90d7aae2c6@oracle.com/">Calum Mackay</a> opened this week's segment by bisecting the breakage to Miklos' three patches:</p>
+<blockquote>
+<p>"I have been doing some testing of Chuck's nfsd-testing tree, which includes some vfs changes. The test systems are reliably crashing, in what looks like it might possibly be something related to these three patches."</p>
+<p>"I reverted the three patches, and the crashes stopped."</p>
+</blockquote>
+<p>He attached a full oops from a QEMU/i440FX guest running <code>7.1.0-rc4.master.20260524.el10.rc1.x86_64</code>, with the faulting instruction at <code>simple_xattr_set+0x27/0x8b0</code> (NULL pointer dereference, address <code>00000000000000e0</code>) during PID 1 (<code>systemd</code>). The call trace is the key evidence:</p>
+<pre><code>kernfs_new_node → __kernfs_new_node → security_kernfs_init_security
+  → selinux_kernfs_init_security → kernfs_xattr_set → simple_xattr_set (NULL deref)
+</code></pre>
+<p>The crash fires when SELinux tries to initialize a <code>security.*</code> xattr on a freshly created cgroup directory — i.e. any boot with cgroups + SELinux hits it, which is why the reporter's test VMs die within seconds. The NFS angle is indirect but real: Calum was exercising nfsd via Chuck Lever's testing tree, and the VFS changes in that tree are what exposed the latent ordering bug in <code>kernfs_new_node()</code>.</p>
+<h2>Tuesday: Miklos pinpoints the root cause</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/CAJfpegu3PawBxwOPEO-+at-B9zRTJOzY+z4qeV7xOwOQb3Fr7w@mail.gmail.com/">Miklos Szeredi</a> replied the next morning with a one-line diagnosis and Cc'd Greg KH (the cgroup/kernfs maintainer):</p>
+<blockquote>
+<p>"Since <code>__parent</code> is assigned after <code>security_kernfs_init_security()</code> gets called, <code>kernfs_root()</code> will return NULL."</p>
+<p>"Greg, any idea about dealing with this?"</p>
+</blockquote>
+<p>In other words, the simplification series reordered the node-initialisation path so that the LSM hook now runs before the parent pointer is wired up; <code>selinux_kernfs_init_security()</code> then walks back to the root via a NULL <code>__parent</code> and dereferences it. Miklos framed the question as an ordering problem for Greg — "Don't call this so early?" — rather than asking for a full revert.</p>
+<h2>Tuesday: Christian Brauner ships the fix patch</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260526-ablief-demut-wehen-aef8446ef5c9@brauner/">Christian Brauner</a> (VFS maintainer, co-author of the series) responded within ~15 minutes with a follow-up patch. The body was trimmed at ingest, but Calum's reply quotes the operative line:</p>
+<blockquote>
+<p>"The appended patch should fix it."</p>
+</blockquote>
+<h2>Wednesday: verification and Greg's non-answer</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/36507d23-abc0-423d-acf9-573b13a2a135@oracle.com/">Calum Mackay</a> confirmed the fix on his test systems and signed off:</p>
+<blockquote>
+<p>"Looks good to me, thanks Christian; no more crashes with that patch."</p>
+<p><code>Tested-by: Calum Mackay &lt;calum.mackay@oracle.com&gt;</code></p>
+</blockquote>
+<p>Meanwhile <a href="https://lore.kernel.org/linux-nfs/2026052722-garlic-worry-03b2@gregkh/">Greg Kroah-Hartman</a> answered Miklos' direct question with characteristic brevity:</p>
+<blockquote>
+<p>"Don't call this so early? :)"</p>
+<p>"I really don't know, sorry. — greg k-h"</p>
+</blockquote>
+<h2>Where things stand</h2>
+<ul>
+<li><strong>Status:</strong> The three-patch series is effectively held pending Christian's follow-up fix patch, which has a <code>Tested-by</code> from the original reporter and no objections on record this week.</li>
+<li><strong>Nature of the change:</strong> Bug fix (NULL pointer dereference at boot) introduced by a VFS/tmpfs code simplification; not an NFS protocol or feature change. The NFS client/server is only affected insofar as nfsd test trees pull in the broken VFS tree.</li>
+<li><strong>Key technical argument:</strong> LSM <code>init_security</code> hooks must run <em>after</em> the kernfs parent pointer is established, because SELinux's hook walks to the root via that pointer; reordering the assignment broke an implicit invariant.</li>
+<li><strong>Open item:</strong> The fix patch itself has not yet been formally queued/acknowledged in-thread within this week's window; watch for it landing in <code>vfs/vfs</code> (the series referenced <a href="https://git.kernel.org/vfs/vfs/c/12e9e3cd03b5">git.kernel.org/vfs/vfs/c/12e9e3cd03b5</a>).</li>
+</ul>
+<h2>Bridge to prior weeks</h2>
+<p>The thread root is Miklos' original 2026-05-19 cover letter for the three-patch series; no earlier weekly summary file exists for this thread, so there is no prior-week context to bridge beyond noting that the patches were posted on Tue 2026-05-19 and Christian's ack of the original series appeared Fri 2026-05-22 (quoted in Calum's Monday report).</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/5386153f-9112-4971-98fc-de90d7aae2c6@oracle.com/">2026-05-25 Calum Mackay <a href="mailto:calum.mackay@oracle.com">calum.mackay@oracle.com</a> — Re: [PATCH 1/3] tmpfs: simplify constructing "security.foo" xattr names</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAJfpegu3PawBxwOPEO-+at-B9zRTJOzY+z4qeV7xOwOQb3Fr7w@mail.gmail.com/">2026-05-26 Miklos Szeredi <a href="mailto:miklos@szeredi.hu">miklos@szeredi.hu</a> — Re: [PATCH 1/3] tmpfs: simplify constructing "security.foo" xattr names</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260526-ablief-demut-wehen-aef8446ef5c9@brauner/">2026-05-26 Christian Brauner <a href="mailto:brauner@kernel.org">brauner@kernel.org</a> — Re: [PATCH 1/3] tmpfs: simplify constructing "security.foo" xattr names</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/36507d23-abc0-423d-acf9-573b13a2a135@oracle.com/">2026-05-27 Calum Mackay <a href="mailto:calum.mackay@oracle.com">calum.mackay@oracle.com</a> — Re: [PATCH 1/3] tmpfs: simplify constructing "security.foo" xattr names</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/2026052722-garlic-worry-03b2@gregkh/">2026-05-27 Greg Kroah-Hartman <a href="mailto:gregkh@linuxfoundation.org">gregkh@linuxfoundation.org</a> — Re: [PATCH 1/3] tmpfs: simplify constructing "security.foo" xattr names</a></li>
+</ul>
+  </main>
+</body>
+</html>

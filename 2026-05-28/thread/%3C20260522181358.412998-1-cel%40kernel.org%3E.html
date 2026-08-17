@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>svcrdma: wake sq waiters when the transport closes</title>
+  <meta name="description" content="Type: Bug fix (NFS server / RDMA transport) Status this week: Patch posted; no replies yet in-thread. A closely related follow-on series from the same author landed later in the window and was acked by Jeff Layton, giving context for where…">
+  <meta property="og:title" content="svcrdma: wake sq waiters when the transport closes">
+  <meta property="og:description" content="Type: Bug fix (NFS server / RDMA transport) Status this week: Patch posted; no replies yet in-thread. A closely related follow-on series from the same author landed later in the window and was acked by Jeff Layton, giving context for where…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-28T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="svcrdma: wake sq waiters when the transport closes">
+  <meta name="twitter:description" content="Type: Bug fix (NFS server / RDMA transport) Status this week: Patch posted; no replies yet in-thread. A closely related follow-on series from the same author landed later in the window and was acked by Jeff Layton, giving context for where…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-28</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>svcrdma: wake sq waiters when the transport closes</h1>
+<h2>Summary</h2>
+<h2>svcrdma: wake sq waiters when the transport closes</h2>
+<p><strong>Type:</strong> Bug fix (NFS server / RDMA transport)
+<strong>Status this week:</strong> Patch posted; no replies yet in-thread. A closely related follow-on series from the same author landed later in the window and was acked by Jeff Layton, giving context for where this fix sits in a broader svcrdma cleanup effort.</p>
+<h3>The patch</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260522181358.412998-1-cel@kernel.org/">Chuck Lever posted a single-patch fix</a> on Friday 2026-05-22 addressing an uninterruptible hang in the NFS server's RDMA transport. The bug: worker threads parked in <code>svc_rdma_sq_wait()</code> on either <code>sc_sq_ticket_wait</code> or <code>sc_send_wait</code> can sleep forever in <code>TASK_UNINTERRUPTIBLE</code> across transport teardown, pinning <code>svc_xprt</code> references and blocking <code>svc_rdma_free()</code>.</p>
+<p>Lever's cover letter lays out the root cause with unusual precision:</p>
+<blockquote>
+<p>"The close path sets XPT_CLOSE before invoking xpo_detach and both wait_event predicates include an XPT_CLOSE term, but the predicates are re-evaluated only on wakeup. sc_sq_ticket_wait has no completion-driven wake path; it is advanced solely by the chained ticket handoff inside svc_rdma_sq_wait() itself."</p>
+</blockquote>
+<p>The deadlock is aggravated by a second close entry point:</p>
+<blockquote>
+<p>"A remote disconnect arrives at svc_rdma_cma_handler(), which calls svc_xprt_deferred_close(): that sets XPT_CLOSE and enqueues the transport but does not access either RDMA waitqueue, so a worker already parked in svc_rdma_sq_wait() never re-evaluates its predicate. With every worker parked on this transport, no thread is available to run the local teardown either, and the wake site there is unreachable."</p>
+</blockquote>
+<h3>The fix</h3>
+<p>The patch introduces <code>svc_rdma_xprt_deferred_close()</code>, a thin svcrdma wrapper that calls <code>svc_xprt_deferred_close()</code> and then explicitly wakes both <code>sc_sq_ticket_wait</code> and <code>sc_send_wait</code>. All seven svcrdma producers that previously called <code>svc_xprt_deferred_close()</code> directly are converted to use the new helper:</p>
+<ul>
+<li><code>svc_rdma_cma_handler()</code></li>
+<li><code>qp_event_handler()</code></li>
+<li><code>svc_rdma_post_send_err()</code></li>
+<li><code>svc_rdma_wc_send()</code></li>
+<li>the sendto drop path</li>
+<li>the rw completion error paths</li>
+<li>the recvfrom flush and read-list error paths</li>
+</ul>
+<p>Both waitqueues are also woken from <code>svc_rdma_detach()</code>, covering the synchronous <code>svc_xprt_close()</code> path (backchannel ENOTCONN, device removal via <code>svc_rdma_xprt_done</code>) that bypasses the deferred-close helper.</p>
+<p>The patch touches five files (+37/−10) and carries a <code>Fixes:</code> tag pointing at commit <code>ccc89b9d1ed2</code> ("svcrdma: Add fair queuing for Send Queue access"), identifying the introduction of the ticket-based fair-queuing mechanism as the origin of the bug.</p>
+<h3>Authorship and AI-assistance disclosure</h3>
+<p>Notably, the patch is authored by <strong>Chris Mason</strong> (Meta) with Chuck Lever taking over to complete it:</p>
+<blockquote>
+<p>"[ cel: add svc_rdma_xprt_deferred_close() to complete the fix ]"</p>
+</blockquote>
+<p>The commit also includes an explicit <code>Assisted-by: kres (claude-opus-4-7)</code> trailer — a disclosure that Claude AI assisted in drafting the initial version. This is part of a growing pattern of AI-assisted kernel contributions being transparently labeled on linux-nfs.</p>
+<h3>Context: broader svcrdma cleanup wave</h3>
+<p>This patch arrived five days before Lever posted a <a href="https://lore.kernel.org/linux-nfs/20260527-rdma-follow-on-v1-0-1b09bd87b6cd@oracle.com/">five-patch follow-on series</a> titled "Fix resource lifecycle bugs in svcrdma transport setup and teardown," which also includes a Chris Mason contribution ("svcrdma: Fix unmatched rn_unregister on failed accept"). The two efforts together represent a systematic audit of svcrdma's error paths, teardown ordering, and reference-counting.</p>
+<p>Jeff Layton <a href="https://lore.kernel.org/linux-nfs/5dbf09b251da464100ec828c5623aaf064698b96.camel@kernel.org/">acked the follow-on series</a> on 2026-05-27 with a characteristically candid note:</p>
+<blockquote>
+<p>"I don't feel confident in my own abilities to review svcrdma patches, so. Acked-by: Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a>"</p>
+</blockquote>
+<p>No reply has yet appeared in this thread as of the end of the window (2026-05-29). Given the <code>Fixes:</code> tag and the severity of the hang (uninterruptible sleep + memory leak), this patch is a strong candidate for stable backport.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260522181358.412998-1-cel@kernel.org/">2026-05-22 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH] svcrdma: wake sq waiters when the transport closes</a></li>
+</ul>
+  </main>
+</body>
+</html>

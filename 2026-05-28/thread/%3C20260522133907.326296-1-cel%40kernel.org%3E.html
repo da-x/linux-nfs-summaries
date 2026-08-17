@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>sunrpc: fix slab corruption in server-side TLS handshake close race (v2)</title>
+  <meta name="description" content="Type: Bug fix (two-patch series, v2) Affected subsystem: net/sunrpc/svcsock.c — NFS server-side TCP transport with TLS Fixes: b3cbf98e2fdf (&quot;SUNRPC: Support TLS handshake in the server-side TCP socket code&quot;)">
+  <meta property="og:title" content="sunrpc: fix slab corruption in server-side TLS handshake close race (v2)">
+  <meta property="og:description" content="Type: Bug fix (two-patch series, v2) Affected subsystem: net/sunrpc/svcsock.c — NFS server-side TCP transport with TLS Fixes: b3cbf98e2fdf (&quot;SUNRPC: Support TLS handshake in the server-side TCP socket code&quot;)">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-28T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="sunrpc: fix slab corruption in server-side TLS handshake close race (v2)">
+  <meta name="twitter:description" content="Type: Bug fix (two-patch series, v2) Affected subsystem: net/sunrpc/svcsock.c — NFS server-side TCP transport with TLS Fixes: b3cbf98e2fdf (&quot;SUNRPC: Support TLS handshake in the server-side TCP socket code&quot;)">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-28</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>sunrpc: fix slab corruption in server-side TLS handshake close race (v2)</h1>
+<h2>Summary</h2>
+<h2>sunrpc: Fix Slab Corruption in Server-Side TLS Handshake Close Race</h2>
+<p><strong>Type:</strong> Bug fix (two-patch series, v2)
+<strong>Affected subsystem:</strong> <code>net/sunrpc/svcsock.c</code> — NFS server-side TCP transport with TLS
+<strong>Fixes:</strong> b3cbf98e2fdf ("SUNRPC: Support TLS handshake in the server-side TCP socket code")</p>
+<h3>Overview</h3>
+<p>On Friday 2026-05-22, Chuck Lever posted a two-patch v2 series addressing a slab-corruption bug in the NFS server's asynchronous TLS handshake path. The patches were authored by Chris Mason (Meta) and Chuck Lever himself, with review from Jeff Layton. Both patches received Reviewed-by tags within minutes of posting.</p>
+<p>This is a <strong>server-side</strong> fix; it complements an earlier client-side TLS pinning series ([PATCH 0/2] Fix a few memory bugs in RPC-with-TLS, posted May 4) that addressed analogous lifetime issues on the <code>rpc_clnt</code> side.</p>
+<h3>The Bug: Two Close Races Freeing svc_sock Under the Callback</h3>
+<p>The core problem is a reference-counting gap in <code>svc_tcp_handshake()</code>. When the server initiates a TLS handshake via <code>tls_server_hello_x509()</code>, the handshake core takes only a <code>sock_hold()</code> on the socket — nothing pins the embedding <code>struct svc_sock</code> that the completion callback <code>svc_tcp_handshake_done()</code> reaches through <code>container_of()</code>.</p>
+<p>Chuck's commit message for <a href="https://lore.kernel.org/linux-nfs/20260522133907.326296-1-cel@kernel.org/">patch 1/2</a> lays out two distinct race windows:</p>
+<blockquote>
+<p>"Two close races leave the in-flight callback writing through a freed svc_sock."</p>
+</blockquote>
+<p><strong>Race 1 — <code>svc_sock_free()</code> discards the cancel return value:</strong>
+When a connection is closed, <code>svc_sock_free()</code> calls <code>tls_handshake_cancel()</code>. If that returns false (meaning <code>handshake_complete()</code> already set <code>HANDSHAKE_F_REQ_COMPLETED</code> but the callback hasn't finished yet), the code proceeds straight to <code>kfree(svsk)</code> while the callback is still in flight.</p>
+<p><strong>Race 2 — cancel-loser fall-through inside <code>svc_tcp_handshake()</code>:</strong>
+When <code>wait_for_completion_interruptible_timeout()</code> returns ≤ 0 (timeout or signal) and <code>tls_handshake_cancel()</code> also returns false, the function returns without draining. The caller <code>svc_handle_xprt()</code> then calls <code>svc_xprt_received()</code>, which clears <code>XPT_BUSY</code> and can drop the last reference — freeing the transport while the callback is still running.</p>
+<h3>The Corruption Primitive</h3>
+<p>The commit message is emphatic about severity:</p>
+<blockquote>
+<p>"The corruption surfaces as set_bit/clear_bit RMW into the freed xpt_flags slab slot and as complete_all() walking and writing the freed wait_queue_head_t list embedded in sk_handshake_done -- a slab-corruption primitive, not a benign read."</p>
+</blockquote>
+<p>This is a <strong>write-after-free</strong> on kernel slab memory, not merely a use-after-read. The path is reachable on any TLS-enabled NFS server whenever a connection close overlaps the <code>tlshd</code> downcall delivery window. Notably, because the wait is interruptible, signal delivery alone is sufficient to trigger it — no need for the full <code>SVC_HANDSHAKE_TO</code> timeout to expire.</p>
+<h3>Patch 1: Pin svc_xprt Across the Callback</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260522133907.326296-1-cel@kernel.org/">The first patch</a> (by Chris Mason, with Chuck rewriting the commit message) adds a <code>svc_xprt_get(xprt)</code> immediately before <code>tls_server_hello_x509()</code> so the in-flight callback owns its own reference. The reference is released on exactly three edges:</p>
+<ol>
+<li>Submission failure from <code>tls_server_hello_x509()</code></li>
+<li>A successful <code>tls_handshake_cancel()</code></li>
+<li>At the tail of <code>svc_tcp_handshake_done()</code> after <code>complete_all()</code></li>
+</ol>
+<p>The change is minimal: 6 lines added to <code>net/sunrpc/svcsock.c</code>.</p>
+<h3>Patch 2: Wait for In-Flight Callback When Cancel Loses the Race</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260522133907.326296-2-cel@kernel.org/">The second patch</a> (by Chuck Lever) addresses a subtler race in the cancel-loser path. After <code>tls_handshake_cancel()</code> returns false, the current code immediately reads <code>xpt_flags</code> to decide whether the session succeeded. Two sub-races result:</p>
+<blockquote>
+<p>"If the callback has executed set_bit(XPT_TLS_SESSION) but not yet clear_bit(XPT_HANDSHAKE), svc_tcp_handshake() sees a session, enqueues the transport, and returns." — leading to a <strong>second</strong> <code>xpo_handshake</code> invocation that calls <code>init_completion()</code> on <code>svsk-&gt;sk_handshake_done</code> while the original callback concurrently calls <code>complete_all()</code> on it, corrupting the embedded wait queue.</p>
+</blockquote>
+<blockquote>
+<p>"If the callback has set HANDSHAKE_F_REQ_COMPLETED but not yet entered svc_tcp_handshake_done(), svc_tcp_handshake() reads XPT_TLS_SESSION as clear and tears the connection down even though the handshake is about to succeed."</p>
+</blockquote>
+<p>The fix: wait for the callback's completion before inspecting <code>xpt_flags</code>. The commit message notes this is safe because "the completion is guaranteed to fire because handshake_complete() invokes svc_tcp_handshake_done() unconditionally once it has set HANDSHAKE_F_REQ_COMPLETED." This adds 4 lines.</p>
+<h3>Evolution: v1 → v2</h3>
+<p>The v2 was posted just ~12 hours after the <a href="https://lore.kernel.org/linux-nfs/20260522014850.206768-1-cel@kernel.org/">v1 single-patch version</a> (posted 01:48 UTC). Jeff Layton reviewed the v1 by 10:02 UTC, granting a Reviewed-by. The v2 split the work into two logically distinct patches and added patch 2 to handle the cancel-loser fall-through race that the v1's single pinning fix did not fully cover. The <code>Closes:</code> tag in patch 2 references the v1 patchset URL on sashiko.dev, formally superseding it.</p>
+<h3>Review and Status</h3>
+<p>Jeff Layton responded to <a href="https://lore.kernel.org/linux-nfs/a519cba6de7e24b974e279b65bbb7180b0a54682.camel@kernel.org/">patch 2/2</a> within six minutes of posting:</p>
+<blockquote>
+<p>"Reviewed-by: Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a>"</p>
+</blockquote>
+<p>Both patches carry Reviewed-by tags. No objections or further discussion followed in this window. The series appears ready for merge into the NFS tree.</p>
+<h3>Broader Context</h3>
+<p>This fix is part of a broader campaign to harden RPC-with-TLS lifetime management. A related <a href="https://lore.kernel.org/linux-nfs/20260504-sunrpc-tls-clnt-pin-v1-0-197f359c6072@oracle.com/">client-side series</a> (posted May 4, still under discussion as of June) addresses analogous pinning issues in the <code>rpc_clnt</code> TLS connect path. Together, these patches close a class of write-after-free bugs that were latent since TLS support was first added to the server-side TCP socket code.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260522133907.326296-1-cel@kernel.org/">2026-05-22 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 1/2] sunrpc: pin svc_xprt across the asynchronous TLS handshake callback</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260522133907.326296-2-cel@kernel.org/">2026-05-22 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 2/2] sunrpc: wait for in-flight TLS handshake callback when cancel loses race</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/a519cba6de7e24b974e279b65bbb7180b0a54682.camel@kernel.org/">2026-05-22 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v2 2/2] sunrpc: wait for in-flight TLS handshake callback when cancel loses race</a></li>
+</ul>
+  </main>
+</body>
+</html>

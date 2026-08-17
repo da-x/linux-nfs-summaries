@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd: Fix NULL pointer deref after FOREIGN PUTFH in inter-SSC COPY flow</title>
+  <meta name="description" content="Type: Bug fix (security-relevant — remote-triggerable NULL pointer dereference in the NFSv4 server)">
+  <meta property="og:title" content="nfsd: Fix NULL pointer deref after FOREIGN PUTFH in inter-SSC COPY flow">
+  <meta property="og:description" content="Type: Bug fix (security-relevant — remote-triggerable NULL pointer dereference in the NFSv4 server)">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-28T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd: Fix NULL pointer deref after FOREIGN PUTFH in inter-SSC COPY flow">
+  <meta name="twitter:description" content="Type: Bug fix (security-relevant — remote-triggerable NULL pointer dereference in the NFSv4 server)">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-28</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd: Fix NULL pointer deref after FOREIGN PUTFH in inter-SSC COPY flow</h1>
+<h2>Summary</h2>
+<h2>nfsd: Block non-SAVEFH ops after FOREIGN PUTFH to prevent NULL deref</h2>
+<p><strong>Type:</strong> Bug fix (security-relevant — remote-triggerable NULL pointer dereference in the NFSv4 server)</p>
+<h3>Overview</h3>
+<p>On Wednesday, May 27, Jeff Layton posted a single-patch fix for a NULL pointer dereference in the Linux NFSv4 server (<code>nfsd</code>) that is remotely exploitable when the <code>CONFIG_NFSD_V4_2_INTER_SSC</code> option is enabled. The patch was picked up within hours by nfsd maintainer Chuck Lever, who applied it to the <code>nfsd-testing</code> tree the same afternoon.</p>
+<h3>The Bug</h3>
+<p>The vulnerability sits in the NFSv4 COMPOUND dispatch loop. When a server-to-server (inter-SSC) COPY is in progress, the source filehandle may legitimately be "foreign" — i.e., not resolvable on the local server. To support this, an earlier commit (<code>3ad685d73ed8</code>, "NFSD: allow inter server COPY to have a STALE source server fh") introduced logic that lets <code>nfsd4_putfh()</code> return success even when <code>fh_verify()</code> fails with <code>nfserr_stale</code>, provided the PUTFH was flagged with <code>no_verify</code> (set by <code>check_if_stalefh_allowed()</code> during an inter-SSC COPY).</p>
+<p>The problem: while the <code>NFSD4_FH_FOREIGN</code> flag was set, the dispatch loop only used it to skip the generic "no filehandle" error check. It did <strong>not</strong> prevent subsequent operations in the COMPOUND from executing with both <code>fh_dentry</code> and <code>fh_export</code> left NULL.</p>
+<p>As Layton described in <a href="https://lore.kernel.org/linux-nfs/20260527-putfh_foreign_fh_null_deref_consumers-v1-1-1b8a5aa28c59@kernel.org/">the patch submission</a>:</p>
+<blockquote>
+<p>"A remote client can exploit this by crafting a COMPOUND that includes an inter-SSC COPY (which causes check_if_stalefh_allowed() to set no_verify=true on the saved PUTFH) with an additional op inserted between the source PUTFH and SAVEFH. For example, SETATTR calls fh_want_write() which dereferences fh_export-&gt;ex_path.mnt without calling fh_verify() first, causing a NULL pointer dereference in the nfsd kthread."</p>
+</blockquote>
+<p>In other words, a malicious client could interleave an arbitrary operation (such as SETATTR) between the foreign PUTFH and the SAVEFH that the inter-SSC COPY flow expects, triggering a crash in the server kernel thread.</p>
+<h3>The Fix</h3>
+<p>The patch (16 insertions, 3 deletions in <code>fs/nfsd/nfs4proc.c</code>) adds a gate in the compound dispatch loop: when <code>NFSD4_FH_FOREIGN</code> is set and <code>fh_dentry</code> is NULL, only two categories of operations are allowed to proceed:</p>
+<ol>
+<li><strong>OP_SAVEFH</strong> — required by the inter-SSC COPY flow to restore the saved filehandle state.</li>
+<li><strong>Ops flagged with <code>ALLOWED_WITHOUT_FH</code></strong> — operations that do not require a resolved filehandle at all.</li>
+</ol>
+<p>Every other operation receives <code>NFS4ERR_STALE</code>, which Layton justified by citing the protocol:</p>
+<blockquote>
+<p>"All other ops receive nfserr_stale, per RFC 7862 Section 15.2.3 which specifies that foreign filehandle validation is deferred to the consuming operation and NFS4ERR_STALE returned at that point."</p>
+</blockquote>
+<p>The patch carries a <code>Fixes:</code> tag pointing to the original inter-SSC COPY commit and an <code>Assisted-by: Claude:claude-opus-4-6</code> trailer, indicating AI-assisted development.</p>
+<h3>Resolution</h3>
+<p>Chuck Lever confirmed in <a href="https://lore.kernel.org/linux-nfs/177990236378.209507.13078791366747857489.b4-ty@b4/">his reply</a> just under three hours later:</p>
+<blockquote>
+<p>"Applied to nfsd-testing, thanks!"</p>
+</blockquote>
+<p>The commit landed as <code>d8db9ced22a876091c432c4adb35e5d05be196aa</code> in the <code>nfsd-testing</code> tree. No further discussion or review comments were posted before application, suggesting the fix was straightforward and well-understood by the maintainer.</p>
+<h3>Significance</h3>
+<p>This is a notable security fix for NFS server deployments that enable inter-server synchronous sequential copy (inter-SSC), an NFSv4.2 feature. The bug allowed a remote, unauthenticated client to crash the nfsd kernel thread via a carefully crafted COMPOUND request — a denial-of-service vector. The quick turnaround from submission to application highlights the responsiveness of the nfsd maintenance process for security-relevant fixes.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260527-putfh_foreign_fh_null_deref_consumers-v1-1-1b8a5aa28c59@kernel.org/">2026-05-27 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH] nfsd: block non-SAVEFH ops after FOREIGN PUTFH to prevent NULL deref</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177990236378.209507.13078791366747857489.b4-ty@b4/">2026-05-27 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH] nfsd: block non-SAVEFH ops after FOREIGN PUTFH to prevent NULL deref</a></li>
+</ul>
+  </main>
+</body>
+</html>

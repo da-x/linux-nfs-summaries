@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>sunrpc: Pin svc_xprt across async TLS handshake callback (slab-corruption bug fix)</title>
+  <meta name="description" content="Type: Bug fix — a slab-corruption race in the kernel NFS server (net/sunrpc/svcsock.c) that is reachable on any TLS-enabled NFS server. Though it lands in the shared SUNRPC transport layer, it matters to client developers because it…">
+  <meta property="og:title" content="sunrpc: Pin svc_xprt across async TLS handshake callback (slab-corruption bug fix)">
+  <meta property="og:description" content="Type: Bug fix — a slab-corruption race in the kernel NFS server (net/sunrpc/svcsock.c) that is reachable on any TLS-enabled NFS server. Though it lands in the shared SUNRPC transport layer, it matters to client developers because it…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-28T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="sunrpc: Pin svc_xprt across async TLS handshake callback (slab-corruption bug fix)">
+  <meta name="twitter:description" content="Type: Bug fix — a slab-corruption race in the kernel NFS server (net/sunrpc/svcsock.c) that is reachable on any TLS-enabled NFS server. Though it lands in the shared SUNRPC transport layer, it matters to client developers because it…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-28</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>sunrpc: Pin svc_xprt across async TLS handshake callback (slab-corruption bug fix)</h1>
+<h2>Summary</h2>
+<h2>sunrpc: Pin <code>svc_xprt</code> Across the Asynchronous TLS Handshake Callback</h2>
+<p><strong>Type:</strong> Bug fix — a slab-corruption race in the kernel NFS <em>server</em> (<code>net/sunrpc/svcsock.c</code>) that is reachable on any TLS-enabled NFS server. Though it lands in the shared SUNRPC transport layer, it matters to client developers because it governs the TLS handshake path clients exercise when connecting to a <code>tls</code>-flavored mount.</p>
+<h3>The patch (Thursday, 2026-05-22)</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260522014850.206768-1-cel@kernel.org/">Chuck Lever posted the fix</a>, authored by Chris Mason (Meta) with an <code>Assisted-by: kres (claude-opus-4-7)</code> tag and a <code>[cel: rewrote commit message to describe the actual change]</code> note — a small 6-line addition to <code>net/sunrpc/svcsock.c</code>, but one that closes a genuinely nasty use-after-free.</p>
+<p>The core problem, as Lever's commit message lays out it:</p>
+<blockquote>
+<p>"svc_tcp_handshake() stores the raw svc_xprt pointer in tls_handshake_args.ta_data and submits the request through tls_server_hello_x509(). The handshake core takes only sock_hold(req-&gt;hr_sk); nothing references the embedding struct svc_sock that svc_tcp_handshake_done() reaches via container_of()."</p>
+</blockquote>
+<p>Two distinct close races were identified, both leaving an in-flight callback writing through a freed <code>svc_sock</code>:</p>
+<ol>
+<li><strong>The <code>svc_sock_free()</code> race.</strong> The free path calls <code>tls_handshake_cancel()</code> and discards its return value. A <code>false</code> return means <code>handshake_complete()</code> already set <code>HANDSHAKE_F_REQ_COMPLETED</code> but <code>hp_done()</code> may not have finished — yet the code proceeds straight to <code>kfree(svsk)</code>.</li>
+<li><strong>The cancel-loser fall-through inside <code>svc_tcp_handshake()</code> itself.</strong> When <code>wait_for_completion_interruptible_timeout()</code> returns ≤ 0 (timeout <em>or</em> signal) and <code>tls_handshake_cancel()</code> also returns false, the function does not drain; it returns, <code>svc_handle_xprt()</code> calls <code>svc_xprt_received()</code>, which clears <code>XPT_BUSY</code> and can drop the last reference. A concurrent close then runs <code>svc_sock_free()</code> while <code>svc_tcp_handshake_done()</code> is still touching <code>xpt_flags</code> and walking <code>svsk-&gt;sk_handshake_done</code>.</li>
+</ol>
+<p>Lever was emphatic about how severe the resulting corruption is:</p>
+<blockquote>
+<p>"The corruption surfaces as set_bit/clear_bit RMW into the freed xpt_flags slab slot and as complete_all() walking and writing the freed wait_queue_head_t list embedded in sk_handshake_done -- a slab-corruption primitive, not a benign read."</p>
+</blockquote>
+<p>He also stressed how easy the trigger is:</p>
+<blockquote>
+<p>"The path is reachable on any TLS-enabled NFS server whenever a connection close overlaps the tlshd downcall delivery window; the interruptible wait means signal delivery suffices, not just SVC_HANDSHAKE_TO expiry."</p>
+</blockquote>
+<h3>The fix</h3>
+<p>The remedy is a classic lifetime pin. Take <code>svc_xprt_get(xprt)</code> immediately before <code>tls_server_hello_x509()</code> so the in-flight callback owns its own reference, and release it at exactly the two edges where the callback is guaranteed not to fire — submission failure from <code>tls_server_hello_x509()</code> and a successful <code>tls_handshake_cancel()</code> — plus at the tail of <code>svc_tcp_handshake_done()</code> after <code>complete_all()</code>. The patch carries:</p>
+<blockquote>
+<p>"Fixes: b3cbf98e2fdf ("SUNRPC: Support TLS handshake in the server-side TCP socket code")"</p>
+</blockquote>
+<h3>Review and outcome</h3>
+<p>The discussion was short and decisive. About eight hours later, <a href="https://lore.kernel.org/linux-nfs/39ed8ff380ea3d215102d7f7b57415c33650d57e.camel@kernel.org/">Jeff Layton replied</a> with an unqualified:</p>
+<blockquote>
+<p>"Reviewed-by: Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a>"</p>
+</blockquote>
+<p>No objections, no alternative designs proposed, and no follow-up messages in the thread this week. The patch is effectively ready for merge — a clean, well-scoped 6-line fix that removes a slab-corruption primitive from the TLS handshake path of every Linux NFS server.</p>
+<h3>Context for client developers</h3>
+<p>While the bug lives on the server side of SUNRPC, it directly affects any deployment where clients mount over TLS: a misbehaving or simply closing client connection could previously corrupt kernel memory on the server mid-handshake. The fix tightens reference-counting around the asynchronous <code>tlshd</code> downcall window, so the in-flight handshake callback can no longer outlive its transport.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260522014850.206768-1-cel@kernel.org/">2026-05-22 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH] sunrpc: pin svc_xprt across the asynchronous TLS handshake callback</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/39ed8ff380ea3d215102d7f7b57415c33650d57e.camel@kernel.org/">2026-05-22 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH] sunrpc: pin svc_xprt across the asynchronous TLS handshake callback</a></li>
+</ul>
+  </main>
+</body>
+</html>

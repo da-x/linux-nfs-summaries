@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>lockd: use-after-free fix for nlm_traverse_files() gets Sashiko-flagged regression, v2 promised</title>
+  <meta name="description" content="Type: Bug fix (NFS server / lockd) — slab use-after-free in nlm_traverse_files(), with a stable backport requested.">
+  <meta property="og:title" content="lockd: use-after-free fix for nlm_traverse_files() gets Sashiko-flagged regression, v2 promised">
+  <meta property="og:description" content="Type: Bug fix (NFS server / lockd) — slab use-after-free in nlm_traverse_files(), with a stable backport requested.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-28T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="lockd: use-after-free fix for nlm_traverse_files() gets Sashiko-flagged regression, v2 promised">
+  <meta name="twitter:description" content="Type: Bug fix (NFS server / lockd) — slab use-after-free in nlm_traverse_files(), with a stable backport requested.">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-28</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>lockd: use-after-free fix for nlm_traverse_files() gets Sashiko-flagged regression, v2 promised</h1>
+<h2>Summary</h2>
+<h1>lockd: pin next file across nlm_inspect_file lock-drop</h1>
+<p><strong>Type:</strong> Bug fix (NFS server / lockd) — slab use-after-free in <code>nlm_traverse_files()</code>, with a stable backport requested.</p>
+<h2>The bug and the proposed fix</h2>
+<p>Michael Bommarito opened the thread on Saturday, May 23 with <a href="https://lore.kernel.org/linux-nfs/20260523014203.2462827-1-michael.bommarito@gmail.com/">a single-patch submission</a> targeting <code>fs/lockd/svcsubs.c</code> (42 insertions, 19 deletions). The patch carries <code>Cc: stable@vger.kernel.org</code> and a <code>Fixes:</code> tag pointing at the original deadlock fix (<code>01df9c5e918a</code>, "LOCKD: Fix a deadlock in nlm_traverse_files()") — i.e., this is presented as repairing a hole that the earlier lock-drop fix left behind.</p>
+<p>The core race, in Bommarito's words:</p>
+<blockquote>
+<p>"The f_count bump pins the current file across the lock-drop, but nothing pins next. Any nlmsvc thread that holds the last reference on the file at next will, during that window, call nlm_release_file() -&gt; nlm_delete_file() under nlm_file_mutex, hlist_del() it from the bucket, and kfree() it. When nlm_traverse_files() reacquires the mutex and the macro reads the next entry's f_list.next on the following iteration, the read lands in the freed slab."</p>
+</blockquote>
+<p>The chosen remedy is to walk each hash bucket with <strong>two locally-pinned cursors</strong> (<code>file</code> and <code>next</code>), so the neighbour one step ahead stays alive across the unlock window:</p>
+<blockquote>
+<p>"Pin the neighbour explicitly instead. Walk the bucket with two locally-pinned cursors at a time: file (current, pinned by the prior iteration's next bump) and next (one ahead). Drop file's pin at the end of each iteration, then advance to next, which is still alive because we hold its f_count above zero across the unlock. This bounds the walk at O(N) per bucket and never observes a freed neighbour."</p>
+</blockquote>
+<p>He also explains why the obvious alternative was rejected:</p>
+<blockquote>
+<p>"A naive restart-on-action variant would deadlock-spin against an nlm_release_file holder: nlm_inspect_file() does not always drain the file (it can return 1 with an RPC still holding f_count above the cleanup threshold), and the outer predicate is_failover_file() matches static attributes of the file, so a restart can keep re-finding the same un-cleanable file until the external RPC ref drops."</p>
+</blockquote>
+<p>The patch additionally factors the <code>f_count</code>/list/share/lock cleanup into a helper so that the no-match path also drops stale empty files rather than leaving them in the table.</p>
+<h2>Reproduction evidence</h2>
+<p>Bommarito reports a concrete KASAN reproduction, which is notable for an NFS lockd fix:</p>
+<blockquote>
+<p>"Reproduced under UML + KASAN with a loopback NFSv3 mount, 768 concurrent POSIX fcntl(F_SETLKW) holders, and parallel writes to /proc/fs/nfsd/unlock_filesystem forcing nlmsvc_unlock_all_by_sb() to walk the table while clients churn locks."</p>
+</blockquote>
+<blockquote>
+<p>"BUG: KASAN: slab-use-after-free in nlm_traverse_files+0x71d/0x9d0 — Read of size 8 at addr 0000000070314800 by task nlm-init-..."</p>
+</blockquote>
+<p>And the patched UML kernel "ran the same harness silently." The patch also carries an <code>Assisted-by: Claude:claude-opus-4-7</code> trailer, making it one of the more prominently AI-assisted lockd submissions this week.</p>
+<h2>Sashiko flags a regression; v2 promised</h2>
+<p>NFS maintainer Jeff Layton replied within ten hours <a href="https://lore.kernel.org/linux-nfs/bdf9ef246acd34862588e525c0e9a5fe47f37955.camel@kernel.org/">pointing to the Sashiko static-analysis report</a>:</p>
+<blockquote>
+<p>"Sashiko seems to think there is a regression here."</p>
+</blockquote>
+<p>Bommarito <a href="https://lore.kernel.org/linux-nfs/CAJJ9bXzjm=-CezSy5x=sHAmsersT6osb9rCk7x39xg=CLU42Nw@mail.gmail.com/">confirmed the finding</a> and split it into two items:</p>
+<blockquote>
+<p>"Yeah, the predicate check is a real regression. I'll fix that and send a v2."</p>
+<p>"The other one is a separate issue (nlmsvc_create_block). I never saw that path fire in my harness, but will send a separate patch if I can get that to light up."</p>
+</blockquote>
+<h2>Status / outlook</h2>
+<ul>
+<li><strong>v1 not accepted.</strong> The predicate-check regression blocks merge of the v1 as posted; Bommarito has committed to a v2.</li>
+<li><strong>A second, independent issue</strong> was surfaced in <code>nlmsvc_create_block</code> — out of scope for this patch and dependent on Bommarito being able to reproduce it.</li>
+<li><strong>Stable backport pending.</strong> The original UAF is clearly stable-worthy (it's a classic list-walk use-after-free in the lockd server path), so expect the v2 to carry the same <code>Cc: stable</code> / <code>Fixes:</code> tags and to be picked up for the current -stable tree once it lands.</li>
+<li><strong>Client-side relevance:</strong> although this is a server/lockd fix, it directly affects NFSv3 clients that hold many concurrent POSIX locks (<code>fcntl(F_SETLKW)</code>) against a Linux NFS server during unlock-all / failover sweeps — exactly the workload the KASAN harness exercises.</li>
+</ul>
+<p>No further activity in this thread within the week; watch for the v2 and any follow-up <code>nlmsvc_create_block</code> patch next week.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260523014203.2462827-1-michael.bommarito@gmail.com/">2026-05-23 Michael Bommarito <a href="mailto:michael.bommarito@gmail.com">michael.bommarito@gmail.com</a> — [PATCH] lockd: pin next file across nlm_inspect_file lock-drop</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/bdf9ef246acd34862588e525c0e9a5fe47f37955.camel@kernel.org/">2026-05-23 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH] lockd: pin next file across nlm_inspect_file lock-drop</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAJJ9bXzjm=-CezSy5x=sHAmsersT6osb9rCk7x39xg=CLU42Nw@mail.gmail.com/">2026-05-23 Michael Bommarito <a href="mailto:michael.bommarito@gmail.com">michael.bommarito@gmail.com</a> — Re: [PATCH] lockd: pin next file across nlm_inspect_file lock-drop</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd/sunrpc: convert nfsstat server stats to netlink (v2)</title>
+  <meta name="description" content="This week&#39;s activity in the thread is a single event: on 2026-05-25, Red Hat&#39;s Jeff Layton posted the second revision of his four-patch kernel series, &quot;[PATCH v2 0/4] nfsd/sunrpc: convert nfsstat server-side interfaces to use netlink&quot;.…">
+  <meta property="og:title" content="nfsd/sunrpc: convert nfsstat server stats to netlink (v2)">
+  <meta property="og:description" content="This week&#39;s activity in the thread is a single event: on 2026-05-25, Red Hat&#39;s Jeff Layton posted the second revision of his four-patch kernel series, &quot;[PATCH v2 0/4] nfsd/sunrpc: convert nfsstat server-side interfaces to use netlink&quot;.…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-28T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd/sunrpc: convert nfsstat server stats to netlink (v2)">
+  <meta name="twitter:description" content="This week&#39;s activity in the thread is a single event: on 2026-05-25, Red Hat&#39;s Jeff Layton posted the second revision of his four-patch kernel series, &quot;[PATCH v2 0/4] nfsd/sunrpc: convert nfsstat server-side interfaces to use netlink&quot;.…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-28</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd/sunrpc: convert nfsstat server stats to netlink (v2)</h1>
+<h2>Summary</h2>
+<h1>nfsd/sunrpc: Convert nfsstat Server-Side Statistics to Netlink (PATCH v2)</h1>
+<h2>Overview</h2>
+<p>This week's activity in the thread is a single event: on 2026-05-25, Red Hat's <strong>Jeff Layton</strong> posted the <strong>second revision</strong> of his four-patch kernel series, "[PATCH v2 0/4] nfsd/sunrpc: convert nfsstat server-side interfaces to use netlink". There were no replies or review comments within this week's window — the thread consists solely of the five messages (cover letter plus four patches) that Layton posted in quick succession. The series is a <strong>new feature / interface modernization</strong> rather than a bug fix, though it does include a deliberate behavior change to the procfs statistics output.</p>
+<p>This kernel-side work is the natural companion to the user-space netlink upcall/downcall series Layton sent to nfs-utils back in March (<a href="https://lore.kernel.org/linux-nfs/20260316-exportd-netlink-v1-0-9a408a0b389d@kernel.org/">bridged below</a>), which moved <code>mountd</code>/<code>exportd</code>/<code>exportfs</code> off the legacy <code>/proc</code> cache interfaces. This series extends the same netlink-based philosophy to <strong>server statistics collection</strong>.</p>
+<h2>Motivation and Key Technical Arguments</h2>
+<p>Layton's cover letter lays out three concrete limitations of the current mechanism, in which the <code>nfsstat</code> tool scrapes <code>/proc/net/rpc/nfsd</code>:</p>
+<blockquote>
+<p>"The nfsstat tool currently scrapes /proc/net/rpc/nfsd for server statistics. This procfs interface has several limitations: the counters are global (not network-namespace-aware), the format is fragile to parse, and it cannot be extended without breaking existing parsers."</p>
+</blockquote>
+<p>The proposed solution adds per-network-namespace procedure call counts to the sunrpc layer and exposes them through a new netlink handler in the nfsd generic netlink family, with a procfs fallback retained for older kernels.</p>
+<h2>The Four Patches</h2>
+<p><strong>Patch 1/4 — <code>sunrpc: add per-netns per-procedure call counts to svc_stat</code></strong>
+This is the foundational change. The existing per-procedure counters live in global <code>svc_version-&gt;vs_count[]</code> arrays that are not namespace-aware. Layton adds a <code>vs_count</code> pointer array to <code>struct svc_stat</code>, plus <code>svc_stat_alloc_counts()</code> / <code>svc_stat_free_counts()</code> helpers to manage per-version percpu count arrays tied to the <code>nfsd_net</code> lifecycle:</p>
+<blockquote>
+<p>"Add a vs_count pointer array to struct svc_stat, along with svc_stat_alloc_counts() and svc_stat_free_counts() helpers to manage per-version percpu call count arrays. Increment the per-net counter alongside the global one in svc_generic_init_request()."</p>
+</blockquote>
+<p><strong>Patch 2/4 — <code>sunrpc: use per-net counts in svc_seq_show()</code></strong>
+A small but consequential change that switches <code>svc_seq_show()</code> to read from the per-netns arrays instead of the global ones. Layton flags this as an intentional semantic shift:</p>
+<blockquote>
+<p>"This makes /proc/net/rpc/nfsd report per-network-namespace procedure call counts."</p>
+</blockquote>
+<p>In the cover letter he is candid about the impact:</p>
+<blockquote>
+<p>"Note that this is a behavior change, but I think it's a desirable one."</p>
+</blockquote>
+<p>He notes the only caller is nfsd, which always allocates <code>vs_count</code> via <code>svc_stat_alloc_counts()</code> in <code>nfsd_net_init()</code>, so the per-netns arrays are guaranteed to be present.</p>
+<p><strong>Patch 3/4 — <code>nfsd: implement server-stats-get netlink handler</code></strong>
+The core of the new feature. It implements <code>nfsd_nl_server_stats_get_dumpit()</code>, a <strong>dump operation</strong> that streams statistics across multiple netlink messages:</p>
+<blockquote>
+<p>"First message: all scalar stats (reply cache, filehandle, IO, network, RPC) plus per-version procedure counts (proc2/3/4-ops) using per-netns vs_count arrays. Subsequent messages: NFSv4 per-operation counts (proc4ops-ops), one entry per message, using cb-&gt;args[0] to track the current operation index across dump calls."</p>
+</blockquote>
+<p>This patch also adds a netlink spec (<code>Documentation/netlink/specs/nfsd.yaml</code>) and new UAPI definitions in <code>include/uapi/linux/nfsd_netlink.h</code>.</p>
+<p><strong>Patch 4/4 — <code>sunrpc: remove unused svc_version vs_count field</code></strong>
+A cleanup that removes the now-dead global per-version <code>vs_count</code> percpu counters from nfsd, lockd, and the NFS client callback service. Notably, this touches <strong>NFS client code</strong> (<code>fs/nfs/callback_xdr.c</code>) — the callback service's unused counter array is dropped as part of the deprecation:</p>
+<blockquote>
+<p>"Now that svc_seq_show() and the nfsd netlink stats handler both use the per-netns svc_stat vs_count arrays, the global per-version vs_count percpu counters are no longer read by anything."</p>
+</blockquote>
+<h2>Evolution and Context (Bridging Prior Weeks)</h2>
+<p>The v2 revision continues a multi-round effort. The March summary covered the <strong>user-space</strong> side — Layton's 17-patch nfs-utils series that gave <code>mountd</code>/<code>exportd</code>/<code>exportfs</code> netlink upcalls with procfs fallback, including robust graceful degradation ("the netlink setup silently fails and the daemon falls back to procfs-only operation"). This v2 kernel series is the <strong>server-side statistics</strong> counterpart, applying the same design pattern (netlink primary, procfs fallback) to <code>nfsstat</code>. The change-id in the cover letter (<code>20260316-exportd-netlink-...</code>) confirms this v2 descends from work started in mid-March.</p>
+<h2>Final Conclusions</h2>
+<p>As of the end of this week's window, the series has been posted but <strong>no review feedback or maintainer response</strong> had landed on this thread — it is awaiting discussion. Layton tees up the follow-on user-space work:</p>
+<blockquote>
+<p>"I'll also be sending an nfs-utils patch to convert nfsstat to use the new interfaces."</p>
+</blockquote>
+<p>The net effect, if accepted, would be a namespace-aware, extensible, binary statistics interface for NFS server monitoring — completing the migration of nfsd's user-space tooling off fragile procfs scraping. (Subsequent revisions v3–v7 of this series were posted in later weeks.)</p>
+<h2>Messages This Week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260525-exportd-netlink-v2-0-40003fed450c@kernel.org/">2026-05-25 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v2 0/4] nfsd/sunrpc: convert nfsstat server-side interfaces to use netlink</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260525-exportd-netlink-v2-1-40003fed450c@kernel.org/">2026-05-25 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v2 1/4] sunrpc: add per-netns per-procedure call counts to svc_stat</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260525-exportd-netlink-v2-2-40003fed450c@kernel.org/">2026-05-25 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v2 2/4] sunrpc: use per-net counts in svc_seq_show()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260525-exportd-netlink-v2-3-40003fed450c@kernel.org/">2026-05-25 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v2 3/4] nfsd: implement server-stats-get netlink handler</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260525-exportd-netlink-v2-4-40003fed450c@kernel.org/">2026-05-25 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v2 4/4] sunrpc: remove unused svc_version vs_count field</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260525-exportd-netlink-v2-0-40003fed450c@kernel.org/">2026-05-25 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v2 0/4] nfsd/sunrpc: convert nfsstat server-side interfaces to use netlink</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260525-exportd-netlink-v2-1-40003fed450c@kernel.org/">2026-05-25 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v2 1/4] sunrpc: add per-netns per-procedure call counts to svc_stat</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260525-exportd-netlink-v2-2-40003fed450c@kernel.org/">2026-05-25 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v2 2/4] sunrpc: use per-net counts in svc_seq_show()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260525-exportd-netlink-v2-3-40003fed450c@kernel.org/">2026-05-25 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v2 3/4] nfsd: implement server-stats-get netlink handler</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260525-exportd-netlink-v2-4-40003fed450c@kernel.org/">2026-05-25 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v2 4/4] sunrpc: remove unused svc_version vs_count field</a></li>
+</ul>
+  </main>
+</body>
+</html>

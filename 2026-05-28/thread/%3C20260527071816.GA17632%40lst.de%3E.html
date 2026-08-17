@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Revisiting alloc_pages_bulk() semantics: early-fail, folio API, and sunrpc&#39;s zeroed-array quirk</title>
+  <meta name="description" content="Classification: Core MM allocator API redesign (not a bug fix), with direct consequences for the NFS/sunrpc server-side page-cache path. The thread is an open design discussion — no patches were posted this week, but it landed squarely in…">
+  <meta property="og:title" content="Revisiting alloc_pages_bulk() semantics: early-fail, folio API, and sunrpc&#39;s zeroed-array quirk">
+  <meta property="og:description" content="Classification: Core MM allocator API redesign (not a bug fix), with direct consequences for the NFS/sunrpc server-side page-cache path. The thread is an open design discussion — no patches were posted this week, but it landed squarely in…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-28T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Revisiting alloc_pages_bulk() semantics: early-fail, folio API, and sunrpc&#39;s zeroed-array quirk">
+  <meta name="twitter:description" content="Classification: Core MM allocator API redesign (not a bug fix), with direct consequences for the NFS/sunrpc server-side page-cache path. The thread is an open design discussion — no patches were posted this week, but it landed squarely in…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-28</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Revisiting alloc_pages_bulk() semantics: early-fail, folio API, and sunrpc's zeroed-array quirk</h1>
+<h2>Summary</h2>
+<h1>Revisiting <code>alloc_pages_bulk()</code> semantics</h1>
+<p><strong>Classification:</strong> Core MM allocator API redesign (not a bug fix), with direct consequences for the NFS/sunrpc server-side page-cache path. The thread is an open design discussion — no patches were posted this week, but it landed squarely in the middle of active NFS client/server memory-management work.</p>
+<h2>The opening salvo</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260527071816.GA17632@lst.de/">Christoph Hellwig kicked off the thread</a> on Wednesday with a four-point critique of <code>alloc_pages_bulk()</code>, which he had been trying to adopt "in a few places lately" and found wanting:</p>
+<ol>
+<li><strong>Early-fail semantics</strong> — the bulk allocator does partial allocations, forcing callers into awkward fallback loops or single-page allocation. Hellwig demanded the kernel's usual "try as hard as you can" behavior, with <code>GFP_NORETRY</code>-style flags to relax it.</li>
+<li><strong>Pre-zeroed page array</strong> — only one user in the tree (<code>svc_fill_pages</code> in sunrpc) relies on the zeroed-array behavior; for everyone else it is "extra burden and ... very error prone (speaking from experience)."</li>
+<li><strong>Page instead of folio</strong> — "We're allocating folios, so we should have a folio API."</li>
+<li><strong>Order &gt; 0 support</strong> — the bulk allocator is limited to order 0, which Hellwig called a serious limitation for pagecache and bounce-buffering use cases.</li>
+</ol>
+<h2>The MM pushback: is "try hard" even useful?</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/A68C1B33-053C-4406-B78E-871ECD7293B3@nvidia.com/">Zi Yan (NVIDIA) pushed back on point 1</a>, questioning whether a "try as hard" bulk allocation would actually buy anything:</p>
+<blockquote>
+<p>"My gut feeling is that if one 'usual try' fails, the following 'usual try' might not work. So making alloc_pages_bulks() do heavy allocation might not buy you much."</p>
+</blockquote>
+<p>He also raised the latency concern for order &gt; 0 bulk allocations under memory pressure, noting that THP allocations have been observed to take "&gt;30s allocation latency when under memory pressure," and asked whether "waiting minutes for bulk &gt; order 0 allocation making sense in your use cases."</p>
+<p>Hellwig <a href="https://lore.kernel.org/linux-nfs/20260527080056.GA20040@lst.de/">fired back</a> that the current behavior is "really odd, as other page/folio allocators make that an opt-in through GFP flags," and that callers currently suffer from "lots of divering cargo culting." He clarified his order &gt; 0 needs:</p>
+<blockquote>
+<p>"The allocations I have in mind would only require try hard allocations for typical file system blocks sizes (64k at most), while eveything larger is fair game for falling back."</p>
+</blockquote>
+<p>Zi Yan <a href="https://lore.kernel.org/linux-nfs/2759BB06-005F-41EF-815F-C9F96E822DE1@nvidia.com/">responded</a> with a code-level explanation: the GFP flags <em>are</em> respected inside <code>__alloc_pages_noprof()</code>; the fast <code>rmqueue_pcplist()</code> loop is just a quick free-page grab. He suggested that "a wrapper of <code>__alloc_pages_bulk()</code> that doing allocation in a loop until all requested pages are filled might be good enough," and offered a trick — asking compaction/reclaim to aim for <em>more</em> free pages than the requested order so subsequent allocations succeed without repeated heavy passes.</p>
+<p>Hellwig <a href="https://lore.kernel.org/linux-nfs/20260527121508.GA6079@lst.de/">conceded the point partially</a> but noted that "a whole bunch of callers have the wrong assumption" about GFP flag behavior, and — in a side remark with broader MM implications — cited the LSF/MM large-folio and fragmentation sessions as grounds to raise <code>PAGE_ALLOC_COSTLY_ORDER</code> from 3 to 4 on 4k-page platforms, "as this seems to be a proble for 64k folio allocations."</p>
+<h2>Vlastimil Babka: partial success and the folio question</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/df21e8b0-a67b-4b71-8178-91221b596949@kernel.org/">Vlastimil Babka (SUSE) weighed in</a> with two important design questions:</p>
+<ul>
+<li>On early-fail semantics, he argued against discarding partial progress: "Seems wasteful to suceed N-1 and then throw all away, if the caller can use a fallback only for the last one." He asked whether a flag should distinguish all-or-nothing from partial-success callers.</li>
+<li>On the folio API, he noted that folios have drifted beyond "base or compound page" — they are now also rmappable via <code>page_rmappable_folio()</code> — and proposed keeping both <code>alloc_pages_bulk()</code> and <code>folio_alloc_bulk()</code>.</li>
+</ul>
+<p>Hellwig <a href="https://lore.kernel.org/linux-nfs/20260527121920.GB6079@lst.de/">answered</a> that "a lot of callers (but not all) need all or nothing semantics," but freeing already-allocated pages is cheap — the caller just needs a <code>release_pages</code> call. On sunrpc, he flagged that Chuck Lever had "objected to previous attempts to change it" and proposed a two-tier API: a lower-level helper that works as-is, plus a wrapper that zeroes the array.</p>
+<h2>The NFS angle: why sunrpc insists on zeroed pages</h2>
+<p>This is where the thread becomes genuinely about NFS development. <a href="https://lore.kernel.org/linux-nfs/ahbwX_AdOrtCXS6-@casper.infradead.org/">Matthew Wilcox offered a sharp observation</a>:</p>
+<blockquote>
+<p>"I think the problem is that sunrpc uses the pages as a queue instead of a stack. If it consumed pages from the end instead of the beginning, it could just refill the entire tail of the array."</p>
+</blockquote>
+<p><a href="https://lore.kernel.org/linux-nfs/276835c4-78d4-411d-8097-93cdfb000648@oracle.com/">Chuck Lever (Oracle), pulled into the discussion, explained the real constraint</a>:</p>
+<blockquote>
+<p>"What the svc/nfsd thread is trying to avoid is sleeping uninterruptibly waiting for memory resources. That stalls server shutdown, among other things. Guaranteeing forward progress is the bottom line."</p>
+</blockquote>
+<p>He argued that if sunrpc is truly the only user of the zeroed-array behavior, it would be sensible to "hoist the 'zero fill' capability into sunrpc.ko," and cited his own in-flight optimization (commit <code>d7f3efd9ff47</code>, targeting 7.1) that limits the <code>rq_respages</code> fill in <code>svc_alloc_arg()</code> to the <code>[rq_respages, rq_next_page)</code> range rather than scanning the full ~259-slot array for 1MB messages — a measurable win on the server-side RPC path.</p>
+<p>Hellwig <a href="https://lore.kernel.org/linux-nfs/20260528090054.GA8376@lst.de/">pressed further</a>, asking whether <code>svc_rqst_release_pages()</code> NULLs the entire range (in which case no NULL check is needed at all — just point the bulk allocation at that range) and probing Wilcox's queue-vs-stack idea.</p>
+<p>Lever <a href="https://lore.kernel.org/linux-nfs/93abf217-12d5-43da-88fb-81fa1e70f0e1@oracle.com/">closed the week with a detailed architectural explanation</a>. The key insight: <code>struct xdr_buf</code>'s <code>pages</code> field points directly into the <code>rq_pages</code> array, and "many places in sunrpc point to rq_pages and use it as an array" — so it cannot be treated as a simple FIFO. He described the two-phase lifecycle:</p>
+<blockquote>
+<p>"Phase A prepares the thread (svc_rqst) for the next RPC ... alloc_bulk_pages refills the NULL entries. Phase B is done while the client is waiting for the server to send an RPC reply, so it has to be low latency."</p>
+</blockquote>
+<p>He ended on a forward-looking note that opens the door to exactly the restructuring Hellwig wants:</p>
+<blockquote>
+<p>"Note that as struct xdr_buf is transitioned from 'struct page **' to a bvec array, we indeed have good low-risk opportunities to restructure this code and how it uses rq_pages."</p>
+</blockquote>
+<h2>Where things stand</h2>
+<p>The thread ended without a consensus or patch set, but the discussion converged on several practical next steps:</p>
+<ul>
+<li><strong>Early-fail / "try hard" semantics</strong> remain contested; Zi Yan's wrapper-loop proposal is the leading lightweight option, with the <code>PAGE_ALLOC_COSTLY_ORDER</code> bump (3→4) as a related MM-side fix for 64k folio allocation.</li>
+<li><strong>The zeroed-array quirk</strong> is now understood as a sunrpc-specific forward-progress guarantee tied to <code>xdr_buf</code>'s array-based page consumption, not a general allocator need. The in-tree plan is a two-tier API (raw helper + zeroing wrapper), with the longer-term hope that the <code>xdr_buf</code> → bvec conversion lets sunrpc drop the special case entirely.</li>
+<li><strong>Folio API and order &gt; 0 support</strong> have broad agreement in principle, with Babka's dual-API suggestion (<code>alloc_pages_bulk()</code> / <code>folio_alloc_bulk()</code>) as the likely shape.</li>
+</ul>
+<p>For NFS developers, the practical takeaway is that the server-side <code>rq_respages</code> allocation path — already optimized by Lever's 7.1 patch — is about to be touched again as part of a broader MM allocator cleanup, and the <code>xdr_buf</code> bvec migration is the natural vehicle for eliminating sunrpc's last holdout on legacy bulk-allocation semantics.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260527071816.GA17632@lst.de/">2026-05-27 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — revisiting alloc_pages_bulks semantics?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/A68C1B33-053C-4406-B78E-871ECD7293B3@nvidia.com/">2026-05-27 Zi Yan <a href="mailto:ziy@nvidia.com">ziy@nvidia.com</a> — Re: revisiting alloc_pages_bulks semantics?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260527080056.GA20040@lst.de/">2026-05-27 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: revisiting alloc_pages_bulks semantics?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/2759BB06-005F-41EF-815F-C9F96E822DE1@nvidia.com/">2026-05-27 Zi Yan <a href="mailto:ziy@nvidia.com">ziy@nvidia.com</a> — Re: revisiting alloc_pages_bulks semantics?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/df21e8b0-a67b-4b71-8178-91221b596949@kernel.org/">2026-05-27 "Vlastimil Babka (SUSE)" <a href="mailto:vbabka@kernel.org">vbabka@kernel.org</a> — Re: revisiting alloc_pages_bulks semantics?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260527121508.GA6079@lst.de/">2026-05-27 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: revisiting alloc_pages_bulks semantics?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260527121920.GB6079@lst.de/">2026-05-27 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: revisiting alloc_pages_bulks semantics?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ahbwX_AdOrtCXS6-@casper.infradead.org/">2026-05-27 Matthew Wilcox <a href="mailto:willy@infradead.org">willy@infradead.org</a> — Re: revisiting alloc_pages_bulks semantics?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/276835c4-78d4-411d-8097-93cdfb000648@oracle.com/">2026-05-27 Chuck Lever <a href="mailto:chuck.lever@oracle.com">chuck.lever@oracle.com</a> — Re: revisiting alloc_pages_bulks semantics?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260528090054.GA8376@lst.de/">2026-05-28 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: revisiting alloc_pages_bulks semantics?</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/93abf217-12d5-43da-88fb-81fa1e70f0e1@oracle.com/">2026-05-28 Chuck Lever <a href="mailto:chuck.lever@oracle.com">chuck.lever@oracle.com</a> — Re: revisiting alloc_pages_bulks semantics?</a></li>
+</ul>
+  </main>
+</body>
+</html>

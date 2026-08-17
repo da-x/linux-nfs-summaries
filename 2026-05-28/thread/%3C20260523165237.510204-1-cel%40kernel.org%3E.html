@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SUNRPC: Reject short RFC 4121 MIC tokens in gss_krb5_verify_mic_v2</title>
+  <meta name="description" content="A short but security-relevant thread landed this week, opened by Chuck Lever with a small bug-fix patch to the Linux NFS client&#39;s Kerberos GSS implementation and closed out the next morning with a quick review from Jeff Layton. The…">
+  <meta property="og:title" content="SUNRPC: Reject short RFC 4121 MIC tokens in gss_krb5_verify_mic_v2">
+  <meta property="og:description" content="A short but security-relevant thread landed this week, opened by Chuck Lever with a small bug-fix patch to the Linux NFS client&#39;s Kerberos GSS implementation and closed out the next morning with a quick review from Jeff Layton. The…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-28T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="SUNRPC: Reject short RFC 4121 MIC tokens in gss_krb5_verify_mic_v2">
+  <meta name="twitter:description" content="A short but security-relevant thread landed this week, opened by Chuck Lever with a small bug-fix patch to the Linux NFS client&#39;s Kerberos GSS implementation and closed out the next morning with a quick review from Jeff Layton. The…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-28</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>SUNRPC: Reject short RFC 4121 MIC tokens in gss_krb5_verify_mic_v2</h1>
+<h2>Summary</h2>
+<h1>SUNRPC: Reject short RFC 4121 MIC tokens in gss_krb5_verify_mic_v2</h1>
+<p>A short but security-relevant thread landed this week, opened by Chuck Lever with a small bug-fix patch to the Linux NFS client's Kerberos GSS implementation and closed out the next morning with a quick review from Jeff Layton. The discussion is squarely about a <strong>bug fix</strong> — specifically an out-of-bounds read in the RFC 4121 MIC verification path that could be triggered by a malicious NFS server.</p>
+<h2>The bug: missing length check in <code>gss_krb5_verify_mic_v2()</code></h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260523165237.510204-1-cel@kernel.org/">Chuck Lever's patch</a> (submitted 2026-05-23, reported by Chris Mason of Meta) describes a missing bounds check in the client-side Kerberos MIC verifier:</p>
+<blockquote>
+<p>"gss_krb5_verify_mic_v2() reads the token ID at ptr[0..1], the flags byte at ptr[2], and padding at ptr[3..7], then passes ptr + GSS_KRB5_TOK_HDR_LEN and cksum_len to gss_krb5_mic_build_sg(). None of these accesses check read_token-&gt;len first."</p>
+</blockquote>
+<p>Lever walks through all four callers that funnel wire-supplied token lengths into this function, demonstrating that none of them enforce a <em>lower</em> bound large enough to be safe:</p>
+<ul>
+<li><code>gss_unwrap_resp_integ()</code> — the client-side path most relevant to NFSv3/v4 RPCSEC_GSS integrity protection. It only enforces an upper bound (<code>offset + len &lt;= rcv_buf-&gt;len</code>) before doing <code>mic.data = kmalloc(len)</code>. Lever is explicit about the attack surface:
+<blockquote>
+<p>"A malicious NFS server can therefore supply a short checksum opaque, producing a small slab allocation that the Kerberos MIC verifier reads past."</p>
+</blockquote>
+</li>
+<li><code>gss_validate()</code> — only checks <code>len &lt;= RPC_MAX_AUTH_SIZE (400)</code> before passing the wire-supplied length into <code>gss_validate_seqno_mic()</code>.</li>
+<li><code>svcauth_gss_verify_header()</code> — server-side, but the same class of bug: it only requires <code>checksum.len &gt;= XDR_UNIT (4 bytes)</code>.</li>
+<li><code>svcauth_gss_unwrap_integ()</code> — checks only that the checksum fits in <code>gsd-&gt;gsd_scratch</code>.</li>
+</ul>
+<p>The minimum safe token size is <code>GSS_KRB5_TOK_HDR_LEN</code> (16 bytes) plus <code>ctx-&gt;krb5e-&gt;cksum_len</code> (12–24 bytes depending on enctype), so any token shorter than ~28 bytes is invalid.</p>
+<h2>The fix: a 3-line length guard</h2>
+<p>The patch adds a single early-return at the top of <code>gss_krb5_verify_mic_v2()</code>, before any <code>ptr[]</code> access or scatterlist construction, returning <code>GSS_S_DEFECTIVE_TOKEN</code> when the token is too short. Lever justifies why this is safe for legitimate traffic:</p>
+<blockquote>
+<p>"Well-formed MIC tokens from gss_krb5_get_mic_v2() already have exactly GSS_KRB5_TOK_HDR_LEN + cksum_len bytes, so valid traffic is unaffected."</p>
+</blockquote>
+<p>The change touches only <code>net/sunrpc/auth_gss/gss_krb5_unseal.c</code> (3 insertions) and carries a <code>Fixes:</code> tag pointing at <code>de9c17eb4a91 ("gss_krb5: add support for new token formats in rfc4121")</code>, indicating the bug has been present since RFC 4121 token-format support was originally merged.</p>
+<h2>Review and disposition</h2>
+<p>The thread closed quickly. <a href="https://lore.kernel.org/linux-nfs/bf984c177007a6171ce30aa96806500edf787f44.camel@kernel.org/">Jeff Layton replied</a> the following morning (2026-05-24) with a single line after quoting the patch:</p>
+<blockquote>
+<p>"Reviewed-by: Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a>"</p>
+</blockquote>
+<p>No objections, no design debate — the fix is minimal, localized, and clearly correct. With an upstream reporter (Chris Mason / Meta), a <code>Fixes:</code> tag, and a Reviewed-by from the NFS/GSS maintainer, this patch is in good shape for the next merge window.</p>
+<h2>Significance for NFS client development</h2>
+<p>While small, this is a meaningful hardening fix for the <strong>NFS client's RPCSEC_GSS integrity path</strong>: it closes an out-of-bounds slab read that a hostile server could trigger against any Linux NFS client using Kerberos v2 (RFC 4121) MIC tokens. The same class of bug exists on the server side (<code>svcauth_gss_*</code>), which Lever documents but does not fix in this patch — worth watching for a follow-up.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260523165237.510204-1-cel@kernel.org/">2026-05-23 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH] SUNRPC: Reject short RFC 4121 MIC tokens in gss_krb5_verify_mic_v2</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/bf984c177007a6171ce30aa96806500edf787f44.camel@kernel.org/">2026-05-24 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH] SUNRPC: Reject short RFC 4121 MIC tokens in gss_krb5_verify_mic_v2</a></li>
+</ul>
+  </main>
+</body>
+</html>

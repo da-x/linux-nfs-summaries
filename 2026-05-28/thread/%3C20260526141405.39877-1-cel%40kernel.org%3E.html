@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>xprtrdma v3: Decouple request recycling from RPC completion (use-after-free fix)</title>
+  <meta name="description" content="Type: Bug fix (use-after-free / DMA race in the NFS/RDMA client), with architectural cleanup.">
+  <meta property="og:title" content="xprtrdma v3: Decouple request recycling from RPC completion (use-after-free fix)">
+  <meta property="og:description" content="Type: Bug fix (use-after-free / DMA race in the NFS/RDMA client), with architectural cleanup.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-28T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="xprtrdma v3: Decouple request recycling from RPC completion (use-after-free fix)">
+  <meta name="twitter:description" content="Type: Bug fix (use-after-free / DMA race in the NFS/RDMA client), with architectural cleanup.">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-28</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>xprtrdma v3: Decouple request recycling from RPC completion (use-after-free fix)</h1>
+<h2>Summary</h2>
+<h2>xprtrdma v3: Decoupling request recycling from RPC completion</h2>
+<p><strong>Type:</strong> Bug fix (use-after-free / DMA race in the NFS/RDMA client), with architectural cleanup.</p>
+<p>On Tuesday, 2026-05-26, Chuck Lever posted the third revision of his "xprtrdma: Decouple req recycling from RPC completion" series — a five-patch set aimed at the kernel's NFS-over-RDMA (xprtrdma) client. The thread in this window consists solely of the patchset itself (<a href="https://lore.kernel.org/linux-nfs/20260526141405.39877-1-cel@kernel.org/">cover letter</a> plus patches 1–5); no reviewer discussion landed within the week. A trivial two-patch follow-up posted on June 1 confirms the series was accepted into the tree, so this v3 is effectively the final form.</p>
+<h3>The bug being fixed</h3>
+<p>The core problem is a lifetime conflation in <code>rl_kref</code>, the reference count that gates both when a Reply may wake its RPC task <em>and</em> when an <code>rpcrdma_req</code> may return to its free pool. As Lever frames it in the cover letter:</p>
+<blockquote>
+<p>"rl_kref currently conflates two lifetimes through one refcount: it gates when a Reply can wake its RPC task, and it gates when an rpcrdma_req can return to its free pool."</p>
+</blockquote>
+<p>The danger case is a Send carrying only pre-registered buffers. Because the marshal path takes the Send-side reference only when <code>sc_unmap_count &gt; 0</code>, such a Send acquires no Send-side ref. If the Reply then arrives before the Send completes, the reply handler drops <code>rl_kref</code> from 1 to 0 and frees the request while the HCA is still DMA-reading from its send buffer:</p>
+<blockquote>
+<p>"When the Reply for such an RPC arrives before its Send completes, the Reply handler drops rl_kref from 1 to 0 and frees the req while the HCA may still be DMA-reading from its send buffer. A retransmission can put different bytes on the wire."</p>
+</blockquote>
+<p>That last clause is the real-world symptom: a freed-and-reused buffer means a retransmitted RPC could silently carry corrupted data. The fix carries a <code>Fixes:</code> tag pointing at commit <code>0ab115237025</code> ("xprtrdma: Wake RPCs directly in rpcrdma_wc_send path"), the change that introduced the direct-wake behavior.</p>
+<h3>The design</h3>
+<p>The series narrows <code>rl_kref</code> to a single job by splitting ownership into two distinct references:</p>
+<blockquote>
+<p>"The RPC layer takes one reference at slot allocation; rpcrdma_prepare_send_sges() takes a Send-side reference unconditionally after WR prep succeeds. A req returns to its free pool only after both owners release."</p>
+</blockquote>
+<p>Replies now complete the RPC directly, with no atomic activity on <code>rl_kref</code>. The central patch (<a href="https://lore.kernel.org/linux-nfs/20260526141405.39877-3-cel@kernel.org/">2/5</a>) lays out three invariants that follow from this scheme:</p>
+<blockquote>
+<p>"Any rpcrdma_req held by an rpc_rqst has rl_kref &gt;= 1."</p>
+</blockquote>
+<p>Lever is explicit about why the first invariant matters — without it, an RPC task that aborts between slot allocation and marshal (a GSS refresh failure or a signal during <code>call_connect</code>) would drive a <code>kref_put</code> against a zero refcount:</p>
+<blockquote>
+<p>"Without this invariant, an RPC task that aborts between slot allocation and marshal ... would drive xprt_release() -&gt; xprt_rdma_free_slot() -&gt; kref_put against a refcount of zero, saturating refcount_t and stranding the slot."</p>
+</blockquote>
+<p>The other two invariants cover the marshal-failure path (<code>rpcrdma_sendctx_cancel()</code> unmaps SGEs and clears <code>sc_req</code> without touching <code>rl_kref</code>, so "a burst of -EIO marshal failures cannot hold reqs off rb_send_bufs") and the re-arming of <code>rl_kref</code> in the release callback before a request returns to the pool.</p>
+<h3>Supporting patches</h3>
+<ul>
+<li>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260526141405.39877-2-cel@kernel.org/">1/5</a></strong> is a prep change that converts the Send-signaling test from an indirect <code>rl_kref</code> check to <code>sc_unmap_count</code> directly, "remov[ing] one dependency on the old rl_kref semantics before the request lifetime rules are changed."</p>
+</li>
+<li>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260526141405.39877-4-cel@kernel.org/">3/5</a></strong> adds bounded headroom to the request pool. Because recycling is now gated on Send completion, a completed RPC's request can stay pinned by the sendctx ring until the next signaled Send completion. Lever bounds the worst case at <code>max_reqs / 8</code> (since <code>re_send_batch = re_max_requests &gt;&gt; 3</code>, one in eight Sends is signaled) and allocates <code>max_reqs + DIV_ROUND_UP(max_reqs, 8)</code> objects so "the recycle delay does not stall a slot allocation that the RPC/RDMA credit window would admit." He stresses this does <em>not</em> raise the in-flight ceiling — the sendctx ring and hardware Send Queue are unchanged.</p>
+</li>
+<li>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260526141405.39877-5-cel@kernel.org/">4/5</a></strong> is an ownership-hygiene pass that clears stale receive-side pointers (<code>rr_rqst</code>, <code>rl_reply</code>, <code>rl_sendctx</code>) on release so each pointer can be reasoned about locally rather than "tracing the whole reply path."</p>
+</li>
+<li>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260526141405.39877-6-cel@kernel.org/">5/5</a></strong> documents and asserts the reply-handler invariants with <code>WARN_ON_ONCE</code> probes. Notably, Lever frames this as a defense against automated review noise:</p>
+<blockquote>
+<p>"The xprtrdma reply path has been the subject of recurring LLM-driven review claims that 'an RPC can complete while receive buffers are still DMA-mapped' or that 'the req can be freed while the HCA still owns the send buffer.' No runtime reproducer has surfaced, but the absence of a written-down invariant set lets each pass of automated review reach the same hypothetical conclusion."</p>
+</blockquote>
+<p>He states invariants I1–I5 in a comment above <code>rpcrdma_reply_handler()</code> and backs four of them with assertions; I5 (the request lifecycle) is documented but not probed, since making it assertible would require restructuring the <code>kref_init</code> placement — "That restructuring is deferred -- the invariant is unchanged either way."</p>
+</li>
+</ul>
+<h3>Evolution across revisions</h3>
+<p>This is a mature series that has been through two prior cycles. v1 was a single patch; v2 (posted 2026-05-23) split it into three and addressed kernel-test-robot build breaks on configs without <code>CONFIG_SUNRPC_BACKCHANNEL</code>, plus the teardown-ordering fixes (<code>rpcrdma_sendctxs_destroy()</code> ordered ahead of <code>rpcrdma_reqs_reset()</code>, and a second <code>xprt_rdma_bc_destroy()</code> call to reclaim backchannel prealloc requests). The v3 changes are summarized in the cover letter:</p>
+<blockquote>
+<p>"While addressing sashiko review comments, substantially reworked to simplify and better align the series with the current architecture of xprtrdma."</p>
+</blockquote>
+<p>Concretely, v3 grew from three patches to five by splitting out the pointer-cleanup patch (4/5) and adding the invariant-documentation/assertion patch (5/5).</p>
+<h3>Conclusion</h3>
+<p>As of the end of this week the v3 series sat posted with no on-list discussion. The June 1 follow-up ("Fix I3 invariant comment" and "Remove tautological I2 assertion") — both trivial cleanups to the just-merged code — indicates the series was accepted, closing out a careful, multi-cycle fix for a latent use-after-free in the NFS/RDMA client's request-recycling path.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260526141405.39877-2-cel@kernel.org/">2026-05-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 1/5] xprtrdma: Use sendctx DMA state for Send signaling</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260526141405.39877-1-cel@kernel.org/">2026-05-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 0/5] xprtrdma: Decouple req recycling from RPC completion</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260526141405.39877-3-cel@kernel.org/">2026-05-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 2/5] xprtrdma: Decouple req recycling from RPC completion</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260526141405.39877-5-cel@kernel.org/">2026-05-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 4/5] xprtrdma: Clear receive-side ownership pointers on release</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260526141405.39877-4-cel@kernel.org/">2026-05-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 3/5] xprtrdma: Add request-pool slack for delayed recycling</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260526141405.39877-6-cel@kernel.org/">2026-05-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 5/5] xprtrdma: Document and assert reply-handler invariants</a></li>
+</ul>
+  </main>
+</body>
+</html>

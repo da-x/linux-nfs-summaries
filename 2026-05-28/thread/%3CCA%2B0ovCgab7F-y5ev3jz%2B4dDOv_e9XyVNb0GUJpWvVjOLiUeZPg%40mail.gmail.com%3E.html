@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Independent rediscovery of fixed sunrpc cache_seq_start_rcu() slab-out-of-bounds bug</title>
+  <meta name="description" content="Type: Bug fix (already merged) — this week&#39;s thread is a short exchange confirming that an independently reported vulnerability has already been addressed.">
+  <meta property="og:title" content="Independent rediscovery of fixed sunrpc cache_seq_start_rcu() slab-out-of-bounds bug">
+  <meta property="og:description" content="Type: Bug fix (already merged) — this week&#39;s thread is a short exchange confirming that an independently reported vulnerability has already been addressed.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-28T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Independent rediscovery of fixed sunrpc cache_seq_start_rcu() slab-out-of-bounds bug">
+  <meta name="twitter:description" content="Type: Bug fix (already merged) — this week&#39;s thread is a short exchange confirming that an independently reported vulnerability has already been addressed.">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-28</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Independent rediscovery of fixed sunrpc cache_seq_start_rcu() slab-out-of-bounds bug</h1>
+<h2>Summary</h2>
+<h2>Independent Rediscovery of Fixed <code>cache_seq_start_rcu()</code> Slab-Out-of-Bounds Bug</h2>
+<p><strong>Type:</strong> Bug fix (already merged) — this week's thread is a short exchange confirming that an independently reported vulnerability has already been addressed.</p>
+<h3>The Report</h3>
+<p>On May 28, Farhad Alemi (UC Berkeley) posted a bug report to linux-nfs titled <a href="https://lore.kernel.org/linux-nfs/CA+0ovCgab7F-y5ev3jz+4dDOv_e9XyVNb0GUJpWvVjOLiUeZPg@mail.gmail.com/">[BUG] sunrpc: cache_seq_start_rcu() slab-out-of-bounds (unpriv-userns reachable)</a>. The report described a slab-out-of-bounds read in the sunrpc cache sequence-file code, reachable from an unprivileged user namespace. Alemi noted that he had performed a novelty check against the syzbot dashboard but did not find a matching report before submitting his own.</p>
+<h3>Chuck Lever's Response: Already Fixed</h3>
+<p>Within 45 minutes, NFS maintainer Chuck Lever replied <a href="https://lore.kernel.org/linux-nfs/3b7cc21f-34e2-4752-8dc6-14abab41e955@app.fastmail.com/">confirming the bug was already known and fixed</a>:</p>
+<blockquote>
+<p>"Your report appears to be an independent rediscovery of a bug syzbot already reported and which we've already fixed. The fix was pushed this week to Linus for merge into v7.1-rc5."</p>
+</blockquote>
+<p>Lever pointed Alemi to the original syzbot instance (ID <code>60cfa08822470bbebe44</code>) that had first triggered the KASAN report on April 21:</p>
+<blockquote>
+<p>"Your novelty check noted that you searched the syzbot dashboard but did not find a match. See syzbot instance ID 60cfa08822470bbebe44."</p>
+</blockquote>
+<h3>Technical Background (from prior weeks)</h3>
+<p>The underlying bug was introduced by commit <code>7b546bd89975</code> ("sunrpc/cache: improve RCU safety in cache_list walking."), which changed the tail of <code>__cache_seq_start()</code> to unconditionally store <code>*pos = ((long long)hash &lt;&lt; 32) + 1</code> before returning, dropping a prior <code>hash &gt;= cd-&gt;hash_size</code> guard. When the while loop exits because every remaining bucket is empty, <code>hash</code> equals <code>cd-&gt;hash_size</code>, so the stored position points one past the last valid bucket. A subsequent <code>pread(2)</code> at that file offset skips <code>traverse()</code> and hands the stale index back to <code>__cache_seq_start()</code>, which decodes <code>hash = cd-&gt;hash_size</code> and dereferences <code>cd-&gt;hash_table[cd-&gt;hash_size]</code> — one <code>hlist_head</code> past the end of the kzalloc'd table.</p>
+<p>KASAN reported an eight-byte slab-out-of-bounds read at the tail of the 2048-byte hash_table allocation for the NFSD export cache (<code>EXPORT_HASHMAX * sizeof(struct hlist_head) == 256 * 8</code>). The trigger path involves <code>unshare(CLONE_NEWNET)</code> creating a new network namespace, which initializes the NFSD export cache, followed by a <code>pread(2)</code> on the corresponding <code>/proc</code> seq_file.</p>
+<h3>The Fix</h3>
+<p>Chuck Lever posted <a href="https://lore.kernel.org/linux-nfs/20260421161126.129533-1-cel@kernel.org/">the fix on April 21</a>, adding a bounds check to reject an out-of-range input hash before touching the hash table:</p>
+<blockquote>
+<p>"Reject an input hash that is out of range before touching the hash table. cache_seq_next() already bounds-checks its own loop; the start routine needs to be symmetric."</p>
+</blockquote>
+<p>The patch (3 lines in <code>net/sunrpc/cache.c</code>) received quick reviews from <a href="https://lore.kernel.org/linux-nfs/B3C1AAE8-7593-4E86-8C95-E95C57585DE9@hammerspace.com/">Benjamin Coddington</a> ("We were hunting for this one. You'll probably get a Tested-by shortly.") and <a href="https://lore.kernel.org/linux-nfs/177682599675.1474915.15004300765582458400@noble.neil.brown.name/">NeilBrown</a> ("I prefer the approach you took as it is more robust.").</p>
+<p>A separate, independent patch from Alessandro Zanni addressing the same syzbot report was <a href="https://lore.kernel.org/linux-nfs/20260428134230.136533-1-alessandro.zanni87@gmail.com/">posted on April 28</a>, but Lever noted it was already superseded by the fix in his nfsd-testing tree.</p>
+<h3>Real-World Impact Confirmed This Week</h3>
+<p>In a related thread also active this week, Calum Mackay (Oracle) <a href="https://lore.kernel.org/linux-nfs/62a13421-2201-47be-8b3e-799b9e278e72@oracle.com/">confirmed the fix resolves production crashes</a>:</p>
+<blockquote>
+<p>"This looks good to me, Chuck. Fixes the frequent sosreport crashes in cache_check_rcu we've been seeing, even with Erkun's revert applied."</p>
+</blockquote>
+<p>The fix was pushed to Linus for merge into v7.1-rc5 during this week.</p>
+<h3>Conclusion</h3>
+<p>This thread is a brief two-message exchange: an external researcher independently rediscovered and reported a sunrpc cache slab-out-of-bounds vulnerability that was already known via syzbot, and the NFS maintainer confirmed the fix had just been merged for v7.1-rc5. No new code or discussion resulted — the bug is closed.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/CA+0ovCgab7F-y5ev3jz+4dDOv_e9XyVNb0GUJpWvVjOLiUeZPg@mail.gmail.com/">2026-05-28 Farhad Alemi <a href="mailto:farhad.alemi@berkeley.edu">farhad.alemi@berkeley.edu</a> — [BUG] sunrpc: cache_seq_start_rcu() slab-out-of-bounds (unpriv-userns reachable)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/3b7cc21f-34e2-4752-8dc6-14abab41e955@app.fastmail.com/">2026-05-28 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [BUG] sunrpc: cache_seq_start_rcu() slab-out-of-bounds (unpriv-userns reachable)</a></li>
+</ul>
+  </main>
+</body>
+</html>

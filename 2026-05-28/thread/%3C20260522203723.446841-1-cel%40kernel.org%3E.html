@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd: reset write verifier when async COPY writeback fails (v2)</title>
+  <meta name="description" content="This short thread is a bug fix in the Linux NFS server (nfsd), and it lands as a quiet but important follow-on to a data-durability bug that was being fixed in the same week. Chuck Lever posted PATCH v2 on Friday, May 22, and Jeff Layton…">
+  <meta property="og:title" content="nfsd: reset write verifier when async COPY writeback fails (v2)">
+  <meta property="og:description" content="This short thread is a bug fix in the Linux NFS server (nfsd), and it lands as a quiet but important follow-on to a data-durability bug that was being fixed in the same week. Chuck Lever posted PATCH v2 on Friday, May 22, and Jeff Layton…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-28T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd: reset write verifier when async COPY writeback fails (v2)">
+  <meta name="twitter:description" content="This short thread is a bug fix in the Linux NFS server (nfsd), and it lands as a quiet but important follow-on to a data-durability bug that was being fixed in the same week. Chuck Lever posted PATCH v2 on Friday, May 22, and Jeff Layton…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-28</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd: reset write verifier when async COPY writeback fails (v2)</h1>
+<h2>Summary</h2>
+<h2>nfsd: rotate the write verifier on async-COPY writeback failure</h2>
+<p>This short thread is a <strong>bug fix</strong> in the Linux NFS server (nfsd), and it lands as a quiet but important follow-on to a data-durability bug that was being fixed in the same week. Chuck Lever posted <a href="https://lore.kernel.org/linux-nfs/20260522203723.446841-1-cel@kernel.org/">PATCH v2</a> on Friday, May 22, and Jeff Layton returned a <code>Reviewed-by</code> within twenty minutes — the whole exchange fits inside one afternoon.</p>
+<h3>The bug in plain terms</h3>
+<p>NFSv4's async COPY (server-side offload) hands back a write verifier to the client via <code>CB_OFFLOAD</code>. If post-copy writeback fails, the server is supposed to tell the client "your data is UNSTABLE" so the client issues <code>COMMIT</code> and re-checks durability. Lever walks through the failure mode in the cover letter:</p>
+<blockquote>
+<p>"A client that receives NFS_UNSTABLE in CB_OFFLOAD follows up with COMMIT to make the copied data durable. With the verifier unchanged, COMMIT returns the same value the client just received via CB_OFFLOAD, and the client concludes the copy is durable -- silently dropping the data whose writeback in fact failed."</p>
+</blockquote>
+<p>That violates the UNSTABLE+COMMIT durability contract (RFC 7862 §15.1, RFC 8881 §18.32). Lever notes this is the same class of bug that was "just fixed in <code>nfsd_vfs_write()</code> and <code>nfsd_commit()</code>" — a reference to Layton's companion <a href="https://lore.kernel.org/linux-nfs/20260522-missing_verifier_reset_on_wb_err-v1-1-bf9f427f9b26@kernel.org/">patch</a> posted earlier that day, which closes the same verifier-rotation gap on the deferred-writeback error paths in <code>vfs.c</code>.</p>
+<h3>Why v2?</h3>
+<p>The v1 of this patch (<a href="https://lore.kernel.org/linux-nfs/20260522194441.436065-1-cel@kernel.org/">posted ~50 minutes earlier</a> at 19:44 UTC) drew a quick review question from Layton:</p>
+<blockquote>
+<p>"commit_reset_write_verifier() filters out EAGAIN and ENOSPC. Do we need the same filter here?"</p>
+</blockquote>
+<p>Lever's v2, posted about an hour later, answers that directly in the commit message:</p>
+<blockquote>
+<p>"Filter out -EAGAIN and -ESTALE, matching commit_reset_write_verifier(), since neither indicates a durable-storage failure."</p>
+</blockquote>
+<p>(He also explains why <code>commit_reset_write_verifier()</code> itself can't be reused here — the async COPY worker has no <code>svc_rqst</code> — so the fix calls <code>nfsd_reset_write_verifier()</code> directly, mirroring what <code>nfsd_file_check_write_error()</code> already does for the same purpose.)</p>
+<h3>The fix</h3>
+<p>The patch is a two-line change to <code>fs/nfsd/nfs4proc.c</code>, rotating <code>nn-&gt;writeverf</code> at the writeback-failure site in <code>_nfsd_copy_file_range()</code>. It carries:</p>
+<ul>
+<li><code>Fixes: eac0b17a77fb ("NFSD add vfs_fsync after async copy is done")</code></li>
+<li><code>Cc: stable@vger.kernel.org</code> — i.e., a candidate for backport to stable trees.</li>
+<li>An unusual <code>Assisted-by: kres:claude-opus-4-7</code> trailer, which (like the matching <code>kres:claude-opus-4-6</code> on Layton's companion patch) marks these as AI-assisted kernel submissions — a notable data point in this week's NFS activity.</li>
+</ul>
+<h3>Outcome</h3>
+<p>Layton's <a href="https://lore.kernel.org/linux-nfs/56c8729bb543832b6915ff98d186d7432609ed40.camel@kernel.org/">reply</a> at 20:56 UTC is a clean sign-off:</p>
+<blockquote>
+<p>"Reviewed-by: Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a>"</p>
+</blockquote>
+<p>No further discussion in this week's window. The thread closes with the patch ready for merge, and it pairs with Layton's <code>nfsd_vfs_write()</code>/<code>nfsd_commit()</code> verifier-rotation fix to close out a family of silent data-loss bugs in nfsd's UNSTABLE+COMMIT handling.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260522203723.446841-1-cel@kernel.org/">2026-05-22 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2] nfsd: reset write verifier when async COPY writeback fails</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/56c8729bb543832b6915ff98d186d7432609ed40.camel@kernel.org/">2026-05-22 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v2] nfsd: reset write verifier when async COPY writeback fails</a></li>
+</ul>
+  </main>
+</body>
+</html>

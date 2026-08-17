@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd: XDR length-calculation fix in flexfile LAYOUTGET encoder</title>
+  <meta name="description" content="Type: Bug fix (NFS server / NFSv4.1+ flexfiles layout) — direct impact on NFS client correctness">
+  <meta property="og:title" content="nfsd: XDR length-calculation fix in flexfile LAYOUTGET encoder">
+  <meta property="og:description" content="Type: Bug fix (NFS server / NFSv4.1+ flexfiles layout) — direct impact on NFS client correctness">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-28T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd: XDR length-calculation fix in flexfile LAYOUTGET encoder">
+  <meta name="twitter:description" content="Type: Bug fix (NFS server / NFSv4.1+ flexfiles layout) — direct impact on NFS client correctness">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-28</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd: XDR length-calculation fix in flexfile LAYOUTGET encoder</h1>
+<h2>Summary</h2>
+<h1>nfsd: Fix XDR Length Calculation in <code>nfsd4_ff_encode_layoutget</code></h1>
+<p><strong>Type:</strong> Bug fix (NFS server / NFSv4.1+ flexfiles layout) — direct impact on NFS client correctness</p>
+<h2>The Problem</h2>
+<p>On May 28, Jeff Layton posted a patch fixing a cluster of buffer-size miscalculations in <code>nfsd4_ff_encode_layoutget()</code>, the function that encodes the LAYOUTGET reply for the flexfiles layout type. As he laid out:</p>
+<blockquote>
+<p>"The XDR buffer size calculation in nfsd4_ff_encode_layoutget() has multiple errors that can result in either an out-of-bounds write or leaking uninitialized kernel memory to the client."</p>
+</blockquote>
+<p>Layton itemized three distinct defects:</p>
+<ol>
+<li><code>fh_len</code> did not account for XDR padding on the file-handle data;</li>
+<li>The uid/gid lengths used <code>8 + len</code>, but <code>xdr_encode_opaque()</code> actually writes <code>4 + xdr_align_size(len)</code> bytes;</li>
+<li><code>ds_len</code> omitted the <code>flags</code> and <code>stats_collect_hint</code> fields (8 bytes), while the header constant overestimated by 8 — "these partially cancel but leave a net mismatch."</li>
+</ol>
+<p>The failure modes were asymmetric, which is what made this one especially nasty:</p>
+<blockquote>
+<p>"The worst case occurs with short strings (e.g. uid=0, gid=0 with an odd-sized file handle), where the function writes up to 5 bytes past the reserved XDR buffer. Conversely, when string lengths happen to be 4-byte aligned, the reservation is too large and stale buffer content is sent to the client."</p>
+</blockquote>
+<p>So depending on input shape, the server either smashed memory (a real security/stability bug) or shipped garbage bytes to the client — both violating the XDR contract that NFS clients rely on for byte-exact decoding.</p>
+<p>The patch breaks every encoded field out explicitly in <code>ds_len</code>, uses <code>xdr_align_size()</code> for all variable-length opaque fields, and corrects the header constants. It touches only <code>fs/nfsd/flexfilelayoutxdr.c</code> (11 insertions, 6 deletions) and carries a <code>Fixes:</code> tag pointing at <code>9b9960a0ca47</code> ("nfsd: Add a super simple flex file server") — i.e., the bug has been present since the flexfiles layout code was first introduced. The patch also bears an <code>Assisted-by: kres:claude-opus-4-7</code> line, continuing the pattern of LLM-assisted review in this codebase.</p>
+<h2>Bridge to Prior Week</h2>
+<p>This thread is the direct follow-up that Chuck Lever requested in yesterday's flexfiles GETDEVICEINFO thread. There, while reviewing Layton's <code>ff_encode_getdeviceinfo</code> padding fix, Lever had flagged:</p>
+<blockquote>
+<p>"nfsd4_ff_encode_layoutget at fs/nfsd/flexfilelayoutxdr.c:40-41 has the same unaligned pattern for UID/GID strings: 8 + uid.len + 8 + gid.len. Do you intend to address that calculation as well?"</p>
+</blockquote>
+<p>Layton had replied, "Yep, I just saw the Sashiko review for it. I'll fix that one up in a separate patch." This thread is that promised follow-up — and notably, the final analysis went further than Lever's initial pointer, also catching the <code>fh_len</code> padding miss and the <code>ds_len</code> flags/stats_collect_hint imbalance.</p>
+<h2>Review and Resolution</h2>
+<p>Chuck Lever picked it up quickly. His reply on May 28 was terse but conclusive:</p>
+<blockquote>
+<p>"Applied to nfsd-testing, thanks!"
+commit: c8bb9d5360bfb534065aed091579199ad2843f43</p>
+</blockquote>
+<p>No substantive review objections — the fix landed in <code>nfsd-testing</code> within ~36 minutes of posting, closing out the last known instance of this class of XDR padding bug in the flexfiles encoder.</p>
+<h2>Significance for NFS Client Development</h2>
+<p>Although this is a server-side fix, the impact lands squarely on NFS clients:</p>
+<ul>
+<li><strong>Memory-safety exposure:</strong> A 5-byte OOB write in a network-facing kernel path is a genuine stability and security concern for any host running nfsd with flexfiles exports.</li>
+<li><strong>Client-visible corruption:</strong> When the reservation was oversized (the 4-byte-aligned case), stale reply-page bytes were transmitted to clients as part of the LAYOUTGET reply. A conforming client would decode those bytes as part of the deviceinfo list — potentially mis-parsing <code>flags</code>, <code>stats_collect_hint</code>, or subsequent layout segments, leading to wrong-device I/O selection or outright decode failures.</li>
+<li><strong>Closing the flexfiles XDR bug class:</strong> Together with yesterday's <code>ff_encode_getdeviceinfo</code> fix (commit d53136757d41), this patch clears out the remaining known padding/length miscalculations in <code>flexfilelayoutxdr.c</code>. Lever had earlier noted his longer-term preference would be "to convert to xdrgen instead, but that's a much bigger and less back-portable change" — so for now, hand-audited XDR arithmetic is what keeps flexfiles clients happy.</li>
+</ul>
+<h2>Key Messages</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260528-pnfs-fixes-v1-1-8a1255ae2f16@kernel.org/">Original patch by Jeff Layton</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177998122994.340259.8082786758412696206.b4-ty@b4/">Chuck Lever's application to nfsd-testing</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260528-pnfs-fixes-v1-1-8a1255ae2f16@kernel.org/">2026-05-28 Jeff Layton — [PATCH] nfsd: fix XDR length calculation in nfsd4_ff_encode_layoutget</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177998122994.340259.8082786758412696206.b4-ty@b4/">2026-05-28 Chuck Lever — Re: [PATCH] nfsd: fix XDR length calculation in nfsd4_ff_encode_layoutget</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260528-pnfs-fixes-v1-1-8a1255ae2f16@kernel.org/">2026-05-28 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH] nfsd: fix XDR length calculation in nfsd4_ff_encode_layoutget</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177998122994.340259.8082786758412696206.b4-ty@b4/">2026-05-28 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH] nfsd: fix XDR length calculation in nfsd4_ff_encode_layoutget</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd: fix silent data loss in async COPY by sampling writeback error cursor up front</title>
+  <meta name="description" content="Type: Bug fix (race condition leading to silent data loss on the NFSv4 server)">
+  <meta property="og:title" content="nfsd: fix silent data loss in async COPY by sampling writeback error cursor up front">
+  <meta property="og:description" content="Type: Bug fix (race condition leading to silent data loss on the NFSv4 server)">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-28T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd: fix silent data loss in async COPY by sampling writeback error cursor up front">
+  <meta name="twitter:description" content="Type: Bug fix (race condition leading to silent data loss on the NFSv4 server)">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-28</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd: fix silent data loss in async COPY by sampling writeback error cursor up front</h1>
+<h2>Summary</h2>
+<h2>nfsd: sample writeback error cursor before async COPY loop</h2>
+<p><strong>Type:</strong> Bug fix (race condition leading to silent data loss on the NFSv4 server)</p>
+<h3>Overview</h3>
+<p>This week's thread is short but consequential. Chuck Lever posted a one-line patch to <code>fs/nfsd/nfs4proc.c</code> that closes a race in the asynchronous <code>NFSD4_COPY_F_COMMITTED</code> path, and Jeff Layton reviewed it within four minutes of posting. The fix was reported by an automated bot (sashiko-bot) and carries a <code>Fixes:</code> tag pointing back to the commit that introduced <code>errseq_t</code>-based writeback error tracking in nfsd.</p>
+<h3>The Bug</h3>
+<p>The core issue is a classic "who observed the cursor first" race, described with unusual precision in <a href="https://lore.kernel.org/linux-nfs/20260522214558.460859-1-cel@kernel.org/">Chuck's patch message</a>:</p>
+<blockquote>
+<p><code>_nfsd_copy_file_range()</code> samples <code>dst-&gt;f_wb_err</code> into "since" after the copy loop, then uses it to detect writeback errors via <code>filemap_check_wb_err()</code> once <code>vfs_fsync_range()</code> returns. Because the nfsd_file cache reuses a single struct file across requests targeting the same inode, a concurrent COMMIT or stable WRITE on dst advances <code>dst-&gt;f_wb_err</code> to the current <code>mapping-&gt;wb_err</code> via <code>file_check_and_advance_wb_err()</code> during its own <code>vfs_fsync_range()</code>.</p>
+</blockquote>
+<p>In other words, if another thread (handling a COMMIT or a synchronous WRITE) observes and advances the per-file writeback error cursor <em>between</em> the moment a real writeback failure lands in <code>mapping-&gt;wb_err</code> and the moment the COPY worker samples "since", the COPY worker captures an already-advanced cursor. The subsequent <code>errseq_check()</code> then sees <code>cur == since</code>, returns zero, and the code sets <code>NFSD4_COPY_F_COMMITTED</code> as if everything succeeded:</p>
+<blockquote>
+<p>If that advancement lands between the writeback error appearing in <code>mapping-&gt;wb_err</code> and the COPY worker sampling "since", the worker captures the already-advanced cursor, errseq_check() sees cur == since and returns zero, and NFSD4_COPY_F_COMMITTED is set even though writeback failed. CB_OFFLOAD then encodes wr_stable_how = FILE_SYNC4, the client treats the copied data as durable, and the failure becomes silent data loss.</p>
+</blockquote>
+<p>The consequence on the wire is severe: the server's <code>CB_OFFLOAD</code> callback tells the NFSv4 client that the offloaded copy completed with full durability (<code>FILE_SYNC4</code>), so the client has no way to detect the underlying writeback failure. Data written by the COPY is lost without any error surfacing to userspace.</p>
+<h3>The Fix</h3>
+<p>The patch moves the sampling of <code>since</code> from <em>after</em> the copy loop to the very start of <code>_nfsd_copy_file_range()</code>:</p>
+<blockquote>
+<p>Sample since once at the start of the function. The cursor then reflects state in effect before this COPY issues any writes, and filemap_check_wb_err() detects any error that occurs during the copy regardless of which thread first observes it. This matches the pattern used by nfsd_vfs_write() and nfsd4_clone_file_range().</p>
+</blockquote>
+<p>By capturing the cursor before any I/O is issued, the COPY worker guarantees that any writeback error occurring during its own operation will be a <em>new</em> event relative to "since", no matter how many concurrent threads also advance the shared cursor. The change is a single line (1 insertion, 1 deletion) and aligns <code>nfsd_copy_file_range()</code> with the already-correct pattern in <code>nfsd_vfs_write()</code> and <code>nfsd4_clone_file_range()</code>.</p>
+<h3>Review and Conclusion</h3>
+<p>Jeff Layton's <a href="https://lore.kernel.org/linux-nfs/b4921cfa9cb30ba9521db915cf7daaf21b7e22ac.camel@kernel.org/">reply</a> was brief and affirmative:</p>
+<blockquote>
+<p>That makes a lot more sense.</p>
+<p>Reviewed-by: Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a></p>
+</blockquote>
+<p>The patch carries the following metadata:</p>
+<ul>
+<li><strong>Reported-by:</strong> sashiko-bot (automated static-analysis / code-review bot)</li>
+<li><strong>Closes:</strong> link to the sashiko.dev patchset report</li>
+<li><strong>Fixes:</strong> <code>555dbf1a9aac</code> ("nfsd: Replace use of rwsem with errseq_t")</li>
+</ul>
+<h3>Significance for NFS Client Development</h3>
+<p>Although this is a server-side fix, its impact on the client is direct and important. The <code>CB_OFFLOAD</code> callback is the mechanism by which an NFSv4 client learns that a server-initiated offloaded copy (e.g., via <code>COPY</code> or <code>PUTFH</code>-based file range copy) has completed. A false <code>FILE_SYNC4</code> status means the client will:</p>
+<ol>
+<li>Report successful completion to userspace with no retry opportunity.</li>
+<li>Consider the destination file's data fully durable, potentially skipping its own COMMIT.</li>
+<li>Have no error path to trigger recovery or re-copy.</li>
+</ol>
+<p>This makes the fix a critical correctness patch for any deployment relying on NFSv4 offloaded copy (a feature increasingly used in cloud and storage-orchestration workloads). The race window is narrow but real: it requires concurrent I/O on the same destination inode, which is common in multi-client or multi-threaded server configurations.</p>
+<h3>Timeline</h3>
+<table><thead><tr><th>Date</th><th>Event</th></tr></thead><tbody>
+<tr><td>2026-05-22 21:45 UTC</td><td>Chuck Lever posts the patch</td></tr>
+<tr><td>2026-05-22 21:50 UTC</td><td>Jeff Layton reviews and approves</td></tr>
+</tbody></table>
+<p>The thread closed with a clean Reviewed-by in under five minutes, reflecting the clarity of both the bug description and the minimal fix.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260522214558.460859-1-cel@kernel.org/">2026-05-22 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH] nfsd: sample writeback error cursor before async COPY loop</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/b4921cfa9cb30ba9521db915cf7daaf21b7e22ac.camel@kernel.org/">2026-05-22 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH] nfsd: sample writeback error cursor before async COPY loop</a></li>
+</ul>
+  </main>
+</body>
+</html>

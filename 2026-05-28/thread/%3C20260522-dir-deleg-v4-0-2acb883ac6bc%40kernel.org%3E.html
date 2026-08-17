@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CB_NOTIFY directory delegation NFSD patches posted as v4, rebased onto merged VFS branch</title>
+  <meta name="description" content="This week marked a significant milestone in the long-running effort to add CB_NOTIFY callback support to NFSv4 directory delegations. Jeff Layton posted version 4 of the 21-patch NFSD series on May 22, a clean rebase onto Chuck Lever&#39;s…">
+  <meta property="og:title" content="CB_NOTIFY directory delegation NFSD patches posted as v4, rebased onto merged VFS branch">
+  <meta property="og:description" content="This week marked a significant milestone in the long-running effort to add CB_NOTIFY callback support to NFSv4 directory delegations. Jeff Layton posted version 4 of the 21-patch NFSD series on May 22, a clean rebase onto Chuck Lever&#39;s…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-28T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="CB_NOTIFY directory delegation NFSD patches posted as v4, rebased onto merged VFS branch">
+  <meta name="twitter:description" content="This week marked a significant milestone in the long-running effort to add CB_NOTIFY callback support to NFSv4 directory delegations. Jeff Layton posted version 4 of the 21-patch NFSD series on May 22, a clean rebase onto Chuck Lever&#39;s…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-28</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>CB_NOTIFY directory delegation NFSD patches posted as v4, rebased onto merged VFS branch</h1>
+<h2>Summary</h2>
+<h1>CB_NOTIFY Directory Delegation: NFSD Patches Land as v4 on Merged VFS Base</h1>
+<h2>Overview</h2>
+<p>This week marked a significant milestone in the long-running effort to add <code>CB_NOTIFY</code> callback support to NFSv4 directory delegations. Jeff Layton posted <a href="https://lore.kernel.org/linux-nfs/20260522-dir-deleg-v4-0-2acb883ac6bc@kernel.org/">version 4 of the 21-patch NFSD series</a> on May 22, a clean rebase onto Chuck Lever's <code>nfsd-testing</code> branch — which itself now sits atop Christian Brauner's already-merged <code>vfs-7.2.directory.delegations</code> branch. This is the server-side counterpart to the VFS patches that merged into vfs.git last week.</p>
+<p>The series is fundamentally a <strong>new protocol feature</strong>: it implements RFC8881bis's <code>CB_NOTIFY</code> callback, allowing NFSv4 clients to register interest in directory changes (creates, unlinks, renames) and receive asynchronous notifications with updated attributes — without losing their delegation lease. The cover letter explains the goal clearly:</p>
+<blockquote>
+<p>"With this support, the client can register interest in a directory and get notifications about changes within it without losing its lease."</p>
+</blockquote>
+<h2>Key Technical Content of the Series</h2>
+<p>The 21-patch series (2,184 insertions across 16 files) covers several distinct areas:</p>
+<p><strong>Protocol and XDR plumbing:</strong></p>
+<ul>
+<li>Patch 02 adds the <code>CB_NOTIFY</code> protocol definitions to the XDR grammar (<code>nfs4_1.x</code>) and regenerates the C code. Notably, this also removes duplicate <code>NFS4_VERIFIER_SIZE</code> and <code>NFS4_FHSIZE</code> constants from UAPI headers — Layton notes these are "defined by the RFC, and are not part of the kernel API."</li>
+<li>Patch 03 adds new <code>NOTIFY4_*</code> flags proposed in RFC8881bis.</li>
+</ul>
+<p><strong>Lease and fsnotify integration:</strong></p>
+<ul>
+<li>Patches 04–05 wire up directory leases with ignore masks and maintain the fsnotify mark as delegations are added/removed.</li>
+<li>Patch 08 is a notable <strong>bug fix / race condition hardening</strong>: it converts <code>fi_deleg_file</code> to RCU protection because "Concurrent accesses from workqueue callbacks -- such as CB_NOTIFY -- can dereference a NULL pointer if they race with this teardown." This prepares the callback path for safe lockless reference acquisition.</li>
+</ul>
+<p><strong>Callback encoding/decoding and event handling:</strong></p>
+<ul>
+<li>Patches 07, 09–10 add the data structures (<code>nfsd_notify_event</code>, <code>nfsd4_cb_notify</code>), fsnotify event handlers, and the logic to create CB_NOTIFY requests from directory change events.</li>
+<li>Patch 12 applies the notify mask at delegation time, with an important protocol detail: "If the client doesn't set NOTIFY4_GFLAG_EXTEND, then don't offer any notifications, as nfsd won't provide directory offset information."</li>
+</ul>
+<p><strong>Attribute marshaling in callbacks:</strong></p>
+<ul>
+<li>Patches 13–20 are largely refactoring to allow <code>fattr4</code> encoding without a <code>svc_export</code>/<code>svc_fh</code> context (unavailable in the callback path), plus tracking of which attributes the client actually requested.</li>
+<li>Patch 21 completes the feature by sending directory attribute changes alongside add/remove/rename events, with the caveat that "the server will still recall the delegation on a SETATTR, so these are only sent for changes to child dirents."</li>
+</ul>
+<h2>Discussion and Review Activity</h2>
+<p>The review activity this week was light but pointed:</p>
+<p><strong>Chuck Lever's nit on patch 20/21:</strong>
+<a href="https://lore.kernel.org/linux-nfs/be0feab5-5be2-495f-beb4-bae9cd876e30@app.fastmail.com/">Chuck Lever</a> offered a minor clarification about the split between patches 20 and 21:</p>
+<blockquote>
+<p>"Nit: The encode-time use of dl_notify_mask for NOTIFY4_CHANGE_DIR_ATTRS is wired up in 21/21. This patch adds only the tracking; the per-event encoder change lives in the subsequent patch."</p>
+</blockquote>
+<p>This is a documentation/clarity suggestion rather than a functional objection — Lever is noting that a reader might expect the encode path to be active in patch 20, when it actually isn't until the next patch.</p>
+<p><strong>Steven Rostedt's tracepoint question:</strong>
+<a href="https://lore.kernel.org/linux-nfs/20260522103131.080908fc@gandalf.local.home/">Steven Rostedt</a> (who had already provided a <code>Reviewed-by</code> on patch 11) flagged that the new tracepoint references a <code>show_fsnotify_mask()</code> helper he couldn't find in any repo:</p>
+<blockquote>
+<p>"Hmm, I don't have the show_fsnotify_mask() function in my repos and don't see it defined in the patch series (I scanned lore). Have a link to the patch or repo that creates it?"</p>
+</blockquote>
+<p><a href="https://lore.kernel.org/linux-nfs/b8fd4360b890ee8cd04064ef58bd5a0920c1b87b.camel@kernel.org/">Jeff Layton responded</a> within minutes, pointing him to the right place:</p>
+<blockquote>
+<p>"The series is in the dir-deleg branch of my kernel.org repo."</p>
+</blockquote>
+<p>This was a straightforward resolution — the helper lives in the VFS-side patches that were merged last week into <code>vfs-7.2.directory.delegations</code>, which Rostedt hadn't pulled yet.</p>
+<h2>Evolution from Prior Weeks</h2>
+<p>As <a href="https://lore.kernel.org/linux-nfs/20260515-weltschmerz-folgen-68ca0db1ef84@brauner/">documented last week</a>, the VFS-side patches (01–07 of the original 28-patch v3 series) were merged by Christian Brauner into <code>vfs-7.2.directory.delegations</code> on May 15, and Chuck Lever confirmed the NFSD merge prerequisites would be met "end of this week? Early next?" This v4 posting fulfills that expectation: the NFSD patches are now rebased onto the merged VFS base and ready for Chuck's nfsd tree.</p>
+<p>The v4 changes from v3 are minimal — just the rebase and "minor contextual fixups" — indicating the series has stabilized after the substantive fixes in v2 (cross-directory rename handling, fsnotify mask recalculation ordering, not notifying the making client) and v3 (error handling crash fix in <code>alloc_init_dir_deleg()</code>).</p>
+<h2>Significance for NFS Client Development</h2>
+<p>While this is server-side work, the <code>CB_NOTIFY</code> infrastructure is a prerequisite for a meaningful client-side improvement. Once the Linux NFS client implements the corresponding callback handler, clients will be able to:</p>
+<ul>
+<li>Maintain directory delegations across creates/unlinks/renames (currently these trigger delegation recalls)</li>
+<li>Receive push notifications with up-to-date attributes and filehandles</li>
+<li>Reduce round-trips for workloads that monitor directory contents</li>
+</ul>
+<p>Layton's caveat remains relevant: "I don't think we'll want to merge these until we have a complete client-side implementation to test against." The server code is now in good shape, but full integration will await the client counterpart.</p>
+<h2>Status</h2>
+<ul>
+<li><strong>VFS patches:</strong> Merged into <code>vfs-7.2.directory.delegations</code> (last week).</li>
+<li><strong>NFSD patches (v4):</strong> Posted May 22, rebased and ready for Chuck Lever's nfsd tree. No blocking objections raised this week.</li>
+<li><strong>Client-side implementation:</strong> Still pending; will be needed before final merge.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260522-dir-deleg-v4-0-2acb883ac6bc@kernel.org/">2026-05-22 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v4 00/21] nfsd: add support for CB_NOTIFY callbacks in directory delegations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260522-dir-deleg-v4-1-2acb883ac6bc@kernel.org/">2026-05-22 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v4 01/21] nfsd: check fl_lmops in nfsd_breaker_owns_lease()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260522-dir-deleg-v4-2-2acb883ac6bc@kernel.org/">2026-05-22 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v4 02/21] nfsd: add protocol support for CB_NOTIFY</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260522-dir-deleg-v4-3-2acb883ac6bc@kernel.org/">2026-05-22 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v4 03/21] nfs_common: add new NOTIFY4_* flags proposed in RFC8881bis</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260522-dir-deleg-v4-4-2acb883ac6bc@kernel.org/">2026-05-22 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v4 04/21] nfsd: allow nfsd to get a dir lease with an ignore mask</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260522-dir-deleg-v4-5-2acb883ac6bc@kernel.org/">2026-05-22 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v4 05/21] nfsd: update the fsnotify mark when setting or removing a dir delegation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260522-dir-deleg-v4-6-2acb883ac6bc@kernel.org/">2026-05-22 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v4 06/21] nfsd: make nfsd4_callback_ops-&gt;prepare operation bool return</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260522-dir-deleg-v4-7-2acb883ac6bc@kernel.org/">2026-05-22 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v4 07/21] nfsd: add callback encoding and decoding linkages for CB_NOTIFY</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260522-dir-deleg-v4-8-2acb883ac6bc@kernel.org/">2026-05-22 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v4 08/21] nfsd: use RCU to protect fi_deleg_file</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260522-dir-deleg-v4-9-2acb883ac6bc@kernel.org/">2026-05-22 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v4 09/21] nfsd: add data structures for handling CB_NOTIFY</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260522-dir-deleg-v4-10-2acb883ac6bc@kernel.org/">2026-05-22 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v4 10/21] nfsd: add notification handlers for dir events</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260522-dir-deleg-v4-11-2acb883ac6bc@kernel.org/">2026-05-22 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v4 11/21] nfsd: add tracepoint to dir_event handler</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260522-dir-deleg-v4-12-2acb883ac6bc@kernel.org/">2026-05-22 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v4 12/21] nfsd: apply the notify mask to the delegation when requested</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260522-dir-deleg-v4-13-2acb883ac6bc@kernel.org/">2026-05-22 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v4 13/21] nfsd: add helper to marshal a fattr4 from completed args</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260522-dir-deleg-v4-14-2acb883ac6bc@kernel.org/">2026-05-22 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v4 14/21] nfsd: allow nfsd4_encode_fattr4_change() to work with no export</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260522-dir-deleg-v4-15-2acb883ac6bc@kernel.org/">2026-05-22 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v4 15/21] nfsd: send basic file attributes in CB_NOTIFY</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260522-dir-deleg-v4-16-2acb883ac6bc@kernel.org/">2026-05-22 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v4 16/21] nfsd: allow encoding a filehandle into fattr4 without a svc_fh</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260522-dir-deleg-v4-17-2acb883ac6bc@kernel.org/">2026-05-22 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v4 17/21] nfsd: add a fi_connectable flag to struct nfs4_file</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260522-dir-deleg-v4-18-2acb883ac6bc@kernel.org/">2026-05-22 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v4 18/21] nfsd: add the filehandle to returned attributes in CB_NOTIFY</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260522-dir-deleg-v4-19-2acb883ac6bc@kernel.org/">2026-05-22 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v4 19/21] nfsd: properly track requested child attributes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260522-dir-deleg-v4-20-2acb883ac6bc@kernel.org/">2026-05-22 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v4 20/21] nfsd: track requested dir attributes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260522-dir-deleg-v4-21-2acb883ac6bc@kernel.org/">2026-05-22 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v4 21/21] nfsd: add support to CB_NOTIFY for dir attribute changes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/be0feab5-5be2-495f-beb4-bae9cd876e30@app.fastmail.com/">2026-05-22 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v4 20/21] nfsd: track requested dir attributes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260522103131.080908fc@gandalf.local.home/">2026-05-22 Steven Rostedt <a href="mailto:rostedt@goodmis.org">rostedt@goodmis.org</a> — Re: [PATCH v4 11/21] nfsd: add tracepoint to dir_event handler</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/b8fd4360b890ee8cd04064ef58bd5a0920c1b87b.camel@kernel.org/">2026-05-22 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v4 11/21] nfsd: add tracepoint to dir_event handler</a></li>
+</ul>
+  </main>
+</body>
+</html>

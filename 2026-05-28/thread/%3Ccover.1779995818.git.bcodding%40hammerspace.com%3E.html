@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ben Coddington posts client patch to preemptively return write delegation on access-dropping SETATTR</title>
+  <meta name="description" content="This week, Benjamin Coddington (Hammerspace) opened a new thread with a single-patch series aimed at the NFSv4 client. The goal is to eliminate an unnecessary CB_RECALL round trip that occurs when a client holding a write delegation issues…">
+  <meta property="og:title" content="Ben Coddington posts client patch to preemptively return write delegation on access-dropping SETATTR">
+  <meta property="og:description" content="This week, Benjamin Coddington (Hammerspace) opened a new thread with a single-patch series aimed at the NFSv4 client. The goal is to eliminate an unnecessary CB_RECALL round trip that occurs when a client holding a write delegation issues…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-28T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Ben Coddington posts client patch to preemptively return write delegation on access-dropping SETATTR">
+  <meta name="twitter:description" content="This week, Benjamin Coddington (Hammerspace) opened a new thread with a single-patch series aimed at the NFSv4 client. The goal is to eliminate an unnecessary CB_RECALL round trip that occurs when a client holding a write delegation issues…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-28</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Ben Coddington posts client patch to preemptively return write delegation on access-dropping SETATTR</h1>
+<h2>Summary</h2>
+<h1>Client patch: optimize away CB_RECALL for write delegations</h1>
+<h2>Overview</h2>
+<p>This week, Benjamin Coddington (Hammerspace) opened a new thread with a single-patch series aimed at the NFSv4 <strong>client</strong>. The goal is to eliminate an unnecessary <code>CB_RECALL</code> round trip that occurs when a client holding a write delegation issues a <code>SETATTR</code> that would strip its own write access. Rather than waiting for the server to recall the delegation, the patch has the client detect the situation locally and return the delegation first — a targeted <strong>bug fix / performance optimization</strong> in the delegation state machine.</p>
+<p>The series landed on May 28 with no in-window replies yet; follow-up discussion from Trond Myklebust and Rick Macklem began the following day (May 29), outside this week's window, so it is noted only as a forward pointer.</p>
+<h2>The Problem</h2>
+<p>Coddington frames the issue in the <a href="https://lore.kernel.org/linux-nfs/cover.1779995818.git.bcodding@hammerspace.com/">cover letter</a>:</p>
+<blockquote>
+<p>"A client holding a write delegation that performs a SETATTR that would remove the client's write access can expect the server to recall that delegation. The following patch addresses the simplest case to detect this and then preemptively return the delegation rather than have server recall it."</p>
+</blockquote>
+<p>The deeper mechanics are spelled out in the <a href="https://lore.kernel.org/linux-nfs/64a9c99c387432399b4c4d9ce6dd4836b0170c15.1779995818.git.bcodding@hammerspace.com/">patch description</a>. A client holding an <code>OPEN_DELEGATE_WRITE</code> delegation can satisfy a later <code>open(O_WRONLY)</code> from the cached delegation via <code>can_open_delegated()</code> without contacting the server. But that cached "open for write" assertion is only valid while the holder still has write access:</p>
+<blockquote>
+<p>"A SETATTR that changes mode, owner, or group can revoke that access -- after which an open served from the delegation would bypass an access check the server would now fail."</p>
+</blockquote>
+<p>So there are two failure modes the patch addresses:</p>
+<ol>
+<li><strong>Correctness risk</strong> — serving a cached open for write after access was revoked would bypass a server-side access check.</li>
+<li><strong>Latency cost</strong> — against a server that recalls on such a change, the <code>SETATTR</code> triggers an expensive <code>CB_RECALL/NFS4ERR_DELAY/DELEGRETURN/retry</code> round trip.</li>
+</ol>
+<h2>The Fix</h2>
+<p>The patch (62 insertions, 4 deletions in <code>fs/nfs/nfs4proc.c</code>) adds a pre-<code>SETATTR</code> check: before issuing the attribute change, the client evaluates whether the proposed mode/owner/group would remove write access for the delegation's owning credential, judged by the resulting POSIX mode bits. If so, it returns the delegation first — synchronously, which also flushes modified data — so the <code>SETATTR</code> then proceeds on an open or special stateid and the next open revalidates with the server:</p>
+<blockquote>
+<p>"If so, return the delegation first: the return is synchronous and flushes modified data, so the SETATTR proceeds on an open or special stateid and the next open revalidates access with the server. Permission changes that keep the holder's write access leave the delegation in place."</p>
+</blockquote>
+<h2>Deliberate Conservatism</h2>
+<p>Coddington is explicit about the limits of a client-side heuristic. The check consults only mode bits and the holder's <code>fsuid</code>/<code>fsgid</code>; it cannot evaluate NFSv4 ACLs, privileged callers may retain access the bits deny, and supplementary group membership is not checked:</p>
+<blockquote>
+<p>"the test is necessarily approximate -- but an inexact answer costs at most an unnecessary delegation return or a fall back to the server's recall, never incorrect access."</p>
+</blockquote>
+<p>This framing — that a false positive degrades gracefully to existing behavior while a false negative is impossible — is the key safety argument for the approach.</p>
+<h2>Relationship to Prior Work</h2>
+<p>The patch description carefully situates this change relative to an earlier optimization. Commit <code>c01d36457dcc</code> ("NFSv4: Don't return the delegation when not needed by NFSv4.x (x&gt;0)") had stopped returning write delegations on <code>SETATTR</code> for NFSv4.1+, since modern servers can identify the holder from the <code>SEQUENCE</code> clientid and need not recall. Coddington's patch carves out a narrow exception to that rule:</p>
+<blockquote>
+<p>"That holds for changes that do not affect the holder's access; restore a return only for the narrow case where the holder's own write access is removed."</p>
+</blockquote>
+<p>The change is also grounded in protocol permission — RFC 8881 Section 10.4.4 allows a client to voluntarily return a delegation, performing the same pre-return state updates (data flush, pending truncation, CLOSE/OPEN/LOCK) it would on a recall.</p>
+<h2>Status and Outlook</h2>
+<ul>
+<li><strong>In-window activity:</strong> Initial posting only (cover letter + patch), May 28. No in-window review comments.</li>
+<li><strong>Forward pointer:</strong> Trond Myklebust replied on May 29 (just outside this window), followed by an exchange with Rick Macklem — suggesting the patch is now under active review. That discussion will be covered in next week's summary.</li>
+</ul>
+<p>This is a focused, well-reasoned client-side improvement that trades a small amount of local state computation for the elimination of a multi-step recall round trip, while preserving correctness through a deliberately conservative access test.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/cover.1779995818.git.bcodding@hammerspace.com/">2026-05-28 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — [PATCH 0/1] Client optimize away CB_RECALL for write delegation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/64a9c99c387432399b4c4d9ce6dd4836b0170c15.1779995818.git.bcodding@hammerspace.com/">2026-05-28 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — [PATCH 1/1] nfs: return a write delegation when a SETATTR drops our write access</a></li>
+</ul>
+  </main>
+</body>
+</html>

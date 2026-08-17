@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD: two small atomic_open() edge-case fixes in dentry_create() — reviewed, applied by hand with process guidance</title>
+  <meta name="description" content="On May 26, NeilBrown posted a two-patch series addressing edge-case problems in the NFS server&#39;s use of atomic_open() within dentry_create(), as flagged by automated review (Sashiko). Both patches carry Fixes: 64a989dbd144 (&quot;VFS/knfsd:…">
+  <meta property="og:title" content="NFSD: two small atomic_open() edge-case fixes in dentry_create() — reviewed, applied by hand with process guidance">
+  <meta property="og:description" content="On May 26, NeilBrown posted a two-patch series addressing edge-case problems in the NFS server&#39;s use of atomic_open() within dentry_create(), as flagged by automated review (Sashiko). Both patches carry Fixes: 64a989dbd144 (&quot;VFS/knfsd:…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-28T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSD: two small atomic_open() edge-case fixes in dentry_create() — reviewed, applied by hand with process guidance">
+  <meta name="twitter:description" content="On May 26, NeilBrown posted a two-patch series addressing edge-case problems in the NFS server&#39;s use of atomic_open() within dentry_create(), as flagged by automated review (Sashiko). Both patches carry Fixes: 64a989dbd144 (&quot;VFS/knfsd:…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-28</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD: two small atomic_open() edge-case fixes in dentry_create() — reviewed, applied by hand with process guidance</h1>
+<h2>Summary</h2>
+<h1>NFSD: Two Small <code>atomic_open()</code> Edge-Case Fixes in <code>dentry_create()</code></h1>
+<h2>Overview</h2>
+<p>On May 26, NeilBrown posted a two-patch series addressing edge-case problems in the NFS server's use of <code>atomic_open()</code> within <code>dentry_create()</code>, as flagged by automated review (Sashiko). Both patches carry <code>Fixes: 64a989dbd144</code> ("VFS/knfsd: Teach dentry_create() to use atomic_open()"), making this a <strong>bug fix</strong> series targeting the NFS server's file-creation path. The fixes are small (12 lines and 1 line changed respectively) but close theoretical use-after-free and unopened-file-dereference windows that could be triggered under unusual export configurations.</p>
+<p>Both patches received <code>Reviewed-by</code> tags from Jeff Layton and Benjamin Coddington within hours of posting. Chuck Lever, the NFS server maintainer, applied them by hand after a brief back-and-forth about base-tree compatibility — and used the opportunity to issue process guidance to the community about basing patches on <code>nfsd-testing</code>.</p>
+<h2>The Two Patches in Detail</h2>
+<h3>Patch 1/2: Fix possible <code>fh_compose</code> of wrong dentry in <code>nfsd4_create_file()</code></h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260526053004.4014491-2-neilb@ownmail.net/">NeilBrown's first patch</a> addresses a subtle use-after-free scenario:</p>
+<blockquote>
+<p>"dentry_create() can hypothetically provide a different dentry than the one passed in. This could happen, for example, if the exported filesystem is NFS, and the server return to OPEN a filehandle which matched a directory that was already in the dcache."</p>
+</blockquote>
+<p>The danger: if <code>dentry_create()</code> returns a <em>different</em> dentry than the one pre-stored in <code>resfhp</code>, the original child dentry could be freed and later dereferenced when <code>fh_compose()</code> is called. The fix moves the <code>fh_compose()</code> call to two explicit sites — one for the already-exists path, one after <code>dentry_create()</code> succeeds — so the filehandle is always composed from the <em>final</em> dentry.</p>
+<blockquote>
+<p>"We shouldn't call fh_compose() until we are certain that we have the final dentry."</p>
+</blockquote>
+<p>This is an 8-insertion / 4-deletion change in <code>fs/nfsd/nfs4proc.c</code>.</p>
+<h3>Patch 2/2: Ensure <code>nfsd_file_to_acquire()</code> does not use a non-opened file</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260526053004.4014491-3-neilb@ownmail.net/">The second patch</a> is a one-line change in <code>fs/nfsd/filecache.c</code>. It adds an <code>FMODE_OPENED</code> check before using the file returned by <code>dentry_create()</code>:</p>
+<blockquote>
+<p>"-&gt;atomic_open is permitted to return success without actually opening the file. It indicates this by calling finish_no_open(). This mean dentry_create() can return a file which hasn't been opened."</p>
+</blockquote>
+<p>NeilBrown acknowledges the scenario is extremely unlikely:</p>
+<blockquote>
+<p>"This is extremely unlikely as -&gt;atomic_open handlers typically use finish_no_open() only for already existing files, and dentry_create() isn't called in that case, and the parent being locked should prevent races. However out of an abundance of caution it seems wise to teach nfsd to only use the file returned by dentry_create() if FMODE_OPENED is set."</p>
+</blockquote>
+<h2>Review and Discussion Evolution</h2>
+<p>The review was swift and positive:</p>
+<ol>
+<li>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/022276b7a4d1fbf19dd36424cc8f91368553278e.camel@kernel.org/">Jeff Layton</a></strong> (May 26, ~6h after posting): "For both: Reviewed-by: Jeff Layton"</p>
+</li>
+<li>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/B2DB156F-1BC2-4F43-8CB0-3795621C4A06@hammerspace.com/">Benjamin Coddington</a></strong> (May 26): "Except for the subject in 2/2 ( _do_acquire), these look correct to me. Thanks Neil." — followed by <code>Reviewed-by</code> for both patches.</p>
+</li>
+<li>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/40cb481d-105b-408d-969c-9aed9199708c@app.fastmail.com/">Chuck Lever</a></strong> (May 26) raised a practical concern: "These do not apply to nfsd-testing. Where should I apply them?"</p>
+</li>
+<li>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/177983232870.3379282.1364318067313942375@noble.neil.brown.name/">NeilBrown responded</a></strong> (May 26): "I created them against nfsd-next, but I just tried applying them to nfsd-testing with 'patch -p1'. The first works perfectly. The second works with Hunk #1 succeeded at 1181 (offset -46 lines). Is that what you mean by 'does not apply' ??"</p>
+</li>
+<li>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/0b482fc8-324c-4ea4-87e0-9e3131b08347@app.fastmail.com/">Chuck clarified</a></strong> (May 27): "The first patch applied, the second didn't. Since you didn't specify a base commit, it's always best to ask."</p>
+</li>
+<li>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/8086a201-c74e-4a9b-9179-6e0df19a04c9@app.fastmail.com/">Chuck's final message</a></strong> (May 27) escalated the point into community-wide process guidance:</p>
+</li>
+</ol>
+<blockquote>
+<p>"This comment is directed both to you and to the room: The second patch doesn't apply to nfsd-testing without conflicts. It's not just a 'Hunk succeeded' issue for me. That's a red flag."</p>
+</blockquote>
+<p>He also noted an infrastructure detail: "any tool that tries to retrieve these patches directly from lore (like 'curl') is blocked by Anubis. So the 'b4 am' then 'git apply' or 'stg import' flow is the only one that is reliable. Also 'b4 am' does DKIM checking of the email sender."</p>
+<p>And issued his forward-looking preference:</p>
+<blockquote>
+<p>"Going forward, I prefer that you base your patches on current nfsd-testing so that I can leverage the careful checking that all the scripts do. I believe that is how contribution is documented in nfsd-maintainer-entry-profile.rst."</p>
+</blockquote>
+<p>Despite the friction, Chuck confirmed he would apply both patches by hand: "I will apply these two by hand, but that really isn't scalable for me."</p>
+<h2>Significance for NFS Development</h2>
+<p>While these are <strong>server-side</strong> fixes (not client), they matter to the broader NFS ecosystem in several ways:</p>
+<ul>
+<li><strong>Correctness of the <code>atomic_open()</code> integration:</strong> Commit 64a989dbd144 was a significant VFS/knfsd refactoring that taught <code>dentry_create()</code> to use <code>atomic_open()</code>. These two patches close residual edge cases from that refactor, ensuring the server's CREATE path is robust even in exotic configurations (e.g., NFS-on-NFS exports).</li>
+<li><strong>Defense-in-depth:</strong> Both fixes are "extremely unlikely" scenarios per NeilBrown's own assessment, but they eliminate theoretical UAF and unopened-file-dereference vectors. In a network-facing service like NFSD, eliminating any path to memory corruption is valuable.</li>
+<li><strong>Process maturation:</strong> Chuck Lever's explicit guidance about basing patches on <code>nfsd-testing</code> (rather than <code>nfsd-next</code>) and using <code>b4 am</code> for reliable patch retrieval reflects the NFS server subsystem's continued effort to streamline contribution workflows — particularly relevant as the CB_NOTIFY directory delegation feature (see <a href="https://lore.kernel.org/linux-nfs/20260523-dir-deleg-fixes-v1-0-142c884f85ce@kernel.org/">this week's related thread</a>) pushes through multiple large patch series in rapid succession.</li>
+</ul>
+<h2>Status</h2>
+<ul>
+<li><strong>Both patches:</strong> Reviewed (Layton, Coddington) and applied by hand to <code>nfsd-testing</code> by Chuck Lever.</li>
+<li><strong>No resend required</strong> despite the base-tree mismatch; Chuck handled it manually.</li>
+<li><strong>Process note:</strong> Future NFSD contributors are expected to base patches on current <code>nfsd-testing</code> and specify the base commit in the cover letter.</li>
+</ul>
+<h2>Messages This Week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260526053004.4014491-1-neilb@ownmail.net/">2026-05-26 NeilBrown — [PATCH 0/2] nfsd: fix minor issues with atomic_create() use in dentry_create()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260526053004.4014491-2-neilb@ownmail.net/">2026-05-26 NeilBrown — [PATCH 1/2] nfsd: fix possible fh_compose of wrong dentry in nfsd4_create_file()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260526053004.4014491-3-neilb@ownmail.net/">2026-05-26 NeilBrown — [PATCH 2/2] nfsd: ensure nfsd_file_to_acquire() does not use a non-opened file</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/022276b7a4d1fbf19dd36424cc8f91368553278e.camel@kernel.org/">2026-05-26 Jeff Layton — Re: (Reviewed-by both)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/40cb481d-105b-408d-969c-9aed9199708c@app.fastmail.com/">2026-05-26 Chuck Lever — Re: (apply question)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/B2DB156F-1BC2-4F43-8CB0-3795621C4A06@hammerspace.com/">2026-05-26 Benjamin Coddington — Re: (Reviewed-by both)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177983232870.3379282.1364318067313942375@noble.neil.brown.name/">2026-05-26 NeilBrown — Re: (base-tree clarification)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/0b482fc8-324c-4ea4-87e0-9e3131b08347@app.fastmail.com/">2026-05-27 Chuck Lever — Re: (b4/stg workflow note)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/8086a201-c74e-4a9b-9179-6e0df19a04c9@app.fastmail.com/">2026-05-27 Chuck Lever — Re: (process guidance to the room)</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260526053004.4014491-1-neilb@ownmail.net/">2026-05-26 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 02/] nfsd: fix minor issues with atomic_create() use in dentry_create()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260526053004.4014491-2-neilb@ownmail.net/">2026-05-26 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 1/2] nfsd: fix possible fh_compose of wrong dentry in nfsd4_create_file()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260526053004.4014491-3-neilb@ownmail.net/">2026-05-26 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 2/2] nfsd: ensure nfsd_file_to_acquire() does not use a non-opened file.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/022276b7a4d1fbf19dd36424cc8f91368553278e.camel@kernel.org/">2026-05-26 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 02/] nfsd: fix minor issues with atomic_create() use in dentry_create()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/40cb481d-105b-408d-969c-9aed9199708c@app.fastmail.com/">2026-05-26 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 02/] nfsd: fix minor issues with atomic_create() use in dentry_create()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/B2DB156F-1BC2-4F43-8CB0-3795621C4A06@hammerspace.com/">2026-05-26 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — Re: [PATCH 02/] nfsd: fix minor issues with atomic_create() use in dentry_create()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/177983232870.3379282.1364318067313942375@noble.neil.brown.name/">2026-05-26 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH 02/] nfsd: fix minor issues with atomic_create() use in dentry_create()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/0b482fc8-324c-4ea4-87e0-9e3131b08347@app.fastmail.com/">2026-05-27 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 02/] nfsd: fix minor issues with atomic_create() use in dentry_create()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/8086a201-c74e-4a9b-9179-6e0df19a04c9@app.fastmail.com/">2026-05-27 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 02/] nfsd: fix minor issues with atomic_create() use in dentry_create()</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hellwig reviews netfs bvecq helpers: rename kmap helper, kill iov_iter_get_pages*()</title>
+  <meta name="description" content="This week brought the first substantive review from the block side to David Howells&#39; 21-patch netfs &quot;bvecq&quot; series, which migrates netfslib (the shared I/O layer under the NFS, AFS and CIFS clients) from its private…">
+  <meta property="og:title" content="Hellwig reviews netfs bvecq helpers: rename kmap helper, kill iov_iter_get_pages*()">
+  <meta property="og:description" content="This week brought the first substantive review from the block side to David Howells&#39; 21-patch netfs &quot;bvecq&quot; series, which migrates netfslib (the shared I/O layer under the NFS, AFS and CIFS clients) from its private…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-28T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Hellwig reviews netfs bvecq helpers: rename kmap helper, kill iov_iter_get_pages*()">
+  <meta name="twitter:description" content="This week brought the first substantive review from the block side to David Howells&#39; 21-patch netfs &quot;bvecq&quot; series, which migrates netfslib (the shared I/O layer under the NFS, AFS and CIFS clients) from its private…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-28</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Hellwig reviews netfs bvecq helpers: rename kmap helper, kill iov_iter_get_pages*()</h1>
+<h2>Summary</h2>
+<h2>netfs bvecq series: block-maintainer review of the page-kmap and iov_iter helpers</h2>
+<p>This week brought the first substantive review from the block side to David Howells' 21-patch <a href="https://lore.kernel.org/linux-nfs/20260518222959.488126-1-dhowells@redhat.com/">netfs "bvecq" series</a>, which migrates netfslib (the shared I/O layer under the NFS, AFS and CIFS clients) from its private <code>folio_queue</code>/<code>rolling_buffer</code> buffering onto segmented <code>bio_vec[]</code> chains. Two of the series' foundational helper patches — both touching generic block/VFS infrastructure that the NFS client depends on — drew pointed feedback from block maintainer Christoph Hellwig on 2026-05-25.</p>
+<h3>Context (prior week, briefly)</h3>
+<p>Last week Howells posted the v2 series and received only light stylistic nitpicks: David Laight questioned the use of bitfields in <code>struct bvecq</code>, and Stefan Metzmacher acked the CIFS/SMBDirect pieces while asking for commit-message wording fixes. The NFS-relevant stakes are that this is a <strong>protocol-agnostic infrastructure refactor</strong> (not a bug fix) whose payoff for the client is unified buffered/DIO buffering, single-<code>kernel_sendmsg()</code> RPC transmission, and faster cachefiles lookups. This week's messages target two of the building blocks that make that possible.</p>
+<h3>Patch 05/21 — <code>kmap_local_bvec()</code>: naming, style, and a design question</h3>
+<p>Howells' <a href="https://lore.kernel.org/linux-nfs/20260518222959.488126-6-dhowells@redhat.com/">patch 05/21</a> adds an inline helper to kmap a single page out of a multipage <code>bio_vec</code> by byte offset:</p>
+<blockquote>
+<p><code>+static inline void *kmap_local_bvec(struct bio_vec *bvec, size_t offset)</code>
+<code>+	offset += bvec-&gt;bv_offset;</code>
+<code>+	return kmap_local_page(bvec-&gt;bv_page + offset / PAGE_SIZE) + offset % PAGE_SIZE;</code></p>
+</blockquote>
+<p>Hellwig's <a href="https://lore.kernel.org/linux-nfs/ahPodavlA-gt44FO@infradead.org/">reply</a> raises three concerns, the first being naming:</p>
+<blockquote>
+<p>"The name is rather confusing for something that does not map the entire bvec, and is an anagram of the existing bvec_kmap_local. So please rename it to bvec_kmap_partial or something."</p>
+</blockquote>
+<p>He then flags the implementation as both too long and suboptimal:</p>
+<blockquote>
+<p>"Overly long line. Also this can use shits [sic] and byte masking to be a tad more efficient and matching the rest of the bvec code."</p>
+</blockquote>
+<p>Most importantly, he challenges the underlying design choice, asking why a bespoke page-offset kmap is needed at all when the established block idiom already exists:</p>
+<blockquote>
+<p>"Users of this would be interesting and why you're not simply using a bvec_iter at page granularity, which is what other block kmap code does."</p>
+</blockquote>
+<p>That last question is the crux: if the netfs I/O path can iterate with <code>bvec_iter</code> at page granularity (the convention used elsewhere in block), the new helper may be unnecessary API surface. Howells has not yet responded as of this week's window.</p>
+<h3>Patch 06/21 — <code>iov_iter_get_pages*()</code>: a call to delete, not wrap</h3>
+<p>The second patch, <a href="https://lore.kernel.org/linux-nfs/20260518222959.488126-7-dhowells@redhat.com/">06/21</a>, is a net 145-line deletion that makes <code>iov_iter_get_pages*()</code> simply wrap <code>iov_iter_extract_pages()</code> for the kernel iterator types (<code>ITER_BVEC</code>, <code>ITER_FOLIOQ</code>, <code>ITER_XARRAY</code>), bumping refcounts on non-slab pages and leaving <code>ITER_KVEC</code> to return <code>-EFAULT</code>. Rather than accept this consolidation, Hellwig <a href="https://lore.kernel.org/linux-nfs/ahPon44OlN0SqzU6@infradead.org/">pushes for outright removal</a>:</p>
+<blockquote>
+<p>"Just kill off iov_iter_get_pages*, please. Or at least stop using it where these types matter."</p>
+</blockquote>
+<p>This is a notable escalation from the prior week's minor nits — Hellwig is asking Howells to drop an existing VFS/block API entirely (or at least retire its use for the iterator types the netfs path relies on) instead of layering a thin wrapper over <code>iov_iter_extract_pages()</code>. Resolving this will determine how much of the series lands in the VFS tree versus requiring a follow-on cleanup.</p>
+<h3>Classification and status</h3>
+<ul>
+<li><strong>Type:</strong> Protocol-agnostic infrastructure refactor / API consolidation (not a bug fix, not an on-the-wire protocol change). The NFS client is affected indirectly through netfslib's buffering and send path.</li>
+<li><strong>Evolution this week:</strong> Review shifted from cosmetic nitpicks (Laight, Metzmacher) to substantive block-maintainer pushback on two core helpers — a rename + design question for the kmap helper, and a delete-the-API demand for <code>iov_iter_get_pages*()</code>.</li>
+<li><strong>Open items / next steps:</strong> Howells needs to (1) rename <code>kmap_local_bvec()</code> (e.g. to <code>bvec_kmap_partial</code>), shorten/rework its body with shift-and-mask arithmetic, and justify or replace it with a page-granularity <code>bvec_iter</code>; and (2) decide whether to remove <code>iov_iter_get_pages*()</code> rather than wrap it. No conclusion has been reached yet; the ball is in Howells' court.</li>
+</ul>
+<h3>Key messages</h3>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/ahPodavlA-gt44FO@infradead.org/">Christoph Hellwig — Re: [PATCH v2 05/21] Add a function to kmap one page of a multipage bio_vec</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ahPon44OlN0SqzU6@infradead.org/">Christoph Hellwig — Re: [PATCH v2 06/21] iov_iter: Make iov_iter_get_pages*() wrap iov_iter_extract_pages()</a></li>
+<li>(Referenced patches) <a href="https://lore.kernel.org/linux-nfs/20260518222959.488126-6-dhowells@redhat.com/">David Howells — PATCH v2 05/21</a>, <a href="https://lore.kernel.org/linux-nfs/20260518222959.488126-7-dhowells@redhat.com/">PATCH v2 06/21</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/ahPodavlA-gt44FO@infradead.org/">2026-05-25 Christoph Hellwig <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [PATCH v2 05/21] Add a function to kmap one page of a multipage bio_vec</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ahPon44OlN0SqzU6@infradead.org/">2026-05-25 Christoph Hellwig <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [PATCH v2 06/21] iov_iter: Make iov_iter_get_pages*() wrap iov_iter_extract_pages()</a></li>
+</ul>
+  </main>
+</body>
+</html>

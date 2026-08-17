@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>[PATCH 0/6] Harden server-side RPCSEC GSS decode and backchannel teardown</title>
+  <meta name="description" content="Classification: Bug fixes (hardening audit) — five memory-safety / stale-state defects in the NFS server-side RPCSEC GSS accept path, plus one race/use-after-free in callback-service teardown. Not a new feature or protocol change.">
+  <meta property="og:title" content="[PATCH 0/6] Harden server-side RPCSEC GSS decode and backchannel teardown">
+  <meta property="og:description" content="Classification: Bug fixes (hardening audit) — five memory-safety / stale-state defects in the NFS server-side RPCSEC GSS accept path, plus one race/use-after-free in callback-service teardown. Not a new feature or protocol change.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-28T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="[PATCH 0/6] Harden server-side RPCSEC GSS decode and backchannel teardown">
+  <meta name="twitter:description" content="Classification: Bug fixes (hardening audit) — five memory-safety / stale-state defects in the NFS server-side RPCSEC GSS accept path, plus one race/use-after-free in callback-service teardown. Not a new feature or protocol change.">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-28</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>[PATCH 0/6] Harden server-side RPCSEC GSS decode and backchannel teardown</h1>
+<h2>Summary</h2>
+<h1>[PATCH 0/6] Harden server-side RPCSEC GSS decode and backchannel teardown</h1>
+<p><strong>Classification:</strong> Bug fixes (hardening audit) — five memory-safety / stale-state defects in the NFS <em>server</em>-side RPCSEC GSS accept path, plus one race/use-after-free in callback-service teardown. Not a new feature or protocol change.</p>
+<h2>Overview</h2>
+<p>On Thursday 2026-05-28, Chuck Lever posted a six-patch series titled "[PATCH 0/6] Harden server-side RPCSEC GSS decode and backchannel teardown" <a href="https://lore.kernel.org/linux-nfs/20260528-tier2-v1-0-d026a1415e0b@oracle.com/">introducing the work</a>. The series is the product of an audit, as Lever framed it in the cover letter:</p>
+<blockquote>
+<p>"Address findings from an audit of how the server-side RPCSEC GSS accept path handles partially decoded and stale credential state. The common defect class: gss_svc_data and the rpc_gss_wire_cred it embeds (svcdata-&gt;clcred) are allocated with non-zeroing kmalloc and reused across requests, so an early decode failure leaves this request's partial writes mixed with the previous request's residue for a later consumer to trust."</p>
+</blockquote>
+<p>Four of the six patches are authored by Chris Mason (Meta), two by Lever himself. The series touches <code>fs/nfs/callback.c</code>, <code>include/linux/sunrpc/bc_xprt.h</code>, and several files under <code>net/sunrpc/auth_gss/</code> and <code>net/sunrpc/backchannel_rqst.c</code>, with a net change of 58 insertions and 11 deletions across six files.</p>
+<p>Although the defects are server-side, they matter to NFS client development because they govern how the kernel's own NFSv4.1+ callback (backchannel) machinery tears down — the very path the client uses for delegation recall and other server-initiated callbacks. The backchannel fix in particular is a genuine use-after-free that affects clients running an active callback service.</p>
+<h2>Patch-by-patch technical arguments</h2>
+<p><strong>Patch 1/6 — Reject krb5 v2 wrap tokens with oversized ec field</strong> <a href="https://lore.kernel.org/linux-nfs/20260528-tier2-v1-1-d026a1415e0b@oracle.com/">Lever</a>
+A narrow two-line fix in <code>gss_krb5_unwrap_v2()</code>. The 16-bit "extra count" (ec) field is authenticated, but a peer holding a valid GSS context can still legitimately encrypt a token whose ec exceeds the plaintext length — structurally malformed per RFC 4121. Lever notes that although <code>xdr_buf_trim()</code> now clamps to avoid unsigned underflow, "the buffer is still left in a semantically invalid state (zero length, inconsistent iov lengths) when ec is oversized." The fix rejects such tokens <em>before</em> trimming, returning a well-defined <code>GSS_S_DEFECTIVE_TOKEN</code>. A subtle point: the comparison must be against the remaining wrapped segment (<code>buf-&gt;len - offset</code>), not the whole buffer, because "comparing against buf-&gt;len alone leaves an offset-wide window in which an oversized ec passes the test and xdr_buf_trim() cuts into the bytes ahead of the blob."</p>
+<p><strong>Patch 2/6 — fix gssx_dec_option_array error path bugs</strong> <a href="https://lore.kernel.org/linux-nfs/20260528-tier2-v1-2-d026a1415e0b@oracle.com/">Mason</a>
+The most intricate patch, fixing "four coupled defects" that make the error paths unsafe: a NULL deref in the caller, a refcount leak on the decoded <code>group_info</code>, and a latent use-after-free. The key chain of reasoning:</p>
+<ul>
+<li><code>oa-&gt;count = 1</code> is set <em>before</em> allocating <code>oa-&gt;data</code>; on allocation failure the caller then does <code>res.options.data[0].value</code> — a NULL deref.</li>
+<li><code>free_creds:</code> releases the partially decoded <code>svc_cred</code> with a bare <code>kfree(creds)</code>, dropping the refcounted, kvmalloc-backed <code>cr_group_info</code> wrapper and leaking it.</li>
+<li>The natural leak fix (calling <code>free_svc_cred()</code>) would itself expose a use-after-free because the existing <code>out_free_groups:</code> path called <code>groups_free()</code> without clearing the pointer, so a later <code>put_group_info()</code> "would touch freed memory."</li>
+</ul>
+<p>Mason fixes all four together: move the count assignment below the allocation, reset <code>oa-&gt;count</code> to 0 at <code>free_oa:</code>, wire <code>free_svc_cred()</code> into the free path, and switch <code>out_free_groups:</code> to the refcount-aware <code>put_group_info()</code> while clearing the pointer. Notably, this patch carries an "Assisted-by: kres (claude-opus-4-7)" tag — a sign of AI-assisted kernel development appearing in upstream-style submission metadata.</p>
+<p><strong>Patch 3/6 — reject duplicate CREDS_VALUE options</strong> <a href="https://lore.kernel.org/linux-nfs/20260528-tier2-v1-3-d026a1415e0b@oracle.com/">Mason</a>
+A reply carrying two <code>CREDS_VALUE</code> entries overwrites <code>cr_group_info</code> on the second iteration, orphaning (leaking) the first allocation. The fix tracks whether a <code>CREDS_VALUE</code> was already decoded and returns <code>-EINVAL</code> on any subsequent match. Lever's cover letter stresses a hard ordering dependency here: "Only once that refcount-aware free path exists does rejecting a duplicate CREDS_VALUE option actually release the single installed group_info instead of leaking it. Reviewed out of order, the duplicate-rejection patch looks incomplete."</p>
+<p><strong>Patch 4/6 — Guard svcauth_gss_release() dispatch on rq_auth_stat</strong> <a href="https://lore.kernel.org/linux-nfs/20260528-tier2-v1-4-d026a1415e0b@oracle.com/">Mason</a>
+<code>svcauth_gss_release()</code> reads <code>gc_proc</code> and switches on <code>gc_svc</code> <em>before</em> consulting <code>rq_auth_stat</code>. On the <code>SVC_DENIED</code> path after a failed accept, those fields "may hold stale values from a prior request or uninitialized slab residue." The fix mirrors the existing <code>rq_auth_stat</code> gate one frame up so the dispatch is skipped entirely when authentication has not succeeded. This patch carries the oldest <code>Fixes:</code> tag in the series — <code>1da177e4c3f4 ("Linux-2.6.12-rc2")</code> — i.e., a defect present since the 2.6 era, though currently masked by a downstream early-return.</p>
+<p><strong>Patch 5/6 — Zero rpc_gss_wire_cred at svcauth_gss_decode_credbody() entry</strong> <a href="https://lore.kernel.org/linux-nfs/20260528-tier2-v1-5-d026a1415e0b@oracle.com/">Mason</a>
+The sharpest stale-state case: the trailing <code>body_len</code> tightness check leaves <code>gc_ctx.data</code> pointing into the current request's XDR pages while <code>gc_ctx.len</code> retains its prior value, so "once the request pages are released the pooled clcred carries a dangling pointer paired with a stale length." Zeroing the cred at function entry ensures every early-return path leaves a deterministic all-zero cred, which "neuters length-driven consumers such as gss_svc_searchbyctx() that would otherwise walk the dangling data pointer."</p>
+<p><strong>Patch 6/6 — close backchannel before destroying callback service</strong> <a href="https://lore.kernel.org/linux-nfs/20260528-tier2-v1-6-d026a1415e0b@oracle.com/">Mason</a>
+The standalone race/UAF fix, which Lever's cover letter describes as "a genuine race and use-after-free in callback-service teardown." The mechanism: a backchannel receive can complete a request while the NFS callback service is being torn down. If teardown has already cleared <code>xprt-&gt;bc_serv</code>, the committed request (and its <code>xprt_get()</code>) is leaked; if the producer wins the race, it can enqueue onto <code>sv_cb_list</code> after <code>nfs_callback_down()</code> stopped the threads, "leaving the request linked to a svc_serv that is about to be freed." The fix adds <code>xprt_svc_shutdown_bc()</code> to clear <code>xprt-&gt;bc_serv</code> under <code>bc_pa_lock</code> <em>before</em> stopping the service threads, releases losing requests through the normal backchannel free path, and drains any remaining <code>sv_cb_list</code> requests before <code>svc_destroy()</code>. This is the patch most directly relevant to NFS client robustness.</p>
+<h2>Discussion and outcome</h2>
+<p>The thread was short-lived but decisive. Within roughly two and a half hours of the posting, Jeff Layton replied <a href="https://lore.kernel.org/linux-nfs/984d1a00b9e5dc222f9bc6f3c162808ad89a5a8a.camel@kernel.org/">with a review</a> to the cover letter and granted:</p>
+<blockquote>
+<p>"Reviewed-by: Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a>"</p>
+</blockquote>
+<p>No objections, no requests for changes, and no further back-and-forth appeared in the thread this week. The series is therefore in a clean, reviewed state as of the close of the window (2026-05-28), with a single <code>Reviewed-by</code> from an established NFS maintainer — a strong signal it is on track for merge.</p>
+<h2>Takeaways</h2>
+<ul>
+<li>This is a <strong>hardening / bug-fix</strong> series, not a feature or protocol change: five memory-safety fixes (NULL deref, refcount leaks ×2, use-after-free ×2, stale-state/dangling pointer) plus one teardown race/UAF.</li>
+<li>The recurring theme — non-zeroing <code>kmalloc</code> buffers reused across requests — is a classic source of subtle NFS server-side credential bugs, and the series systematically closes it by zeroing state at entry and making every error path refcount-aware.</li>
+<li>Patches 2/6 and 3/6 have an explicit ordering dependency that reviewers must respect.</li>
+<li>The backchannel teardown fix (6/6) is the most consequential for NFS <em>client</em> behavior, since it protects the live callback service clients rely on for delegation recall.</li>
+<li>Two patches carry <code>Assisted-by</code> tags referencing an AI model, a noteworthy data point in how kernel hardening work is being produced today.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260528-tier2-v1-0-d026a1415e0b@oracle.com/">2026-05-28 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 0/6] Harden server-side RPCSEC GSS decode and backchannel teardown</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260528-tier2-v1-1-d026a1415e0b@oracle.com/">2026-05-28 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 1/6] SUNRPC: Reject krb5 v2 wrap tokens with oversized ec field</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260528-tier2-v1-2-d026a1415e0b@oracle.com/">2026-05-28 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 2/6] SUNRPC: fix gssx_dec_option_array error path bugs</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260528-tier2-v1-3-d026a1415e0b@oracle.com/">2026-05-28 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 3/6] SUNRPC: reject duplicate CREDS_VALUE options</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260528-tier2-v1-4-d026a1415e0b@oracle.com/">2026-05-28 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 4/6] SUNRPC: Guard svcauth_gss_release() dispatch on rq_auth_stat</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260528-tier2-v1-5-d026a1415e0b@oracle.com/">2026-05-28 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 5/6] SUNRPC: Zero rpc_gss_wire_cred at svcauth_gss_decode_credbody() entry</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260528-tier2-v1-6-d026a1415e0b@oracle.com/">2026-05-28 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 6/6] SUNRPC: close backchannel before destroying callback service</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/984d1a00b9e5dc222f9bc6f3c162808ad89a5a8a.camel@kernel.org/">2026-05-28 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 0/6] Harden server-side RPCSEC GSS decode and backchannel teardown</a></li>
+</ul>
+  </main>
+</body>
+</html>

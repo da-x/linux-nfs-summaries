@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>sunrpc: close length validation gaps in krb5p unwrap</title>
+  <meta name="description" content="Type: Bug fix / security hardening (not a new feature or protocol change) Status this week: Patch series posted, reviewed, and approved.">
+  <meta property="og:title" content="sunrpc: close length validation gaps in krb5p unwrap">
+  <meta property="og:description" content="Type: Bug fix / security hardening (not a new feature or protocol change) Status this week: Patch series posted, reviewed, and approved.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-28T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="sunrpc: close length validation gaps in krb5p unwrap">
+  <meta name="twitter:description" content="Type: Bug fix / security hardening (not a new feature or protocol change) Status this week: Patch series posted, reviewed, and approved.">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-28</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>sunrpc: close length validation gaps in krb5p unwrap</h1>
+<h2>Summary</h2>
+<h1>sunrpc: closing length-validation gaps in the krb5p unwrap path</h1>
+<p><strong>Type:</strong> Bug fix / security hardening (not a new feature or protocol change)
+<strong>Status this week:</strong> Patch series posted, reviewed, and approved.</p>
+<h2>The story</h2>
+<p>On Saturday 2026-05-24, Chuck Lever posted a four-patch series on the linux-nfs list titled <a href="https://lore.kernel.org/linux-nfs/20260524010213.557424-1-cel@kernel.org/">sunrpc: close length validation gaps in krb5p unwrap</a>. The patches are authored by Chris Mason (Meta) and signed off by Lever, and they target a cluster of integer-handling defects in the kernel's RPCSEC_GSS / krb5p privacy ("krb5p") unwrap path — code that runs on both NFS clients and servers when processing Kerberos-encrypted RPC traffic.</p>
+<p>The cover letter lays out the threat model with characteristic precision:</p>
+<blockquote>
+<p>"An authenticated krb5p peer -- NFS client or server -- can send a token shorter than the 16-byte RFC 4121 header and reach gss_krb5_unwrap_v2() with a length that drives pre-decrypt out-of-bounds reads, a divide-by-zero in _rotate_left(), and a post-decrypt unsigned underflow in the movelen computation that feeds a multi-gigabyte memmove."</p>
+</blockquote>
+<p>In other words, an <em>authenticated</em> peer — not an untrusted outsider — could still trigger memory-safety bugs by crafting a malformed token. Lever emphasizes the layered design of the fix:</p>
+<blockquote>
+<p>"The fixes are layered so that neither the caller boundary nor the unwrap core depends on the other for safety. The caller-side floor checks (patches 1, 2) are sufficient to close the attack, but gss_krb5_unwrap_v2() must also be self-defending because it is reachable through gss_unwrap() from any future caller that might not enforce the same floor."</p>
+</blockquote>
+<h2>The four patches</h2>
+<p><strong>Patch 1 — server-side minimum-length check.</strong> <a href="https://lore.kernel.org/linux-nfs/20260524010213.557424-2-cel@kernel.org/">SUNRPC: svcauth_gss: enforce krb5 token minimum length</a> adds a floor to <code>svcauth_gss_unwrap_priv()</code>, which previously only validated an <em>upper</em> bound on the wire-supplied opaque length. The patch explains that "a len in [0, 16] passes this check and is handed to gss_unwrap()", letting sub-header tokens reach <code>gss_krb5_unwrap_v2()</code> where header reads at <code>ptr+4</code> and <code>ptr+6</code> run past the token, and <code>_rotate_left()</code>'s <code>shift %= buf-&gt;len</code> can divide by zero. The fix is a two-line guard:</p>
+<blockquote>
+<p>"if (len &lt;= GSS_KRB5_TOK_HDR_LEN) goto unwrap_failed;"</p>
+</blockquote>
+<p>It carries a <code>Fixes:</code> tag pointing at the original 2006-era server-side krb5p privacy implementation.</p>
+<p><strong>Patch 2 — client-side hardening.</strong> <a href="https://lore.kernel.org/linux-nfs/20260524010213.557424-3-cel@kernel.org/">SUNRPC: harden gss_unwrap_resp_priv length checks</a> is the most important patch for NFS <em>client</em> development, since it protects the client from a malicious or buggy krb5p server's reply. The original check <code>offset + opaque_len &gt; rcv_buf-&gt;len</code> has two flaws: both operands are u32, so "a reply with opaque_len near 0xffffffff makes offset + opaque_len wrap to a small value that is below rcv_buf-&gt;len, so the bound check passes and gss_unwrap() is called with end &lt; begin." It also lacks any lower bound. The patch replaces the single combined test with three u32-safe guards (offset bound, length bound via safe subtraction, and an RFC 4121 minimum-length floor). Lever's cover letter flags this client-only overflow:</p>
+<blockquote>
+<p>"The client side (patch 2) has an additional u32 integer-overflow bypass that the server side does not: the original <code>offset + opaque_len &gt; rcv_buf-&gt;len</code> wraps when opaque_len is near UINT_MAX, accepting a huge token length that re-enters the same underflow chain."</p>
+</blockquote>
+<p><strong>Patch 3 — generic xdr_buf_trim clamp.</strong> <a href="https://lore.kernel.org/linux-nfs/20260524010213.557424-4-cel@kernel.org/">SUNRPC: xdr_buf_trim: clamp buf-&gt;len to avoid underflow</a> fixes a defect that is independent of krb5 itself. In <code>xdr_buf_trim()</code>, the final accounting <code>buf-&gt;len -= (len - trim)</code> can underflow when <code>buf-&gt;len</code> is smaller than the sum of the iovec lengths, wrapping to near UINT_MAX and then "propagat[ing] as the authoritative stream bound into every downstream XDR decoder." The fix clamps the decrement with <code>min_t()</code>. Lever notes this is a generic invariant violation that <code>gss_krb5_unwrap_v2()</code> merely happens to be "the only current trigger for, but that any caller could hit if buf-&gt;len and the component iov_lens get out of sync."</p>
+<p><strong>Patch 4 — self-defense in the unwrap core.</strong> <a href="https://lore.kernel.org/linux-nfs/20260524010213.557424-5-cel@kernel.org/">SUNRPC: harden gss_krb5_unwrap_v2 against short tokens</a> adds four defense-in-depth guards inside <code>gss_krb5_unwrap_v2()</code> so it is safe regardless of what its callers validate: reject sub-16-byte tokens before touching <code>ptr+4</code>/<code>ptr+6</code>; bail from <code>rotate_left()</code> when <code>buf-&gt;len &lt;= base</code>; return early from <code>_rotate_left()</code> when <code>buf-&gt;len</code> is zero (preventing the modulo fault); and replace a dead <code>BUG_ON</code> with a live check that returns <code>GSS_S_DEFECTIVE_TOKEN</code>. The patch calls out a subtle bug in the existing sanity check:</p>
+<blockquote>
+<p>"The BUG_ON re-adds the value just subtracted, so it reduces to min(A, B) &gt; A and is permanently false; it cannot catch the unsigned underflow of movelen, which then drives a ~UINT_MAX-byte memmove()."</p>
+</blockquote>
+<p>Across the four files the series is small — 17 insertions, 4 deletions — but each change closes a distinct failure mode in the same attack chain.</p>
+<h2>The discussion and conclusion</h2>
+<p>The thread was short and decisive. Jeff Layton replied about ten hours later with a review:</p>
+<blockquote>
+<p>"Looks good. The unsigned offset math in this parsing code is just so nasty. I wonder if we'd be better off using signed math here for some of this. Oh well..."</p>
+<p>Reviewed-by: Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a></p>
+</blockquote>
+<p>Layton's aside about the fragility of "unsigned offset math" captures the recurring theme of this kind of XDR/RPC parsing code — and suggests a possible future cleanup direction, though no such follow-up was posted this week.</p>
+<h2>Bottom line</h2>
+<p>This is a textbook layered-defense bug-fix series: caller-side floor checks on both the server and client entry points, a generic <code>xdr_buf_trim()</code> invariant fix, and self-contained guards in the krb5 unwrap core. It hardens NFS clients against crafted RPCSEC_GSS replies from a peer server (patch 2's u32 overflow bypass being the most client-relevant), while also covering the symmetric server-side exposure. With Layton's Reviewed-by, the series is in good shape for merge; no objections or open questions remained as of the end of the window.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260524010213.557424-1-cel@kernel.org/">2026-05-24 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 0/4] sunrpc: close length validation gaps in krb5p unwrap</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260524010213.557424-2-cel@kernel.org/">2026-05-24 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 1/4] SUNRPC: svcauth_gss: enforce krb5 token minimum length</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260524010213.557424-3-cel@kernel.org/">2026-05-24 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 2/4] SUNRPC: harden gss_unwrap_resp_priv length checks</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260524010213.557424-4-cel@kernel.org/">2026-05-24 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 3/4] SUNRPC: xdr_buf_trim: clamp buf-&gt;len to avoid underflow</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260524010213.557424-5-cel@kernel.org/">2026-05-24 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 4/4] SUNRPC: harden gss_krb5_unwrap_v2 against short tokens</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/12085a8163a420de80664a5c014aafb4295484ed.camel@kernel.org/">2026-05-24 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 0/4] sunrpc: close length validation gaps in krb5p unwrap</a></li>
+</ul>
+  </main>
+</body>
+</html>

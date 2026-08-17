@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>svcrdma: Five-patch series fixes resource lifecycle bugs in transport setup/teardown</title>
+  <meta name="description" content="On Wednesday, May 27, Oracle&#39;s Chuck Lever posted a five-patch series titled [PATCH 0/5] Fix resource lifecycle bugs in svcrdma transport setup and…">
+  <meta property="og:title" content="svcrdma: Five-patch series fixes resource lifecycle bugs in transport setup/teardown">
+  <meta property="og:description" content="On Wednesday, May 27, Oracle&#39;s Chuck Lever posted a five-patch series titled [PATCH 0/5] Fix resource lifecycle bugs in svcrdma transport setup and…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-28T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="svcrdma: Five-patch series fixes resource lifecycle bugs in transport setup/teardown">
+  <meta name="twitter:description" content="On Wednesday, May 27, Oracle&#39;s Chuck Lever posted a five-patch series titled [PATCH 0/5] Fix resource lifecycle bugs in svcrdma transport setup and…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-28</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>svcrdma: Five-patch series fixes resource lifecycle bugs in transport setup/teardown</h1>
+<h2>Summary</h2>
+<h1>svcrdma: Fixing Resource Lifecycle Bugs in Transport Setup and Teardown</h1>
+<h2>Overview</h2>
+<p>On Wednesday, May 27, Oracle's Chuck Lever posted a five-patch series titled [PATCH 0/5] Fix resource lifecycle bugs in svcrdma transport setup and teardown](https://lore.kernel.org/linux-nfs/20260527-rdma-follow-on-v1-0-1b09bd87b6cd@oracle.com/) to the linux-nfs mailing list. The series addresses a cluster of memory leaks, use-after-free hazards, and reference-counting errors lurking in the NFS server's RDMA transport (svcrdma) — specifically in its creation, acceptance, and teardown paths. This is squarely a <strong>bug-fix</strong> effort, not a new feature or protocol change, though it touches on subtle resource-management design that affects how future partially-constructed transports are handled.</p>
+<p>The series modifies two files: <code>net/sunrpc/xprtrdma/ib_client.c</code> and <code>net/sunrpc/xprtrdma/svc_rdma_transport.c</code>, with 74 insertions and 19 deletions across the five patches. Notably, the first patch is authored by Chris Mason (Meta) with Lever's sign-off, while the remaining four are Lever's own work.</p>
+<h2>Key Design Choices Spanning the Series</h2>
+<p>In the cover letter, <a href="https://lore.kernel.org/linux-nfs/20260527-rdma-follow-on-v1-0-1b09bd87b6cd@oracle.com/">Lever articulated two unifying design decisions</a>:</p>
+<blockquote>
+<p>"The first is the rn_done sentinel. rpcrdma_rn_register() assigns rn-&gt;rn_done only after xa_alloc() and kref_get() have both succeeded, making rn_done == NULL a natural 'never registered' marker."</p>
+</blockquote>
+<p>This turns <code>rpcrdma_rn_unregister()</code> into an idempotent operation — callers no longer need to track whether registration completed before calling unregister. The accept error path, the reordered free path, and any future partially-constructed transport that reaches <code>svc_rdma_free()</code> all rely on this single mechanism rather than separate boolean flags.</p>
+<blockquote>
+<p>"The second is routing error-path teardown through svc_xprt_put() instead of inline cleanup."</p>
+</blockquote>
+<p>Previously, the accept error path did manual <code>ib_destroy_qp</code> / <code>rdma_destroy_id</code> / <code>rpcrdma_rn_unregister</code> sequences and then leaked the <code>svcxprt_rdma</code>; the listener create path called <code>kfree()</code> directly, bypassing <code>svc_xprt_free()</code>'s net namespace release. Both now drop the kref_init() birth reference via <code>svc_xprt_put()</code>, which dispatches <code>svc_rdma_free()</code> where existing NULL/IS_ERR guards (plus the new rn_done sentinel) handle partially-constructed state.</p>
+<h2>Patch-by-Patch Breakdown</h2>
+<h3>Patch 1: Fix Unmatched rn_unregister on Failed Accept (Chris Mason)</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260527-rdma-follow-on-v1-1-1b09bd87b6cd@oracle.com/">This patch</a>, authored by Chris Mason from Meta, fixes the most severe bug in the series. When <code>svc_rdma_accept()</code> takes the errout path before <code>rpcrdma_rn_register()</code> has succeeded:</p>
+<blockquote>
+<p>"the existing cleanup block calls rpcrdma_rn_unregister(dev, &amp;newxprt-&gt;sc_rn) unconditionally. svcxprt_rdma is kzalloc'd, so on that path sc_rn.rn_index is 0 and sc_rn.rn_done is NULL; the unregister therefore xa_erase()s another caller's slot 0 and performs an unmatched kref_put() on the rpcrdma_device's rd_kref."</p>
+</blockquote>
+<p>This was a cross-transport corruption bug — one failed accept could destroy another transport's registration. The same errout path also leaked the <code>svcxprt_rdma</code> (and the net/ns_tracker it pinned) because the kref went 1 → 2 → 1 and never reached zero.</p>
+<p>The fix introduces the rn_done sentinel guard in <code>rpcrdma_rn_unregister()</code> and routes cleanup through <code>svc_xprt_put()</code>. The patch carries a <code>Fixes:</code> tag pointing to commit 8ac6fcae5dc0 ("svcrdma: Unregister the device if svc_rdma_accept() fails") and an "Assisted-by: kres (claude-opus-4-7)" tag, indicating AI-assisted development.</p>
+<h3>Patch 2: Reorder rpcrdma_rn_unregister before rdma_destroy_id</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260527-rdma-follow-on-v1-2-1b09bd87b6cd@oracle.com/">This patch</a> addresses a use-after-free race in <code>svc_rdma_free()</code>:</p>
+<blockquote>
+<p>"svc_rdma_free() caches rdma-&gt;sc_cm_id-&gt;device before teardown, then calls rdma_destroy_id(sc_cm_id) which frees the cm_id. rpcrdma_rn_unregister() follows, but between those two calls the transport's sc_rn entry is still installed in the device's rd_xa. A concurrent ib_unregister_device walk can dispatch svc_rdma_xprt_done() against the now-freed sc_cm_id."</p>
+</blockquote>
+<p>The fix moves <code>rpcrdma_rn_unregister()</code> before <code>rdma_destroy_id()</code> so the notification entry is removed from the xarray before the cm_id it references is destroyed. It also adds a NULL guard for <code>sc_cm_id</code> dereference, anticipating paths introduced by later patches. Fixes tag: c4de97f7c454.</p>
+<h3>Patch 3: Use svc_xprt_put to Free Listener on Create Failure</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260527-rdma-follow-on-v1-3-1b09bd87b6cd@oracle.com/">This patch</a> fixes a net namespace reference leak:</p>
+<blockquote>
+<p>"svc_rdma_create() calls kfree(cma_xprt) when svc_rdma_create_listen_id() fails. svc_xprt_init() has already acquired a net namespace reference via get_net_track(); kfree bypasses svc_xprt_free() which releases it."</p>
+</blockquote>
+<p>The fix replaces <code>kfree()</code> with <code>svc_xprt_put()</code> and adds a compensating <code>__module_get()</code> to balance the module reference that both <code>svc_xprt_free()</code> and the caller <code>_svc_xprt_create()</code> would otherwise double-put. Fixes tag: 4fb8518bdac8 ("sunrpc: Tag svc_xprt with net").</p>
+<h3>Patch 4: Reject Connection When Transport Allocation Fails</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260527-rdma-follow-on-v1-4-1b09bd87b6cd@oracle.com/">This patch</a> addresses a remotely amplifiable resource leak:</p>
+<blockquote>
+<p>"handle_connect_req() returns without action when svc_rdma_create_xprt() fails to allocate the new transport. The CM core returns 0 for CONNECT_REQUEST events, so it does not destroy the new rdma_cm_id. Each allocation failure under memory pressure leaks one rdma_cm_id, and a remote peer driving connection attempts can amplify this."</p>
+</blockquote>
+<p>The fix rejects the connection by returning a non-zero status from the CM event handler, telling the CM core to destroy the orphaned cm_id. This is notable as a security-adjacent fix — it prevents a remote peer from amplifying resource exhaustion. Fixes tag: 377f9b2f4529 ("rdma: SVCRDMA Core Transport Services"), one of the oldest commits in svcrdma's history.</p>
+<h3>Patch 5: Clear sc_cm_id When ADDR_CHANGE Replacement Fails</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260527-rdma-follow-on-v1-5-1b09bd87b6cd@oracle.com/">This patch</a> fixes a use-after-free in the address-change handling path:</p>
+<blockquote>
+<p>"When svc_rdma_listen_handler() handles RDMA_CM_EVENT_ADDR_CHANGE, it creates a replacement listener cm_id and returns 1, telling the CM core to destroy the old one. If the replacement allocation fails, sc_cm_id still points at the old cm_id that the CM core is about to destroy. Any subsequent dereference of sc_cm_id -- such as svc_rdma_detach()'s rdma_disconnect() call -- is a use-after-free."</p>
+</blockquote>
+<p>The fix NULLs <code>sc_cm_id</code> on the failure path and guards <code>svc_rdma_detach()</code>'s <code>rdma_disconnect()</code> call against NULL. Fixes tag: d1b586e75ec6 ("svcrdma: Handle ADDR_CHANGE CM event properly").</p>
+<h2>Review and Acknowledgment</h2>
+<p>Within roughly 20 minutes of posting, Red Hat's Jeff Layton <a href="https://lore.kernel.org/linux-nfs/5dbf09b251da464100ec828c5623aaf064698b96.camel@kernel.org/">replied with an acknowledgment</a>, though he was candid about his comfort level:</p>
+<blockquote>
+<p>"I don't feel confident in my own abilities to review svcrdma patches, so."</p>
+<p>"Acked-by: Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a>"</p>
+</blockquote>
+<p>This is a common pattern on the NFS list — Layton, as a long-time sunrpc maintainer, provides an Acked-by to signal that the patch is acceptable for merge even when the specific subsystem (svcrdma) falls outside his deep expertise. The quick turnaround suggests no concerns were raised about the approach.</p>
+<h2>Significance and Context</h2>
+<p>This series is significant for several reasons:</p>
+<ol>
+<li>
+<p><strong>Breadth of impact</strong>: The bugs span the entire transport lifecycle — creation, acceptance, address change, and teardown — suggesting a systemic weakness in how svcrdma handles error paths for partially-constructed state.</p>
+</li>
+<li>
+<p><strong>Security relevance</strong>: Patch 4 specifically addresses a remotely triggerable resource leak, making it relevant to NFS server hardening.</p>
+</li>
+<li>
+<p><strong>Design improvement</strong>: The rn_done sentinel and the routing of all error paths through <code>svc_xprt_put()</code> establish a cleaner invariant that will simplify future maintenance. As Lever noted in the cover letter: "callers no longer need to track whether registration completed before calling unregister."</p>
+</li>
+<li>
+<p><strong>AI-assisted development</strong>: Patch 1's "Assisted-by: kres (claude-opus-4-7)" tag marks one of the more prominent examples of AI-assisted kernel development on the NFS list, with the fix credited to Chris Mason at Meta.</p>
+</li>
+</ol>
+<p>The series appears ready for merge pending standard review cycles, with Layton's early Acked-by clearing the path.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260527-rdma-follow-on-v1-0-1b09bd87b6cd@oracle.com/">2026-05-27 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 0/5] Fix resource lifecycle bugs in svcrdma transport setup and teardown</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260527-rdma-follow-on-v1-1-1b09bd87b6cd@oracle.com/">2026-05-27 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 1/5] svcrdma: Fix unmatched rn_unregister on failed accept</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260527-rdma-follow-on-v1-2-1b09bd87b6cd@oracle.com/">2026-05-27 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 2/5] svcrdma: Reorder rpcrdma_rn_unregister before rdma_destroy_id</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260527-rdma-follow-on-v1-3-1b09bd87b6cd@oracle.com/">2026-05-27 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 3/5] svcrdma: Use svc_xprt_put to free listener on create failure</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260527-rdma-follow-on-v1-5-1b09bd87b6cd@oracle.com/">2026-05-27 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 5/5] svcrdma: Clear sc_cm_id when ADDR_CHANGE replacement fails</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260527-rdma-follow-on-v1-4-1b09bd87b6cd@oracle.com/">2026-05-27 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 4/5] svcrdma: Reject connection when transport allocation fails</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/5dbf09b251da464100ec828c5623aaf064698b96.camel@kernel.org/">2026-05-27 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 0/5] Fix resource lifecycle bugs in svcrdma transport setup and teardown</a></li>
+</ul>
+  </main>
+</body>
+</html>

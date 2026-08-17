@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>pNFS client: kernel panic from malformed GETDEVICEINFO — NULL-deref + unbounded multipath loop fix</title>
+  <meta name="description" content="Type: Bug fix (NFSv4 / pNFS client) — a remotely-triggerable kernel NULL-pointer dereference in the pNFS flexfile and legacy file layout drivers, plus a latent unbounded-decode loop. Stable backport requested for all three Fixes: targets.">
+  <meta property="og:title" content="pNFS client: kernel panic from malformed GETDEVICEINFO — NULL-deref + unbounded multipath loop fix">
+  <meta property="og:description" content="Type: Bug fix (NFSv4 / pNFS client) — a remotely-triggerable kernel NULL-pointer dereference in the pNFS flexfile and legacy file layout drivers, plus a latent unbounded-decode loop. Stable backport requested for all three Fixes: targets.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-05-28T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="pNFS client: kernel panic from malformed GETDEVICEINFO — NULL-deref + unbounded multipath loop fix">
+  <meta name="twitter:description" content="Type: Bug fix (NFSv4 / pNFS client) — a remotely-triggerable kernel NULL-pointer dereference in the pNFS flexfile and legacy file layout drivers, plus a latent unbounded-decode loop. Stable backport requested for all three Fixes: targets.">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-05-28</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>pNFS client: kernel panic from malformed GETDEVICEINFO — NULL-deref + unbounded multipath loop fix</h1>
+<h2>Summary</h2>
+<h1>pNFS client: kernel panic from a 56-byte malformed GETDEVICEINFO</h1>
+<p><strong>Type:</strong> Bug fix (NFSv4 / pNFS <strong>client</strong>) — a remotely-triggerable kernel NULL-pointer dereference in the pNFS flexfile and legacy file layout drivers, plus a latent unbounded-decode loop. Stable backport requested for all three <code>Fixes:</code> targets.</p>
+<h2>The bug: a malicious metadata server can panic any pNFS-flexfile client</h2>
+<p>Michael Bommarito opened the thread on Saturday, May 23 with <a href="https://lore.kernel.org/linux-nfs/20260523014033.2459677-1-michael.bommarito@gmail.com/">a two-patch series</a> describing a clean, deterministic client crash reachable purely over the wire:</p>
+<blockquote>
+<p>"A malicious or compromised NFSv4.1+ pNFS metadata server can panic any pNFS-flexfile client by returning a GETDEVICEINFO body with a multipath-DS count of &gt;= 3 and exactly one valid (netid, uaddr) pair."</p>
+</blockquote>
+<p>The mechanics are an XDR-decode slip in <code>nfs4_decode_mp_ds_addr()</code>. The decoder pulls the <code>r_netid</code>/<code>r_addr</code> opaques out of a netaddr4 via <code>xdr_stream_decode_string_dup()</code> and then immediately calls <code>strrchr(buf, '.')</code> to find the port separator. But when the on-wire opaque has length zero, that helper sets <code>*str = NULL</code> and returns <strong>0</strong> — and the caller only checks <code>&lt; 0</code>:</p>
+<blockquote>
+<p>"The caller in nfs4_decode_mp_ds_addr() only checks '&lt; 0' and immediately calls strrchr(NULL, '.')."</p>
+</blockquote>
+<p>Because the inner multipath loop is unbounded, a server that lies about <code>mp_count</code> keeps iterating past the one valid pair and consumes the trailing <code>version_count</code>/<code>version</code>/<code>minor</code> words of the body as bogus netid+uaddr pairs — both decoding to zero-length strings, hence the NULL deref. Bommarito nails down how cheap and reliable the trigger is:</p>
+<blockquote>
+<p>"The shortest crashing GETDEVICEINFO body is 56 bytes, the panic is 5/5 deterministic at multipath_count = 10, and it fires before any user-level read can complete on the first pNFS file the client touches."</p>
+</blockquote>
+<p>He backs this with a concrete KASAN oops (Linux 7.0-rc7 + KASAN under QEMU/KVM), showing the crash landing in <code>strrchr</code> via <code>nfs4_decode_mp_ds_addr</code> → <code>nfs4_ff_alloc_deviceid_node</code> → <code>nfs4_find_get_deviceid</code>, with a full read-path call trace down to <code>do_sendfile</code>:</p>
+<blockquote>
+<p>"Oops: general protection fault [#1] SMP KASAN NOPTI … RIP: 0010:strrchr+0x24/0x80 … Kernel panic - not syncing: Fatal exception"</p>
+</blockquote>
+<p>He also notes the crash threshold is sharp: with <code>multipath_count &lt;= 2</code> "the loop ends before consuming the malformed trailing bytes," so it does not fire.</p>
+<h2>The two-patch fix</h2>
+<p>The series splits into a direct NULL-deref close and a defense-in-depth bound, with Bommarito stressing that either one alone stops the panic but only together do they retire the whole class:</p>
+<blockquote>
+<p>"Either patch alone closes the panic; both together close the latent unbounded-decode class."</p>
+</blockquote>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260523014033.2459677-2-michael.bommarito@gmail.com/">Patch 1/2</a></strong> is a two-line change in <code>fs/nfs/pnfs_nfs.c</code>: flip the two return-value checks on <code>xdr_stream_decode_string_dup()</code> from <code>&lt; 0</code> to <code>&lt;= 0</code>, so a zero-length decode fails with <code>-EBADMSG</code> (treated as a malformed GETDEVICEINFO body) instead of dereferencing NULL. It carries <code>Fixes: 6b7f3cf96364</code> ("nfs41: pull decode_ds_addr from file layout to generic pnfs") — the commit that unified the netaddr decode and introduced the NULL-deref site.</p>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260523014033.2459677-3-michael.bommarito@gmail.com/">Patch 2/2</a></strong> is the structural fix. It promotes <code>NFS4_PNFS_MAX_MULTI_CNT</code> (== 256) from a filelayout-private header up into <code>include/linux/nfs4.h</code> so both drivers share it, caps the inner <code>mp_count</code> loop in <strong>both</strong> the flexfile and legacy file layout drivers against that constant, and bails on the first NULL return from <code>nfs4_decode_mp_ds_addr()</code>. The unbounded-loop exposure is old:</p>
+<blockquote>
+<p>"The unbound on mp_count predates the flexfile driver: the same loop exists in the legacy file layout since 35124a0994fc … and was carried into flexfile by d67ae825a59d."</p>
+</blockquote>
+<p>Hence two <code>Fixes:</code> tags (the 2011 LAYOUTGET/GETDEVICEINFO XDR cleanup and the 2014 FlexFile driver introduction). Without the bound, Bommarito warns, a hostile server can "drive the inner loop indefinitely (up to 2^32 - 1 iterations) against a fixed-size 56-byte body, with each iteration triggering an allocation / kmemdup_nul cycle."</p>
+<p>Both patches carry <code>Cc: stable@vger.kernel.org</code> and an <code>Assisted-by: Claude:claude-opus-4-7</code> trailer — part of a busy week for Bommarito on the list (see the sibling lockd UAF series this same week).</p>
+<h2>Review: Anna Schumaker's minor nits</h2>
+<p>NFS client maintainer <a href="https://lore.kernel.org/linux-nfs/727ea49a-ba0a-435a-b08c-da1d94abe931@app.fastmail.com/">Anna Schumaker replied</a> on Tuesday, May 26 to Patch 2/2 with two small editorial asks rather than any objection to the approach:</p>
+<blockquote>
+<p>"I don't think we need the comment saying that the value has moved." (re: a leftover note in <code>filelayout.h</code> about <code>NFS4_PNFS_MAX_MULTI_CNT</code> relocating)</p>
+</blockquote>
+<blockquote>
+<p>"In the original location, this had a comment saying where the 256 came from. Can you carry that over to here too, please?"</p>
+</blockquote>
+<h2>Status / outlook</h2>
+<ul>
+<li><strong>Not yet merged.</strong> The series is in review; Schumaker's two nits are cosmetic (drop a redundant comment, restore the provenance comment on the 256 constant), so a v2 is expected and unblocking should be quick.</li>
+<li><strong>Stable backport pending</strong> for all three <code>Fixes:</code> commits (<code>6b7f3cf96364</code>, <code>35124a0994fc</code>, <code>d67ae825a59d</code>) — appropriate given this is a trivially-triggered remote client panic.</li>
+<li><strong>Client-side relevance:</strong> this is squarely an NFS <strong>client</strong> bug — any pNFS-flexfile (or legacy file-layout) client mounted against a malicious or compromised metadata server can be crashed before its first read completes. The fix hardens the XDR decode path in <code>fs/nfs/pnfs_nfs.c</code> and both layout drivers, closing the NULL-deref and the unbounded-decode class in one go.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260523014033.2459677-1-michael.bommarito@gmail.com/">2026-05-23 Michael Bommarito — [PATCH 0/2] NFSv4/pNFS: fix client kernel panic from malformed GETDEVICEINFO</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260523014033.2459677-2-michael.bommarito@gmail.com/">2026-05-23 Michael Bommarito — [PATCH 1/2] NFSv4/pNFS: reject zero-length r_addr in nfs4_decode_mp_ds_addr</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260523014033.2459677-3-michael.bommarito@gmail.com/">2026-05-23 Michael Bommarito — [PATCH 2/2] NFSv4/flexfile,filelayout: bound multipath DS count in GETDEVICEINFO</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/727ea49a-ba0a-435a-b08c-da1d94abe931@app.fastmail.com/">2026-05-26 Anna Schumaker — Re: [PATCH 2/2] NFSv4/flexfile,filelayout: bound multipath DS count in GETDEVICEINFO</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260523014033.2459677-1-michael.bommarito@gmail.com/">2026-05-23 Michael Bommarito <a href="mailto:michael.bommarito@gmail.com">michael.bommarito@gmail.com</a> — [PATCH 0/2] NFSv4/pNFS: fix client kernel panic from malformed GETDEVICEINFO</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260523014033.2459677-2-michael.bommarito@gmail.com/">2026-05-23 Michael Bommarito <a href="mailto:michael.bommarito@gmail.com">michael.bommarito@gmail.com</a> — [PATCH 1/2] NFSv4/pNFS: reject zero-length r_addr in nfs4_decode_mp_ds_addr</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260523014033.2459677-3-michael.bommarito@gmail.com/">2026-05-23 Michael Bommarito <a href="mailto:michael.bommarito@gmail.com">michael.bommarito@gmail.com</a> — [PATCH 2/2] NFSv4/flexfile,filelayout: bound multipath DS count in GETDEVICEINFO</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/727ea49a-ba0a-435a-b08c-da1d94abe931@app.fastmail.com/">2026-05-26 "Anna Schumaker" <a href="mailto:anna@kernel.org">anna@kernel.org</a> — Re: [PATCH 2/2] NFSv4/flexfile,filelayout: bound multipath DS count in GETDEVICEINFO</a></li>
+</ul>
+  </main>
+</body>
+</html>
