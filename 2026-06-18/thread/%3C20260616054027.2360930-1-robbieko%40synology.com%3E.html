@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd: out-of-range timestamp validation (v3) — per-version checks applied to nfsd-testing</title>
+  <meta name="description" content="This week&#39;s activity is the resolution of a multi-week data-integrity bug fix that began on 2026-06-12 (v1), was re-posted as v2 on 2026-06-15, and closed out on Tuesday 2026-06-16 with v3 posted, reviewed, and applied to nfsd-testing in a…">
+  <meta property="og:title" content="nfsd: out-of-range timestamp validation (v3) — per-version checks applied to nfsd-testing">
+  <meta property="og:description" content="This week&#39;s activity is the resolution of a multi-week data-integrity bug fix that began on 2026-06-12 (v1), was re-posted as v2 on 2026-06-15, and closed out on Tuesday 2026-06-16 with v3 posted, reviewed, and applied to nfsd-testing in a…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-18T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd: out-of-range timestamp validation (v3) — per-version checks applied to nfsd-testing">
+  <meta name="twitter:description" content="This week&#39;s activity is the resolution of a multi-week data-integrity bug fix that began on 2026-06-12 (v1), was re-posted as v2 on 2026-06-15, and closed out on Tuesday 2026-06-16 with v3 posted, reviewed, and applied to nfsd-testing in a…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-18</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd: out-of-range timestamp validation (v3) — per-version checks applied to nfsd-testing</h1>
+<h2>Summary</h2>
+<h1>nfsd: reject out-of-range timestamps in NFSv2/NFSv3 setattr &amp; create (v3)</h1>
+<h2>The series lands — v3 splits the check per protocol version and is merged</h2>
+<p>This week's activity is the <strong>resolution</strong> of a multi-week data-integrity bug fix that began on 2026-06-12 (v1), was re-posted as v2 on 2026-06-15, and closed out on Tuesday 2026-06-16 with <strong>v3 posted, reviewed, and applied to <code>nfsd-testing</code></strong> in a single day. The work is squarely an <strong>NFS server-side bug fix</strong> (not a feature, not a protocol change), though its practical impact lands on the client side: any NFSv2 or NFSv3 client that issues SETATTR, CREATE, MKDIR, SYMLINK, or MKNOD with a malformed timestamp no longer silently corrupts on-disk metadata.</p>
+<p>The v3 series is Robbie Ko's (Synology) direct response to <a href="https://lore.kernel.org/linux-nfs/3d50191e-b225-4e8d-9795-3d0ae715115c@app.fastmail.com//">Chuck Lever's review of v2</a>, in which Lever had objected to the single choke-point check in <code>nfsd_setattr()</code> and laid out a per-version redesign. Ko restructured the series exactly along those lines, expanding it from two patches to three:</p>
+<h3>Patch 1/3 — NFSv2 decode-time guard on raw useconds</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260616054027.2360930-1-robbieko@synology.com/">The first patch</a> addresses the specific 32-bit hazard Lever had flagged: in <code>svcxdr_decode_sattr()</code>, the wire useconds is converted to nanoseconds via <code>iap-&gt;ia_atime.tv_nsec = tmp2 * NSEC_PER_USEC;</code> where <code>tmp2</code> is a <code>u32</code>. On ILP32 that product is computed in a 32-bit unsigned long, so an out-of-range value wraps:</p>
+<blockquote>
+<p>"tmp2 is a u32 and NSEC_PER_USEC is 1000, so the product is computed in unsigned long. On ILP32 that is 32 bits, and an out-of-range useconds value such as 4294968 wraps to tv_nsec == 704. The corruption therefore happens during decode, before any proc function can inspect the value, and a later range check on tv_nsec would see an in-range result and accept it."</p>
+</blockquote>
+<p>The fix guards the raw useconds <em>before</em> the multiplication, rejecting values greater than 1000000. Ko carefully preserves the Sun "set to current server time" convention:</p>
+<blockquote>
+<p>"useconds == 1000000 is kept: it is the Sun convention for 'set to the current server time', and the in-tree Linux NFSv2 client emits it in both the atime and the mtime field for a plain touch / utimes(file, NULL) ... Rejecting 1000000 would turn that common operation into a hard decode failure for both SETATTR and CREATE."</p>
+</blockquote>
+<p>Ko also fixed an asymmetry Lever's review implicitly exposed: the decoder had only applied the Sun convention in the mtime block. The patch extends it to the atime block as well, clearing <code>ATTR_ATIME_SET</code> so the server uses its current time rather than storing a bogus value.</p>
+<h3>Patch 2/3 — NFSv3 proc-handler check, placed before object creation</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260616054027.2360930-2-robbieko@synology.com/">The second patch</a> moves the NFSv3 validation out of <code>nfsd_setattr()</code> and into the per-operation proc handlers, which is precisely Lever's concern about orphaned objects on the create path:</p>
+<blockquote>
+<p>"Checking in the proc handlers, rather than in nfsd_setattr(), keeps the rejection in front of object creation. The create operations create the object before nfsd_create_setattr() runs, so a late failure would leave the new object behind and turn a non-idempotent request into a namespace change that reports failure."</p>
+</blockquote>
+<p>Ko explains the cast-width choice (matching <code>timespec64_valid()</code> rather than truncating to <code>u32</code>):</p>
+<blockquote>
+<p>"tv_nsec is a long, so the comparison casts it to unsigned long (the same width) rather than to u32, matching timespec64_valid(). A u32 cast would truncate on 64-bit; the unsigned long cast also rejects a value that became negative when an out-of-range u32 wire nseconds was assigned to a 32-bit long."</p>
+</blockquote>
+<p>The patch returns <code>NFS3ERR_INVAL</code>, which Ko justifies against RFC 1813: "the error for a value the server 'can not store ... in its own representation'; the client maps it to EINVAL." The sattrguard3 ctime is deliberately left unvalidated, since an out-of-range guard simply never matches and yields <code>NFS3ERR_NOT_SYNC</code> — "the protocol-correct outcome rather than rejecting the request."</p>
+<h3>Patch 3/3 — NFSv4 readability cleanup</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260616054027.2360930-3-robbieko@synology.com/">The third patch</a> is a one-line change to <code>nfsd4_decode_nfstime4()</code>, replacing the open-coded <code>(u32)1000000000</code> literal with <code>NSEC_PER_SEC</code>. It carries no functional change but preserves the 32-bit signed-compare protection by casting <code>tv_nsec</code> to <code>unsigned long</code>:</p>
+<blockquote>
+<p>"The original code cast the literal to u32 to force an unsigned comparison, which matters on 32-bit where tv_nsec is a 32-bit signed long ... Keep that protection by casting tv_nsec to unsigned long, the same width as tv_nsec, matching timespec64_valid(). No functional change."</p>
+</blockquote>
+<h2>Review: Layton's minor style note, then immediate Reviewed-by</h2>
+<p>Jeff Layton reviewed all three patches within hours of posting. On patch 1/3 he approved the logic but suggested a cosmetic improvement — replacing the repeated magic-number comments with a named constant:</p>
+<blockquote>
+<p>"The logic looks fine, but rather than having these verbose comments above each use of 1000000, it'd be better to declare a constant and document its use once above that. Something like this (and consolidate the comments above that): <code>#define SUN_V2_SET_TO_NOW 1000000</code>"</p>
+</blockquote>
+<p>On patches 2/3 and 3/3 he issued <a href="https://lore.kernel.org/linux-nfs/7065e7822237951c1e24f2a10320fe7bde35fed9.camel@kernel.org//">Reviewed-by tags</a> without further comment.</p>
+<h2>Applied — Chuck Lever merges all three to nfsd-testing</h2>
+<p>Lever <a href="https://lore.kernel.org/linux-nfs/178164909508.424942.9440635362510515285.b4-ty@b4//">applied the full series</a> to <code>nfsd-testing</code> later that same evening:</p>
+<blockquote>
+<p>"Applied to nfsd-testing, thanks!"</p>
+</blockquote>
+<p>with commit hashes <code>5a6e45730d33afefe6ac1208173365840314dfd9</code>, <code>ccf2a0a8a51b8fa23bd4e4413e01b57a81451c7f</code>, and <code>324975079e798c30a15d23396c51216937389baf</code>.</p>
+<p>When Layton's style suggestion about the named constant came up, Lever confirmed it was already handled in the applied version and closed the loop:</p>
+<blockquote>
+<p>"The applied version of this patch defines such a symbolic constant. Robbie, no need to resend."</p>
+</blockquote>
+<h2>Bottom line</h2>
+<p>This is a <strong>data-integrity bug fix</strong> that closes a long-standing gap where malformed NFSv2/NFSv3 timestamps could silently corrupt on-disk metadata (wrong year on read-back for ext4 and bigtime XFS). The v3 series — which restructured the validation from a single <code>nfsd_setattr()</code> choke point into per-protocol-version checks at the decode/proc layer — was posted, reviewed, and merged to <code>nfsd-testing</code> in under 24 hours on 2026-06-16. The fix is flagged as an LTS backport candidate. No further changes are expected; the thread is closed.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260616054027.2360930-1-robbieko@synology.com/">2026-06-16 robbieko <a href="mailto:robbieko@synology.com">robbieko@synology.com</a> — [PATCH v3 1/3] nfsd: reject out-of-range useconds in NFSv2 SETATTR/CREATE</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260616054027.2360930-2-robbieko@synology.com/">2026-06-16 robbieko <a href="mailto:robbieko@synology.com">robbieko@synology.com</a> — [PATCH v3 2/3] nfsd: reject out-of-range nseconds in NFSv3 SETATTR and create ops</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260616054027.2360930-3-robbieko@synology.com/">2026-06-16 robbieko <a href="mailto:robbieko@synology.com">robbieko@synology.com</a> — [PATCH v3 3/3] nfsd: use NSEC_PER_SEC in nfsd4_decode_nfstime4()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/cb4eedd0becf980ed5d8113f54eb5d35ed56ae5c.camel@poochiereds.net/">2026-06-16 Jeff Layton <a href="mailto:jlayton@poochiereds.net">jlayton@poochiereds.net</a> — Re: [PATCH v3 1/3] nfsd: reject out-of-range useconds in NFSv2 SETATTR/CREATE</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/7065e7822237951c1e24f2a10320fe7bde35fed9.camel@kernel.org/">2026-06-16 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v3 2/3] nfsd: reject out-of-range nseconds in NFSv3 SETATTR and create ops</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/a769d2f211035c82cdac1cd0d2530c6259b55ac9.camel@kernel.org/">2026-06-16 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v3 3/3] nfsd: use NSEC_PER_SEC in nfsd4_decode_nfstime4()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178164909508.424942.9440635362510515285.b4-ty@b4/">2026-06-16 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v3 1/3] nfsd: reject out-of-range useconds in NFSv2 SETATTR/CREATE</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/9695b086-512d-4be6-9730-20d490519b15@app.fastmail.com/">2026-06-16 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v3 1/3] nfsd: reject out-of-range useconds in NFSv2 SETATTR/CREATE</a></li>
+</ul>
+  </main>
+</body>
+</html>

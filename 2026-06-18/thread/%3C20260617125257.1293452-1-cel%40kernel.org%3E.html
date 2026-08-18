@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS client bug fix: return a delegation the client fails to record</title>
+  <meta name="description" content="This week&#39;s activity on this thread is a single, self-contained patch submission from Chuck Lever (Oracle), posted Wednesday, June 17. The change is squarely about NFS client development and constitutes an important bug fix in…">
+  <meta property="og:title" content="NFS client bug fix: return a delegation the client fails to record">
+  <meta property="og:description" content="This week&#39;s activity on this thread is a single, self-contained patch submission from Chuck Lever (Oracle), posted Wednesday, June 17. The change is squarely about NFS client development and constitutes an important bug fix in…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-18T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS client bug fix: return a delegation the client fails to record">
+  <meta name="twitter:description" content="This week&#39;s activity on this thread is a single, self-contained patch submission from Chuck Lever (Oracle), posted Wednesday, June 17. The change is squarely about NFS client development and constitutes an important bug fix in…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-18</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS client bug fix: return a delegation the client fails to record</h1>
+<h2>Summary</h2>
+<h1>NFS client bug fix: return a delegation the client fails to record</h1>
+<h2>Overview</h2>
+<p>This week's activity on this thread is a single, self-contained patch submission from Chuck Lever (Oracle), posted Wednesday, June 17. The change is squarely about <strong>NFS client development</strong> and constitutes an <strong>important bug fix</strong> in <code>fs/nfs/delegation.c</code> — not a new feature or protocol change. It closes a long-standing hole where the NFSv4 client could silently drop a delegation granted by the server, leaving both sides out of sync on state.</p>
+<p>As of the end of this week's window (2026-06-18), the thread contains only the initial patch — no maintainer review or commit has landed yet. The two follow-up messages in the thread (from Chuck Lever and Anna Schumaker) are dated July 2, outside this reporting window, and will be covered next week.</p>
+<h2>The bug: three error flows that drop a delegation</h2>
+<p>Lever's <a href="https://lore.kernel.org/linux-nfs/20260617125257.1293452-1-cel@kernel.org/">patch</a> targets <code>nfs_inode_set_delegation()</code>, the function the client calls when an NFS server grants a delegation in an OPEN reply. The core problem, as Lever frames it:</p>
+<blockquote>
+<p>"When an NFS server grants a delegation in an OPEN reply, nfs_inode_set_delegation() records it on the client. However, three of its error flows return without sending DELEGRETURN."</p>
+</blockquote>
+<p>The protocol consequence is severe. Lever grounds the argument in RFC 8881 (NFSv4.2):</p>
+<blockquote>
+<p>"A delegation can be relinquished only by DELEGRETURN (RFC 8881 Section 20.2.4), so dropping one silently leaves the server believing the client still holds it."</p>
+</blockquote>
+<p>He then traces the cascade of failures that follows when the server later tries to recall that phantom delegation:</p>
+<blockquote>
+<p>"If the server happens to recall that delegation, the client answers CB_RECALL with NFS4ERR_BADHANDLE because it has no record of the stateid. The server revokes the delegation and moves it onto its cl_revoked list, because the client never sends the FREE_STATEID that would drain it."</p>
+</blockquote>
+<p>The end state is a livelock in the client's state manager:</p>
+<blockquote>
+<p>"Every subsequent SEQUENCE reply then carries SEQ4_STATUS_RECALLABLE_STATE_REVOKED, and the client's state manager loops issuing TEST_STATEID across its delegations without ever clearing the condition."</p>
+</blockquote>
+<h2>Why the window is easy to reach now</h2>
+<p>Lever flags that this is not a theoretical corner case. The race is now routinely reachable because of how modern servers grant write delegations:</p>
+<blockquote>
+<p>"The window is easy to reach now that a server offers a write delegation on any write OPEN: a delegation recalled for one opener races a re-open that the server answers with a fresh write delegation."</p>
+</blockquote>
+<p>This makes the bug particularly relevant for NFS client workloads where multiple openers contend on the same file — exactly the pattern that stresses delegation recall/re-grant cycles.</p>
+<h2>The fix</h2>
+<p>The patch is small and surgical: 14 insertions, 4 deletions in <code>fs/nfs/delegation.c</code>. Rather than letting the three error paths silently return (and thereby drop the delegation), they now hand the delegation back to the server via DELEGRETURN:</p>
+<blockquote>
+<p>"Instead of dropping it, hand the delegation back during these error flows."</p>
+</blockquote>
+<p>The patch carries a <code>Fixes:</code> tag pointing at commit <code>ade04647dd56</code> ("NFSv4: Ensure we honour NFS_DELEGATION_RETURNING in nfs_inode_set_delegation()"), identifying the original code that introduced the regression. No <code>Cc: stable</code> tag is visible in the cover message, but given the <code>Fixes:</code> tag and the severity of the resulting state-manager livelock, this is a strong candidate for stable backport.</p>
+<h2>Context within this week's NFS client activity</h2>
+<p>This patch sits alongside several other NFS client fixes posted this week, reinforcing a theme of delegation-state correctness:</p>
+<ul>
+<li><strong>CB_NOTIFY dir-delegation v6 review</strong> (Layton/Lever): Lever's sweep of patches 10–20 surfaced an unlocked refcount inc-from-zero in the delegation recall path and an order-aware-client spec violation — both server-side but with direct client-visible consequences.</li>
+<li><strong>NFSv3 ENXIO on O_CREAT symlink open</strong> (Nemanov, Vast Data): a separate NFS client bug fix in <code>fs/nfs/dir.c</code> addressing a different edge case in the <code>atomic_open</code> path.</li>
+<li><strong>Missing <code>ida_free()</code> in <code>nfs_alloc_server()</code></strong> (Elfring/Jaillet): a resource-leak fix on the NFS mount path, elevated from a Coccinelle cleanup to a genuine bug fix during review.</li>
+</ul>
+<p>The delegation-return fix is the most protocol-sensitive of this week's client patches: it touches the exact state-machine boundary (OPEN → DELEGRETURN → CB_RECALL → FREE_STATEID) where client and server must agree on who holds what, and where a single dropped RPC can leave both sides in an unrecoverable loop.</p>
+<h2>Status</h2>
+<ul>
+<li><strong>Patch:</strong> Posted 2026-06-17; no review or commit in-window.</li>
+<li><strong>Classification:</strong> Bug fix (NFS client, <code>fs/nfs/delegation.c</code>).</li>
+<li><strong>Next expected:</strong> Review from Trond Myklebust / Anna Schumaker (client maintainers). The two out-of-window replies (July 2) will be covered next week.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260617125257.1293452-1-cel@kernel.org/">2026-06-17 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH] NFS: Return a delegation the client fails to record</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260617125257.1293452-1-cel@kernel.org/">2026-06-17 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH] NFS: Return a delegation the client fails to record</a></li>
+</ul>
+  </main>
+</body>
+</html>

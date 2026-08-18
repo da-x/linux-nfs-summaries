@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CB_NOTIFY dir-delegation v6: Lever&#39;s review sweeps patches 10–20, surfacing a refcount race and an order-aware client spec violation</title>
+  <meta name="description" content="This week the CB_NOTIFY directory-delegation thread moved from posting to deep review. After Jeff Layton posted the v6 NFSD series on June 11 — a 20-patch set adding RFC8881bis CB_NOTIFY callback support to Linux nfsd for directory…">
+  <meta property="og:title" content="CB_NOTIFY dir-delegation v6: Lever&#39;s review sweeps patches 10–20, surfacing a refcount race and an order-aware client spec violation">
+  <meta property="og:description" content="This week the CB_NOTIFY directory-delegation thread moved from posting to deep review. After Jeff Layton posted the v6 NFSD series on June 11 — a 20-patch set adding RFC8881bis CB_NOTIFY callback support to Linux nfsd for directory…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-18T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="CB_NOTIFY dir-delegation v6: Lever&#39;s review sweeps patches 10–20, surfacing a refcount race and an order-aware client spec violation">
+  <meta name="twitter:description" content="This week the CB_NOTIFY directory-delegation thread moved from posting to deep review. After Jeff Layton posted the v6 NFSD series on June 11 — a 20-patch set adding RFC8881bis CB_NOTIFY callback support to Linux nfsd for directory…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-18</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>CB_NOTIFY dir-delegation v6: Lever's review sweeps patches 10–20, surfacing a refcount race and an order-aware client spec violation</h1>
+<h2>Summary</h2>
+<h1>CB_NOTIFY Directory Delegation v6 — Review Sweeps Patches 10–20</h1>
+<h2>Overview</h2>
+<p>This week the <code>CB_NOTIFY</code> directory-delegation thread moved from posting to deep review. After <a href="https://lore.kernel.org/linux-nfs/20260611-dir-deleg-v6-0-4c45080e5f3f@kernel.org/">Jeff Layton posted the v6 NFSD series on June 11</a> — a 20-patch set adding RFC8881bis <code>CB_NOTIFY</code> callback support to Linux nfsd for directory delegations, targeted at v7.3 — Chuck Lever <a href="https://lore.kernel.org/linux-nfs/9119f5c0-cf25-4f30-bad2-b928a2db239d@app.fastmail.com/">resumed his in-order review within hours</a> with a wire-safety finding on patch 02/20 (an XDR enum leak via <code>NFS4ERR_FIRST_FREE</code>).</p>
+<p>On June 12, Lever <a href="https://lore.kernel.org/linux-nfs/b94c3e40-0520-4e83-9b4f-53a9325cecfe@app.fastmail.com/">swept through the remaining unreviewed patches in one concentrated burst</a>, posting eight review messages covering patches 10, 11, 15, 16, 17, 18, 19, and 20 of the series. The findings range from a genuine concurrency bug (an unlocked refcount inc-from-zero in the delegation recall path) to protocol-correctness issues that would break future order-aware clients, to several nits and latent hazards. Layton responded within about an hour on the most serious item, agreeing with the fix direction.</p>
+<p>This is primarily <strong>new-feature development</strong> (the CB_NOTIFY dir-delegation callback), but this week's review surfaced a cluster of <strong>bug fixes</strong> that will need to be folded into v7: the refcount race, the stale <code>ncn_encode_err</code> flag, an order-aware-client spec violation in the notify-mask negotiation, and a size-budgeting bug that can leave clients without a granted stateid.</p>
+<h2>Bridge from Prior Week</h2>
+<p>As <a href="2026-06-11/thread/%3C20260611-dir-deleg-v6-0-4c45080e5f3f%40kernel.org%3E.html">summarized last week</a>, the v6 repost already folded in Lever's earlier findings (the rename TOCTOU race, the RCU UAF on <code>fi_deleg_file</code>, and a lease-type check). Layton's gating condition for upstream merge was restated:</p>
+<blockquote>
+<p>"I don't think we'll want to merge these until we have a complete client-side implementation to test against."</p>
+</blockquote>
+<p>That caveat remains in force and is the reason this feature is still landing server-first with the client on the critical path.</p>
+<h2>Key Technical Arguments</h2>
+<h3>Patch 10/20 — The refcount race (the week's headline finding)</h3>
+<p>Lever's <a href="https://lore.kernel.org/linux-nfs/b94c3e40-0520-4e83-9b4f-53a9325cecfe@app.fastmail.com/">review of patch 10/20</a> is the most technically significant message of the week. He identified three distinct problems in the new notification-handler code:</p>
+<ol>
+<li>
+<p><strong>A stale <code>ncn_encode_err</code> flag.</strong> The flag "is zeroed only once, at allocation time in alloc_init_dir_deleg(). It is never cleared in nfsd4_cb_notify_prepare()." Because the callback can be requeued while in flight, a clean encode followed by a stale error observation would cause the server to "discard a good notification and recall the delegation unnecessarily."</p>
+</li>
+<li>
+<p><strong>An unlocked refcount inc-from-zero.</strong> This is the core bug:</p>
+<blockquote>
+<p>"nfsd_break_one_deleg() does an unconditional refcount_inc(&amp;dp-&gt;dl_stid.sc_count), and its comment justifies this with 'the lease code is serialized by the flc_lock.' That invariant holds when called from nfsd_break_deleg_cb() under flc_lock, but nfsd4_cb_notify_prepare() runs on a workqueue WITHOUT flc_lock."</p>
+</blockquote>
+<p>Lever noted that "the delegation can be concurrently destroyed with sc_count already at zero, making this an inc-from-zero," and pointed out that the dispatch path <code>nfsd4_run_cb_notify</code> "already does this correctly with refcount_inc_not_zero" — the <code>out_recall:</code> path just needs the same guard.</p>
+</li>
+<li>
+<p><strong>The overflow branch becomes a live path.</strong> Lever observed that the final patch in the series rewrites the queue-size guard from <code>if (count &gt; NOTIFY4_EVENT_QUEUE_SIZE)</code> to <code>if (count &gt; limit)</code> with <code>limit = NOTIFY4_EVENT_QUEUE_SIZE - 1</code>, which "turns the previously-dead overflow branch into a live, routine path to out_recall, which adds another normal-operation route into this unlocked recall."</p>
+</li>
+</ol>
+<p>Layton <a href="https://lore.kernel.org/linux-nfs/d2a53fc34760fc986315df31ca6887bb3a54f47d.camel@kernel.org/">responded within ~45 minutes</a>, accepting all three points. On the refcount race he confirmed the fix direction:</p>
+<blockquote>
+<p>"I think we need to do a refcount_inc_not_zero() in nfsd_break_one_deleg() and just return without queuing the callback if it's already at 0. That means that the recall is racing with the lease teardown, so I think the right thing to do is to not send the recall in that case."</p>
+</blockquote>
+<p>On the stale flag he simply agreed: "Ok, so we need to reset this in -&gt;prepare."</p>
+<h3>Patch 11/20 — Order-aware client spec violation</h3>
+<p>Lever's <a href="https://lore.kernel.org/linux-nfs/b43a8d34-52b9-418c-8df0-76bd1c3553cd@app.fastmail.com/">review of patch 11/20</a> flagged a protocol-correctness issue in the notify-mask negotiation. When a client requests <code>NOTIFY4_GFLAG_EXTEND | NOTIFY4_CFLAG_ORDER</code> plus ADD/REMOVE/RENAME, the patch "still grants the content notification bits because it only requires GFLAG_EXTEND." The problem:</p>
+<blockquote>
+<p>"The rest of NFSD's CB_NOTIFY encoder does not store that order-aware request and emits zero/absent cookie and previous-entry information, which is only safe for order-unaware clients. An order-aware client can then keep an ordered directory cache from unusable notifications instead of having the delegation recalled."</p>
+</blockquote>
+<p>Lever cited the bis draft directly (sections 27.4.5, 16.2.13, and 16.2.11.3) to show that "GFLAG_EXTEND set PLUS CFLAG_ORDER set is also order-aware," and concluded: "This finding is latent when this patch is first applied, but the NFSD's negotiation is incorrect for any future order-aware client." He noted he did not see the issue addressed by a subsequent patch in the series.</p>
+<h3>Patch 15/20 — Latent NULL deref on FSID encoding</h3>
+<p>Lever's <a href="https://lore.kernel.org/linux-nfs/84a3d934-a0ca-4b8c-b36f-8a29ee425d02@app.fastmail.com/">review of patch 15/20</a> was a smaller finding: after making filehandle encoding svc_fh-free, the FSID encoder still calls <code>fsid_source(args-&gt;fhp)</code> without a NULL check, and both share the same attrmask gate. "No current caller trips it: the CB_NOTIFY path does not request FSID. But a future CB_NOTIFY attrset that adds FSID would dereference a NULL fhp."</p>
+<h3>Patch 16/20 — Shared nfs4_file connectability hazard</h3>
+<p>Lever's <a href="https://lore.kernel.org/linux-nfs/dfa17ce6-5ecb-46c5-b5ca-fe1149605a17@app.fastmail.com/">review of patch 16/20</a> flagged that when two clients use exports of the same directory root differing only in <code>subtree_check</code>/<code>no_subtree_check</code>, "the root filehandle is the same and nfsd4_file_hash_insert() can reuse the same nfs4_file." This makes <code>fi_connectable</code> depend on whichever export first initialized the shared object. Lever's recommendation: "the delegation's sc_export is the per-export state to derive connectability from, and the export is already available via dp-&gt;dl_stid.sc_export."</p>
+<h3>Patch 17/20 — Signed filehandle MAC (confirming a prior fix)</h3>
+<p>Lever's <a href="https://lore.kernel.org/linux-nfs/bb6e580b-5deb-4731-afda-07c23e572b4e@app.fastmail.com/">review of patch 17/20</a> confirmed that the signed-filehandle fix from last week's review was correctly carried into v6. He noted: "Codex flagged setup_notify_fhandle() for constructing a child FILEHANDLE attribute without calling fh_append_mac()." The fix — signing the constructed handle or suppressing the attribute when the export requires signed filehandles — is client-visible: "A client that does not receive the FH falls back to a LOOKUP, so suppression degrades gracefully."</p>
+<h3>Patch 18/20 — Size-budgeting bug (client-impacting)</h3>
+<p>Lever's <a href="https://lore.kernel.org/linux-nfs/450e3437-13db-4898-b90d-49e8116acf4e@app.fastmail.com/">review of patch 18/20</a> identified a reply-size bug: when a client requests any supported child attribute in word 1, "nfsd4_encode_bitmap4() emits a two-word bitmap. nfsd4_get_dir_delegation_rsize() still budgets only the old one-word child-attribute bitmap before executing this non-idempotent op." The consequence is directly client-visible:</p>
+<blockquote>
+<p>"a compound near the reply/slot limit can grant a directory delegation and then fail encoding with NFS4ERR_RESOURCE/REP_TOO_BIG, leaving the client without the returned stateid."</p>
+</blockquote>
+<h3>Patch 19/20 — Bisectability / premature feature advertisement</h3>
+<p>Lever's <a href="https://lore.kernel.org/linux-nfs/8dc1a997-0152-4a28-a58a-0cb131d89779@app.fastmail.com/">review of patch 19/20</a> raised a bisectability concern: after this patch, "a client that requests NOTIFY4_CHANGE_DIR_ATTRS now gets that bit echoed in gddr_notification, but the callback path still only maps/encodes add, remove, and rename notifications." His conclusion: "That lets the server grant a directory delegation while promising dir-attribute CB_NOTIFYs it cannot send until the follow-up support lands, so this bit should not be advertised in this patch." He also added a minor type nit: "Maybe these should be u32. uint32_t is a user space type."</p>
+<h3>Patch 20/20 — Queue overflow livelock and export UAF</h3>
+<p>Lever's <a href="https://lore.kernel.org/linux-nfs/0a0bfce8-c35e-4c96-8f7b-65267fd96a61@app.fastmail.com/">review of patch 20/20</a> was the longest and most detailed. He identified:</p>
+<ul>
+<li>
+<p><strong>A queue overflow livelock:</strong> "the CB_NOTIFY event queue can fill to NOTIFY4_EVENT_QUEUE_SIZE (3) events while the consumer only accepts 2 (it reserves a slot for the dir-attr-change entry). The resulting overflow path in nfsd4_cb_notify_prepare() recalls the delegation without draining the queue, and nfsd4_cb_notify_release() then requeues the same callback indefinitely."</p>
+</li>
+<li>
+<p><strong>An export use-after-free:</strong> "The function dereferences the new exp parameter unconditionally... An in-flight CB_NOTIFY callback holds a sc_count reference but NOT an export reference. drop_stid_export() can run concurrently (admin revoke / unexport), NULL sc_export, and drop what may be the last export reference, freeing the svc_export while the callback dereferences it."</p>
+</li>
+<li>
+<p><strong>A minor XDR rollback nit:</strong> when <code>nfsd4_encode_dir_attr_change()</code> returns NULL after a successful <code>xdr_reserve_space()</code>, "the 4-byte reservation is never rolled back and *maskp is never written, yet the function still takes the success path." Lever noted this is "probably benign only because nfs4_xdr_enc_cb_notify re-encodes from the ncn_nf[] array."</p>
+</li>
+</ul>
+<h2>Evolution of the Discussion</h2>
+<p>The thread's multi-week arc continues to converge:</p>
+<ol>
+<li><strong>Week of May 15</strong> — VFS-side patches merged.</li>
+<li><strong>Week of May 28</strong> — v4/v5 NFSD series posted; Lever begins review, punts to v7.3.</li>
+<li><strong>Week of June 5–11</strong> — Lever's deep-dive review of v5 patches 04–10 (TOCTOU, RCU UAF, lease-type check).</li>
+<li><strong>Week of June 11 (prior summary)</strong> — v6 repost incorporating all reviewed fixes; Lever flags XDR enum leak on patch 02/20.</li>
+<li><strong>This week (June 12)</strong> — Lever completes review of patches 10–20 in a single day, surfacing 8 distinct findings across concurrency, protocol correctness, size budgeting, and UAF categories. Layton responds to the most critical item (the refcount race) within an hour, confirming the fix.</li>
+</ol>
+<p>The review is now essentially complete for v6 — all 20 patches have received Lever's scrutiny. The remaining work is for Layton to produce a v7 incorporating this week's fixes.</p>
+<h2>Implications for NFS Client Development</h2>
+<ul>
+<li>
+<p><strong>The order-aware client spec violation (patch 11/20) is the most forward-looking finding.</strong> Any future Linux client implementing <code>NOTIFY4_CFLAG_ORDER</code> would receive notifications it cannot use to maintain its ordered directory cache, and — worse — would not get a delegation recall as the spec requires. This must be fixed server-side before any order-aware client ships.</p>
+</li>
+<li>
+<p><strong>The size-budgeting bug (patch 18/20) is directly client-visible.</strong> A client near the reply/slot limit could grant a directory delegation and then receive <code>NFS4ERR_RESOURCE</code> with no stateid, leaving it in an inconsistent state. Client code would need to handle this as a transient error, but the fix should eliminate the case entirely.</p>
+</li>
+<li>
+<p><strong>The export UAF (patch 20/20) is a server-side crash risk</strong> that could manifest as a client-visible connection reset or stale-handle storm during admin operations (unexport/revoke) while CB_NOTIFY callbacks are in flight.</p>
+</li>
+<li>
+<p><strong>Layton's testing caveat remains the gating dependency:</strong> "I don't think we'll want to merge these until we have a complete client-side implementation to test against." The v7.3 timeline gives both sides roughly a full merge cycle, but the client work is on the critical path.</p>
+</li>
+</ul>
+<h2>Status</h2>
+<ul>
+<li><strong>NFSD patches (v6):</strong> All 20 patches now reviewed by Lever. Eight new findings this week require fixes for v7.</li>
+<li><strong>Open items:</strong> refcount_inc_not_zero in out_recall path; reset ncn_encode_err in -&gt;prepare; order-aware client mask negotiation; size budgeting for two-word bitmap; export reference pinning during CB_NOTIFY; queue overflow drain-before-recall; premature NOTIFY4_CHANGE_DIR_ATTRS advertisement in patch 19.</li>
+<li><strong>Client-side implementation:</strong> Still pending; remains the gating dependency for final upstream merge in v7.3.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/b94c3e40-0520-4e83-9b4f-53a9325cecfe@app.fastmail.com/">2026-06-12 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v6 10/20] nfsd: add notification handlers for dir events</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/b43a8d34-52b9-418c-8df0-76bd1c3553cd@app.fastmail.com/">2026-06-12 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v6 11/20] nfsd: apply the notify mask to the delegation when requested</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/84a3d934-a0ca-4b8c-b36f-8a29ee425d02@app.fastmail.com/">2026-06-12 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v6 15/20] nfsd: allow encoding a filehandle into fattr4 without a svc_fh</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/dfa17ce6-5ecb-46c5-b5ca-fe1149605a17@app.fastmail.com/">2026-06-12 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v6 16/20] nfsd: add a fi_connectable flag to struct nfs4_file</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/bb6e580b-5deb-4731-afda-07c23e572b4e@app.fastmail.com/">2026-06-12 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v6 17/20] nfsd: add the filehandle to returned attributes in CB_NOTIFY</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/450e3437-13db-4898-b90d-49e8116acf4e@app.fastmail.com/">2026-06-12 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v6 18/20] nfsd: properly track requested child attributes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/8dc1a997-0152-4a28-a58a-0cb131d89779@app.fastmail.com/">2026-06-12 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v6 19/20] nfsd: track requested dir attributes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/0a0bfce8-c35e-4c96-8f7b-65267fd96a61@app.fastmail.com/">2026-06-12 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v6 20/20] nfsd: add support to CB_NOTIFY for dir attribute changes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/d2a53fc34760fc986315df31ca6887bb3a54f47d.camel@kernel.org/">2026-06-12 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v6 10/20] nfsd: add notification handlers for dir events</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd: reject out-of-range nseconds in setattr atime/mtime (data-integrity fix)</title>
+  <meta name="description" content="A two-patch series from Robbie Ko (Synology), posted Friday 2026-06-12, addresses a long-standing data-integrity bug in the NFS server&#39;s handling of client-supplied file timestamps. The work is squarely about NFS server-side correctness…">
+  <meta property="og:title" content="nfsd: reject out-of-range nseconds in setattr atime/mtime (data-integrity fix)">
+  <meta property="og:description" content="A two-patch series from Robbie Ko (Synology), posted Friday 2026-06-12, addresses a long-standing data-integrity bug in the NFS server&#39;s handling of client-supplied file timestamps. The work is squarely about NFS server-side correctness…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-18T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd: reject out-of-range nseconds in setattr atime/mtime (data-integrity fix)">
+  <meta name="twitter:description" content="A two-patch series from Robbie Ko (Synology), posted Friday 2026-06-12, addresses a long-standing data-integrity bug in the NFS server&#39;s handling of client-supplied file timestamps. The work is squarely about NFS server-side correctness…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-18</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd: reject out-of-range nseconds in setattr atime/mtime (data-integrity fix)</h1>
+<h2>Summary</h2>
+<h2>nfsd: reject out-of-range nseconds in setattr atime/mtime</h2>
+<p>A two-patch series from Robbie Ko (Synology), posted Friday 2026-06-12, addresses a long-standing <strong>data-integrity bug</strong> in the NFS server's handling of client-supplied file timestamps. The work is squarely about <strong>NFS server-side correctness and an important bug fix</strong>, with implications for any client that can issue SETATTR (or, on NFSv3, file creation) with a malformed time.</p>
+<h3>The bug</h3>
+<p>The core problem is that a client can send a SETATTR carrying an atime or mtime whose <code>nseconds</code> field is out of range — well-formed on the wire and decodable into a valid <code>uint32</code>, but not a valid <code>timespec64</code>:</p>
+<blockquote>
+<p>"A client can send a SETATTR (and, for NFSv3, a file creation) carrying an atime or mtime whose nseconds field is out of range. The value is well-formed on the wire and decodes cleanly into a valid uint32, but it is not a valid timespec64: tv_nsec must be less than NSEC_PER_SEC."</p>
+</blockquote>
+<p>Robbie Ko traced why nothing in the existing path catches it <a href="https://lore.kernel.org/linux-nfs/20260612060539.4137523-1-robbieko@synology.com/">in the patch 1/2 cover</a>:</p>
+<blockquote>
+<p>"Nothing in the path clamps it. notify_change() runs the time through timestamp_truncate(), which does not reduce tv_nsec below NSEC_PER_SEC when the filesystem supports nanosecond granularity (s_time_gran == 1), and the inode atime/mtime setters store it verbatim (only ctime is normalized, via inode_set_ctime_to_ts())."</p>
+</blockquote>
+<p>The consequence is concrete on-disk corruption rather than a benign no-op:</p>
+<blockquote>
+<p>"The un-normalized value then corrupts on-disk metadata. ext4's ext4_encode_extra_time() shifts tv_nsec left by EXT4_EPOCH_BITS; an out-of-range value overflows the 32-bit extra field and clobbers the seconds-epoch bits, so the stored seconds (and thus the year) are wrong on read-back. XFS with bigtime mis-stores the timestamp for the same reason. There is no WARN_ON anywhere in the path to catch it."</p>
+</blockquote>
+<h3>The fix</h3>
+<p>The patch validates client-supplied atime/mtime in <code>nfsd_setattr()</code>, chosen as "the common choke point for SETATTR and for the create paths (via nfsd_create_setattr()), and covers both NFSv2 and NFSv3." The check is performed up front, before any resources are acquired, so no cleanup path is involved. On failure it returns <code>NFS3ERR_INVAL</code> (<code>NFSERR_INVAL</code> for NFSv2), which the client maps to <code>EINVAL</code>.</p>
+<p>Ko carefully scoped what <em>is</em> and <em>is not</em> checked, citing RFC 1813:</p>
+<blockquote>
+<p>"Only client-supplied times are checked: SET_TO_SERVER_TIME requests carry no client value and are filled in by the server. The NFSv2 Sun 'set both to now' convention clears ATTR_[AM]TIME_SET in the SETATTR proc before nfsd_setattr() runs, so it is unaffected."</p>
+</blockquote>
+<p>He also explained a deliberate non-change for the ctime guard:</p>
+<blockquote>
+<p>"The sattrguard3 ctime is deliberately left alone: an out-of-range guard simply never matches the object's ctime and yields NFS3ERR_NOT_SYNC via the existing guardtime comparison, which is the protocol-correct outcome rather than rejecting the request."</p>
+</blockquote>
+<p>Notably, NFSv4 was already protected — <code>nfsd4_decode_nfstime4()</code> rejects such values, so they "do not reach this check on that path." Because the missing validation predates the git history of the code, no <code>Fixes:</code> tag is provided, but Ko flagged it as a candidate for LTS backport:</p>
+<blockquote>
+<p>"The lack of validation is long-standing and predates the git history of this code, so no Fixes: tag is provided. This is a data-integrity fix and is a candidate for LTS backport."</p>
+</blockquote>
+<h3>Companion cleanup</h3>
+<p>Patch 2/2 <a href="https://lore.kernel.org/linux-nfs/20260612060539.4137523-2-robbieko@synology.com/">is a readability-only change</a> to the NFSv4 decoder, replacing an open-coded literal with the named constant:</p>
+<blockquote>
+<p>"nfsd4_decode_nfstime4() open-codes the nanoseconds upper bound as the literal (u32)1000000000. Use the named constant NSEC_PER_SEC instead, matching the out-of-range check added for the NFSv2/NFSv3 setattr path and improving readability. No functional change."</p>
+</blockquote>
+<h3>Review status</h3>
+<p>As of the end of this week's window, the series is in early review. Jeff Layton replied to patch 1/2 <a href="https://lore.kernel.org/linux-nfs/4d5af4ac926efa4e7ec0e2b87e21ad4e30e12210.camel@poochiereds.net/">on 2026-06-12</a> to point the author toward automated review feedback:</p>
+<blockquote>
+<p>"Sashiko had some review comments on this series that you should take a look at."</p>
+</blockquote>
+<p>No substantive technical objections or merge decisions have landed in-thread yet, so the discussion is still in its first round.</p>
+<h3>Bottom line</h3>
+<p>This is a <strong>bug fix</strong> (data integrity), not a new feature or protocol change. It closes a gap where malformed NFSv2/NFSv3 timestamps could silently corrupt on-disk metadata on ext4 and bigtime XFS, by adding an early validation check at the <code>nfsd_setattr()</code> choke point and returning <code>EINVAL</code> to the client. A trivial companion patch cleans up the existing NFSv4 constant usage. The series is a candidate for LTS backport and awaits further review following Layton's pointer to Sashiko's automated comments.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260612060539.4137523-1-robbieko@synology.com/">2026-06-12 robbieko <a href="mailto:robbieko@synology.com">robbieko@synology.com</a> — [PATCH 1/2] nfsd: reject out-of-range nseconds in setattr atime/mtime</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260612060539.4137523-2-robbieko@synology.com/">2026-06-12 robbieko <a href="mailto:robbieko@synology.com">robbieko@synology.com</a> — [PATCH 2/2] nfsd: use NSEC_PER_SEC in nfsd4_decode_nfstime4()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/4d5af4ac926efa4e7ec0e2b87e21ad4e30e12210.camel@poochiereds.net/">2026-06-12 Jeff Layton <a href="mailto:jlayton@poochiereds.net">jlayton@poochiereds.net</a> — Re: [PATCH 1/2] nfsd: reject out-of-range nseconds in setattr atime/mtime</a></li>
+</ul>
+  </main>
+</body>
+</html>

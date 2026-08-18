@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd/sunrpc: Convert nfsstat server-side interfaces to netlink (v4) — review and design debate</title>
+  <meta name="description" content="Type: New feature / interface conversion (with a minor bug fix in v4)">
+  <meta property="og:title" content="nfsd/sunrpc: Convert nfsstat server-side interfaces to netlink (v4) — review and design debate">
+  <meta property="og:description" content="Type: New feature / interface conversion (with a minor bug fix in v4)">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-18T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd/sunrpc: Convert nfsstat server-side interfaces to netlink (v4) — review and design debate">
+  <meta name="twitter:description" content="Type: New feature / interface conversion (with a minor bug fix in v4)">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-18</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd/sunrpc: Convert nfsstat server-side interfaces to netlink (v4) — review and design debate</h1>
+<h2>Summary</h2>
+<h1>nfsd/sunrpc: Convert nfsstat server-side interfaces to netlink (v4)</h1>
+<p><strong>Type:</strong> New feature / interface conversion (with a minor bug fix in v4)</p>
+<h2>Overview</h2>
+<p>On June 16, Jeff Layton posted <a href="https://lore.kernel.org/linux-nfs/20260616-exportd-netlink-v4-0-03505aee3883@kernel.org/">version 4 of his patch series</a> to convert the NFS server-side statistics interface from procfs to netlink. The series replaces the fragile, global <code>/proc/net/rpc/nfsd</code> scraping used by <code>nfsstat</code> with a proper generic netlink dump handler in the nfsd family, adding network-namespace-awareness and extensibility.</p>
+<p>The v4 changes were minimal:</p>
+<blockquote>
+<p>"This version just fixes an error handling bug that Sashiko noticed."</p>
+</blockquote>
+<p>Specifically, the series now ensures errors are returned when <code>nla_put_*()</code> calls fail in the netlink dump path. The four patches:</p>
+<ol>
+<li><strong>Patch 1</strong> – Adds per-netns per-procedure percpu call count arrays to <code>struct svc_stat</code>, allocated with the nfsd_net lifecycle.</li>
+<li><strong>Patch 2</strong> – Switches <code>svc_seq_show()</code> to read from the per-netns counters, making <code>/proc/net/rpc/nfsd</code> namespace-aware (a deliberate behavior change Layton called "desirable").</li>
+<li><strong>Patch 3</strong> – Implements the <code>server-stats-get</code> netlink dump handler, streaming reply-cache, filehandle, IO, network, and RPC statistics plus per-version and per-operation procedure counts across multiple netlink messages.</li>
+<li><strong>Patch 4</strong> – Removes the now-unused global <code>svc_version vs_count</code> percpu arrays from nfsd, lockd, and the NFS client callback service (39 lines deleted).</li>
+</ol>
+<p>Layton also noted: "I'll also be sending an nfs-utils patch to convert nfsstat to use the new interfaces."</p>
+<h2>Review Round 1: Build Breakage (Patch 1)</h2>
+<p>Chuck Lever <a href="https://lore.kernel.org/linux-nfs/d29b710e-2771-4e5d-8765-1de806a9aa72@app.fastmail.com/">identified a build break</a> in Patch 1 the same evening:</p>
+<blockquote>
+<p>"This patch appears to break the build for an NFSv3-only server configured with CONFIG_PROC_FS=n."</p>
+</blockquote>
+<p>The issue: <code>svc_stat_alloc_counts()</code> and <code>svc_stat_free_counts()</code> live in <code>net/sunrpc/stats.c</code>, which is only compiled when <code>CONFIG_PROC_FS=y</code>. However, <code>nfsd_net_init()</code>/<code>nfsd_net_exit()</code> call both helpers unconditionally, and the declarations sit outside the <code>#ifdef CONFIG_PROC_FS</code> guard. Since <code>CONFIG_NFSD</code> does not depend on <code>PROC_FS</code> (only <code>NFSD_V4</code> does), a valid Kconfig combination of <code>NFSD=y</code> with V2/V3 only and <code>PROC_FS=n</code> results in an undefined reference at link time.</p>
+<p>Lever suggested moving the functions to <code>net/sunrpc/svc.c</code>, which is always built. Layton <a href="https://lore.kernel.org/linux-nfs/d322de3e8e54e8f64b0a630a3f517fb565342abc.camel@kernel.org/">agreed</a>:</p>
+<blockquote>
+<p>"Thanks. Looks pretty simple to fix. I'll plan to send a v5."</p>
+</blockquote>
+<h2>Review Round 2: Missing <code>wdeleg_getattr</code> Counter (Patch 3)</h2>
+<p>The more substantive design discussion centered on Patch 3. Lever <a href="https://lore.kernel.org/linux-nfs/e55738ec-80a5-4e74-85e3-29c17d4f67c9@app.fastmail.com/">pointed out</a> that the netlink dump handler drops a counter present in the procfs output:</p>
+<blockquote>
+<p>"The procfs output in nfsd_show() emits one more counter that this dump handler drops: wdeleg_getattr (NFSD_STATS_WDELEG_GETATTR), printed at the end of the CONFIG_NFSD_V4 block in fs/nfsd/stats.c, right after proc4ops."</p>
+</blockquote>
+<p>Lever provided a concrete fix recipe: add a <code>wdeleg-getattr</code> (u64) attribute to the YAML schema, add the corresponding UAPI enum value, and emit it as a scalar in the first dump message wrapped in <code>CONFIG_NFSD_V4</code>.</p>
+<p>Layton <a href="https://lore.kernel.org/linux-nfs/657f71a2c6dc1e817be57e40431a6578281ea823.camel@kernel.org/">pushed back</a>, arguing the omission was intentional:</p>
+<blockquote>
+<p>"This omission was intentional. The stated purpose of this patchset was to convert nfsstat to use netlink. nfsstat does not access or display this field today. Without something that consumes this stat, I don't see the point of adding it here."</p>
+</blockquote>
+<p>Lever <a href="https://lore.kernel.org/linux-nfs/c62cacac-dc7e-4203-b83e-000d04f797fb@app.fastmail.com/">rebutted</a> on API-compatibility grounds:</p>
+<blockquote>
+<p>"If we were adding a greenfield kernel-userspace API, I would agree. However, this API is meant to be compatible with the existing procfs API, so it should match to prevent a regression."</p>
+</blockquote>
+<p>He added a useful process note: "since a missing feature cannot be expressed in a patch's diff body, your intention to exclude this field could be mentioned in the commit message." Lever also noted that <code>nfsstat</code> <em>should</em> display the field: "It has simply been forgotten."</p>
+<p>Layton <a href="https://lore.kernel.org/linux-nfs/ea1230d947d8bcdf5dc25f8f90fb46d4c0b155c5.camel@kernel.org/">conceded</a>:</p>
+<blockquote>
+<p>"Ok. I'll plan to add it to the interface and send it in v5."</p>
+</blockquote>
+<h2>Design Evolution: Callback Call Counts</h2>
+<p>In a <a href="https://lore.kernel.org/linux-nfs/9dc8568569c5f169f8cdf5fe379809fd94a154aa.camel@kernel.org/">follow-up message</a>, Layton proposed a broader design change. He noted that <code>wdeleg_getattr</code> is "weird in that it's not a statistic about server-side protocol operations" and suggested instead keeping and exposing server-side callback call counts as a new section in nfsstat output:</p>
+<blockquote>
+<p>"What would you (and Dai) think about instead keeping and exposing server-side callback call counts? Then we could just add a new section to nfsstat server-side output with all of the callback operation counts in it. wdeleg_getattr would just be the count for CB_GETATTRs."</p>
+</blockquote>
+<p>Lever <a href="https://lore.kernel.org/linux-nfs/728ef156-fd4c-4046-a4e3-cced09102db7@app.fastmail.com/">endorsed the idea</a>:</p>
+<blockquote>
+<p>"That sounds ideal."</p>
+</blockquote>
+<h2>Conclusions and Next Steps</h2>
+<p>The thread ended with clear agreement on the v5 changes:</p>
+<ol>
+<li><strong>Fix the <code>CONFIG_PROC_FS=n</code> build break</strong> by relocating the count allocation/free helpers to <code>net/sunrpc/svc.c</code>.</li>
+<li><strong>Add <code>wdeleg_getattr</code> to the netlink interface</strong> for procfs compatibility, or better yet, <strong>expose the full set of server-side callback operation counts</strong> as a new section in both the netlink dump and nfsstat output.</li>
+<li>Layton will send v5 with these fixes; an nfs-utils follow-on patch to update <code>nfsstat</code> is also planned.</li>
+</ol>
+<p>The discussion was entirely about NFS <strong>server-side</strong> infrastructure (nfsd/sunrpc), though it touches the NFS client callback service (<code>fs/nfs/callback_xdr.c</code>) in Patch 4's cleanup of the removed <code>vs_count</code> field. No NFS client protocol or client bug fixes were involved.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260616-exportd-netlink-v4-0-03505aee3883@kernel.org/">2026-06-16 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v4 0/4] nfsd/sunrpc: convert nfsstat server-side interfaces to use netlink</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260616-exportd-netlink-v4-1-03505aee3883@kernel.org/">2026-06-16 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v4 1/4] sunrpc: add per-netns per-procedure call counts to svc_stat</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260616-exportd-netlink-v4-2-03505aee3883@kernel.org/">2026-06-16 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v4 2/4] sunrpc: use per-net counts in svc_seq_show()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260616-exportd-netlink-v4-3-03505aee3883@kernel.org/">2026-06-16 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v4 3/4] nfsd: implement server-stats-get netlink handler</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260616-exportd-netlink-v4-4-03505aee3883@kernel.org/">2026-06-16 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v4 4/4] sunrpc: remove unused svc_version vs_count field</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/d29b710e-2771-4e5d-8765-1de806a9aa72@app.fastmail.com/">2026-06-16 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v4 1/4] sunrpc: add per-netns per-procedure call counts to svc_stat</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/e55738ec-80a5-4e74-85e3-29c17d4f67c9@app.fastmail.com/">2026-06-17 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v4 3/4] nfsd: implement server-stats-get netlink handler</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/d322de3e8e54e8f64b0a630a3f517fb565342abc.camel@kernel.org/">2026-06-17 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v4 1/4] sunrpc: add per-netns per-procedure call counts to svc_stat</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/657f71a2c6dc1e817be57e40431a6578281ea823.camel@kernel.org/">2026-06-17 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v4 3/4] nfsd: implement server-stats-get netlink handler</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/c62cacac-dc7e-4203-b83e-000d04f797fb@app.fastmail.com/">2026-06-17 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v4 3/4] nfsd: implement server-stats-get netlink handler</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ea1230d947d8bcdf5dc25f8f90fb46d4c0b155c5.camel@kernel.org/">2026-06-17 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v4 3/4] nfsd: implement server-stats-get netlink handler</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/9dc8568569c5f169f8cdf5fe379809fd94a154aa.camel@kernel.org/">2026-06-17 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v4 3/4] nfsd: implement server-stats-get netlink handler</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/728ef156-fd4c-4046-a4e3-cced09102db7@app.fastmail.com/">2026-06-17 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v4 3/4] nfsd: implement server-stats-get netlink handler</a></li>
+</ul>
+  </main>
+</body>
+</html>

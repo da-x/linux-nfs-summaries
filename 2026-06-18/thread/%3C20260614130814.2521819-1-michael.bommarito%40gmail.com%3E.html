@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSv4.1/pnfs: bound GETDEVICEINFO notification bitmap length (new fix, awaiting review)</title>
+  <meta name="description" content="This week&#39;s activity in this thread is limited to a single event: Michael Bommarito submitted a two-patch series on 2026-06-14 that fixes an out-of-bounds read in the NFSv4.1 pNFS client&#39;s GETDEVICEINFO decoder. There were no replies,…">
+  <meta property="og:title" content="NFSv4.1/pnfs: bound GETDEVICEINFO notification bitmap length (new fix, awaiting review)">
+  <meta property="og:description" content="This week&#39;s activity in this thread is limited to a single event: Michael Bommarito submitted a two-patch series on 2026-06-14 that fixes an out-of-bounds read in the NFSv4.1 pNFS client&#39;s GETDEVICEINFO decoder. There were no replies,…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-18T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSv4.1/pnfs: bound GETDEVICEINFO notification bitmap length (new fix, awaiting review)">
+  <meta name="twitter:description" content="This week&#39;s activity in this thread is limited to a single event: Michael Bommarito submitted a two-patch series on 2026-06-14 that fixes an out-of-bounds read in the NFSv4.1 pNFS client&#39;s GETDEVICEINFO decoder. There were no replies,…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-18</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSv4.1/pnfs: bound GETDEVICEINFO notification bitmap length (new fix, awaiting review)</h1>
+<h2>Summary</h2>
+<h2>NFSv4.1/pnfs: bounding the GETDEVICEINFO notification bitmap — a new client-side bug fix</h2>
+<p>This week's activity in this thread is limited to a single event: Michael Bommarito submitted a two-patch series on 2026-06-14 that fixes an out-of-bounds read in the NFSv4.1 pNFS client's <code>GETDEVICEINFO</code> decoder. There were no replies, reviews, or discussion within this week's window — the thread stands at the point of submission, awaiting maintainer and reviewer response.</p>
+<h3>What kind of change this is</h3>
+<p>This is a <strong>bug fix</strong> (a security-relevant robustness fix on the NFS client), not a new feature or protocol change. It targets the Linux NFSv4.1 pNFS <em>client</em> — specifically <code>decode_getdeviceinfo()</code> in <code>fs/nfs/nfs4xdr.c</code> — and is marked for stable backporting:</p>
+<blockquote>
+<p>"Fixes: b1f69b754ee3 ("NFSv4.1: pnfs: add LAYOUTGET and GETDEVICEINFO infrastructure")"
+"Cc: stable@vger.kernel.org"</p>
+</blockquote>
+<h3>The technical argument</h3>
+<p>The core of the report is an integer-overflow-driven out-of-bounds read in how the client handles a server-supplied notification bitmap length. As Bommarito lays it out in the cover letter <a href="https://lore.kernel.org/linux-nfs/20260614130814.2521819-1-michael.bommarito@gmail.com/">PATCH 0/2</a>:</p>
+<blockquote>
+<p>"decode_getdeviceinfo() scales a server-supplied notification bitmap length by four for xdr_inline_decode(). The 32-bit multiply wraps to 0 for len &gt;= 0x40000000, so the bounds check passes on an empty request and the verify loop reads up to ~2^30 words past the inline XDR buffer."</p>
+</blockquote>
+<p>The mechanism is precise: a <code>u32</code> length is multiplied by four in 32-bit arithmetic. For lengths of <code>0x40000000</code> or greater, that multiply wraps to zero, which defeats the subsequent <code>!p</code> bounds check on an otherwise empty request and lets the verification loop read far past the inline XDR buffer.</p>
+<p>Bommarito carefully scopes the impact in both directions. On the threat side:</p>
+<blockquote>
+<p>"A malicious or compromised pNFS server, or a man in the middle on an unprotected mount, can drive this out-of-bounds read while the client decodes a GETDEVICEINFO reply."</p>
+</blockquote>
+<p>On the severity side, he is explicit that this is <em>not</em> an information leak:</p>
+<blockquote>
+<p>"It is a read, not a leak: the loop only checks each word for nonzero and returns -EIO on the first, so over-read contents are never returned."</p>
+</blockquote>
+<h3>The fix</h3>
+<p>The remedy rests on a protocol observation: RFC 8881 defines only two deviceid notification bits (CHANGE and DELETE), both in word 0, so a conformant reply needs just one word. The fix bounds the length before scaling it, eliminating the wrap entirely:</p>
+<blockquote>
+<p>"Bound len to NFS4_GETDEVICEINFO_NOTIFY_MAXWORDS before scaling, which cannot wrap and still tolerates trailing zero words the decoder keeps verifying."</p>
+</blockquote>
+<p>Patch 1 <a href="https://lore.kernel.org/linux-nfs/20260614130814.2521819-2-michael.bommarito@gmail.com/">PATCH 1/2</a> is the minimal fix — six lines across <code>fs/nfs/nfs4xdr.c</code> and a new constant in <code>include/linux/nfs4.h</code>.</p>
+<h3>Testing and KUnit coverage</h3>
+<p>A notable feature of this submission is its testing rigor. Bommarito reproduced the bug under KASAN on QEMU, citing:</p>
+<blockquote>
+<p>"BUG: KASAN: slab-out-of-bounds in decode_getdeviceinfo"</p>
+</blockquote>
+<p>Because integer overflow has no dedicated sanitizer, the test oracle is the downstream KASAN fault itself. Patch 2 <a href="https://lore.kernel.org/linux-nfs/20260614130814.2521819-3-michael.bommarito@gmail.com/">PATCH 2/2</a> adds a KUnit suite that drives the <em>real</em> file-local <code>decode_getdeviceinfo()</code> over a crafted reply. To reach the static decoder without exporting it, the test is compiled into <code>nfs4xdr.c</code> behind a new config gate:</p>
+<blockquote>
+<p>"It is included into nfs4xdr.c (gated by CONFIG_NFS_GETDEVICEINFO_KUNIT_TEST) to reach the static decoder without exporting it."</p>
+</blockquote>
+<p>The suite contains one trigger case (the wrapping length, placed at a page edge) and two benign in-bounds controls. The reported results:</p>
+<blockquote>
+<p>"on QEMU x86_64 with KASAN the trigger faults on stock and passes after patch 1, while both controls pass on stock and fixed trees."</p>
+</blockquote>
+<p>Bommarito deliberately decoupled the test from the fix so it can be accepted or dropped independently:</p>
+<blockquote>
+<p>"Patch 2 adds KUnit coverage and is offered separately so it can be taken or dropped on its own."</p>
+</blockquote>
+<p>He also notes a gap in existing coverage that motivated the new suite:</p>
+<blockquote>
+<p>"fs/nfs has no existing kselftest for this decoder."</p>
+</blockquote>
+<h3>Evolution of the discussion and current state</h3>
+<p>Within this week's window there is no back-and-forth — the thread consists only of Bommarito's three-message submission (cover letter, fix, and test). There are no maintainer ACKs, reviewer comments, or follow-up patches as of the 2026-06-18 close. The discussion is therefore at its starting point: a well-documented, reproducible client-side bug fix with stable backport intent, now waiting for review.</p>
+<h3>Broader context (brief bridge)</h3>
+<p>This submission continues a pattern of pNFS <code>GETDEVICEINFO</code> hardening by the same author. In late May 2026, Bommarito posted related work titled "fix client kernel panic from malformed GETDEVICEINFO," which addressed a zero-length <code>r_addr</code> in <code>nfs4_decode_mp_ds_addr</code> and bounded the multipath DS count in GETDEVICEINFO. The current series extends that effort to the notification-bitmap length path — the same decoder family, a different overflow vector — reinforcing an ongoing campaign to make the pNFS client robust against malformed or malicious <code>GETDEVICEINFO</code> replies.</p>
+<p>Both patches carry an "Assisted-by: Claude:claude-opus-4-8" trailer, indicating AI-assisted authorship.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260614130814.2521819-2-michael.bommarito@gmail.com/">2026-06-14 Michael Bommarito <a href="mailto:michael.bommarito@gmail.com">michael.bommarito@gmail.com</a> — [PATCH 1/2] NFSv4.1/pnfs: bound notification bitmap length in decode_getdeviceinfo</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260614130814.2521819-1-michael.bommarito@gmail.com/">2026-06-14 Michael Bommarito <a href="mailto:michael.bommarito@gmail.com">michael.bommarito@gmail.com</a> — [PATCH 0/2] NFSv4.1/pnfs: bound GETDEVICEINFO notification bitmap length</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260614130814.2521819-3-michael.bommarito@gmail.com/">2026-06-14 Michael Bommarito <a href="mailto:michael.bommarito@gmail.com">michael.bommarito@gmail.com</a> — [PATCH 2/2] NFSv4.1/pnfs: add KUnit coverage for GETDEVICEINFO notification decode</a></li>
+</ul>
+  </main>
+</body>
+</html>

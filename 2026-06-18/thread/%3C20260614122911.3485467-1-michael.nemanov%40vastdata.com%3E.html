@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS client: fix ENXIO on O_CREAT open of existing symlink over NFSv3</title>
+  <meta name="description" content="On June 14, Michael Nemanov (Vast Data) posted a targeted bug-fix patch to the linux-nfs mailing list addressing a long-standing edge case in the NFSv3 client&#39;s atomic_open path. The issue: calling open(2) with O_CREAT on a path that…">
+  <meta property="og:title" content="NFS client: fix ENXIO on O_CREAT open of existing symlink over NFSv3">
+  <meta property="og:description" content="On June 14, Michael Nemanov (Vast Data) posted a targeted bug-fix patch to the linux-nfs mailing list addressing a long-standing edge case in the NFSv3 client&#39;s atomic_open path. The issue: calling open(2) with O_CREAT on a path that…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-18T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS client: fix ENXIO on O_CREAT open of existing symlink over NFSv3">
+  <meta name="twitter:description" content="On June 14, Michael Nemanov (Vast Data) posted a targeted bug-fix patch to the linux-nfs mailing list addressing a long-standing edge case in the NFSv3 client&#39;s atomic_open path. The issue: calling open(2) with O_CREAT on a path that…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-18</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS client: fix ENXIO on O_CREAT open of existing symlink over NFSv3</h1>
+<h2>Summary</h2>
+<h1>NFS Client Bug Fix: ENXIO on O_CREAT Open of Existing Symlink over NFSv3</h1>
+<h2>Overview</h2>
+<p>On June 14, Michael Nemanov (Vast Data) posted a targeted bug-fix patch to the linux-nfs mailing list addressing a long-standing edge case in the NFSv3 client's <code>atomic_open</code> path. The issue: calling <code>open(2)</code> with <code>O_CREAT</code> on a path that already exists as a symbolic link, over an NFSv3 mount with a cold dentry cache, causes the kernel to return <code>ENXIO</code> (errno 6) instead of transparently following the symlink to its target.</p>
+<p>This is a <strong>bug fix</strong> in the NFS client (<code>fs/nfs/dir.c</code>), not a new feature or protocol change.</p>
+<h2>The Bug and Its Root Cause</h2>
+<p>Nemanov provided a concise reproducer script demonstrating the failure on kernel 7.1-rc6:</p>
+<blockquote>
+<p>"When open(2) is called with O_CREAT on a path that already exists as a symlink, over an NFSv3 mount with a cold dcache, the kernel returns ENXIO instead of following the symlink to its target."</p>
+</blockquote>
+<p>The root cause involves a confluence of three factors:</p>
+<ol>
+<li>
+<p><strong>NFSv3 CREATE UNCHECKED semantics</strong>: Per RFC 1813 §3.3.8, when the server receives a CREATE for a name that already exists as a non-regular file (like a symlink), it returns <code>NFS3_OK</code> with the existing object's file handle — not <code>NFS3ERR_EXIST</code>. Nemanov noted:</p>
+<blockquote>
+<p>"when the name already exists as a non-regular file the server returns NFS3_OK with the existing object's file handle rather than NFS3ERR_EXIST"</p>
+</blockquote>
+</li>
+<li>
+<p><strong>Unconditional <code>finish_open()</code> call</strong>: After <code>nfs_do_create()</code> succeeds (returning 0), the client code unconditionally calls <code>finish_open()</code>, which dispatches through <code>inode-&gt;i_fop-&gt;open()</code>.</p>
+</li>
+<li>
+<p><strong>Symlink inodes have no real file operations</strong>: The VFS initializes symlink inodes with <code>&amp;no_open_fops</code> because POSIX mandates that <code>open(2)</code> must follow symlinks, never open them directly. Thus <code>no_open()</code> returns <code>-ENXIO</code>.</p>
+</li>
+</ol>
+<p>The bug is masked when the dcache is warm (e.g., after a prior <code>stat(2)</code>), because <code>lookup_open()</code> then finds a positive dentry and skips <code>atomic_open</code> entirely, leaving symlink resolution to the normal VFS path. Nemanov highlighted this subtlety:</p>
+<blockquote>
+<p>"The bug does not trigger when the dcache is warm (e.g. after a prior stat(2)), because lookup_open() then finds a positive dentry and skips atomic_open entirely, leaving symlink resolution to the VFS."</p>
+</blockquote>
+<h2>The Fix</h2>
+<p>The patch adds 7 lines to <code>fs/nfs/dir.c</code>. After <code>nfs_do_create()</code> succeeds, the code now verifies that the returned inode is a regular file before calling <code>finish_open()</code>. If the object is not regular, it returns <code>finish_no_open()</code> so the VFS can follow the symlink through the normal open path.</p>
+<p>Nemanov explained the design choice for the type check:</p>
+<blockquote>
+<p>"!S_ISREG() is used rather than S_ISLNK() to cover any other non-regular types a server might return."</p>
+</blockquote>
+<p>This defensive approach ensures correctness even if a non-conformant NFSv3 server were to return a handle for, say, a directory or device node.</p>
+<p>The patch carries a <code>Fixes:</code> tag pointing to commit <code>7c6c5249f061</code> ("NFS: add atomic_open for NFSv3 to handle O_TRUNC correctly."), identifying the original code that introduced the regression.</p>
+<h2>Status and Context</h2>
+<p>As of this week's window, the thread contains only the initial patch submission — no replies from maintainers (Trond Myklebust or others) have yet appeared within the June 12–18 timeframe. The patch is a small, well-scoped fix with a clear <code>Fixes:</code> tag and self-test, making it a strong candidate for inclusion in a stable/fixes tree once reviewed.</p>
+<p>This type of bug — where NFSv3's lenient CREATE semantics interact poorly with the VFS's assumptions about file types at open time — is a recurring theme in NFS client development, underscoring the fragility of the <code>atomic_open</code> path when the server returns an unexpected file type.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260614122911.3485467-1-michael.nemanov@vastdata.com/">2026-06-14 Michael Nemanov <a href="mailto:michael.nemanov@vastdata.com">michael.nemanov@vastdata.com</a> — [PATCH] nfs: fix ENXIO on O_CREAT open of existing symlink over NFSv3</a></li>
+</ul>
+  </main>
+</body>
+</html>

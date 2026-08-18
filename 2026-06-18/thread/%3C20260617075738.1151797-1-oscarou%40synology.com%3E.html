@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>lockd: fix swapped arguments in nlmsvc_match_ip()</title>
+  <meta name="description" content="Type: Bug fix (NFS server / lockd)">
+  <meta property="og:title" content="lockd: fix swapped arguments in nlmsvc_match_ip()">
+  <meta property="og:description" content="Type: Bug fix (NFS server / lockd)">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-18T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="lockd: fix swapped arguments in nlmsvc_match_ip()">
+  <meta name="twitter:description" content="Type: Bug fix (NFS server / lockd)">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-18</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>lockd: fix swapped arguments in nlmsvc_match_ip()</h1>
+<h2>Summary</h2>
+<h2>lockd: Fix Swapped Arguments in <code>nlmsvc_match_ip()</code> — A Long-Silent Bug in Unlock-by-IP</h2>
+<p><strong>Type:</strong> Bug fix (NFS server / lockd)</p>
+<p>A one-line bug fix from Synology's Oscar Ou landed quickly this week, correcting a subtle argument-swap defect in the NFS lock daemon that had rendered the <code>/proc/fs/nfsd/unlock_ip</code> interface effectively non-functional since its introduction.</p>
+<h3>The Bug</h3>
+<p>Oscar Ou <a href="https://lore.kernel.org/linux-nfs/20260617075738.1151797-1-oscarou@synology.com/">submitted the patch</a> on Wednesday, June 17, explaining the root cause in detail:</p>
+<blockquote>
+<p>"nlmsvc_match_ip() has had these two arguments reversed ever since the unlock-by-IP feature was introduced in commit 4373ea84c84d ('lockd: unlock lockd locks associated with a given server ip')"</p>
+</blockquote>
+<p>The issue is one of callback-convention confusion. When an administrator triggers a bulk unlock by IP via <code>/proc/fs/nfsd/unlock_ip</code>, the code path flows through <code>nlmsvc_unlock_all_by_ip()</code> → <code>nlm_traverse_files(server_addr, nlmsvc_match_ip, NULL)</code>. The traversal machinery then invokes the match callback with the convention that <strong>arg1 is the real <code>nlm_host</code></strong> (the lock owner) and <strong>arg2 is the caller-supplied reference value</strong> (here, the server sockaddr). Every other match callback in the file — <code>nlmsvc_mark_host()</code>, <code>nlmsvc_same_host()</code>, <code>nlmsvc_is_client()</code> — follows this convention.</p>
+<p>But <code>nlmsvc_match_ip()</code> had it backwards:</p>
+<blockquote>
+<p>"Here @host is actually the server sockaddr, so nlm_srcaddr(host) dereferences a struct sockaddr as a struct nlm_host and reads garbage at the offset of h_srcaddr; meanwhile @datap is actually the lock owner's nlm_host but is compared as a sockaddr. As a result the comparison practically never matches and locks are not released for the requested IP."</p>
+</blockquote>
+<p>In other words, the function was dereferencing a <code>struct sockaddr</code> as if it were a <code>struct nlm_host</code>, reading out-of-bounds garbage, and comparing it against the actual lock owner's host structure cast to a sockaddr. The comparison essentially never succeeded, meaning <strong>locks were silently never released</strong> for the requested IP — a functional failure rather than a crash, which likely explains why it went unnoticed.</p>
+<h3>The Fix</h3>
+<p>The fix is a single-line swap of the two arguments in <code>rpc_cmp_addr()</code>:</p>
+<pre><code class="language-c">- return rpc_cmp_addr(nlm_srcaddr(host), datap);
++ return rpc_cmp_addr(nlm_srcaddr(datap), (struct sockaddr *)host);
+</code></pre>
+<p>This correctly compares the lock owner's source address (<code>datap</code>, which is actually the <code>nlm_host</code>) against the requested server address (<code>host</code>, which is the sockaddr passed down as opaque data).</p>
+<h3>Resolution</h3>
+<p>NFS maintainer Chuck Lever <a href="https://lore.kernel.org/linux-nfs/178170349726.1539549.17398579325429557639.b4-ty@b4/">picked up the patch</a> later the same day:</p>
+<blockquote>
+<p>"Applied to nfsd-testing, thanks!"</p>
+</blockquote>
+<p>The fix was committed as <code>80e05cc8a30aec76f4457a9c163b222e9ff5a671</code> in the nfsd-testing tree. The same-day turnaround reflects how straightforward and well-scoped the fix is — a classic case of a bug that's easy to spot once you understand the callback convention, but easy to miss in code review because the types involved (<code>struct sockaddr *</code> vs <code>struct nlm_host *</code>) are both opaque pointers at the call site.</p>
+<h3>Context</h3>
+<p>This is a server-side lockd fix rather than a client change, but it matters for NFS administrators who rely on <code>/proc/fs/nfsd/unlock_ip</code> as an operational tool to release stale locks after a client or server IP changes. The <code>Fixes:</code> tag points back to the original feature commit, confirming this has been broken since the unlock-by-IP mechanism was first added.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260617075738.1151797-1-oscarou@synology.com/">2026-06-17 Oscar Ou <a href="mailto:oscarou@synology.com">oscarou@synology.com</a> — [PATCH] lockd: fix swapped arguments in nlmsvc_match_ip()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178170349726.1539549.17398579325429557639.b4-ty@b4/">2026-06-17 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH] lockd: fix swapped arguments in nlmsvc_match_ip()</a></li>
+</ul>
+  </main>
+</body>
+</html>

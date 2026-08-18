@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Layton posts three follow-on bug fixes for CB_NOTIFY dir-delegation support</title>
+  <meta name="description" content="On June 17, Jeff Layton posted a three-patch series titled &quot;nfsd: follow-on fixes for CB_NOTIFY support,&quot; addressing defects in the recently reviewed RFC 8881bis CB_NOTIFY directory-delegation callback code. The series is squarely a…">
+  <meta property="og:title" content="Layton posts three follow-on bug fixes for CB_NOTIFY dir-delegation support">
+  <meta property="og:description" content="On June 17, Jeff Layton posted a three-patch series titled &quot;nfsd: follow-on fixes for CB_NOTIFY support,&quot; addressing defects in the recently reviewed RFC 8881bis CB_NOTIFY directory-delegation callback code. The series is squarely a…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-18T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Layton posts three follow-on bug fixes for CB_NOTIFY dir-delegation support">
+  <meta name="twitter:description" content="On June 17, Jeff Layton posted a three-patch series titled &quot;nfsd: follow-on fixes for CB_NOTIFY support,&quot; addressing defects in the recently reviewed RFC 8881bis CB_NOTIFY directory-delegation callback code. The series is squarely a…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-18</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Layton posts three follow-on bug fixes for CB_NOTIFY dir-delegation support</h1>
+<h2>Summary</h2>
+<h1>nfsd: Three Follow-On Bug Fixes for CB_NOTIFY Directory Delegation Support</h1>
+<h2>Overview</h2>
+<p>On June 17, Jeff Layton posted a <a href="https://lore.kernel.org/linux-nfs/20260617-dir-deleg-fixes-v1-0-32b85b366c29@kernel.org/">three-patch series</a> titled "nfsd: follow-on fixes for CB_NOTIFY support," addressing defects in the recently reviewed RFC 8881bis <code>CB_NOTIFY</code> directory-delegation callback code. The series is squarely a <strong>bug-fix</strong> effort — three distinct concurrency and correctness issues in the server-side callback path that were surfaced during review of the v6 NFSD series earlier this week.</p>
+<blockquote>
+<p>"These are just some problems that Sashiko pointed out in review that seem to be valid concerns."
+— <a href="https://lore.kernel.org/linux-nfs/20260617-dir-deleg-fixes-v1-0-32b85b366c29@kernel.org/">Jeff Layton, cover letter</a></p>
+</blockquote>
+<p>The patches target <code>fs/nfsd/nfs4state.c</code> and <code>fs/nfsd/nfs4xdr.c</code>, with 64 insertions and 28 deletions across the two files. Layton noted that the <code>Fixes:</code> tags reference commits from his own tree, so maintainers will need to fold them into the appropriate upstream patches rather than apply them as standalone fixes.</p>
+<h2>Bridge from Prior Week</h2>
+<p>As <a href="https://lore.kernel.org/linux-nfs/20260611-dir-deleg-v6-0-4c45080e5f3f@kernel.org/">summarized in the CB_NOTIFY dir-delegation v6 thread</a>, Chuck Lever completed his review of all 20 patches in the v6 NFSD series on June 12, surfacing eight distinct findings. Two of those findings — the queue-overflow livelock and the export use-after-free — were specifically called out in Lever's <a href="https://lore.kernel.org/linux-nfs/0a0bfce8-c35e-4c96-8f7b-65267fd96a61@app.fastmail.com/">review of patch 20/20</a>. This week's three-patch series addresses those two plus a third protocol-correctness issue (silently dropping requested dir-attr notifications), all in the <code>nfsd4_cb_notify_prepare()</code> / <code>setup_notify_fhandle()</code> code path.</p>
+<h2>Patch-by-Patch Analysis</h2>
+<h3>PATCH 1/3 — Fix CB_NOTIFY workqueue loop when queue overflows</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260617-dir-deleg-fixes-v1-1-32b85b366c29@kernel.org/">Jeff Layton's first patch</a> fixes a <strong>livelock</strong> in the callback workqueue. The root cause is an off-by-one between the producer and consumer of the CB_NOTIFY event queue:</p>
+<blockquote>
+<p>"When NOTIFY4_CHANGE_DIR_ATTRS is requested, nfsd4_cb_notify_prepare() lowers its limit to NOTIFY4_EVENT_QUEUE_SIZE - 1 to reserve a slot for the dir attribute update. The producer in nfsd_handle_dir_event() caps ncn_evt_cnt at NOTIFY4_EVENT_QUEUE_SIZE, so the queue can fill to one more than that limit."</p>
+</blockquote>
+<p>The consequence is severe: when the overflow branch fires, <code>prepare()</code> jumps to <code>out_recall</code> without draining the queue, leaving <code>ncn_evt_cnt</code> nonzero. The release op then requeues the callback, which hits the same overflow check again — spinning a workqueue thread forever while pinning an stid reference so the delegation is never freed:</p>
+<blockquote>
+<p>"Returning false from prepare causes nfsd41_destroy_cb() to run the release op, and nfsd4_cb_notify_release() requeues the callback whenever ncn_evt_cnt &gt; 0. The requeued callback hits the same overflow check and recalls again, spinning a workqueue thread forever."</p>
+</blockquote>
+<p>The fix drains queued events (dropping their references) and resets <code>ncn_evt_cnt</code> before recalling, and additionally guards the release-side requeue against a revoked delegation:</p>
+<blockquote>
+<p>"Also guard the release-side requeue against a revoked delegation: there is no point notifying a client that no longer holds the delegation, and skipping the requeue avoids pinning the stid and spinning the workqueue."</p>
+</blockquote>
+<p>This was first identified by Lever in his <a href="https://lore.kernel.org/linux-nfs/0a0bfce8-c35e-4c96-8f7b-65267fd96a61@app.fastmail.com/">patch 20/20 review</a>, who described it as a "queue overflow livelock."</p>
+<h3>PATCH 2/3 — Fix NULL deref / UAF of sc_export in setup_notify_fhandle</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260617-dir-deleg-fixes-v1-2-32b85b366c29@kernel.org/">The second patch</a> addresses a <strong>use-after-free and NULL pointer dereference</strong> in <code>setup_notify_fhandle()</code>. The function read <code>dp-&gt;dl_stid.sc_export</code> locklessly and dereferenced it unconditionally in the subtree-check branch, even though the code later acknowledged with an <code>if (exp &amp;&amp; ...)</code> guard that the pointer could be NULL.</p>
+<p>The race window is narrow but real: CB_NOTIFY callbacks run asynchronously holding only an <code>sc_count</code> reference. While <code>nfs4_put_stid()</code> keeps the export alive until <code>sc_count</code> reaches zero, the admin-revocation path (<code>drop_stid_export()</code> via <code>revoke_one_stid()</code>) clears <code>sc_export</code> and drops its reference independently of <code>sc_count</code>, under <code>cl_lock</code>:</p>
+<blockquote>
+<p>"A concurrent revocation can therefore make the lockless read return NULL (NULL deref in the subtree-check branch) or a pointer that exp_put() frees mid-encode (use-after-free)."</p>
+</blockquote>
+<p>The fix grabs a reference to the export under <code>cl_lock</code> — mirroring the locking discipline already used in <code>drop_stid_export()</code> — and guards every use of <code>exp</code> with a NULL check. This was also flagged by Lever in his <a href="https://lore.kernel.org/linux-nfs/0a0bfce8-c35e-4c96-8f7b-65267fd96a61@app.fastmail.com/">patch 20/20 review</a>.</p>
+<h3>PATCH 3/3 — Recall delegation if a requested dir attr change can't be encoded</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260617-dir-deleg-fixes-v1-3-32b85b366c29@kernel.org/">The third patch</a> fixes a <strong>protocol-correctness bug</strong>: when the client requested <code>NOTIFY4_CHANGE_DIR_ATTRS</code>, the server could silently fail to encode the directory attribute change (due to attrmask space reservation failure, buffer exhaustion, or an encode error) and still transmit a CB_NOTIFY lacking the requested notification. The result was that "the client's cached directory attributes [would be] stale with no indication."</p>
+<p>Layton cites the RFC directly:</p>
+<blockquote>
+<p>"RFC 8881 s10.4 requires the server to recall the delegation when it cannot deliver a requested notification."</p>
+</blockquote>
+<p>The fix treats a failure to encode the dir attribute change identically to the per-event encode failures already handled in the loop above — setting an error and falling through to <code>out_recall</code>. This ensures the client is properly notified that its cached directory attributes are no longer valid.</p>
+<h2>Significance for NFS Client Development</h2>
+<p>All three fixes are server-side, but their impact on clients is direct:</p>
+<ul>
+<li><strong>The livelock (patch 1/3)</strong> would manifest as a hung server with an unresponsive delegation — the client would see no recalls and no notifications indefinitely, while the server burns CPU. This is the kind of bug that can only be caught under sustained directory-event load.</li>
+<li><strong>The UAF (patch 2/3)</strong> is a crash risk during admin operations (unexport, revoke) while CB_NOTIFY callbacks are in flight. A client would see connection resets or stale-handle storms.</li>
+<li><strong>The silent notification drop (patch 3/3)</strong> is the most insidious: without the fix, a client maintaining a cached directory view could operate on stale attributes with no way to detect the staleness until it performs an explicit GETATTR.</li>
+</ul>
+<p>These fixes are prerequisites for the client-side implementation that Layton has identified as the gating dependency for upstream merge:</p>
+<blockquote>
+<p>"I don't think we'll want to merge these until we have a complete client-side implementation to test against."
+— <a href="https://lore.kernel.org/linux-nfs/20260611-dir-deleg-v6-0-4c45080e5f3f@kernel.org/">Layton, prior week</a></p>
+</blockquote>
+<h2>Status</h2>
+<ul>
+<li><strong>Thread status:</strong> No replies as of the end of this week's window. The three patches are posted and awaiting review (presumably by Chuck Lever, who conducted the original v6 review).</li>
+<li><strong>Relationship to main series:</strong> These are follow-on fixes to be folded into the CB_NOTIFY dir-delegation series (targeting v7.3), not standalone upstream commits.</li>
+<li><strong>Open items from prior week still pending:</strong> The refcount race in <code>nfsd_break_one_deleg()</code>, the stale <code>ncn_encode_err</code> flag, the order-aware client mask negotiation issue, and the size-budgeting bug for two-word bitmaps have not yet received corresponding fix patches in this series.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260617-dir-deleg-fixes-v1-0-32b85b366c29@kernel.org/">2026-06-17 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 0/3] nfsd: follow-on fixes for CB_NOTIFY support</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260617-dir-deleg-fixes-v1-1-32b85b366c29@kernel.org/">2026-06-17 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 1/3] nfsd: fix CB_NOTIFY workqueue loop when queue overflows</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260617-dir-deleg-fixes-v1-2-32b85b366c29@kernel.org/">2026-06-17 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 2/3] nfsd: fix NULL deref / UAF of sc_export in setup_notify_fhandle</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260617-dir-deleg-fixes-v1-3-32b85b366c29@kernel.org/">2026-06-17 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 3/3] nfsd: recall deleg if a requested dir attr change can't be encoded</a></li>
+</ul>
+  </main>
+</body>
+</html>
