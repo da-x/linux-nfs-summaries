@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS 7.2 client pull merged into mainline; xprtrdma hardening, pNFS/flexfiles fixes, and a hot delegation-performance debate dominate the week</title>
+  <meta name="description" content="The single most consequential event of the week is the merge of Anna Schumaker&#39;s nfs-for-7.2-1 pull request into torvalds/linux.git — sent June 23, confirmed merged by pr-tracker-bot just six hours later on June 24. The diffstat is…">
+  <meta property="og:title" content="NFS 7.2 client pull merged into mainline; xprtrdma hardening, pNFS/flexfiles fixes, and a hot delegation-performance debate dominate the week">
+  <meta property="og:description" content="The single most consequential event of the week is the merge of Anna Schumaker&#39;s nfs-for-7.2-1 pull request into torvalds/linux.git — sent June 23, confirmed merged by pr-tracker-bot just six hours later on June 24. The diffstat is…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-25T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS 7.2 client pull merged into mainline; xprtrdma hardening, pNFS/flexfiles fixes, and a hot delegation-performance debate dominate the week">
+  <meta name="twitter:description" content="The single most consequential event of the week is the merge of Anna Schumaker&#39;s nfs-for-7.2-1 pull request into torvalds/linux.git — sent June 23, confirmed merged by pr-tracker-bot just six hours later on June 24. The diffstat is…">
+  <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../index.html">Summaries</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS 7.2 client pull merged into mainline; xprtrdma hardening, pNFS/flexfiles fixes, and a hot delegation-performance debate dominate the week</h1>
+<p><em>Week ending 2026-06-25</em></p>
+<h1>Linux NFS — Week ending 2026-06-25</h1>
+<h2>Top story: NFS client 7.2 pull merged into mainline</h2>
+<p>The single most consequential event of the week is the <a href="thread/%253C20260623195315.829881-1-anna%2540kernel.org%253E.html">merge of Anna Schumaker's <code>nfs-for-7.2-1</code> pull request</a> into torvalds/linux.git — sent June 23, confirmed merged by pr-tracker-bot just six hours later on June 24. The diffstat is substantial: <strong>35 files changed, +703 / -326</strong>, with the heaviest concentration in <code>net/sunrpc/xprtrdma/</code> and <code>fs/nfs/</code>.</p>
+<p>The pull bundles:</p>
+<ul>
+<li><strong>XPRTRDMA hardening (13 patches by Chuck Lever)</strong> — decoupling request recycling from RPC completion, fixing a use-after-free where an <code>rpcrdma_req</code> could be recycled while the HCA was still DMA-reading from its send buffer. Includes conversion of the send-buffer free list to a lockless llist and several connect/reply-path fixes by Chris Mason (ep kref imbalance on ADDR_CHANGE, <code>re_id</code> init, bcall rep leak).</li>
+<li><strong>FMODE_NOWAIT for read-only files</strong> — lets io_uring complete NFS I/O inline rather than punting to worker threads.</li>
+<li><strong>16 distinct bug fixes</strong> across SUNRPC, XPRTRDMA, NFS core, NFSv4, pNFS, and flexfiles (EOF updates after fallocate/zero-range, sticky page-group read-failed flag, file-lock list UAF fix by Yang Erkun, LAYOUTCOMMIT retry loop on OLD_STATEID, <code>return_range</code> callback deferral, flexfiles <code>FF_FLAGS_NO_IO_THRU_MDS</code> honoring, zero-length r_addr/filehandle rejection, etc.).</li>
+<li><strong>Fileid field removal from <code>struct nfs_inode</code></strong> — the long-promised follow-on to the 7.1 treewide <code>inode-&gt;i_ino</code> widening; eliminates the decade-old XOR-folding hack for 32-bit userspace.</li>
+<li><strong>Mount option redaction</strong> — cert_serial/privkey_serial now shown as <code>&lt;redacted&gt;</code> in <code>/proc/mounts</code>.</li>
+</ul>
+<p>The follow-on fileid cleanup also <a href="thread/%253C20260512-nfsino-v1-0-284720522f4c%2540kernel.org%253E.html">landed into Anna's linux-next branch this week</a> after a five-week dormancy, with a side-thread on an arm32 LTP <code>ioctl10</code> regression (the test's <code>sscanf()</code> overflows when <code>/proc/self/maps</code> now prints full 64-bit inode numbers on 32-bit arches).</p>
+<h2>Critical client bugs and fixes in flight</h2>
+<h3>KASAN slab-use-after-free in <code>xprt_put</code> — confirmed live on mainline</h3>
+<p>The <a href="thread/%253C4EB31731-B511-44E6-9019-760EED0A2BD1%2540gmail.com%253E.html">KASAN UAF report from June 7</a> finally got its first maintainer triage this week. Anna Schumaker asked the reporter to retest against current mainline in light of the recently merged transport-lifecycle fixes; Shuangpeng Bai confirmed within hours that <strong>the bug still reproduces on <code>f0e6f20cb52b</code></strong> with an essentially unchanged trace — a write into a freed 2048-byte slab object from <code>rpc_free_client_work</code>. This is now queued for genuine root-cause work in the SunRPC client transport lifetime path.</p>
+<h3>NFSv4.1/pnfs: XDR-wrap OOB read in <code>decode_pnfs_layout_types</code></h3>
+<p>Michael Bommarito <a href="thread/%253C20260622124836.1696330-1-michael.bommarito%2540gmail.com%253E.html">posted a stable-tagged fix</a> for an integer-overflow-driven out-of-bounds read reachable from a malicious NFSv4.1+ server during FSINFO decode. A <code>u32</code> count multiplied by 4 wraps for values ≥ <code>0x40000000</code>, letting the verify loop read up to ~2^30 words past the inline XDR buffer. Trond Myklebust's reply was terse but consequential: <em>"This is just open coding xdr_stream_decode_uint32_array(), and doing so incorrectly."</em> — steering the fix toward the canonical helper. This is the companion to his earlier GETDEVICEINFO notification-bitmap fix from last week; both are part of a pNFS decoder-hardening campaign against hostile servers.</p>
+<h3>NFSv4 callback IDR leak on allocation failure</h3>
+<p><a href="thread/%253C20260624035858.172129-1-ruoyuw560%2540gmail.com%253E.html">Ruoyu Wang posted</a> a surgical fix for a publish-before-free lifetime bug in <code>nfs4_alloc_client()</code>: if any later initialization step fails, the error path frees the client directly with <code>nfs_free_client()</code> (bypassing <code>nfs_put_client()</code>), leaving <code>cb_ident_idr</code> pointing at freed memory. A later NFSv4.0 callback lookup by <code>cb_ident</code> would find the stale pointer and take a reference to it. Found by a local static-analysis checker, confirmed manually. No maintainer reply yet as of week's end.</p>
+<h3>NFSv4.1 FREE_STATEID refcount leak + blocklayout device leaks</h3>
+<p><a href="thread/%253C20260625032038.11535-1-zhang.guodong%2540linux.dev%253E.html">ZhangGuoDong (KylinOS) posted a two-patch series</a>: (1) a one-line fix dropping the <code>nfs_client</code> reference before returning <code>-ENOMEM</code> in <code>nfs41_free_stateid()</code>, and (2) three related fixes in the pNFS blocklayout device parser — child array leak on parse failure, <code>bl_free_device()</code> not releasing the children array when <code>nr_children == 0</code>, and a double-free risk in <code>bl_parse_scsi()</code> after <code>fput()</code>. No replies yet.</p>
+<h3>NFS file-lock UAF fix lands in linux-next after 16-week wait</h3>
+<p>The <a href="thread/%253C20260226012203.3962997-1-yangerkun%2540huawei.com%253E.html">long-running RFC from Yang Erkun (Huawei)</a> to protect NFS file-lock list traversal using <code>nfsi-&gt;rwsem</code> instead of <code>flc_lock</code> finally landed in Anna Schumaker's linux-next branch this week (commit 4837fb36219e). The fix has carried Jeff Layton's Reviewed-by since March; the delay was purely queue-related. Erkun's final ping and apology for checking only the MAINTAINERS-listed tree closed out a cordial sixteen-week saga.</p>
+<h3>RPC-with-TLS memory bugs finally get maintainer attention</h3>
+<p>After seven weeks unqueued, Chuck Lever's <a href="thread/%253C20260504-sunrpc-tls-clnt-pin-v1-0-197f359c6072%2540oracle.com%253E.html">two-patch series fixing an rpc_clnt leak and a use-after-free in RPC-over-TLS</a> got a gentle ping from Lever on June 24 and an immediate commitment from Anna Schumaker: <em>"I'll take a look soon, and try to include them in a bugfixes pull request."</em> The UAF was reported in the field by Michael Nemanov (Vast Data) and produces a <code>refcount_t</code> underflow on mTLS mounts whose client certificate the server rejects.</p>
+<h3>lockd: GRANTED_MSG regression fix</h3>
+<p>Olga Kornievskaia (Red Hat) <a href="thread/%253C20260625211852.31972-1-okorniev%2540redhat.com%253E.html">posted a one-line-per-file swap</a> fixing a regression introduced by the xdrgen XDR conversion of <code>GRANTED_MSG</code>: pure NFS clients (no nfsd running) were failing every incoming NLM callback because the client-side path was wired through server-oriented <code>nlm4svc_lookup_host()</code> helpers that require <code>nlmsvc_ops</code> registration. The fix uses the generic <code>nlmsvc_lookup_host()</code> instead.</p>
+<h3>lockd: TEST handling fix queued for 7.0</h3>
+<p>NeilBrown's patch (posted by Chuck Lever) <a href="thread/%253C20260619204750.1803357-1-cel%2540kernel.org%253E.html">fixing how lockd handles NLM TEST when not all permissions are available</a> was confirmed queued for 7.0 by Sasha Levin. The bug — present since git history began but masked until a recent nfsd permission-handling change — caused qemu to fail when accessing read-only filesystem images over NFS.</p>
+<h2>Major new features and RFCs</h2>
+<h3>pNFS/flexfiles: honor <code>clora_changed</code> and report cancelled I/O (v2)</h3>
+<p>Benjamin Coddington <a href="thread/%253Ccover.1782388900.git.bcodding%2540hammerspace.com%253E.html">posted v2 of his three-patch series</a> fixing a long-standing protocol-compliance gap: the Linux client has ignored the <code>clora_changed</code> flag in <code>CB_LAYOUTRECALL</code> since 2015, cancelling in-flight data-server I/O on every recall — which can leave a write incomplete at the DS with no write layout held. The v2 addresses Anna's review nits (kerneldoc, <code>FILE_INODE</code> → <code>inode-&gt;i_ino</code>) and is now based on <code>nfs-for-7.2-1</code>, awaiting final sign-off.</p>
+<h3>NFSv4.2 client support for UNCACHEABLE_FILE_DATA</h3>
+<p>Mike Snitzer <a href="thread/%253C20260624191706.72544-1-snitzer%2540kernel.org%253E.html">posted a four-patch series</a> adding Linux NFSv4.2 client support for <code>FATTR4_UNCACHEABLE_FILE_DATA</code> (attribute 87) from the in-flight IETF draft. The motivating use case is HPC-style concurrent writers modifying disjoint byte ranges of a shared file, where cached/delayed writes cause read-modify-write "write holes." When a server marks a file uncacheable, the client transparently opens it <code>O_DIRECT</code>. Review discussion focused on whether to use the server-side xdrgen infrastructure for a client-only attribute; Chuck Lever steered toward keeping the client self-contained.</p>
+<h3>NFS Direct I/O modernization (v2) — folio/bvec debate continues</h3>
+<p>Pranjal Shrivastava <a href="thread/%253C20260616134000.2733403-1-praan%2540google.com%253E.html">responded to last week's review feedback</a> on his seven-patch series migrating NFS <code>O_DIRECT</code> to the modern <code>iov_iter_extract_pages()</code> API. He provided full xfstests quick-suite results (no regressions across RDMA and TCP), acknowledged CC-list additions, and raised a pointed counter-observation: the block layer's own bvec extraction path also calls <code>page_folio()</code> via <code>get_contig_folio_len()</code> without slab/vmalloc checks — questioning whether the correct long-term fix is an API change in <code>lib/iov_iter.c</code> that shields all filesystems from folio semantics.</p>
+<h3>SUNRPC: latency floor for interactive clients (RFC)</h3>
+<p>Benjamin Coddington <a href="thread/%253Ccover.1782314746.git.bcodding%2540hammerspace.com%253E.html">posted a three-patch RFC</a> adding a second per-pool ready queue for transports with no requests in flight, granting them a burst allowance of 64 high-priority dispatches. The goal: prevent interactive NFS client sessions (stats, opens, directory listings) from being starved by bulk workloads saturating the server thread pool. Benchmark data shows up to <strong>12.8× p50 latency improvement</strong> for interactive bursts under heavy contention with no throughput regression. Chuck Lever's review identified a deferred-close routing bug and asked Coddington to validate the exact-zero re-arm trigger under contention via kprobe.</p>
+<h3>nfsd netlink stats (v6) — UAF fixed, dump design debated</h3>
+<p>Jeff Layton <a href="thread/%253C20260619-exportd-netlink-v6-0-ddef3499793c%2540kernel.org%253E.html">posted v6 of his series converting nfsstat to generic netlink</a>, fixing both of Chuck Lever's prior-week blockers (UAF in <code>nfsd4_run_cb()</code> via snapshotting, CB_SEQUENCE undercount). However, Lever's review of v6 introduced two new concerns: (1) the single-message dump design is fragile against buffer-size growth as NFSv4 ops are added — he recommends the streaming pattern already used by <code>nfsd_nl_rpc_status_get_dumpit()</code>; and (2) the CB_SEQUENCE increment still fires for null-probe work items that never send a callback. A v7 will likely address both. See also <a href="thread/%253C20260618-exportd-netlink-v5-0-e9aef947af3d%2540kernel.org%253E.html">the v5 review thread</a>.</p>
+<h2>Ongoing debates and design discussions</h2>
+<h3>NFS delegations: the "warm <code>ls -l</code> is slower than cold" puzzle</h3>
+<p>A <a href="thread/%253Cm2qzlx7eye.fsf%2540gmail.com%253E.html">12-message thread</a> opened by Piyush Sachdeva drew in all four core NFS client maintainers (Layton, Coddington, Schumaker, Myklebust) plus Tigran Mkrtchyan (DESY). The benchmark: on a 100K-file directory with <code>actimeo=5s</code>, a warm <code>ls -l</code> issues <strong>100,000 GETATTRs</strong> and takes ~62 s vs ~14 s for the cold pass. Root cause: directory delegations protect dentries but not file attributes, so post-<code>actimeo</code> stats fall through to per-file GETATTR — far more expensive than batched READDIRPLUS.</p>
+<p>Key proposals discussed:</p>
+<ul>
+<li><strong>Anna Schumaker's "statx-based readdirplus syscall"</strong> — letting userspace declare its intent up front so the client can pick READDIRPLUS deterministically. <em>"I don't think we'll ever have a readdir plus heuristic that makes everybody happy without userspace somehow telling us their intentions."</em></li>
+<li><strong>NOTIFY4_CHANGE_CHILD_ATTRIBUTES</strong> — examined and effectively set aside by Trond Myklebust: <em>"Unlike delegations, notifications are asynchronous by design... the absence of that notification is insufficient to deduce that it is safe not to revalidate those attributes."</em></li>
+<li><strong>Benjamin Coddington's benchmarking scars</strong>: <em>"We made the mistake of trying to improve the benchmark which resulted in performance regressions for real-world users."</em></li>
+</ul>
+<p>No code was committed; the thread is a design discussion, but it surfaces several concrete improvement ideas that would touch the client and possibly the protocol.</p>
+<h3>GSS fore-channel slots vs. replay window — stopgap or structural fix?</h3>
+<p>Vjaceslavs Klimovs <a href="thread/%253CCAC_j7i1WXvMS6Q66w7-EGxZYFrdJ9R_DzA26xweP5%253D7z05KWzg%2540mail.gmail.com%253E.html">posted a patch capping GSS session fore-channel slots at 32</a> to mitigate a production krb5p streaming-write stall (stall to ~0 after 6.12→6.18 upgrade, bisected to on-demand slot growth). Chuck Lever delivered a detailed rebuttal: <em>"the GSS window bounds relative lag, not concurrency... no ratio can close that gap and prevent reordering."</em> He outlined three structurally correct fix directions (client-side spread throttling, per-connection GSS contexts, negotiated window size) and characterized the cap as "a probability knob, not an invariant." The author himself flagged two client-side problems not addressed by the patch: the default 64-slot over-commit across <code>nconnect</code> links, and the v6.16 RFC2203 seqno cache turning a recoverable graze into a hard EIO.</p>
+<h3>sunrpc pool_mode: hardcode to pernode</h3>
+<p>Jeff Layton <a href="thread/%253C20260625-sunrpc-pool-mode-v2-1-4f512b6e1ee8%2540kernel.org%253E.html">posted v2 of his patch removing all non-pernode pool modes</a>. Chuck Lever flagged a critical edge case: when <code>nrservs &lt; number of NUMA nodes</code>, trailing pools get zero threads and work routed to those pools is never serviced. Layton proposed a two-part fix (minimum one thread per CPU-bearing node + enqueue fallback to a populated pool). NeilBrown added code-level nits and design opinions. No v3 yet.</p>
+<h2>Server-side bug fixes (client-impact)</h2>
+<h3>nfsd inter-server copy offload: three UAF/race fixes</h3>
+<p>Jeff Layton <a href="thread/%253C20260624-nfsd-testing-v1-0-b8853eb22e45%2540kernel.org%253E.html">posted a three-patch series</a> fixing bugs in NFSv4.2 COPY/COPY_NOTIFY/OFFLOAD_CANCEL, all identified through LLM inspection: (1) a cpntf publish race allowing an authenticated client to oops the server via OFFLOAD_CANCEL; (2) a UAF in the statelist drain loop; (3) two interlocking UAF hazards in async copy cancel/shutdown (double <code>nfsd_file_put()</code> and kthread lifetime race). All carry <code>Fixes:</code> tags pointing to code in-tree for years.</p>
+<h3>svcrdma: slab-corrupting overflow in pull-up path</h3>
+<p>Chuck Lever <a href="thread/%253C20260623014728.826032-1-cel%2540kernel.org%253E.html">posted a fix</a> for a remote-exploitable memory corruption: a malicious RPC-over-RDMA client can trigger an out-of-bounds slab write and out-of-bounds DMA read by requesting a reply without providing a Write list or Reply chunk when the SGE budget is exhausted. The fix fails the request with <code>ERR_CHUNK</code> per RFC 8166 §4.5.3 rather than dropping the connection. Reported by Chris Mason (Meta), AI-assisted development.</p>
+<h3>NFSD admin state-revocation: startup NULL-deref</h3>
+<p>Following XIAO WU's KASAN-confirmed report of a NULL pointer dereference in <code>unlock_filesystem</code> during the startup window, Chuck Lever <a href="thread/%253C20260621162551.2469460-1-cel%2540kernel.org%253E.html">posted the follow-on fix</a> switching all three unlock paths from testing <code>nn-&gt;nfsd_serv</code> to <code>NFSD_NET_UP</code>. Jeff Layton provided a careful re-derivation and Reviewed-by within a day. See also <a href="thread/%253C20260613-unlock-filesystem-uaf-v1-0-462b9bec8c84%2540kernel.org%253E.html">the original UAF thread where the new bug was discovered</a>.</p>
+<h3>nfsd dir-delegation CB_NOTIFY recall fix (v3 folded)</h3>
+<p>Layton's <a href="thread/%253C20260620-dir-deleg-fixes-v3-1-4ff9a315c793%2540kernel.org%253E.html">v3 patch</a> closing the <code>vfs_getattr()</code> masking gap flagged by Lever's AI-assisted review of v2 was folded into the upstream commit by Lever on June 21. This completes a three-round bug-fix saga ensuring that any client implementing RFC 8881bis directory delegations can rely on the server to either deliver the notification or recall the delegation. See also <a href="thread/%253C20260619-dir-deleg-fixes-v2-1-ad22fe2c7d7d%2540kernel.org%253E.html">the v2 review thread</a>.</p>
+<h3>pynfs: 26-patch directory delegation test suite (v3)</h3>
+<p>Layton <a href="thread/%253C20260619-dir-deleg-v3-0-1077ce8aab1b%2540kernel.org%253E.html">posted v3 of his comprehensive pynfs test series</a> covering all CB_NOTIFY notification types (ADD, REMOVE, RENAME, CHANGE_DIR_ATTRS), recall behavior, edge cases (cross-directory renames, rename-over with <code>nad_old_entry</code>), and lifecycle. Calum Mackay (Oracle) acknowledged receipt on June 23: <em>"I have a bit of a backlog, again, but will get to these asap."</em> These tests are the verification vehicle for the server-side CB_NOTIFY support landing in v7.3.</p>
+<h2>Stale block count debate: NFS vs. XFS</h2>
+<p>Jingbo Xu (Alibaba) <a href="thread/%253C20260622060038.13731-1-jefflexu%2540linux.alibaba.com%253E.html">posted a two-line patch</a> to invalidate <code>i_blocks</code> after COMMIT, fixing xfstests generic/694 on NFSv4-over-XFS. Trond Myklebust NACKed firmly: <em>"That sounds like an XFS bug, not an NFS bug... I fail to see why we should degrade the performance of the generic NFS client in order to address a bug in one of the back end filesystems."</em> Brian Foster (Red Hat) reframed the question — is <code>st_blocks</code> changing across fsync actually a POSIX violation? — and suggested the xfstest may simply need adjustment for NFS. No resolution reached; the ball is with Xu and the XFS maintainers.</p>
+<h2>Minor items</h2>
+<ul>
+<li><a href="thread/%253C20260621213535.539450-1-cel%2540kernel.org%253E.html">NFSD: Replace <code>isdotent()</code> macro with VFS <code>name_is_dot_dotdot()</code></a> — cleanup + latent OOB read fix on zero-length names. Reviewed-by Layton, ready for merge.</li>
+<li><a href="thread/%253C20260619142040.3970345-1-houminxi%2540gmail.com%253E.html">NFS: pnfs.rst stale references fix</a> and <a href="thread/%253C20260625083756.1799608-1-houminxi%2540gmail.com%253E.html">flexfiles <code>ffl_flags</code> validation test</a> — documentation and test hardening.</li>
+<li><a href="thread/%253Ccover.1782148639.git.abo%2540medichon.fr%253E.html">pNFS: refactor using <code>clear_and_wake_up_bit</code></a> — minor cleanup series.</li>
+</ul>
+<h2>Themes this week</h2>
+<ol>
+<li>
+<p><strong>Memory safety is the dominant theme.</strong> The 7.2 pull merged a dozen UAF/refcount fixes; new KASAN reports (<code>xprt_put</code>, svcrdma pull-up, nfsd copy offload) continue to surface in both client and server paths. AI-assisted review (Sashiko, Claude, gpt-5.5) is now routine in both patch authorship and review, catching issues that human reviewers miss — and the loop is closing: findings drive revisions that get folded within days.</p>
+</li>
+<li>
+<p><strong>The NFS client's readdir/stat path remains the hardest optimization problem.</strong> The delegation behavior analysis thread crystallizes why: the kernel cannot see userspace intent, heuristics regress other workloads, and protocol-level solutions (NOTIFY4) have semantic limitations. The "statx-based readdirplus syscall" idea may be the most promising forward-looking direction.</p>
+</li>
+<li>
+<p><strong>Protocol compliance gaps in pNFS/flexfiles are being systematically closed.</strong> Coddington's <code>clora_changed</code> fix, Snitzer's UNCACHEABLE_FILE_DATA support, and Bommarito's decoder-hardening campaign all target RFC 8881/5661 conformance issues that have been latent for years.</p>
+</li>
+<li>
+<p><strong>Server-side work has direct client impact.</strong> The netlink stats interface, CB_NOTIFY directory delegations (v7.3), the latency-floor RFC, and the GSS slot/window debate all shape what clients will need to implement or adapt to in coming cycles.</p>
+</li>
+</ol>
+<h2>Discussions this week</h2>
+<ul>
+<li><a href="thread/%253C20260217214741.1928576-1-cel%2540kernel.org%253E.html">Re: [f2fs-dev] [PATCH v8 00/17] Subject: Exposing case folding behavior</a></li>
+<li><a href="thread/%253C20260507-case-sensitivity-v14-0-e62cc8200435%2540oracle.com%253E.html">Re: [f2fs-dev] [PATCH v14 00/15] Exposing case folding behavior</a></li>
+<li><a href="thread/%253C20260606070735.2163063-1-ernis%2540linux.microsoft.com%253E.html">Re: [PATCH rdma-next v7] RDMA: Change capability fields in ib_device_attr from int to u32</a></li>
+<li><a href="thread/%253C20260619203107.606359-1-ernis%2540linux.microsoft.com%253E.html">[PATCH rdma-next v8] RDMA: Change capability fields in ib_device_attr from int to u32</a></li>
+<li><a href="thread/%253C20260618-exportd-netlink-v5-0-e9aef947af3d%2540kernel.org%253E.html">Re: [PATCH v5 5/6] nfsd: count NFSv4 callback operations per netns</a></li>
+<li><a href="thread/%253C20260619-exportd-netlink-v6-0-ddef3499793c%2540kernel.org%253E.html">[PATCH v6 0/6] nfsd/sunrpc: convert nfsstat server-side interfaces to use netlink</a></li>
+<li><a href="thread/%253C20260619-dir-deleg-fixes-v2-1-ad22fe2c7d7d%2540kernel.org%253E.html">[PATCH v2] nfsd: recall deleg if a requested dir attr change can't be encoded</a></li>
+<li><a href="thread/%253C20260620-dir-deleg-fixes-v3-1-4ff9a315c793%2540kernel.org%253E.html">[PATCH v3] nfsd: recall deleg if a requested dir attr change can't be encoded</a></li>
+<li><a href="thread/%253C20260619-dir-deleg-v3-0-1077ce8aab1b%2540kernel.org%253E.html">[PATCH pynfs v3 00/26] nfs4.1: add some directory delegation testcases</a></li>
+<li><a href="thread/%253Ccover.1782329389.git.bcodding%2540hammerspace.com%253E.html">[PATCH 0/3] pNFS/flexfiles: honor clora_changed and report cancelled I/O</a></li>
+<li><a href="thread/%253Ccover.1782388900.git.bcodding%2540hammerspace.com%253E.html">[PATCH v2 0/3] pNFS/flexfiles: honor clora_changed and report cancelled I/O</a></li>
+<li><a href="thread/%253C20260621093430.264983361%2540kernel.org%253E.html">[PATCH 2/2] tracing: Add CONFIG_TRACE_PRINTK_DEBUGGING to clean up kernel.h</a></li>
+<li><a href="thread/%253C20260625104007.041432666%2540kernel.org%253E.html">[PATCH v4 1/2] tracing: Move non-trace_printk prototypes into trace_controls.h</a></li>
+<li><a href="thread/%253C20260512-nfsino-v1-0-284720522f4c%2540kernel.org%253E.html">Re: [PATCH 0/4] nfs: remove the fileid field from struct nfs_inode</a></li>
+<li><a href="thread/%253C20260616134000.2733403-1-praan%2540google.com%253E.html">Re: [PATCH v2 0/7] nfs: Modernize Direct I/O path</a></li>
+<li><a href="thread/%253C20260504-sunrpc-tls-clnt-pin-v1-0-197f359c6072%2540oracle.com%253E.html">Re: [PATCH 0/2] Fix a few memory bugs in RPC-with-TLS</a></li>
+<li><a href="thread/%253Ccover.1782314746.git.bcodding%2540hammerspace.com%253E.html">[PATCH RFC 1/3] SUNRPC: add a second per-pool ready queue for high-priority transports</a></li>
+<li><a href="thread/%253C20260625-sunrpc-pool-mode-v2-1-4f512b6e1ee8%2540kernel.org%253E.html">[PATCH v2] sunrpc: hardcode pool_mode to pernode, remove other modes</a></li>
+<li><a href="thread/%253C20260619204750.1803357-1-cel%2540kernel.org%253E.html">[PATCH v7.0.2] lockd: fix TEST handling when not all permissions are available.</a></li>
+<li><a href="thread/%253C20260625211852.31972-1-okorniev%2540redhat.com%253E.html">[PATCH 1/1] lockd: fix GRANTED_MSG handling</a></li>
+<li><a href="thread/%253C20260621162551.2469460-1-cel%2540kernel.org%253E.html">[PATCH] NFSD: Guard admin state-revocation walks with NFSD_NET_UP</a></li>
+<li><a href="thread/%253C20260621213535.539450-1-cel%2540kernel.org%253E.html">[PATCH] NFSD: Replace isdotent() macro</a></li>
+<li><a href="thread/%253C20260613-unlock-filesystem-uaf-v1-0-462b9bec8c84%2540kernel.org%253E.html">Re: [PATCH 1/3] NFSD: Prevent post-shutdown use-after-free in unlock_filesystem</a></li>
+<li><a href="thread/%253C20260623014728.826032-1-cel%2540kernel.org%253E.html">[PATCH] svcrdma: Reject inline replies that overflow the pull-up buffer</a></li>
+<li><a href="thread/%253C20260624-nfsd-testing-v1-0-b8853eb22e45%2540kernel.org%253E.html">[PATCH 0/3] nfsd: inter-server copy fixes</a></li>
+<li><a href="thread/%253CCAC_j7i1WXvMS6Q66w7-EGxZYFrdJ9R_DzA26xweP5%253D7z05KWzg%2540mail.gmail.com%253E.html">[PATCH] nfsd: bound GSS session fore-channel slots to the GSS replay window</a></li>
+<li><a href="thread/%253C4EB31731-B511-44E6-9019-760EED0A2BD1%2540gmail.com%253E.html">Re: [BUG] KASAN: slab-use-after-free in xprt_put</a></li>
+<li><a href="thread/%253C20260623195315.829881-1-anna%2540kernel.org%253E.html">[GIT PULL] Please Pull NFS Client Updates for Linux 7.2</a></li>
+<li><a href="thread/%253C20260624191706.72544-1-snitzer%2540kernel.org%253E.html">[PATCH 0/4] nfs: NFSv4.2 client support for UNCACHEABLE_FILE_DATA</a></li>
+<li><a href="thread/%253C20260622060038.13731-1-jefflexu%2540linux.alibaba.com%253E.html">[PATCH] NFS: invalidate i_blocks after COMMIT to fix stale block count on NFSv4</a></li>
+<li><a href="thread/%253C20260622124836.1696330-1-michael.bommarito%2540gmail.com%253E.html">[PATCH] NFSv4.1/pnfs: bound layout-type count in decode_pnfs_layout_types</a></li>
+<li><a href="thread/%253C20260625032038.11535-1-zhang.guodong%2540linux.dev%253E.html">[PATCH 1/2] NFSv4.1: Fix nfs_client refcount leak in nfs41_free_stateid</a></li>
+<li><a href="thread/%253C20260624035858.172129-1-ruoyuw560%2540gmail.com%253E.html">[PATCH] NFSv4: remove callback IDR entry on client allocation failure</a></li>
+<li><a href="thread/%253Ccover.1782148639.git.abo%2540medichon.fr%253E.html">[PATCH 2/2] nfs: refactor pNFS functions using clear_and_wake_up_bit</a></li>
+<li><a href="thread/%253C20260619142040.3970345-1-houminxi%2540gmail.com%253E.html">[PATCH] NFS: pnfs: fix stale references in pnfs.rst</a></li>
+<li><a href="thread/%253C20260625083756.1799608-1-houminxi%2540gmail.com%253E.html">[PATCH] flex: add ffl_flags validation test</a></li>
+<li><a href="thread/%253C20260226012203.3962997-1-yangerkun%2540huawei.com%253E.html">Re: [RFC PATCH] nfs: use nfsi-&gt;rwsem to protect traversal of the file lock list</a></li>
+<li><a href="thread/%253Cm2qzlx7eye.fsf%2540gmail.com%253E.html">NFS delegations behavior analysis</a></li>
+</ul>
+  </main>
+</body>
+</html>
