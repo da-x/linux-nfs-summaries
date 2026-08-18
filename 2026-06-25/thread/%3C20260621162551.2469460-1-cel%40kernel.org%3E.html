@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD: Guard admin state-revocation walks with NFSD_NET_UP (startup NULL-deref fix)</title>
+  <meta name="description" content="Type: Bug fix (NULL pointer dereference in the NFS server&#39;s admin state-revocation paths).">
+  <meta property="og:title" content="NFSD: Guard admin state-revocation walks with NFSD_NET_UP (startup NULL-deref fix)">
+  <meta property="og:description" content="Type: Bug fix (NULL pointer dereference in the NFS server&#39;s admin state-revocation paths).">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-25T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSD: Guard admin state-revocation walks with NFSD_NET_UP (startup NULL-deref fix)">
+  <meta name="twitter:description" content="Type: Bug fix (NULL pointer dereference in the NFS server&#39;s admin state-revocation paths).">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-25</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD: Guard admin state-revocation walks with NFSD_NET_UP (startup NULL-deref fix)</h1>
+<h2>Summary</h2>
+<h1>NFSD: Guard admin state-revocation walks with NFSD_NET_UP</h1>
+<p><strong>Type:</strong> Bug fix (NULL pointer dereference in the NFS server's admin state-revocation paths).</p>
+<h2>The patch and the bug it closes</h2>
+<p>Chuck Lever opened this thread on Sunday, June 21 with a single-patch submission, [PATCH] NFSD: Guard admin state-revocation walks with NFSD_NET_UP. The problem is a locally-triggerable kernel crash in <code>nfsd</code>. As Chuck describes in the commit message:</p>
+<blockquote>
+<p>"Writing to /proc/fs/nfsd/unlock_filesystem, or sending the NFSD_CMD_UNLOCK_FILESYSTEM or NFSD_CMD_UNLOCK_EXPORT netlink command, walks the NFSv4 client hash tables to revoke open state and cancel async COPY operations. All three handlers gate that walk on nn-&gt;nfsd_serv, but a listener added via portlist or netlink listener_set sets nn-&gt;nfsd_serv before any nfsd thread starts."</p>
+</blockquote>
+<p>The consequence is that <code>nn-&gt;conf_id_hashtbl</code> is still NULL when the walkers run, so:</p>
+<blockquote>
+<p>"A local administrator with CAP_SYS_ADMIN can crash the kernel this way without ever starting the server."</p>
+</blockquote>
+<p>The fix switches the three unlock entry points (<code>write_unlock_fs</code>, <code>nfsd_nl_unlock_filesystem_doit</code>, <code>nfsd_nl_unlock_export_doit</code>) from testing <code>nn-&gt;nfsd_serv</code> to testing the <code>NFSD_NET_UP</code> flag, which "brackets the window where the tables are live: set at the end of nfsd_startup_net() and cleared in nfsd_shutdown_net() after they are freed, both under nfsd_mutex." The patch touches <code>fs/nfsd/nfs4proc.c</code>, <code>fs/nfsd/nfs4state.c</code> and <code>fs/nfsd/nfsctl.c</code> (12 insertions, 15 deletions), carries a <code>Reported-by: XIAO WU &lt;xiaowu.417@qq.com&gt;</code> tag, and is marked as a follow-on to commit <code>1ac3629bf012 ("nfsd: prepare for supporting admin-revocation of state")</code>.</p>
+<h2>Review exchange</h2>
+<p>Jeff Layton picked up the patch the next morning (June 22) with a careful re-derivation of the race. He traced <code>nfsd_create_serv()</code> in <code>nfssvc.c</code> and confirmed the startup window:</p>
+<blockquote>
+<p>"Can nn-&gt;nfsd_serv be non-NULL while the NFSv4 state tables are still NULL? ... nfsd_startup_net() is what calls nfs4_state_start_net() which allocates nn-&gt;conf_id_hashtbl in nfs4_state_create_net(). Until threads are started, nn-&gt;nfsd_net_up stays false and the hashtables stay NULL."</p>
+</blockquote>
+<p>He then walked through <code>nfsd4_cancel_copy_by_sb()</code> to show exactly where the NULL deref lands, citing the KASAN report:</p>
+<blockquote>
+<p>"The KASAN trace shows RIP in nfsd4_cancel_copy_by_sb at offset 0x184 with RAX 0, which matches the head pointer load."</p>
+</blockquote>
+<p>He extended the same analysis to <code>nfsd4_revoke_states()</code> and the netlink path, and asked whether checking <code>nn-&gt;nfsd_net_up</code> would be more accurate than <code>nn-&gt;nfsd_serv</code>.</p>
+<p>Chuck's reply (also June 22) confirmed the diagnosis and clarified the relationship between this patch and an earlier series:</p>
+<blockquote>
+<p>"Yep, that's exactly the gap. The hunk you've quoted is 1/3 of the earlier 'post-shutdown use-after-free' series, which only guarded the shutdown side of the window."</p>
+</blockquote>
+<p>He explained that the current patch is the follow-on that closes the startup side by switching all three unlock paths to <code>test_bit(NFSD_NET_UP, &amp;nn-&gt;flags)</code> and updating the walkers' <code>Context:</code> notes accordingly. He also gently noted that Jeff's comment appeared to be aimed at the earlier series:</p>
+<blockquote>
+<p>"I assume your comment was meant for 1/3 of that series rather than this thread... but we've reached the same conclusion, so no action needed beyond this patch, correct?"</p>
+</blockquote>
+<p>Jeff acknowledged the mix-up and signed off:</p>
+<blockquote>
+<p>"Ahh right. I missed that that had been fixed in the other series. This is fine then. Reviewed-by: Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a>"</p>
+</blockquote>
+<h2>Context and significance</h2>
+<p>This is a small but important hardening fix in the NFS server (NFSD) admin-revocation machinery, which has been under active development — earlier work added automatic NFSv4 state revocation on filesystem unmount and a "post-shutdown use-after-free" guard. The current patch completes the picture by ensuring the revocation walkers cannot run before the per-netns state tables are allocated.</p>
+<p>From an NFS client-development perspective, the relevance is indirect but real: the same admin-revocation paths that revoke open state and cancel async COPY operations on the server side determine how quickly a client's stale opens and in-flight <code>COPY</code>/<code>WRITE_SAME</code>-style operations are torn down when an administrator revokes access. A NULL-deref crash here would take down the entire NFS service (and with it, every connected client) without any client-side fault — so closing this startup-window race is a meaningful reliability improvement for deployments that use <code>unlock_filesystem</code> / netlink <code>UNLOCK_FILESYSTEM</code> / <code>UNLOCK_EXPORT</code> as operational tools.</p>
+<h2>Outcome</h2>
+<ul>
+<li>Patch posted: <a href="https://lore.kernel.org/linux-nfs/20260621162551.2469460-1-cel@kernel.org/">2026-06-21</a></li>
+<li>Review analysis: <a href="https://lore.kernel.org/linux-nfs/8369948d3e01471c64d37182ddc6a2f1cdb0c473.camel@kernel.org/">Jeff Layton, 2026-06-22</a></li>
+<li>Author clarification: <a href="https://lore.kernel.org/linux-nfs/2b3f6886-86ca-4da3-b1df-a2bec0f93e5f@app.fastmail.com/">Chuck Lever, 2026-06-22</a></li>
+<li>Reviewed-by from Jeff Layton: <a href="https://lore.kernel.org/linux-nfs/2888cb8f7cde2ed76d59a807b2668cf95f1166ff.camel@kernel.org/">2026-06-22</a></li>
+</ul>
+<p>The thread concluded within a day of posting with an unambiguous Reviewed-by and no outstanding objections.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260621162551.2469460-1-cel@kernel.org/">2026-06-21 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH] NFSD: Guard admin state-revocation walks with NFSD_NET_UP</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/8369948d3e01471c64d37182ddc6a2f1cdb0c473.camel@kernel.org/">2026-06-22 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH] NFSD: Guard admin state-revocation walks with NFSD_NET_UP</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/2b3f6886-86ca-4da3-b1df-a2bec0f93e5f@app.fastmail.com/">2026-06-22 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH] NFSD: Guard admin state-revocation walks with NFSD_NET_UP</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/2888cb8f7cde2ed76d59a807b2668cf95f1166ff.camel@kernel.org/">2026-06-22 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH] NFSD: Guard admin state-revocation walks with NFSD_NET_UP</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ZhangGuoDong&#39;s two-part leak-fix series: NFSv4.1 FREE_STATEID refcount and pNFS blocklayout device cleanup</title>
+  <meta name="description" content="A compact, self-contained bug-fix series landed on the linux-nfs list this week from ZhangGuoDong (KylinOS). The two patches, posted together on 2026-06-25, target two distinct resource-leak paths in the NFS client: one in the NFSv4.1…">
+  <meta property="og:title" content="ZhangGuoDong&#39;s two-part leak-fix series: NFSv4.1 FREE_STATEID refcount and pNFS blocklayout device cleanup">
+  <meta property="og:description" content="A compact, self-contained bug-fix series landed on the linux-nfs list this week from ZhangGuoDong (KylinOS). The two patches, posted together on 2026-06-25, target two distinct resource-leak paths in the NFS client: one in the NFSv4.1…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-25T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="ZhangGuoDong&#39;s two-part leak-fix series: NFSv4.1 FREE_STATEID refcount and pNFS blocklayout device cleanup">
+  <meta name="twitter:description" content="A compact, self-contained bug-fix series landed on the linux-nfs list this week from ZhangGuoDong (KylinOS). The two patches, posted together on 2026-06-25, target two distinct resource-leak paths in the NFS client: one in the NFSv4.1…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-25</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>ZhangGuoDong's two-part leak-fix series: NFSv4.1 FREE_STATEID refcount and pNFS blocklayout device cleanup</h1>
+<h2>Summary</h2>
+<h2>Overview</h2>
+<p>A compact, self-contained bug-fix series landed on the linux-nfs list this week from ZhangGuoDong (KylinOS). The two patches, posted together on 2026-06-25, target two distinct resource-leak paths in the NFS client: one in the NFSv4.1 stateid-freeing RPC machinery and one in the pNFS blocklayout device parser. No discussion has developed yet — both messages are original submissions with no replies as of end-of-week.</p>
+<p>This is squarely a <strong>bug-fix</strong> series (not a new feature or protocol change), addressing reference-count and memory leaks that surface on error paths.</p>
+<h2>Patch 1/2: NFSv4.1 <code>nfs_client</code> refcount leak in <code>nfs41_free_stateid</code></h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260625032038.11535-1-zhang.guodong@linux.dev/">Posted by ZhangGuoDong</a>, this patch fixes a reference-count leak on the <code>nfs_client</code> structure in <code>fs/nfs/nfs4proc.c</code>.</p>
+<p>The author's description is precise about the failure mode:</p>
+<blockquote>
+<p>"nfs41_free_stateid() takes a reference on the nfs_client before allocating the FREE_STATEID calldata. If the calldata allocation fails, the function returns -ENOMEM without dropping that reference."</p>
+</blockquote>
+<p>And the reason the existing cleanup path doesn't catch it:</p>
+<blockquote>
+<p>"The normal async RPC release path drops the reference from nfs41_free_stateid_release(), but that path is not reached when calldata allocation fails."</p>
+</blockquote>
+<p>The fix is minimal — 3 insertions, 1 deletion in <code>fs/nfs/nfs4proc.c</code> — dropping the <code>nfs_client</code> reference before returning the <code>-ENOMEM</code> error. This matters because a leaked <code>nfs_client</code> refcount prevents the client structure (and everything it pins: sockets, state, mounts) from ever being freed, which is particularly painful for short-lived NFSv4.1 sessions or clients that are repeatedly created and destroyed.</p>
+<h2>Patch 2/2: pNFS blocklayout device leaks on parse failure</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260625032038.11535-2-zhang.guodong@linux.dev/">The companion patch</a> addresses a more involved set of leaks in <code>fs/nfs/blocklayout/dev.c</code>, the pNFS block layout driver's device parsing code. The author identifies three related problems:</p>
+<p><strong>1. Child array leak in concat/stripe parsers:</strong></p>
+<blockquote>
+<p>"bl_parse_concat() and bl_parse_stripe() allocate a child device array and then parse each child in turn. If parsing a child fails, the failed child is not counted in nr_children and the parent may be left with a children array that bl_free_device() will not release when nr_children is zero."</p>
+</blockquote>
+<p>The fix releases both the failed child and any already-parsed siblings before propagating the error upward.</p>
+<p><strong>2. <code>bl_free_device()</code> not releasing the children array:</strong></p>
+<blockquote>
+<p>"Also make bl_free_device() release the child array whenever the children pointer is set, so that partially initialised concat or stripe devices are cleaned up correctly."</p>
+</blockquote>
+<p>This is a defensive hardening: rather than relying on <code>nr_children &gt; 0</code> as the trigger for freeing the array, the cleanup now keys off the pointer itself being non-NULL. This catches any future code path that might leave <code>children</code> set with <code>nr_children == 0</code>.</p>
+<p><strong>3. Double-free risk in <code>bl_parse_scsi()</code>:</strong></p>
+<blockquote>
+<p>"bl_parse_scsi() can also fail after assigning d-&gt;bdev_file and dropping the file reference. Clear the pointer after fput() so that an outer cleanup path does not put it again."</p>
+</blockquote>
+<p>This is a classic use-after-fput / double-put hazard: the code drops the <code>struct file</code> reference but leaves the dangling pointer in the device struct, so an outer error handler would call <code>fput()</code> on it a second time. Clearing the pointer after the explicit <code>fput()</code> closes that window.</p>
+<p>The patch is 15 insertions, 6 deletions in <code>fs/nfs/blocklayout/dev.c</code>.</p>
+<h2>Discussion and Status</h2>
+<p>As of the end of this reporting week (2026-06-25), <strong>no replies have been posted</strong> to either patch. The thread consists solely of the two original submissions. Given the small, well-scoped nature of both fixes — a one-line refcount drop and a targeted error-path cleanup in the blocklayout parser — these are the kind of patches that typically receive a quick "Reviewed-by" or direct pick-up by the NFS maintainer without extended discussion.</p>
+<h2>Significance for NFS Client Development</h2>
+<p>Both patches reinforce a recurring theme in kernel NFS client maintenance: <strong>error-path resource management</strong>. The NFSv4.1 stateid machinery and the pNFS blocklayout driver both involve multi-step allocation sequences where intermediate failures must unwind cleanly. Leaks on these paths are low-frequency (they require an <code>kmalloc</code> failure or a malformed layout response) but high-impact in long-running systems:</p>
+<ul>
+<li>A leaked <code>nfs_client</code> refcount is effectively unrecoverable at runtime — the client and all its mounts are pinned forever.</li>
+<li>Leaked blocklayout device structures accumulate on every failed layout parse, which can happen transiently during server-side reconfiguration or network glitches that corrupt layout responses.</li>
+</ul>
+<p>The series comes from KylinOS contributors, continuing a steady stream of hardening patches from non-upstream-primary vendors into the mainline NFS client.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260625032038.11535-1-zhang.guodong@linux.dev/">2026-06-25 zhang.guodong@linux.dev — [PATCH 1/2] NFSv4.1: Fix nfs_client refcount leak in nfs41_free_stateid</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260625032038.11535-2-zhang.guodong@linux.dev/">2026-06-25 zhang.guodong@linux.dev — [PATCH 2/2] pnfs/blocklayout: Fix device leaks on parse failure</a></li>
+</ul>
+  </main>
+</body>
+</html>

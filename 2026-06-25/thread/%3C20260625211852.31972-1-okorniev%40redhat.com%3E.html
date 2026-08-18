@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>lockd: fix GRANTED_MSG handling on the client side</title>
+  <meta name="description" content="Type: Bug fix — a regression in the NFS client-side NLM callback path, introduced by the xdrgen XDR refactoring of the GRANTED_MSG procedure.">
+  <meta property="og:title" content="lockd: fix GRANTED_MSG handling on the client side">
+  <meta property="og:description" content="Type: Bug fix — a regression in the NFS client-side NLM callback path, introduced by the xdrgen XDR refactoring of the GRANTED_MSG procedure.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-25T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="lockd: fix GRANTED_MSG handling on the client side">
+  <meta name="twitter:description" content="Type: Bug fix — a regression in the NFS client-side NLM callback path, introduced by the xdrgen XDR refactoring of the GRANTED_MSG procedure.">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-25</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>lockd: fix GRANTED_MSG handling on the client side</h1>
+<h2>Summary</h2>
+<h1>lockd: fix GRANTED_MSG handling (NFSv3/v4 callback path)</h1>
+<p><strong>Type:</strong> Bug fix — a regression in the NFS <strong>client</strong>-side NLM callback path, introduced by the xdrgen XDR refactoring of the <code>GRANTED_MSG</code> procedure.</p>
+<h2>The week's activity</h2>
+<p>The thread opened late on Thursday with a single patch from Olga Kornievskaia (Red Hat): [PATCH 1/1] lockd: fix GRANTED_MSG handling](https://lore.kernel.org/linux-nfs/20260625211852.31972-1-okorniev@redhat.com/). No further replies landed inside the reporting window, so this week's coverage is essentially the patch itself plus its clearly stated rationale. (Two follow-up acks from NeilBrown and Chuck Lever are visible on lore but fall outside the 2026-06-19 → 2026-06-26 window.)</p>
+<h2>Key technical argument</h2>
+<p>The patch targets a subtle asymmetry between two families of host-lookup helpers in <code>fs/lockd</code>:</p>
+<blockquote>
+<p>"GRANTED_MSG is a server-to-client callback, so it runs on the client, where nfsd never registers nlmsvc_ops."
+— <a href="https://lore.kernel.org/linux-nfs/20260625211852.31972-1-okorniev@redhat.com/">Olga Kornievskaia</a></p>
+</blockquote>
+<p>The <code>nlm4svc_lookup_host()</code> / <code>nlm3svc_lookup_host()</code> helpers were designed for the <strong>server-side</strong> NLM request handlers (<code>TEST</code>/<code>LOCK</code>/<code>CANCEL</code>/<code>UNLOCK</code>). Those paths reach into <code>nlmsvc_ops-&gt;fopen</code>, and the lookup is intentionally strict so that requests are rejected when nfsd isn't running. The xdrgen XDR conversion of <code>GRANTED_MSG</code> (NLMv3 and NLMv4) had mistakenly wired the client-side callback through those same server-oriented helpers, so a pure NFS <strong>client</strong> — one that never runs nfsd and therefore never registers <code>nlmsvc_ops</code> — would fail every incoming <code>GRANTED_MSG</code>.</p>
+<blockquote>
+<p>"The nlm4svc_lookup_host()/nlm3svc_lookup_host() helpers are for the server-side request handlers (TEST/LOCK/CANCEL/UNLOCK), which reach nlmsvc_ops-&gt;fopen and must reject requests when nfsd isn't running. GRANTED_MSG only calls nlmclnt_grant(). Instead, of calling nlm4svc_lookup_host()/nlm3svc_lookup_host() (which results in a client failing a GRANTED_MSG call) call nlmsvc_lookup_host."
+— <a href="https://lore.kernel.org/linux-nfs/20260625211852.31972-1-okorniev@redhat.com/">Olga Kornievskaia</a></p>
+</blockquote>
+<p>The fix is a one-line-per-file swap in <code>fs/lockd/svcproc.c</code> (NLMv3) and <code>fs/lockd/svc4proc.c</code> (NLMv4): use the generic <code>nlmsvc_lookup_host()</code> instead of the versioned <code>*svc_lookup_host()</code> helpers, since <code>GRANTED_MSG</code> only needs to call <code>nlmclnt_grant()</code> and never touches <code>nlmsvc_ops-&gt;fopen</code>.</p>
+<h2>Regression provenance</h2>
+<p>The patch carries two <code>Fixes:</code> tags pointing at the xdrgen XDR conversions that introduced the bug:</p>
+<ul>
+<li><code>62721885e861</code> — "lockd: Use xdrgen XDR functions for the NLMv4 GRANTED_MSG procedure"</li>
+<li><code>6c534ad999b6</code> — "lockd: Use xdrgen XDR functions for the NLMv3 GRANTED_MSG procedure"</li>
+</ul>
+<p>So this is a follow-up to the broader lockd XDR modernization effort, not a new feature or protocol change. The diff is minimal (2 files, +4/-2) and confined to <code>fs/lockd/svcproc.c</code> and <code>fs/lockd/svc4proc.c</code>.</p>
+<h2>Why it matters for NFS clients</h2>
+<p><code>GRANTED_MSG</code> is the NLM callback the server uses to tell a client that an earlier blocked lock request has been granted. A pure NFS <strong>client</strong> — exactly the configuration where nfsd is not running — would previously have failed every such callback, breaking asynchronous lock-grant notifications on both NFSv3 and NFSv4 mounts. The fix restores correct client-side behavior without weakening the server-side safety check that <code>nlmsvc_ops-&gt;fopen</code> callers still rely on.</p>
+<h2>Status at week's end</h2>
+<p>The patch landed in the queue with no in-window discussion or pushback; the two visible replies (NeilBrown, Chuck Lever) postdate the reporting window and are not summarized here.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260625211852.31972-1-okorniev@redhat.com/">2026-06-25 Olga Kornievskaia <a href="mailto:okorniev@redhat.com">okorniev@redhat.com</a> — [PATCH 1/1] lockd: fix GRANTED_MSG handling</a></li>
+</ul>
+  </main>
+</body>
+</html>

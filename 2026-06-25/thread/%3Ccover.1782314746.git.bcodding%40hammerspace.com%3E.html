@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SUNRPC: RFC for a latency floor for interactive NFS clients via sparse-flow dispatch</title>
+  <meta name="description" content="New feature / performance improvement — a three-patch RFC series targeting the NFSD/SUNRPC server-side transport dispatcher. It is not a protocol change and not a traditional bug fix; it addresses a long-standing fairness deficiency in how…">
+  <meta property="og:title" content="SUNRPC: RFC for a latency floor for interactive NFS clients via sparse-flow dispatch">
+  <meta property="og:description" content="New feature / performance improvement — a three-patch RFC series targeting the NFSD/SUNRPC server-side transport dispatcher. It is not a protocol change and not a traditional bug fix; it addresses a long-standing fairness deficiency in how…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-25T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="SUNRPC: RFC for a latency floor for interactive NFS clients via sparse-flow dispatch">
+  <meta name="twitter:description" content="New feature / performance improvement — a three-patch RFC series targeting the NFSD/SUNRPC server-side transport dispatcher. It is not a protocol change and not a traditional bug fix; it addresses a long-standing fairness deficiency in how…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-25</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>SUNRPC: RFC for a latency floor for interactive NFS clients via sparse-flow dispatch</h1>
+<h2>Summary</h2>
+<h1>SUNRPC: A Latency Floor for Interactive Clients via Sparse-Flow Dispatch (RFC)</h1>
+<h2>Classification</h2>
+<p><strong>New feature / performance improvement</strong> — a three-patch RFC series targeting the NFSD/SUNRPC server-side transport dispatcher. It is not a protocol change and not a traditional bug fix; it addresses a long-standing <em>fairness</em> deficiency in how nfsd services ready transports, which manifests as interactive NFS client sessions stalling whenever a bulk (backlogged) client saturates the server's thread pool.</p>
+<hr />
+<h2>Background (Brief Bridge)</h2>
+<p>This RFC is the direct successor to two earlier discussions:</p>
+<ol>
+<li>
+<p><strong>The per-client fair-scheduling thread</strong> from May/June 2026, in which the list debated whether nfsd should enforce proportional fairness between clients. The consensus that emerged — as Coddington frames it — was a reframe by Chuck Lever:</p>
+<blockquote>
+<p>"This is starvation avoidance, not proportional fairness (per Chuck's reframe on [1])."</p>
+</blockquote>
+</li>
+<li>
+<p><strong>Chuck Lever's slot-growth clamp RFC</strong> ("Stop NFSv4.1 slot-growth heuristic from rewarding busy clients"), which caps how large a busy session's slot table can grow relative to the thread ceiling. Coddington explicitly bases this series on that work:</p>
+<blockquote>
+<p>"This series is based on Chuck's 'Stop NFSv4.1 slot-growth heuristic from rewarding busy clients' [2], and both A and B above include it -- so the A/B delta isolates this series and the clamp does not account for the improvement."</p>
+</blockquote>
+</li>
+</ol>
+<p>The two are complementary: the clamp limits <em>how many</em> slots a busy session can hold (nfsd accounting), while this RFC changes the <em>order</em> in which ready transports are dispatched (sunrpc dispatch layer). Coddington notes that "a slot-capped session still fills the pool, so the dispatch-layer floor is still wanted on top of it."</p>
+<hr />
+<h2>The Problem</h2>
+<p>NFS server pools dispatch ready transports in strict FIFO order. A transport's position in the queue is independent of how much work it already has in flight. The practical consequence:</p>
+<blockquote>
+<p>"A client that keeps many requests in flight -- nconnect, a deep v4.1 slot table, or simply several connections -- sits in that queue on equal terms with a client that has been idle. So the request a user is waiting on (a stat, an open, a directory listing) waits behind a backup job's backlog, even though servicing it costs a single round trip."</p>
+</blockquote>
+<p>The user-visible symptom: an interactive session stutters whenever a bulk client is busy.</p>
+<hr />
+<h2>The Approach (Three Patches)</h2>
+<p>Coddington posted the full RFC on <strong>June 24</strong> with three patches:</p>
+<h3>Patch 1/3 — Add a second per-pool ready queue</h3>
+<p>Adds <code>sp_xprts_hi</code> alongside the existing <code>sp_xprts</code>, initialized with each pool. No functional change yet; it is purely structural groundwork.</p>
+<blockquote>
+<p>"Nothing is enqueued to it yet, so this is no functional change; a later patch routes transports with no requests in flight onto it and drains it ahead of sp_xprts."</p>
+</blockquote>
+<h3>Patch 2/3 — Dispatch idle transports ahead of backlogged ones</h3>
+<p>The core dispatch logic: when a transport is enqueued, if <code>xpt_nr_rqsts == 0</code> (no prior requests in flight), it goes on the high-priority queue; otherwise it stays on the normal queue. The dequeue path drains <code>sp_xprts_hi</code> first.</p>
+<blockquote>
+<p>"A flow whose last reply has completed reads zero and jumps the queue, while a flow with requests still in flight stays in the bulk queue."</p>
+</blockquote>
+<p>Key design properties:</p>
+<ul>
+<li><strong>No client identity</strong>: keys only on a transport's own in-flight depth, so it covers v3, v4.0, and v4.1 uniformly.</li>
+<li><strong>No new lock</strong>: each queue is an independent <code>lwq</code> with its own ordering; <code>svc_thread_should_sleep()</code> simply tests both.</li>
+<li><strong>Always on, nothing to tune</strong>.</li>
+</ul>
+<h3>Patch 3/3 — Grant a burst allowance (64 dispatches)</h3>
+<p>A single idle-to-active transition only protects the leading RPC of a burst. Interactive work (a syscall, a page fault) fans out into many correlated RPCs. This patch grants a budget of <code>SVC_XPRT_HI_BURST</code> (fixed at 64) high-priority dispatches when a transport transitions from idle to active.</p>
+<blockquote>
+<p>"The budget refills only on an idle-to-active transition, so a flow that stays continuously backlogged spends its budget once and then lives in the bulk queue: a client cannot hold the high-priority queue by keeping its connections busy or by opening more of them."</p>
+</blockquote>
+<hr />
+<h2>Benchmark Results</h2>
+<p>Coddington provides compelling A/B data (A = stock nfsd-testing, B = patched), measuring NFSv3 interactive burst-completion p50 latency in ms while an aggressor saturates the pool:</p>
+<p><strong>vs. aggressor connection count K (N=32; unobstructed floor 45ms):</strong></p>
+<table><thead><tr><th>K</th><th>4</th><th>8</th><th>16</th><th>32</th></tr></thead><tbody>
+<tr><td>A</td><td>81.6</td><td>242.0</td><td>432.9</td><td>826.6</td></tr>
+<tr><td>B</td><td>60.9</td><td>64.5</td><td>65.4</td><td>64.4</td></tr>
+<tr><td>Speedup</td><td>1.3×</td><td>3.8×</td><td>6.6×</td><td><strong>12.8×</strong></td></tr>
+</tbody></table>
+<blockquote>
+<p>"Baseline climbs ~linearly with the aggressor's backlog; patched holds the floor no matter how deep that backlog is -- the property that matters."</p>
+</blockquote>
+<p><strong>vs. burst size N (K=16):</strong> For N ≤ 64, the whole burst is covered and tracks the floor (B within 1.7× of floor). Beyond 64, the uncovered tail degrades toward baseline — "the knee at exactly 64 is the budget working as designed, not a regression."</p>
+<p><strong>Aggregate throughput</strong> is within 1% A vs B at saturation (~1290 ops/s) — "the dispatcher reorders, it does not throttle."</p>
+<hr />
+<h2>Review Discussion (June 25)</h2>
+<h3>Chuck Lever's deferred-close bug (Patch 2/3)</h3>
+<p>Lever identified a concrete flaw in the classification logic: <strong>deferred transport closes</strong> are enqueued through the same <code>svc_xprt_enqueue()</code> path but with <code>xpt_nr_rqsts != 0</code> (the slot is still held). Because the high-priority queue is drained first, a deferred close on a backlogged connection would wait behind idle-flow traffic — precisely when the server most needs to reclaim resources.</p>
+<blockquote>
+<p>"Control work isn't request work, and svc_xprt_ready() already treats XPT_CONN|XPT_CLOSE|XPT_HANDSHAKE as a class distinct from XPT_DATA. Routing that class to the high-priority queue regardless of the request count keeps the two consistent."</p>
+</blockquote>
+<p>He proposed a fix: route any transport with <code>XPT_CONN | XPT_CLOSE | XPT_HANDSHAKE</code> set to the high-priority queue unconditionally, in addition to the zero-in-flight check.</p>
+<p>Lever also flagged a <strong>pre-existing issue identified by sashiko</strong> (an automated patch-review tool) that "might be amplified by this patch" and should be addressed as a prerequisite:</p>
+<blockquote>
+<p>"You should also have a look at the pre-existing issue that sashiko identified: it might be amplified by this patch, so we should consider addressing that issue as a pre-requisite to this series."</p>
+</blockquote>
+<h3>Coddington's response</h3>
+<p>Coddington accepted both points immediately:</p>
+<blockquote>
+<p>"Excellent - if we v1, I'll add this fix."
+"I'll head over there (cool - sashiko looks smart) and give that issue attention for any v1."</p>
+</blockquote>
+<h3>Chuck Lever's deep-dive on the re-arm trigger (Cover letter reply)</h3>
+<p>In a longer analysis posted later on June 25, Lever probed the most critical assumption in the design: <strong>does an interactive flow actually reach <code>xpt_nr_rqsts == 0</code> often enough under contention to keep its budget refilled?</strong> His concern:</p>
+<blockquote>
+<p>"My worry was that a sustained interactive flow (a tree walk holding a couple of RPCs in flight) never reaches zero, spends its 64 once, and then rides the normal queue."</p>
+</blockquote>
+<p>He ran a kprobe-based measurement on an <em>uncontended</em> v4.2 loopback walk of a 7500-file tree (~15.5k server RPCs):</p>
+<pre><code>depth 0 : 25.6%   &lt;- re-arms the 64-credit budget
+depth 1 : 62.3%
+depth 2 : 12.2%
+depth 3 : ~0
+</code></pre>
+<blockquote>
+<p>"So zero recurs about every fourth enqueue. ~3 credits spent between refills against a budget of 64 -- the credit never approaches zero and the flow stays high-priority for the whole walk."</p>
+</blockquote>
+<p>But he immediately noted the caveat: this was uncontended loopback, where nfsd keeps up and depth collapses naturally. The real risk is under pool contention — "aggressor saturating the threads, the interactive flow's replies delayed, depth staying elevated, the zero-crossings that refill credits becoming rare." He asked Coddington to run the same probe under his aggressor + 10ms service-time hook, providing a ready-made ftrace kprobe recipe.</p>
+<blockquote>
+<p>"The question that settles it: for the interactive xprt under load, does the depth==0 fraction hold up, or do you see depth&gt;=1 runs longer than 64? If it holds, the trigger is fine and the uncovered tail is just the N&gt;64 knee you already document. If it collapses, that's the argument for a low-watermark refill rather than exact-zero."</p>
+</blockquote>
+<hr />
+<h2>Open Questions (as of end of window)</h2>
+<p>Coddington explicitly posed two questions to the list in the cover letter:</p>
+<ol>
+<li><strong>Budget shape</strong>: "is the budget (64 here) the right shape, and should it be fixed, derived from the thread count, or hinted by the v4.1 slot table?"</li>
+<li><strong>Cooperative vs. adversarial framing</strong>: "does the cooperative framing hold, or must we resist deliberate sparse-shaping?" — i.e., can a client game the system by sending ≤64 RPCs, draining, and repeating?</li>
+</ol>
+<p>Lever's follow-up added a third implicit question: whether the exact-zero re-arm trigger is robust under contention, or whether a low-watermark refill is needed.</p>
+<p>The series also deliberately leaves out (for follow-up):</p>
+<ul>
+<li>Inter-tier deficit round-robin to bound bulk-queue starvation under sustained high-priority load.</li>
+<li>LOCALIO (out of scope; local clients bypass RPC dispatch entirely).</li>
+</ul>
+<hr />
+<h2>Status and Outlook</h2>
+<p>As of the end of this week's window, the RFC has received substantive technical review from Chuck Lever with two concrete action items for v1:</p>
+<ol>
+<li>Fix the deferred-close routing to the high-priority queue.</li>
+<li>Address the sashiko-identified pre-existing issue as a prerequisite.</li>
+</ol>
+<p>Additionally, Coddington is expected to provide kprobe data under contention to validate (or refute) the exact-zero re-arm assumption. No further replies from Coddington or other participants fell within this week's window; the next activity in the thread (Neil Brown's replies and Coddington's responses) begins June 26–29, outside this summary's scope.</p>
+<hr />
+<h2>NFS Client Development Relevance</h2>
+<p>While this series is server-side (nfsd/sunrpc), its impact on the <strong>NFS client experience</strong> is direct and significant: it establishes a latency floor that prevents interactive client operations (stats, opens, directory listings, page faults) from being starved by bulk workloads. The design's protocol-agnostic nature — keying on transport in-flight depth rather than client identity — means it uniformly protects NFSv3, v4.0, and v4.1 clients without any client-side changes. For deployments where a single NFS server serves both interactive desktops and backup/CI pipelines, this is the kind of dispatch-layer fix that eliminates the "my NFS share freezes during backups" complaint without requiring per-client QoS configuration.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/335f2842438344832fb46b2822a6c831119bec0a.1782314746.git.bcodding@hammerspace.com/">2026-06-24 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — [PATCH RFC 1/3] SUNRPC: add a second per-pool ready queue for high-priority transports</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/cover.1782314746.git.bcodding@hammerspace.com/">2026-06-24 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — [PATCH RFC 0/3] SUNRPC: a latency floor for interactive clients via sparse-flow dispatch</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/8b65b751a62984fa08797b18be7dfaf16bdb3721.1782314746.git.bcodding@hammerspace.com/">2026-06-24 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — [PATCH RFC 2/3] SUNRPC: dispatch idle transports ahead of backlogged ones</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/fdd0e8541cdf8a37cbb97e5c33730593a1649eb6.1782314746.git.bcodding@hammerspace.com/">2026-06-24 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — [PATCH RFC 3/3] SUNRPC: grant an idle flow a burst allowance on the high-priority queue</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/538fd605-e7be-4450-ad3f-804fad6224eb@app.fastmail.com/">2026-06-25 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH RFC 2/3] SUNRPC: dispatch idle transports ahead of backlogged ones</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ADEE8294-3A99-4259-B5DD-3CB2AD68EC99@hammerspace.com/">2026-06-25 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — Re: [PATCH RFC 2/3] SUNRPC: dispatch idle transports ahead of backlogged ones</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/d8efb4f7-fd91-453e-a6fd-1427bdab1cc0@app.fastmail.com/">2026-06-25 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH RFC 0/3] SUNRPC: a latency floor for interactive clients via sparse-flow dispatch</a></li>
+</ul>
+  </main>
+</body>
+</html>

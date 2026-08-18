@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>KASAN slab-use-after-free in xprt_put: retested on Linus tree, still reproduces</title>
+  <meta name="description" content="Status this week: After sitting silent for a couple of weeks, the NFS/SunRPC client use-after-free thread finally got its first maintainer response. Anna Schumaker asked the reporter to retest against the current upstream tree on the…">
+  <meta property="og:title" content="KASAN slab-use-after-free in xprt_put: retested on Linus tree, still reproduces">
+  <meta property="og:description" content="Status this week: After sitting silent for a couple of weeks, the NFS/SunRPC client use-after-free thread finally got its first maintainer response. Anna Schumaker asked the reporter to retest against the current upstream tree on the…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-25T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="KASAN slab-use-after-free in xprt_put: retested on Linus tree, still reproduces">
+  <meta name="twitter:description" content="Status this week: After sitting silent for a couple of weeks, the NFS/SunRPC client use-after-free thread finally got its first maintainer response. Anna Schumaker asked the reporter to retest against the current upstream tree on the…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-25</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>KASAN slab-use-after-free in xprt_put: retested on Linus tree, still reproduces</h1>
+<h2>Summary</h2>
+<h1>[BUG] KASAN slab-use-after-free in <code>xprt_put</code> — first maintainer triage; bug confirmed to persist</h1>
+<p><strong>Status this week:</strong> After sitting silent for a couple of weeks, the NFS/SunRPC client use-after-free thread finally got its first maintainer response. Anna Schumaker asked the reporter to retest against the current upstream tree on the strength of recently merged fixes, and Shuangpeng Bai promptly confirmed the bug still reproduces — so the issue is <strong>not</strong> resolved by the recent transport-lifecycle patches and remains open for root-cause work.</p>
+<h2>Bridge from prior weeks</h2>
+<p>The thread was opened on 2026-06-07 with a well-documented KASAN slab-use-after-free in <code>xprt_put</code>, reached via the <code>rpc_free_client_work</code> workqueue — a classic NFS/SunRPC <strong>client-side</strong> transport reference-counting / lifetime defect (not a protocol change or new feature). The original report included a minimal diagnostic patch, reproducer, and <code>.config</code> to make the race reliable. See the <a href="https://lore.kernel.org/linux-nfs/4EB31731-B511-44E6-9019-760EED0A2BD1@gmail.com/">prior week's summary</a> for the full initial trace and reproduction details.</p>
+<h2>This week's exchange (2026-06-24)</h2>
+<p>The discussion this week is short but consequential: it moved the bug from "untriaged" to "confirmed live on current mainline."</p>
+<h3>1. Anna Schumaker asks for a retest against current mainline</h3>
+<p>Anna, the NFS client maintainer, opened with a request that frames the whole thread's next step — recent fixes have landed in this area, so she wants to know whether the report is stale:</p>
+<blockquote>
+<p>"There have been a handful of fixes in this area that were just merged upstream. Any chance you can check if the problem is still there with Linus's current tree (or with -rc1 when it releases after the weekend)?"</p>
+</blockquote>
+<p>This is the key technical pivot of the week: rather than immediately diving into a root-cause analysis, Anna first wanted to establish whether the recently merged transport-lifecycle fixes already cover this report. That is standard triage for a corner of RPC object teardown that has been a recurring trouble spot.</p>
+<h3>2. Shuangpeng confirms the bug persists on current Linus tree</h3>
+<p>The reporter responded within hours with a clean retest, pinning it to a specific mainline commit:</p>
+<blockquote>
+<p>"I retested this on current Linus tree, f0e6f20cb52b ("Merge tag 'ntfs3_for_7.2'"), and it still reproduces."</p>
+</blockquote>
+<p>Crucially, he reports the failure is <strong>unchanged in shape</strong> — same fault class, same call path, only the expected address/line-number drift from the newer tree:</p>
+<blockquote>
+<p>"The stack trace is essentially unchanged from the original report, aside from expected address and line-number shifts in the newer tree:"</p>
+<pre><code>BUG: KASAN: slab-use-after-free in xprt_put+0x13/0x50
+Write of size 4 at addr ffff8881046bd000 by task kworker/1:3/8075
+Workqueue: events rpc_free_client_work
+
+Call Trace:
+  xprt_put+0x13/0x50
+  rpc_free_client_work+0x152/0x250
+  process_scheduled_works / worker_thread / kthread
+</code></pre>
+</blockquote>
+<p>And the free side is again an RCU-deferred slab release, which keeps the diagnosis pointing at a race between RCU-delayed transport destruction and a late reference drop:</p>
+<blockquote>
+<p>"Freed by task 0 on cpu 1 at 249.878823s: __rcu_free_sheaf_prepare → rcu_free_sheaf → rcu_core"</p>
+</blockquote>
+<h2>Technical read</h2>
+<ul>
+<li><strong>Classification:</strong> Bug fix (NFS/SunRPC client), specifically a slab use-after-free in the transport reference-counting path — <code>xprt_put()</code> writing into an already-freed 2048-byte <code>kmalloc-2k</code> object during <code>rpc_free_client_work</code> teardown.</li>
+<li><strong>What this week established:</strong> The recently merged fixes in the area do <strong>not</strong> resolve this report; the bug is live on current mainline (<code>f0e6f20cb52b</code>). That rules out "already fixed" and means a distinct, still-unpatched lifetime/ordering defect remains.</li>
+<li><strong>Likely shape (carried over):</strong> A missing/early reference or an ordering gap between RCU-grace-period-deferred transport freeing and the <code>rpc_free_client_work</code> client-teardown sequence — i.e., a late <code>xprt_put()</code> lands on a transport whose slab object was already reclaimed by the RCU path.</li>
+</ul>
+<h2>Where things stand / what to watch for</h2>
+<ul>
+<li>The bug is <strong>confirmed open</strong> and reproducible on current Linus tree; Anna's retest request has been satisfied with a negative result (still broken).</li>
+<li>The next expected step is a real root-cause analysis from the SunRPC/NFS client maintainers — either an RCU-grace-period vs. workqueue ordering fix or a missing reference keeping the transport alive across <code>rpc_free_client_work</code>.</li>
+<li>Worth cross-referencing with prior KASAN UAF reports in the same RPC teardown area, which suggest this corner of the client transport lifecycle is a recurring trouble spot.</li>
+</ul>
+<p><strong>Bottom line:</strong> First substantive triage on the <code>xprt_put</code> use-after-free. Anna Schumaker asked whether recent upstream fixes had already addressed it; Shuangpeng Bai retested on current mainline and confirmed "it still reproduces" with an essentially unchanged trace — so this NFS client bug remains unresolved and is now queued for a genuine fix.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/cfbe2028-c317-4d43-bc87-6004224be128@app.fastmail.com/">2026-06-24 Anna Schumaker <a href="mailto:anna@kernel.org">anna@kernel.org</a> — Re: [BUG] KASAN: slab-use-after-free in xprt_put (asks to retest on current tree)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/DB32E924-DCE7-49F8-A558-5CD77574074E@gmail.com/">2026-06-24 Shuangpeng <a href="mailto:shuangpeng.kernel@gmail.com">shuangpeng.kernel@gmail.com</a> — Re: [BUG] KASAN: slab-use-after-free in xprt_put (retested on f0e6f20cb52b, still reproduces)</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/cfbe2028-c317-4d43-bc87-6004224be128@app.fastmail.com/">2026-06-24 "Anna Schumaker" <a href="mailto:anna@kernel.org">anna@kernel.org</a> — Re: [BUG] KASAN: slab-use-after-free in xprt_put</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/DB32E924-DCE7-49F8-A558-5CD77574074E@gmail.com/">2026-06-24 Shuangpeng <a href="mailto:shuangpeng.kernel@gmail.com">shuangpeng.kernel@gmail.com</a> — Re: [BUG] KASAN: slab-use-after-free in xprt_put</a></li>
+</ul>
+  </main>
+</body>
+</html>

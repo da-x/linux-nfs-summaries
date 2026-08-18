@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSv4.1/pnfs: bound layout-type count in decode_pnfs_layout_types (Trond flags open-coded helper)</title>
+  <meta name="description" content="This week&#39;s activity in this thread is brief but pointed: Michael Bommarito posted a single-patch bug fix on 2026-06-22 that closes an integer-overflow-driven out-of-bounds read in the NFSv4.1 pNFS client&#39;s decode_pnfs_layout_types(), and…">
+  <meta property="og:title" content="NFSv4.1/pnfs: bound layout-type count in decode_pnfs_layout_types (Trond flags open-coded helper)">
+  <meta property="og:description" content="This week&#39;s activity in this thread is brief but pointed: Michael Bommarito posted a single-patch bug fix on 2026-06-22 that closes an integer-overflow-driven out-of-bounds read in the NFSv4.1 pNFS client&#39;s decode_pnfs_layout_types(), and…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-25T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSv4.1/pnfs: bound layout-type count in decode_pnfs_layout_types (Trond flags open-coded helper)">
+  <meta name="twitter:description" content="This week&#39;s activity in this thread is brief but pointed: Michael Bommarito posted a single-patch bug fix on 2026-06-22 that closes an integer-overflow-driven out-of-bounds read in the NFSv4.1 pNFS client&#39;s decode_pnfs_layout_types(), and…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-25</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSv4.1/pnfs: bound layout-type count in decode_pnfs_layout_types (Trond flags open-coded helper)</h1>
+<h2>Summary</h2>
+<h1>NFSv4.1/pnfs: bounding the FSINFO layout-type count — a new client-side XDR-wrap fix, with a maintainer's "open coding" caveat</h1>
+<h2>Overview</h2>
+<p>This week's activity in this thread is brief but pointed: Michael Bommarito posted <a href="https://lore.kernel.org/linux-nfs/20260622124836.1696330-1-michael.bommarito@gmail.com/">a single-patch bug fix</a> on 2026-06-22 that closes an integer-overflow-driven out-of-bounds read in the NFSv4.1 pNFS client's <code>decode_pnfs_layout_types()</code>, and Linux NFS client maintainer Trond Myklebust replied <a href="https://lore.kernel.org/linux-nfs/d53d167ad535d865ffbafb0806398ffbd3559674.camel@kernel.org/">about ninety minutes later</a> with a terse but consequential review note. This is squarely a <strong>bug fix</strong> (a security-relevant robustness fix on the NFS client), not a new feature or protocol change, and it carries <code>Cc: stable@vger.kernel.org</code> for backporting.</p>
+<h2>Bridge from Prior Week</h2>
+<p>This submission is the direct continuation of Bommarito's pNFS decoder-hardening campaign. As <a href="2026-06-18/thread/%3C20260614130814.2521819-1-michael.bommarito%40gmail.com%3E.html">summarized last week</a>, he had posted a two-patch series on 2026-06-14 fixing the same XDR-wrap class in <code>decode_getdeviceinfo()</code> — where a server-supplied notification bitmap length, scaled by four in 32-bit arithmetic, wraps to zero for lengths ≥ <code>0x40000000</code> and lets the verify loop read up to ~2^30 words past the inline XDR buffer. That prior thread had no maintainer reply within its window. This week's patch is explicitly framed as the companion:</p>
+<blockquote>
+<p>"This is the decode_pnfs_layout_types companion to the same XDR-wrap class fixed in decode_getdeviceinfo (NFSv4.1/pnfs: bound notification bitmap length in decode_getdeviceinfo)."</p>
+</blockquote>
+<p>The earlier series also remains awaiting review; no v2 or maintainer ACK has appeared for it within this week's window.</p>
+<h2>The Patch (June 22)</h2>
+<p>Bommarito's <a href="https://lore.kernel.org/linux-nfs/20260622124836.1696330-1-michael.bommarito@gmail.com/">submission</a> targets <code>fs/nfs/nfs4xdr.c</code> (9 insertions, 1 deletion) and is anchored to the original commit that introduced the layout-type list:</p>
+<blockquote>
+<p>"Fixes: ca440c383a58 ("pnfs: add a new mechanism to select a layout driver according to an ordered list")"
+"Cc: stable@vger.kernel.org"</p>
+</blockquote>
+<p>The defect is laid out with the same precision as the GETDEVICEINFO report. The decoder reads a server-controlled <code>u32</code> count and then reserves <code>4 * count</code> bytes:</p>
+<blockquote>
+<p>"decode_pnfs_layout_types() reads a server-controlled u32 count and then reserves 4 * count bytes:</p>
+<pre><code>fsinfo-&gt;nlayouttypes = be32_to_cpup(p);
+...
+p = xdr_inline_decode(xdr, fsinfo-&gt;nlayouttypes * 4);
+</code></pre>
+<p>The multiplication is u32, so any count &gt;= 0x40000000 wraps to a small value and xdr_inline_decode() reserves too few bytes."</p>
+</blockquote>
+<p>Two secondary observations sharpen the analysis. First, the existing <code>NFS_MAX_LAYOUT</code> cap is applied <em>after</em> the reservation, so it cannot save the decode:</p>
+<blockquote>
+<p>"The NFS_MAX_LAYOUT cap is applied only afterwards, so the subsequent reads run past the short reservation."</p>
+</blockquote>
+<p>Second, the obvious <code>array_size()</code> guard is itself unsafe because of how <code>xdr_inline_decode()</code> rounds its argument:</p>
+<blockquote>
+<p>"array_size() is not a safe guard here either: xdr_inline_decode() runs its nbytes argument through XDR_QUADLEN(((l) + 3) &gt;&gt; 2), which wraps SIZE_MAX to a zero-word reservation instead of failing."</p>
+</blockquote>
+<p>The fix rejects counts that cannot fit in the u32 multiplication before the reservation, and switches to <code>sizeof(__be32)</code> for explicit size arithmetic:</p>
+<blockquote>
+<p>"Reject counts that cannot fit in the u32 multiplication before the reservation, and use sizeof(__be32) so the size arithmetic is explicit."</p>
+</blockquote>
+<p>The threat model is a malicious or compromised NFSv4.1+ server (or man-in-the-middle on an unprotected mount):</p>
+<blockquote>
+<p>"A malicious NFSv4.1+ server returning a crafted FATTR4_FS_LAYOUT_TYPES attribute triggers this on the client during FSINFO decode."</p>
+</blockquote>
+<h3>Testing and KUnit coverage</h3>
+<p>As with the GETDEVICEINFO series, Bommarito reproduced the bug under KASAN — this time on a UML build:</p>
+<blockquote>
+<p>"Reproduced on a UML KASAN build with a KUnit case that feeds decode_pnfs_layout_types() an xdr buffer whose nlayouttypes is 0x40000001: nlayouttypes * 4 wraps, xdr_inline_decode() reserves a short buffer, and the decode reads past xdr-&gt;end (KASAN slab-out-of-bounds read). With this patch the count is rejected (-EIO) before the reservation."</p>
+</blockquote>
+<p>He deliberately decoupled the test from the fix so it can be accepted or dropped independently:</p>
+<blockquote>
+<p>"The KUnit test can ride as a separate patch (matching the decode_getdeviceinfo series). Before/after logs available on request."</p>
+</blockquote>
+<p>The sign-off block again credits AI assistance: "Assisted-by: Claude:claude-opus-4-8."</p>
+<h2>Trond Myklebust's Review (June 22)</h2>
+<p>Myklebust's <a href="https://lore.kernel.org/linux-nfs/d53d167ad535d865ffbafb0806398ffbd3559674.camel@kernel.org/">reply</a> is short — a single sentence after quoting the patch — but it reframes the change from "add a bounds check" to "use the existing helper":</p>
+<blockquote>
+<p>"This is just open coding xdr_stream_decode_uint32_array(), and doing so incorrectly."</p>
+</blockquote>
+<p>That one line carries two implications:</p>
+<ol>
+<li><strong>The fix should be a refactor, not a hand-rolled guard.</strong> The kernel already provides <code>xdr_stream_decode_uint32_array()</code> for exactly this pattern — reading a server-supplied count followed by that many <code>__be32</code> words with proper bounds handling. Bommarito's patch reimplements the loop and bounds check by hand; Myklebust is saying the correct upstream shape is to call the helper instead, which would also make the GETDEVICEINFO-series fix consistent if it touches similar patterns.</li>
+<li><strong>"Doing so incorrectly" suggests the hand-rolled version has a residual defect</strong> beyond the wrap itself — most plausibly that the post-hoc <code>NFS_MAX_LAYOUT</code> cap and the new pre-reservation bound do not together cover every edge the helper would (e.g., the interaction between the u32 multiply, the <code>XDR_QUADLEN</code> rounding inside <code>xdr_inline_decode()</code>, and the final cap). Myklebust does not elaborate in this message; the expectation is that Bommarito will rework the patch to call the helper.</li>
+</ol>
+<h2>Evolution of the Discussion and Current State</h2>
+<p>Within this week's window the thread has exactly two messages: the patch and the maintainer reply. There is no v2, no further back-and-forth, and no ACK — the discussion is at the "review comment received, rework expected" stage. The trajectory so far:</p>
+<ul>
+<li><strong>June 14 (prior week):</strong> Bommarito posts the GETDEVICEINFO notification-bitmap fix + KUnit series; no maintainer reply in that window.</li>
+<li><strong>June 22 (this week):</strong> Bommarito posts the FSINFO layout-type companion fix; Myklebust replies within ~90 minutes pointing at <code>xdr_stream_decode_uint32_array()</code>.</li>
+</ul>
+<p>The pattern across both submissions is consistent: a precise, KASAN-reproduced, stable-tagged client-side bug fix from the same author, with AI-assisted sign-offs, and a maintainer who is engaging quickly but steering toward the canonical XDR helper rather than accepting hand-rolled bounds checks.</p>
+<h2>Significance for NFS Client Development</h2>
+<ul>
+<li><strong>Decoder robustness against hostile servers.</strong> Both fixes in this campaign target the same class of bug — server-controlled <code>u32</code> counts multiplied in 32-bit arithmetic before an <code>xdr_inline_decode()</code> reservation — and both are reachable from a malicious or compromised NFSv4.1+ server (or MITM on an unprotected mount). Closing them reduces the attack surface of the pNFS client's GETDEVICEINFO and FSINFO decode paths, which run early in mount and layout setup.</li>
+<li><strong>The helper-first lesson.</strong> Myklebust's "open coding … incorrectly" note is a useful signal for future decoder work: when <code>xdr_stream_decode_uint32_array()</code> (or the corresponding string/array helpers) already exists, the upstream-preferred fix is to call it rather than hand-roll bounds checks. This will likely shape how Bommarito reworks both this patch and, if applicable, the GETDEVICEINFO series.</li>
+<li><strong>Stable backport intent.</strong> Both patches carry <code>Cc: stable@vger.kernel.org</code>, so once accepted they are expected to flow into stable trees — relevant for any distribution shipping an affected kernel.</li>
+</ul>
+<h2>Status and Outlook</h2>
+<ul>
+<li><strong>Thread status:</strong> Open. Awaiting a v2 that calls <code>xdr_stream_decode_uint32_array()</code> (or a justification for the hand-rolled bounds check) from Bommarito.</li>
+<li><strong>Related open thread:</strong> The GETDEVICEINFO notification-bitmap series from 2026-06-14 is still awaiting maintainer review; if Myklebust applies the same "use the helper" lens there, that series may also be reworked.</li>
+<li><strong>Open items:</strong> (a) rework this patch to use <code>xdr_stream_decode_uint32_array()</code>; (b) clarify whether the hand-rolled version has a residual defect beyond the wrap; (c) decide whether the KUnit test rides as a separate patch, matching the GETDEVICEINFO series.</li>
+</ul>
+<h2>Messages This Week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260622124836.1696330-1-michael.bommarito@gmail.com/">2026-06-22 Michael Bommarito — [PATCH] NFSv4.1/pnfs: bound layout-type count in decode_pnfs_layout_types</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/d53d167ad535d865ffbafb0806398ffbd3559674.camel@kernel.org/">2026-06-22 Trond Myklebust — Re: [PATCH] NFSv4.1/pnfs: bound layout-type count in decode_pnfs_layout_types</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260622124836.1696330-1-michael.bommarito@gmail.com/">2026-06-22 Michael Bommarito <a href="mailto:michael.bommarito@gmail.com">michael.bommarito@gmail.com</a> — [PATCH] NFSv4.1/pnfs: bound layout-type count in decode_pnfs_layout_types</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/d53d167ad535d865ffbafb0806398ffbd3559674.camel@kernel.org/">2026-06-22 Trond Myklebust <a href="mailto:trondmy@kernel.org">trondmy@kernel.org</a> — Re: [PATCH] NFSv4.1/pnfs: bound layout-type count in decode_pnfs_layout_types</a></li>
+</ul>
+  </main>
+</body>
+</html>

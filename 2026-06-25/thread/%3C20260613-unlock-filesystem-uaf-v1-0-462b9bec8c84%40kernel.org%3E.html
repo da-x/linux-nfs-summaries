@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD: New NULL-deref bug found in the startup window of unlock_filesystem</title>
+  <meta name="description" content="This week&#39;s activity on this thread was a short but sharp exchange that surfaced a new, previously unreported bug adjacent to — but separate from — the post-shutdown use-after-free fix series Chuck Lever posted last week. The discussion is…">
+  <meta property="og:title" content="NFSD: New NULL-deref bug found in the startup window of unlock_filesystem">
+  <meta property="og:description" content="This week&#39;s activity on this thread was a short but sharp exchange that surfaced a new, previously unreported bug adjacent to — but separate from — the post-shutdown use-after-free fix series Chuck Lever posted last week. The discussion is…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-25T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSD: New NULL-deref bug found in the startup window of unlock_filesystem">
+  <meta name="twitter:description" content="This week&#39;s activity on this thread was a short but sharp exchange that surfaced a new, previously unreported bug adjacent to — but separate from — the post-shutdown use-after-free fix series Chuck Lever posted last week. The discussion is…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-25</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD: New NULL-deref bug found in the startup window of unlock_filesystem</h1>
+<h2>Summary</h2>
+<h2>NFSD: A second, distinct crash lurking in the unlock_filesystem paths</h2>
+<p>This week's activity on this thread was a short but sharp exchange that surfaced a <strong>new, previously unreported bug</strong> adjacent to — but separate from — the post-shutdown use-after-free fix series Chuck Lever posted last week. The discussion is squarely about an <strong>NFSD (server-side) bug fix</strong>, not a client change, protocol change, or new feature.</p>
+<h3>Bridge: where things stood last week</h3>
+<p>Last week, <a href="https://lore.kernel.org/linux-nfs/20260613-unlock-filesystem-uaf-v1-0-462b9bec8c84@kernel.org/">Chuck Lever's three-patch series</a> fixed a local-admin-triggerable slab-use-after-free in both the procfs and netlink <code>unlock_filesystem</code> paths. The fix moved the async COPY cancellation (<code>nfsd4_cancel_copy_by_sb()</code>) inside the <code>nfsd_mutex</code>-held, <code>nn-&gt;nfsd_serv</code>-checked region. <a href="https://lore.kernel.org/linux-nfs/3539a082d6ab43b9b29c4cc749a513f680eb5906.camel@kernel.org/">Jeff Layton endorsed it quickly</a>:</p>
+<blockquote>
+<p>"This all looks good. Reviewed-by: Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a>"</p>
+</blockquote>
+<p>The series was awaiting merge into <code>nfsd-next</code> when this week's messages arrived.</p>
+<h3>This week: an AI review flags a residual hole, and XIAO WU confirms it with KASAN</h3>
+<p>On June 21, <a href="https://lore.kernel.org/linux-nfs/tencent_7C446FB89D462E14FD321DDEB9E47B640A07@qq.com/">XIAO WU posted a detailed report</a> replying directly to PATCH 1/3. The trigger was an external AI code review (Sashiko) that flagged the <code>nn-&gt;nfsd_serv</code> check as insufficient:</p>
+<blockquote>
+<p>"I came across a Sashiko AI code review [1] that flagged a remaining issue in <code>write_unlock_fs()</code> — the <code>nn-&gt;nfsd_serv</code> check is not sufficient to guarantee that <code>nfsd_startup_net()</code> has run and allocated the state tables."</p>
+</blockquote>
+<p>XIAO WU then went beyond the AI's static finding and <strong>reproduced the crash in QEMU with KASAN</strong> on kernel 7.1.0-rc7-next-20260612. The mechanism: creating an NFSD listener via <code>portlist</code> sets <code>nn-&gt;nfsd_serv</code>, but if no threads are started, <code>nfsd_startup_net()</code> never runs and the state tables remain NULL. Writing to <code>unlock_filesystem</code> then passes the <code>nn-&gt;nfsd_serv</code> check and calls <code>nfsd4_cancel_copy_by_sb()</code>, which walks a NULL hashtable:</p>
+<blockquote>
+<p>"Oops: general protection fault, probably for non-canonical address 0xdffffc0000000000 … KASAN: null-ptr-deref in range [0x0000000000000000-0x0000000000000007] … RIP: 0010:nfsd4_cancel_copy_by_sb+0x184/0xa70"</p>
+</blockquote>
+<p>The minimal reproducer was three shell commands:</p>
+<pre><code>echo 2049 &gt; /proc/fs/nfsd/portlist
+mount -t nfsd nfsd /proc/fs/nfsd
+echo /mnt &gt; /proc/fs/nfsd/unlock_filesystem
+</code></pre>
+<h3>Chuck Lever's response: confirms the crash, corrects a detail, and draws the line between two bugs</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/fa4991b0-910e-4ef5-81b1-7a6c236acdd4@app.fastmail.com/">Chuck Lever replied the same afternoon</a>, confirming the finding while making an important technical distinction. He first validated the mechanism:</p>
+<blockquote>
+<p>"Thanks for the careful analysis and the reproducer. I agree the crash is real. nfsd_create_serv() sets nn-&gt;nfsd_serv from the portlist and netlink listener paths, none of which run nfsd_startup_net(), so nn-&gt;nfsd_serv can indeed be non-NULL while the NFSv4 state tables are still NULL."</p>
+</blockquote>
+<p>He then offered a small but notable correction to the report — the array actually dereferenced is <code>nn-&gt;conf_id_hashtbl</code>, not <code>nn-&gt;nfs4_client_hashtbl</code>:</p>
+<blockquote>
+<p>"One correction: the array the walk dereferences is nn-&gt;conf_id_hashtbl, not nn-&gt;nfs4_client_hashtbl. Both are allocated together in nfs4_state_create_net(), reached only via nfsd_startup_net(), so your mechanism holds either way; the name in the report is just off."</p>
+</blockquote>
+<p>The most significant part of his reply was clarifying that <strong>this is a different bug from the one the patch series fixes</strong>, and that it predates the patches:</p>
+<blockquote>
+<p>"However, this crasher is a different bug from the one this series addresses, and AFAICT it is not introduced by this patch. Before this change the cancel ran unconditionally, so the same NULL conf_id_hashtbl walk was reachable in the startup window (and more besides). The nn-&gt;nfsd_serv guard added here narrows the post-shutdown case but does not cover the startup window, because nn-&gt;nfsd_serv is set before the tables exist."</p>
+</blockquote>
+<p>He drew a precise KASAN-level distinction between the two bugs:</p>
+<blockquote>
+<p>"The two also differ at KASAN: this patch fixes a slab-use-after-free on a freed-but-not-cleared conf_id_hashtbl; what you hit is a null-ptr-deref on a never-allocated one."</p>
+</blockquote>
+<h3>The path forward</h3>
+<p>Chuck identified the correct guard for the startup window and committed to addressing it separately:</p>
+<blockquote>
+<p>"The correct guard for the startup window is NFSD_NET_UP, which is set at the tail of nfsd_startup_net() exactly when the state tables become valid, rather than nn-&gt;nfsd_serv. nfsd4_revoke_states() walks the same tables and nfsd_nl_unlock_filesystem_doit() repeats the pattern, so a fix needs to cover both unlock paths. I'll address that in a separate follow-up and add your Reported-by."</p>
+</blockquote>
+<h3>Why this matters</h3>
+<p>This exchange highlights an important subtlety in NFSD's state-table lifecycle: <code>nn-&gt;nfsd_serv</code> is set at listener-creation time (via portlist or netlink), but the actual NFSv4 state tables (<code>conf_id_hashtbl</code>, <code>nfs4_client_hashtbl</code>) are only allocated later, inside <code>nfsd_startup_net()</code>. Any code that walks those tables must guard on <code>NFSD_NET_UP</code> — not <code>nn-&gt;nfsd_serv</code> — to be safe across the full startup-to-shutdown window. The fact that an AI review caught this, and a community member validated it with a concrete KASAN reproducer, underscores how these lifecycle windows remain a fertile source of latent bugs in NFSD's admin interfaces.</p>
+<p>The original three-patch series remains valid and reviewed; the new NULL-deref fix is expected as a separate follow-up from Chuck Lever with a <code>Reported-by:</code> for XIAO WU.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/tencent_7C446FB89D462E14FD321DDEB9E47B640A07@qq.com/">2026-06-21 XIAO WU <a href="mailto:xiaowu.417@qq.com">xiaowu.417@qq.com</a> — Re: [PATCH 1/3] NFSD: Prevent post-shutdown use-after-free in unlock_filesystem</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/fa4991b0-910e-4ef5-81b1-7a6c236acdd4@app.fastmail.com/">2026-06-21 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 1/3] NFSD: Prevent post-shutdown use-after-free in unlock_filesystem</a></li>
+</ul>
+  </main>
+</body>
+</html>

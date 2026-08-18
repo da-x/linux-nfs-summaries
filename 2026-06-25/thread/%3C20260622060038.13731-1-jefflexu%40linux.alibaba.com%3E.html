@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS: invalidate i_blocks after COMMIT — stale block count bug fix NACKed by maintainer</title>
+  <meta name="description" content="Type: Bug fix (proposed) — Status this week: NACKed by the client maintainer, discussion ongoing.">
+  <meta property="og:title" content="NFS: invalidate i_blocks after COMMIT — stale block count bug fix NACKed by maintainer">
+  <meta property="og:description" content="Type: Bug fix (proposed) — Status this week: NACKed by the client maintainer, discussion ongoing.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-25T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS: invalidate i_blocks after COMMIT — stale block count bug fix NACKed by maintainer">
+  <meta name="twitter:description" content="Type: Bug fix (proposed) — Status this week: NACKed by the client maintainer, discussion ongoing.">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-25</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS: invalidate i_blocks after COMMIT — stale block count bug fix NACKed by maintainer</h1>
+<h2>Summary</h2>
+<h1>NFS: invalidate i_blocks after COMMIT to fix stale block count on NFSv4</h1>
+<p><strong>Type:</strong> Bug fix (proposed) — <strong>Status this week: NACKed by the client maintainer, discussion ongoing.</strong></p>
+<h2>The proposed patch</h2>
+<p>On Monday, Jingbo Xu of Alibaba posted a two-line patch to <code>fs/nfs/write.c</code> <a href="https://lore.kernel.org/linux-nfs/20260622060038.13731-1-jefflexu@linux.alibaba.com/">marking <code>NFS_INO_INVALID_BLOCKS</code> on successful COMMIT completion</a>. The stated problem: the NFSv4 COMMIT compound does not include GETATTR, and <code>nfs4_commit_done_cb</code> never refreshes inode attributes — yet every WRITE marks <code>NFS_INO_INVALID_BLOCKS</code> via <code>nfs_post_op_update_inode_force_wcc_locked</code>. As Xu put it:</p>
+<blockquote>
+<p>"After COMMIT, i_blocks remains stale until the next stat() triggers a full revalidation. In writeback-heavy workloads where COMMITs happen without intervening stat() calls, the cached block count can stay indefinitely wrong."</p>
+</blockquote>
+<p>The fix would force the next <code>nfs_getattr</code> requesting <code>STATX_BLOCKS</code> to issue a GETATTR with SPACE_USED, "matching NFSv3 behavior where nfs3_commit_done already calls nfs_refresh_inode with the wcc_data post-op attributes." The patch fixes xfstests generic/694 on an NFSv4.0 loopback setup (notably, it carries an <code>Assisted-by: Qoder:Qwen3.7-Max</code> tag).</p>
+<h2>The maintainer's pushback</h2>
+<p>Trond Myklebust, the Linux NFS client maintainer, replied quickly and bluntly <a href="https://lore.kernel.org/linux-nfs/2d09ab9a74d1eb21c99454dba8be597612d20efa.camel@kernel.org/">the same day</a>:</p>
+<blockquote>
+<p>"That sounds like an XFS bug, not an NFS bug. COMMIT isn't changing the data contents of the file: it is just ensuring that the existing data is persisted onto disk."</p>
+</blockquote>
+<p>Xu confirmed the backend was indeed XFS and <a href="https://lore.kernel.org/linux-nfs/71d4ac02-d760-49ab-a01c-e7d1a6662a18@linux.alibaba.com/">posted a detailed AI-generated root-cause analysis</a>, cc'ing linux-xfs. The sequence: the client's last UNSTABLE WRITE piggybacks a GETATTR that caches SPACE_USED <em>before</em> the server-side delayed allocation has materialized metadata blocks; syncfs then triggers COMMIT, which forces local writeback and allocates a bmap/extent-tree block (+8 sectors), but per RFC 7530 §16.3.3 the COMMIT response carries only a write verifier — no attributes — so the stale cached value persists until remount. Xu noted the failure "is much likely reproducible on NFS upon XFS, while NFS upon EXT4 succeeds for 50 consecutive test runs," and that XFS itself passes the test locally.</p>
+<p>Myklebust <a href="https://lore.kernel.org/linux-nfs/2098148dfb9e156dd88242afecdea5d372b7a169.camel@kernel.org/">doubled down</a>, conceding "this may indeed be a consequence of XFS's delayed allocation feature" but arguing that:</p>
+<blockquote>
+<p>"that hardly changes the fact that it would be a violation of the POSIX rules for how write(), fsync() and stat() are supposed to work in this situation. My point is that I fail to see why we should degrade the performance of the generic NFS client in order to address a bug in one of the back end filesystems (in this case XFS) being exported. So strong NACK to this patch from me."</p>
+</blockquote>
+<p>Xu, admitting "I'm not familiar with NFS," <a href="https://lore.kernel.org/linux-nfs/c0bbe0c0-2b6f-47d9-8f45-b16bb455a089@linux.alibaba.com/">responded simply</a>: "Understand. Just have no idea which is the proper way to fix this."</p>
+<h2>Brian Foster's reframing</h2>
+<p>Brian Foster of Red Hat <a href="https://lore.kernel.org/linux-nfs/ajqMy2kusx1CETBX@bfoster/">stepped in on Tuesday</a> with a more nuanced take, first questioning Myklebust's POSIX framing:</p>
+<blockquote>
+<p>"Is the implication here that st_blocks changing across an fsync is a POSIX violation? If so, can you clarify where that is said? My understanding is that the rules/definitions here are rather vague and st_blocks is a simple count of blocks allocated to the inode (i.e., so this is ambiguous wrt delalloc, metadata blocks, etc.), but I could be missing something."</p>
+</blockquote>
+<p>Foster then walked through the mechanics — NFS caches a post-op block count on write-out; fsync/COMMIT doesn't refresh it; XFS changes the count during fsync via metadata allocation — and offered a different diagnosis of generic/694:</p>
+<blockquote>
+<p>"It feels a little odd to me to call this an fs bug, tbh. The intent of the test seems more to catch an incorrect block count calculation as opposed to enforce any sort of caching or accounting rules... It seems more like the issue is just that the fsync that was added for consistency at the fs level is not sufficient for NFS due to this attribute caching."</p>
+</blockquote>
+<p>He closed by questioning whether this matters in practice: "Is this actually a problem for NFS in practice or will it eventually get the latest value from the server? If the latter, maybe the test simply needs to be fixed up or skipped for NFS..?" He also flagged that g/694 can use fallocate or fall back to buffered write, asking whether fallocate support over NFS is a factor.</p>
+<h2>Where things stand</h2>
+<p>The thread ends with the patch firmly NACKed by the maintainer on performance grounds (forcing GETATTRs after every COMMIT in the generic client), while the XFS-list cc and Foster's questions leave open three possible resolutions: fix it in XFS, adjust/skip the xfstest for NFS, or find a cheaper invalidation path. No conclusion was reached this week; the ball is back with Xu and the XFS maintainers.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260622060038.13731-1-jefflexu@linux.alibaba.com/">2026-06-22 Jingbo Xu <a href="mailto:jefflexu@linux.alibaba.com">jefflexu@linux.alibaba.com</a> — [PATCH] NFS: invalidate i_blocks after COMMIT to fix stale block count on NFSv4</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/2d09ab9a74d1eb21c99454dba8be597612d20efa.camel@kernel.org/">2026-06-22 Trond Myklebust <a href="mailto:trondmy@kernel.org">trondmy@kernel.org</a> — Re: [PATCH] NFS: invalidate i_blocks after COMMIT to fix stale block count on NFSv4</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/71d4ac02-d760-49ab-a01c-e7d1a6662a18@linux.alibaba.com/">2026-06-23 Jingbo Xu <a href="mailto:jefflexu@linux.alibaba.com">jefflexu@linux.alibaba.com</a> — Re: [PATCH] NFS: invalidate i_blocks after COMMIT to fix stale block count on NFSv4</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/2098148dfb9e156dd88242afecdea5d372b7a169.camel@kernel.org/">2026-06-23 Trond Myklebust <a href="mailto:trondmy@kernel.org">trondmy@kernel.org</a> — Re: [PATCH] NFS: invalidate i_blocks after COMMIT to fix stale block count on NFSv4</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/c0bbe0c0-2b6f-47d9-8f45-b16bb455a089@linux.alibaba.com/">2026-06-23 Jingbo Xu <a href="mailto:jefflexu@linux.alibaba.com">jefflexu@linux.alibaba.com</a> — Re: [PATCH] NFS: invalidate i_blocks after COMMIT to fix stale block count on NFSv4</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ajqMy2kusx1CETBX@bfoster/">2026-06-23 Brian Foster <a href="mailto:bfoster@redhat.com">bfoster@redhat.com</a> — Re: [PATCH] NFS: invalidate i_blocks after COMMIT to fix stale block count on NFSv4</a></li>
+</ul>
+  </main>
+</body>
+</html>

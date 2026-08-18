@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Chuck Lever reviews v5 callback-stats patches: flags UAF in patch 5, CB_SEQUENCE gap in patch 6</title>
+  <meta name="description" content="This thread is the v5 posting of Jeff Layton&#39;s series converting the NFS server-side nfsstat interface from procfs scraping to a generic netlink dump handler, with two new patches adding per-netns accounting for NFSv4 backchannel…">
+  <meta property="og:title" content="Chuck Lever reviews v5 callback-stats patches: flags UAF in patch 5, CB_SEQUENCE gap in patch 6">
+  <meta property="og:description" content="This thread is the v5 posting of Jeff Layton&#39;s series converting the NFS server-side nfsstat interface from procfs scraping to a generic netlink dump handler, with two new patches adding per-netns accounting for NFSv4 backchannel…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-25T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Chuck Lever reviews v5 callback-stats patches: flags UAF in patch 5, CB_SEQUENCE gap in patch 6">
+  <meta name="twitter:description" content="This thread is the v5 posting of Jeff Layton&#39;s series converting the NFS server-side nfsstat interface from procfs scraping to a generic netlink dump handler, with two new patches adding per-netns accounting for NFSv4 backchannel…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-25</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Chuck Lever reviews v5 callback-stats patches: flags UAF in patch 5, CB_SEQUENCE gap in patch 6</h1>
+<h2>Summary</h2>
+<h1>nfsd netlink stats (v5): Chuck Lever's review of the new NFSv4 callback-op counters</h1>
+<h2>Context (brief bridge)</h2>
+<p>This thread is the v5 posting of Jeff Layton's series converting the NFS server-side <code>nfsstat</code> interface from procfs scraping to a generic netlink dump handler, with two new patches adding per-netns accounting for NFSv4 <strong>backchannel (callback) operations</strong> — the design agreed in last week's review. The full v5 submission (all seven messages) is covered in <a href="https://lore.kernel.org/linux-nfs/20260618-exportd-netlink-v5-0-e9aef947af3d@kernel.org/">last week's summary</a>. This week brings the first substantive reviewer feedback on those two callback patches.</p>
+<h2>This Week: Chuck Lever's Two Review Replies</h2>
+<p>Both in-window messages are from <a href="https://lore.kernel.org/linux-nfs/cel@kernel.org/">Chuck Lever</a>, landing at the very start of June 19, and both target the new callback-statistics work rather than the netlink plumbing itself.</p>
+<h3>Patch 5/6 — a UAF concern blocks application</h3>
+<p>In his reply to patch 5 (the per-netns callback-op counter), Lever endorses the direction but flags a memory-safety defect:</p>
+<blockquote>
+<p>"I agree with the Sashiko review that this patch introduces a UAF possibility that needs to be addressed before the patch is applied."</p>
+</blockquote>
+<p>So the patch — which adds a per-netns array of percpu counters for backchannel operations, indexed by RFC 8881 callback opcode and bumped in <code>nfsd4_run_cb()</code> — is <strong>not yet acceptable as-is</strong>. Lever is aligning with an automated (Sashiko) review that identified a use-after-free risk, most plausibly tied to the lifetime of the per-netns counter array relative to netns teardown. This is the gating issue for the series: the callback accounting cannot land until the UAF is resolved.</p>
+<h3>Patch 6/6 — CB_SEQUENCE is emitted but never counted</h3>
+<p>Lever's second reply dissects a subtle correctness gap in how patch 6 exports the counters. The netlink dump loop "emits an entry for every opcode in <code>OP_CB_GETATTR..OP_CB_OFFLOAD</code>," but only opcodes with a real <code>nfsd4_callback_ops</code> instance are ever incremented (via <code>nfsd4_run_cb()</code> keyed on <code>cb-&gt;cb_ops-&gt;opcode</code>). Lever isolates the one case that breaks this assumption:</p>
+<blockquote>
+<p>"The exception is op 11 / CB_SEQUENCE: it's written by encode_cb_sequence4args() on every minorversion&gt;0 callback, so it goes out on the wire but is never counted. The dump always shows op 11 with count 0, which could be misread as 'none sent' rather than 'not tracked.'"</p>
+</blockquote>
+<p>He closes with an actionable pointer:</p>
+<blockquote>
+<p>"Check what the forechannel counter does for SEQUENCE operations."</p>
+</blockquote>
+<p>This is a <strong>statistics-correctness / observability bug</strong>: the netlink dump would report <code>CB_SEQUENCE</code> (op 11) as zero even though it is sent on every minorversion&gt;0 callback, misleading anyone reading the stats. The fix direction Lever suggests is to mirror whatever convention the forward-channel (proc4ops) counter already uses for SEQUENCE — i.e., keep the backchannel reporting consistent with the existing forechannel behavior rather than emitting a perpetually-zero line.</p>
+<h2>Classification and Significance</h2>
+<ul>
+<li><strong>Type:</strong> This week's activity is purely <strong>review</strong> of a new feature (server-side netlink stats + callback-op accounting) plus identification of two defects — one a memory-safety bug (UAF, patch 5) and one a statistics-reporting bug (CB_SEQUENCE undercount, patch 6). No client protocol change.</li>
+<li><strong>NFS client relevance:</strong> The work is server-side (nfsd/sunrpc), but the callback backchannel is the channel the NFS <em>client</em> receives callbacks over, so accurate <code>CB_*</code> counters matter for anyone diagnosing delegation and callback behavior on a client. Note also that patch 4 of the series touched the client's callback service code (<code>fs/nfs/callback_xdr.c</code>) during cleanup — but that was last week's posting, not this week's discussion.</li>
+<li><strong>Net effect:</strong> The v5 series is still in review. Two concrete blockers are now on record for the callback patches: resolve the UAF before applying patch 5, and reconcile CB_SEQUENCE reporting with the forechannel convention before exporting patch 6.</li>
+</ul>
+<h2>Key Messages This Week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/9847a194-22e9-49d7-8729-6dc31475d203@app.fastmail.com/">2026-06-19 Chuck Lever — Re: [PATCH v5 5/6] nfsd: count NFSv4 callback operations per netns (UAF concern)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/73060044-e8fd-4944-83e7-497e1355332e@app.fastmail.com/">2026-06-19 Chuck Lever — Re: [PATCH v5 6/6] nfsd: export NFSv4 callback op stats via netlink (CB_SEQUENCE gap)</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/9847a194-22e9-49d7-8729-6dc31475d203@app.fastmail.com/">2026-06-19 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v5 5/6] nfsd: count NFSv4 callback operations per netns</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/73060044-e8fd-4944-83e7-497e1355332e@app.fastmail.com/">2026-06-19 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v5 6/6] nfsd: export NFSv4 callback op stats via netlink</a></li>
+</ul>
+  </main>
+</body>
+</html>

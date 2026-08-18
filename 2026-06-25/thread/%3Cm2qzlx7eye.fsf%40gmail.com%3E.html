@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS delegations behavior analysis: warm `ls -l` GETATTR storm on large directories</title>
+  <meta name="description" content="This week&#39;s thread (all 12 messages landed on Tue, 2026-06-23) opened with a fresh performance study by Piyush Sachdeva and quickly drew in the core Linux NFS client maintainers — Jeff Layton, Benjamin Coddington, Anna Schumaker, Trond…">
+  <meta property="og:title" content="NFS delegations behavior analysis: warm `ls -l` GETATTR storm on large directories">
+  <meta property="og:description" content="This week&#39;s thread (all 12 messages landed on Tue, 2026-06-23) opened with a fresh performance study by Piyush Sachdeva and quickly drew in the core Linux NFS client maintainers — Jeff Layton, Benjamin Coddington, Anna Schumaker, Trond…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-25T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS delegations behavior analysis: warm `ls -l` GETATTR storm on large directories">
+  <meta name="twitter:description" content="This week&#39;s thread (all 12 messages landed on Tue, 2026-06-23) opened with a fresh performance study by Piyush Sachdeva and quickly drew in the core Linux NFS client maintainers — Jeff Layton, Benjamin Coddington, Anna Schumaker, Trond…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-25</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS delegations behavior analysis: warm <code>ls -l</code> GETATTR storm on large directories</h1>
+<h2>Summary</h2>
+<h1>NFS delegations behavior analysis — the "warm ls is slower than cold" puzzle</h1>
+<p>This week's thread (all 12 messages landed on Tue, 2026-06-23) opened with a fresh performance study by Piyush Sachdeva and quickly drew in the core Linux NFS client maintainers — Jeff Layton, Benjamin Coddington, Anna Schumaker, Trond Myklebust — plus Tigran Mkrtchyan (DESY) and Daire Byrne. It is squarely about <strong>NFS client caching behavior</strong> (directory delegations, <code>actimeo</code>, READDIRPLUS vs GETATTR), not a bug fix or a protocol change per se, but it surfaces several concrete improvement ideas that would touch the client and possibly the protocol.</p>
+<h2>The setup: a benchmark that surprises</h2>
+<p>Piyush posted a micro-benchmark of <code>ls</code> against a flat directory with ~100K files, comparing cold vs warm passes under <code>actimeo=5s</code>, <code>rdirplus=force</code>, ACLs off <a href="https://lore.kernel.org/linux-nfs/m2qzlx7eye.fsf@gmail.com/">in his opening analysis</a>:</p>
+<blockquote>
+<p>"if the next <code>ls -l</code> is issued after the <code>actimeo</code>, a massive GETATTR storm hits the server, doing stat() calls for every file in the directory. As a result, the performance of this warm <code>ls -l</code> run ends up being worse than the cold pass."</p>
+</blockquote>
+<p>His numbers: on the warm pass the client issues <strong>100,000 GETATTRs</strong> (vs 27 READDIRPLUS calls and ~23.6 MB received on the cold pass) and takes ~62 s vs ~14 s for the cold run. The diagnosis: the directory delegation keeps the dcache valid so no READDIR is needed, but file <em>attributes</em> are only cached per <code>actimeo</code>, so every <code>stat()</code> falls through to a single-file GETATTR — which turns out to be far more expensive than one batched READDIRPLUS.</p>
+<p>He proposed three fixes: (1) fall back to READDIRPLUS when the client detects attribute cache misses, (2) extend directory delegations to cover file attributes (a protocol change), or (3) a bulk GETATTR operation.</p>
+<h2>The core difficulty: the kernel can't see userspace's intent</h2>
+<p>Jeff Layton framed the fundamental problem <a href="https://lore.kernel.org/linux-nfs/0b39c1e01a92f99fe456c76523ec7f3aa5dc1a81.camel@kernel.org/">in his first reply</a>:</p>
+<blockquote>
+<p>"ls is such a hard workload to get right, because we don't really get an indication in the kernel of what userland's intentions are. It's basically a readdir() call followed by a bunch of stat()'s, but at the point where we're getting the readdir() call, we don't know if userland intends to stat() those files or not."</p>
+</blockquote>
+<p>He pushed back on Piyush's READDIRPLUS-fallback idea with a pointed question: "Why should you decide to do a READDIRPLUS at that point instead of a regular READDIR?" — i.e., the client has no signal at readdir time that stats are coming. He then asked whether existing heuristics could be tuned, noting <a href="https://lore.kernel.org/linux-nfs/227140ce94ebe4186d02b081489a58f32b878ec4.camel@kernel.org/">in his follow-up</a> that "Ben did the latest pass of trying to tune the heuristics here" and asking what workloads must not regress.</p>
+<h2>Tigran's angle: a statx-based readdirplus syscall</h2>
+<p>Tigran Mkrtchyan (DESY) weighed in <a href="https://lore.kernel.org/linux-nfs/455619640.1622514.1782212671358.JavaMail.zimbra@desy.de/">in his reply</a>, arguing for a way to "get all attributes in one go" — effectively letting userspace declare its intent up front. Anna Schumaker responded <a href="https://lore.kernel.org/linux-nfs/a9885b28-a3fb-4ec6-b6fb-1be78ef16b2e@app.fastmail.com/">with her take</a>:</p>
+<blockquote>
+<p>"We do something like that already. I don't think we'll ever have a readdir plus heuristic that makes everybody happy without userspace somehow telling us their intentions. I know a statx-based readdir plus system call probably sounds crazy, but something like that would go a long way to take all the guesswork out of things on our end."</p>
+</blockquote>
+<p>That "statx-based readdirplus syscall" idea — letting the application say "I will stat these entries" so the client can pick READDIRPLUS deterministically — became one of the thread's most discussed proposals.</p>
+<h2>Benjamin Coddington: benchmarking scars and a delegation question</h2>
+<p>Benjamin Coddington brought practical war stories <a href="https://lore.kernel.org/linux-nfs/4323491E-64A0-4883-8343-5EB569A0D81A@hammerspace.com/">from his Red Hat readdir work</a>:</p>
+<blockquote>
+<p>"We also found that our performance benchmarks rarely matched the most common real-world workloads. We made the mistake of trying to improve the benchmark which resulted in performance regressions for real-world users."</p>
+</blockquote>
+<p>He also noted prior ideas about teaching readdir to respond to fadvise flags, while conceding utilities try to stay filesystem-agnostic, and offered a pragmatic fallback: "sometimes the simplest thing might be to just use more directories on NFS." He then turned to the delegation mechanics with a self-directed question — "can we simply re-hydrate the dentry cache from the directory page mappings if the delegation is still valid?" — and answered it himself <a href="https://lore.kernel.org/linux-nfs/E86DDFB0-6E5E-40CC-8DFA-7233793D25E1@hammerspace.com/">minutes later</a>:</p>
+<blockquote>
+<p>"we don't keep the file attributes in the mappings today. And, more to the point - the directory delegation doesn't protect those file attributes either. We'd need NOTIFY4_CHANGE_CHILD_ATTRIBUTES implemented."</p>
+</blockquote>
+<h2>Daire Byrne: negative lookups as a sibling problem</h2>
+<p>Daire Byrne connected this to a long-standing pain <a href="https://lore.kernel.org/linux-nfs/CAPt2mGPFoW5h7J2V8sCGnU7cQ9Xjx4ddc_sq8pPi4rPZy+J6bQ@mail.gmail.com/">in his reply</a>:</p>
+<blockquote>
+<p>"I have also long hoped for a way to cache or speed up 'negative' lookups using something akin to directory delegations... It would be nice if a client that got the directory contents could also serve negative lookups until the server told it that something had changed. But as has been explained to me multiple times before, there is no mechanism to say that a client 'has the complete cache of directory contents'."</p>
+</blockquote>
+<h2>Jeff's root-cause refinement and the NOTIFY4 detour</h2>
+<p>Jeff sharpened the diagnosis <a href="https://lore.kernel.org/linux-nfs/6076ff478091a512354443e7764ca1b737a386aa.camel@kernel.org/">in his later message</a>:</p>
+<blockquote>
+<p>"the client skips checking directory attributes before trusting the dcache because of the delegation (which is good), but the inodes those dentries point to have an attrcache timeout, and we end up doing a GETATTR for each statx() call when a readdirplus would have been cheaper."</p>
+</blockquote>
+<p>He floated watching for bursts of statx() from one pid on one directory as a trigger to switch to READDIR, while admitting "that sounds horrid to get right and keep working." On the NOTIFY4_CHANGE_CHILD_ATTRIBUTES route he sketched <a href="https://lore.kernel.org/linux-nfs/509e5aecbccb57cd7cd033d45a0c28db8ba8b52c.camel@kernel.org/">a Linux-server implementation path</a> — fsnotify already supports <code>FS_EVENT_ON_CHILD | FS_ATTRIB</code> — but warned it "could be very chatty" and would require nfsd to send multi-page callbacks. Benjamin agreed <a href="https://lore.kernel.org/linux-nfs/C21821AB-720B-444C-852F-CA492DFA8914@hammerspace.com/">in his reply</a> that it "could easily end up having the opposite effect of optimizing performance by amplifying op counts for information the client might not actually use."</p>
+<h2>Trond's closing verdict: notifications don't solve this</h2>
+<p>Trond Myklebust, Linux NFS client maintainer, delivered <a href="https://lore.kernel.org/linux-nfs/3aab8cd1b42edbd1cbfc3981fd3624ab8e988993.camel@kernel.org/">the final word</a> on the notification-based approach:</p>
+<blockquote>
+<p>"Unlike delegations, notifications are asynchronous by design. Upon reception of a notification, you may deduce that you should revalidate the attributes on a file. However the absence of that notification is insufficient to deduce that it is safe not to revalidate those attributes. So when it comes to informing the client whether to use READDIR or READDIRPLUS, I'm sceptical concerning the value of throwing NOTIFY4_CHANGE_CHILD_ATTRS at the problem."</p>
+</blockquote>
+<h2>Where things stand</h2>
+<ul>
+<li><strong>No code was committed this week</strong>; the thread is an analysis/design discussion rather than a bug fix.</li>
+<li>The consensus root cause: directory delegations protect dentries but not file attributes, so post-<code>actimeo</code> <code>ls -l</code> degrades into a per-file GETATTR storm that beats READDIRPLUS on cost.</li>
+<li>The most promising forward-looking idea is <strong>userspace signaling intent</strong> (Anna's "statx-based readdirplus system call", echoing Tigran's "all attributes in one go"), since kernel-side heuristics have repeatedly regressed other workloads per Benjamin's Red Hat experience.</li>
+<li>The NOTIFY4_CHANGE_CHILD_ATTRIBUTES route was examined and effectively set aside by Trond on semantic grounds (asynchronous notifications can't prove absence of change).</li>
+<li>Practical mitigations remain: <code>rdirplus=force</code>, larger <code>actimeo</code>, or sharding large flat directories.</li>
+</ul>
+<p>This thread is a useful snapshot of why the NFS client's readdir/stat path remains one of the hardest corners of the stack to optimize without userspace cooperation.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/m2qzlx7eye.fsf@gmail.com/">2026-06-23 Piyush Sachdeva <a href="mailto:s.piyush1024@gmail.com">s.piyush1024@gmail.com</a> — NFS delegations behavior analysis</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/0b39c1e01a92f99fe456c76523ec7f3aa5dc1a81.camel@kernel.org/">2026-06-23 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: NFS delegations behavior analysis</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/227140ce94ebe4186d02b081489a58f32b878ec4.camel@kernel.org/">2026-06-23 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: NFS delegations behavior analysis</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/455619640.1622514.1782212671358.JavaMail.zimbra@desy.de/">2026-06-23 "Mkrtchyan, Tigran" <a href="mailto:tigran.mkrtchyan@desy.de">tigran.mkrtchyan@desy.de</a> — Re: NFS delegations behavior analysis</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/a9885b28-a3fb-4ec6-b6fb-1be78ef16b2e@app.fastmail.com/">2026-06-23 "Anna Schumaker" <a href="mailto:anna@nowheycreamery.com">anna@nowheycreamery.com</a> — Re: NFS delegations behavior analysis</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/4323491E-64A0-4883-8343-5EB569A0D81A@hammerspace.com/">2026-06-23 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — Re: NFS delegations behavior analysis</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAPt2mGPFoW5h7J2V8sCGnU7cQ9Xjx4ddc_sq8pPi4rPZy+J6bQ@mail.gmail.com/">2026-06-23 Daire Byrne <a href="mailto:daire@brahma.io">daire@brahma.io</a> — Re: NFS delegations behavior analysis</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/E86DDFB0-6E5E-40CC-8DFA-7233793D25E1@hammerspace.com/">2026-06-23 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — Re: NFS delegations behavior analysis</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/6076ff478091a512354443e7764ca1b737a386aa.camel@kernel.org/">2026-06-23 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: NFS delegations behavior analysis</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/509e5aecbccb57cd7cd033d45a0c28db8ba8b52c.camel@kernel.org/">2026-06-23 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: NFS delegations behavior analysis</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/C21821AB-720B-444C-852F-CA492DFA8914@hammerspace.com/">2026-06-23 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — Re: NFS delegations behavior analysis</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/3aab8cd1b42edbd1cbfc3981fd3624ab8e988993.camel@kernel.org/">2026-06-23 Trond Myklebust <a href="mailto:trondmy@kernel.org">trondmy@kernel.org</a> — Re: NFS delegations behavior analysis</a></li>
+</ul>
+  </main>
+</body>
+</html>

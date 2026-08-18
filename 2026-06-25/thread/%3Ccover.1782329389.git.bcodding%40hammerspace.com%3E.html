@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>pNFS/flexfiles: honor clora_changed and report cancelled I/O (PATCH 0/3)</title>
+  <meta name="description" content="Type: Bug fix series for the NFSv4.1+ pNFS client, addressing a long-standing protocol-compliance gap in how the Linux client handles CB_LAYOUTRECALL callbacks under RFC 8881 (the NFSv4.x flexfiles layout specification).">
+  <meta property="og:title" content="pNFS/flexfiles: honor clora_changed and report cancelled I/O (PATCH 0/3)">
+  <meta property="og:description" content="Type: Bug fix series for the NFSv4.1+ pNFS client, addressing a long-standing protocol-compliance gap in how the Linux client handles CB_LAYOUTRECALL callbacks under RFC 8881 (the NFSv4.x flexfiles layout specification).">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-25T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="pNFS/flexfiles: honor clora_changed and report cancelled I/O (PATCH 0/3)">
+  <meta name="twitter:description" content="Type: Bug fix series for the NFSv4.1+ pNFS client, addressing a long-standing protocol-compliance gap in how the Linux client handles CB_LAYOUTRECALL callbacks under RFC 8881 (the NFSv4.x flexfiles layout specification).">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-25</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>pNFS/flexfiles: honor clora_changed and report cancelled I/O (PATCH 0/3)</h1>
+<h2>Summary</h2>
+<h2>pNFS/flexfiles: honor clora_changed and report cancelled I/O</h2>
+<p><strong>Type:</strong> Bug fix series for the NFSv4.1+ pNFS client, addressing a long-standing protocol-compliance gap in how the Linux client handles <code>CB_LAYOUTRECALL</code> callbacks under RFC 8881 (the NFSv4.x flexfiles layout specification).</p>
+<h3>The problem</h3>
+<p>Benjamin Coddington opened <a href="https://lore.kernel.org/linux-nfs/cover.1782329389.git.bcodding@hammerspace.com/">a three-patch series</a> on Wednesday, June 24, targeting v7.1, that exposes a subtle but serious flaw in the pNFS client's layout-recall handling. The cover letter lays out the background:</p>
+<blockquote>
+<p>"RFC 8881 section 20.3.3 lets CB_LAYOUTRECALL carry clora_changed: when it is FALSE the client may flush modified data to the data servers before returning the layout; only when it is TRUE should it stop writing to the DS and redirect through the MDS."</p>
+</blockquote>
+<p>The Linux client had been decoding the <code>cbl_layoutchanged</code> field but silently ignoring it ever since commit b739a5bd9d9f ("NFSv4/flexfiles: Cancel I/O if the layout is recalled or revoked"), which made the client cancel in-flight data-server I/O on every recall, regardless of intent. Coddington flags the consequence bluntly:</p>
+<blockquote>
+<p>"…cancelling in-flight DS I/O unconditionally -- which can leave a write incomplete at the DS with no write layout held."</p>
+</blockquote>
+<p>In other words, when a server sent an <em>unchanged</em> recall (the layout is still valid, the client just needs to return it), the client was needlessly aborting writes that may already have reached the data server — and those orphaned writes could land after the LAYOUTRETURN, which the metadata server would then see as a write with no layout.</p>
+<h3>The three patches</h3>
+<p><strong>Patch 1/3</strong> (<a href="https://lore.kernel.org/linux-nfs/fd8dbaed67881b7813ab9e77bbacc71a30d6de4b.1782329389.git.bcodding@hammerspace.com/">report clora_changed in the cb_layoutrecall_file tracepoint</a>) is an observability improvement: it gives <code>nfs4_cb_layoutrecall_file</code> its own tracepoint event definition so that the intent of a recall (changed vs. unchanged) becomes visible in ftrace output rather than being "otherwise invisible."</p>
+<p><strong>Patch 2/3</strong> (<a href="https://lore.kernel.org/linux-nfs/4429120164c368c8e0c45e1ec9145b6b8177b7d3.1782329389.git.bcodding@hammerspace.com/">honor clora_changed when recalling a layout</a>) is the core fix. It threads the recall's <code>clora_changed</code> value through <code>pnfs_mark_matching_lsegs_return()</code> and only cancels in-flight I/O when the layout is actually changing (restriping or a failed storage device). For an unchanged recall, the existing deferred-return path now waits for in-flight writes to drain before sending LAYOUTRETURN. Coddington notes that other callers — those tearing down or returning layouts for their own reasons — "continue to cancel as before," so the behavior change is scoped precisely to the callback path.</p>
+<p><strong>Patch 3/3</strong> (<a href="https://lore.kernel.org/linux-nfs/5c889ef9a3766960f2cc6f61b1054ba1e71bbb81.1782329389.git.bcodding@hammerspace.com/">report cancelled I/O as a layout error</a>) closes the reporting loop for the cases where cancellation <em>is</em> warranted (changed recall or revoke). The problem: cancellations completed with <code>-EAGAIN</code>, which <code>ff_layout_io_track_ds_error()</code> did not recognize — it "fell through the switch and recorded nothing, so no error was reported to the server." Coddington's fix avoids keying on <code>-EAGAIN</code> (which is overloaded in the RPC layer) by cancelling with <code>-ECANCELED</code> instead, then mapping that to <code>NFS4ERR_NXIO</code> — the same status already used for transport errors that leave a write incomplete. The error is then reported via LAYOUTERROR / LAYOUTRETURN so the MDS can "reconcile the affected mirror instance."</p>
+<p>A notable subtlety in Patch 3: because the client itself aborted the I/O (rather than discovering a device failure), it deliberately skips marking the data server unreachable and forcing an additional layout return. Coddington explains:</p>
+<blockquote>
+<p>"Unlike a genuine transport error, though, we aborted the I/O ourselves and have no evidence the device is at fault, so once the error is recorded we skip marking the device unreachable and forcing a further layout return."</p>
+</blockquote>
+<p>He also confirms the retry path is unchanged: both <code>NFS4ERR_NXIO</code> and <code>-ECANCELED</code> are no-ops in <code>ff_layout_async_handle_error()</code>, which "still resets the I/O to pNFS (or the MDS), so it is re-driven as before."</p>
+<h3>Review feedback</h3>
+<p>Anna Schumaker reviewed the series within roughly 40 minutes of submission, issuing two small nits:</p>
+<ol>
+<li>
+<p>On <strong>Patch 1</strong>, she flagged a stale API usage in the new tracepoint code:</p>
+<blockquote>
+<p>"Note that Jeff had some patches that went into 7.2 to store the nfs fileid directly in the inode. The NFS_FILEID() macro has been removed, and you should use inode-&gt;i_ino instead." (<a href="https://lore.kernel.org/linux-nfs/8874c1b4-87e7-45a5-9b95-59ae1a2fdf88@app.fastmail.com/">review reply</a>)</p>
+</blockquote>
+</li>
+<li>
+<p>On <strong>Patch 2</strong>, she requested documentation for the new parameter:</p>
+<blockquote>
+<p>"Can you also add a description for the new 'cancel_io' parameter to the documentation right above this function?" (<a href="https://lore.kernel.org/linux-nfs/71b36f0e-169e-40fc-b1d6-3eb39e87d79b@app.fastmail.com/">review reply</a>)</p>
+</blockquote>
+</li>
+</ol>
+<p>Neither comment objects to the technical approach; both are housekeeping items for a v2. No further replies were posted within this week's window, so the series is pending a revised posting.</p>
+<h3>Significance</h3>
+<p>This is squarely a <strong>bug fix</strong> with protocol-compliance implications: the client was violating RFC 8881 §20.3.3 by treating every layout recall as a "layout changed" event. The practical risk — writes landing at a data server after the layout has been returned, leaving the MDS unable to reconcile mirror state — is exactly the kind of silent data-integrity hazard that pNFS deployments are most exposed to during restriping or DS failure events. The series is small (92 insertions across five files) but touches three distinct layers: tracepoint observability, the generic pNFS recall path in <code>pnfs.c</code>, and the flexfiles layout driver's error reporting.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/cover.1782329389.git.bcodding@hammerspace.com/">2026-06-24 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — [PATCH 0/3] pNFS/flexfiles: honor clora_changed and report cancelled I/O</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/fd8dbaed67881b7813ab9e77bbacc71a30d6de4b.1782329389.git.bcodding@hammerspace.com/">2026-06-24 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — [PATCH 1/3] pNFS: report clora_changed in the cb_layoutrecall_file tracepoint</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/5c889ef9a3766960f2cc6f61b1054ba1e71bbb81.1782329389.git.bcodding@hammerspace.com/">2026-06-24 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — [PATCH 3/3] NFSv4/flexfiles: report cancelled I/O as a layout error</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/4429120164c368c8e0c45e1ec9145b6b8177b7d3.1782329389.git.bcodding@hammerspace.com/">2026-06-24 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — [PATCH 2/3] pNFS: honor clora_changed when recalling a layout</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/8874c1b4-87e7-45a5-9b95-59ae1a2fdf88@app.fastmail.com/">2026-06-24 "Anna Schumaker" <a href="mailto:anna@kernel.org">anna@kernel.org</a> — Re: [PATCH 1/3] pNFS: report clora_changed in the cb_layoutrecall_file tracepoint</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/71b36f0e-169e-40fc-b1d6-3eb39e87d79b@app.fastmail.com/">2026-06-24 "Anna Schumaker" <a href="mailto:anna@kernel.org">anna@kernel.org</a> — Re: [PATCH 2/3] pNFS: honor clora_changed when recalling a layout</a></li>
+</ul>
+  </main>
+</body>
+</html>

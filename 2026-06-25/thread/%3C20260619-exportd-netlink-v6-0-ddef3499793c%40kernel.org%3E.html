@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd netlink stats v6: fixes UAF and CB_SEQUENCE gaps, Lever flags single-message dump buffer risk</title>
+  <meta name="description" content="This is version 6 of Jeff Layton&#39;s series converting the NFS server-side nfsstat interface from procfs scraping to a generic netlink dump handler, with per-netns accounting for both forward-channel procedure counts and — new since v5 —…">
+  <meta property="og:title" content="nfsd netlink stats v6: fixes UAF and CB_SEQUENCE gaps, Lever flags single-message dump buffer risk">
+  <meta property="og:description" content="This is version 6 of Jeff Layton&#39;s series converting the NFS server-side nfsstat interface from procfs scraping to a generic netlink dump handler, with per-netns accounting for both forward-channel procedure counts and — new since v5 —…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-25T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd netlink stats v6: fixes UAF and CB_SEQUENCE gaps, Lever flags single-message dump buffer risk">
+  <meta name="twitter:description" content="This is version 6 of Jeff Layton&#39;s series converting the NFS server-side nfsstat interface from procfs scraping to a generic netlink dump handler, with per-netns accounting for both forward-channel procedure counts and — new since v5 —…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-25</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd netlink stats v6: fixes UAF and CB_SEQUENCE gaps, Lever flags single-message dump buffer risk</h1>
+<h2>Summary</h2>
+<h1>nfsd/sunrpc netlink stats (v6): Layton ships fixes for the UAF and CB_SEQUENCE review items; Lever digs into the dump design</h1>
+<h2>Context (brief bridge)</h2>
+<p>This is <strong>version 6</strong> of Jeff Layton's series converting the NFS server-side <code>nfsstat</code> interface from procfs scraping to a generic netlink dump handler, with per-netns accounting for both forward-channel procedure counts and — new since v5 — NFSv4 backchannel (callback) operations. The full posting history is summarized in <a href="https://lore.kernel.org/linux-nfs/20260618-exportd-netlink-v5-0-e9aef947af3d@kernel.org/">last week's v5 thread</a> and the <a href="https://lore.kernel.org/linux-nfs/20260618-exportd-netlink-v5-0-e9aef947af3d@kernel.org/">v5 review follow-up</a>. In that prior week, Chuck Lever had raised two concrete blockers on the callback patches: a <strong>use-after-free</strong> in patch 5 and a <strong>CB_SEQUENCE undercount</strong> in patch 6. v6 is Layton's response to both.</p>
+<h2>This Week (June 19): The v6 Posting and Lever's Detailed Review</h2>
+<p>All nine in-window messages landed on June 19. Seven are Layton's v6 submission; two are Lever's review replies, arriving a few hours later.</p>
+<h3>The v6 cover letter: what changed</h3>
+<p>Layton frames the revision tersely: <a href="https://lore.kernel.org/linux-nfs/20260619-exportd-netlink-v6-0-ddef3499793c@kernel.org/">the cover letter</a> states, "This version fixes a few problems that Chuck and Sashiko pointed out in review." The three bullets of the v6 delta:</p>
+<blockquote>
+<ul>
+<li>Emit the entire server-stats object in a single netlink dump message</li>
+<li>Count CB_SEQUENCE on v4.1+ callbacks, for parity with the forechannel SEQUENCE count</li>
+<li>Fix a use-after-free in nfsd4_run_cb() by snapshotting the opcode, net, and minorversion</li>
+</ul>
+</blockquote>
+<p>So both of Lever's prior-week blockers are addressed: the UAF is fixed by <strong>snapshotting</strong> the callback opcode, netns pointer, and minorversion before queuing (so the work item no longer dereferences <code>cb</code>/<code>clp</code> after they may be freed), and the CB_SEQUENCE gap is closed by explicitly counting it on v4.1+ callbacks to match the forechannel SEQUENCE convention. The series remains six patches; the patch list is unchanged from v5, but the contents of patches 3, 5, and 6 were revised.</p>
+<h3>Patch-by-patch (v6)</h3>
+<ol>
+<li>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260619-exportd-netlink-v6-1-ddef3499793c@kernel.org/">Patch 1/6 — per-netns per-procedure counts in svc_stat</a>:</strong> Adds a <code>vs_count</code> pointer array to <code>struct svc_stat</code> plus <code>svc_stat_alloc_counts()</code>/<code>svc_stat_free_counts()</code> helpers managing per-version percpu count arrays, allocated in <code>nfsd_net_init()</code> and freed in <code>nfsd_net_exit()</code>. The per-net counter is incremented alongside the global one in <code>svc_generic_init_request()</code>.</p>
+</li>
+<li>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260619-exportd-netlink-v6-2-ddef3499793c@kernel.org/">Patch 2/6 — svc_seq_show() uses per-net counts</a>:</strong> A one-line change making <code>/proc/net/rpc/nfsd</code> report per-network-namespace procedure call counts. Layton's safety argument: "The only caller is nfsd, which always allocates vs_count via svc_stat_alloc_counts() in nfsd_net_init(), so the per-netns arrays are always available."</p>
+</li>
+<li>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260619-exportd-netlink-v6-3-ddef3499793c@kernel.org/">Patch 3/6 — server-stats-get netlink handler</a>:</strong> Implements <code>nfsd_nl_server_stats_get_dumpit()</code> in the nfsd generic netlink family. <strong>This is where v6 diverges most from v5</strong>: the commit message still describes a streaming design ("Subsequent messages: NFSv4 per-operation counts (proc4ops-ops), one entry per message, using cb-&gt;args[0] to track the current operation index across dump calls"), but — as Lever immediately points out — the code actually emits everything in a single message. Includes 105 lines of netlink YAML spec and new UAPI definitions.</p>
+</li>
+<li>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260619-exportd-netlink-v6-4-ddef3499793c@kernel.org/">Patch 4/6 — remove unused svc_version vs_count</a>:</strong> With both consumers migrated to per-netns arrays, the global <code>vs_count</code> percpu counters are dead. This patch deletes the field and all its <code>DEFINE_PER_CPU_ALIGNED</code> initializers across nfsd, lockd, and the NFS client callback service (<code>fs/nfs/callback_xdr.c</code>) — 39 lines of pure cleanup.</p>
+</li>
+<li>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260619-exportd-netlink-v6-5-ddef3499793c@kernel.org/">Patch 5/6 — count NFSv4 callback operations per netns</a>:</strong> Adds a per-netns array of percpu counters for backchannel operations, indexed by RFC 8881 callback opcode (<code>OP_CB_GETATTR</code>..<code>OP_CB_OFFLOAD</code>), bumped in <code>nfsd4_run_cb()</code>. <strong>This is where the UAF fix lives</strong>: the opcode, net, and minorversion are now snapshotted before <code>nfsd4_queue_cb()</code> returns, so the post-queue counter increment no longer dereferences a potentially-freed <code>cb</code>. The patch also contains the behavioral rework of the old <code>wdeleg_getattr</code> counter:</p>
+<blockquote>
+<p>"CB_GETATTR is sent when a GETATTR conflicts with an outstanding write delegation, which is roughly what the dedicated wdeleg_getattr counter tracked. The two are not identical: the old counter incremented on every such conflict, whereas the CB_GETATTR counter only counts callbacks that are actually queued, so concurrent conflicts that coalesce onto an already in-flight CB_GETATTR are now counted once rather than once per conflict."</p>
+</blockquote>
+</li>
+<li>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260619-exportd-netlink-v6-6-ddef3499793c@kernel.org/">Patch 6/6 — export callback op stats via netlink</a>:</strong> Adds a <code>proc4cb-ops</code> nested attribute to the server-stats dump, reusing the existing <code>server-proc-entry</code> (op/count) layout. Since the callback opcode set is small, it fits in the first dump message with no extra paging: "This lets nfsstat report NFSv4 backchannel operation counts over netlink, including CB_GETATTR which corresponds to the procfs wdeleg_getattr line."</p>
+</li>
+</ol>
+<h3>Chuck Lever's review of patch 3/6 — the big one</h3>
+<p>Lever's <a href="https://lore.kernel.org/linux-nfs/8173debc-96fb-4354-ba11-dff99b772523@app.fastmail.com/">reply to patch 3</a> is the most substantive piece of this week's discussion. He opens with a mismatch between the commit message and the code:</p>
+<blockquote>
+<p>"The commit message says: ... Subsequent messages: NFSv4 per-operation counts (proc4ops-ops), one entry per message, using cb-&gt;args[0] to track the current operation index across dump calls. The code does not stream across subsequent messages. The proc4ops-ops nests are emitted in the first message, inside the same 'if (start == 0)' block as the scalars, and cb-&gt;args[0] only ever holds 0 or -1, never an operation index."</p>
+</blockquote>
+<p>He then asks the pointed question: "Should the commit message be reworded to match the code, or should the code move to the streaming design the message describes?" — and immediately follows with a <strong>buffer-size argument</strong> for why the single-message form is fragile:</p>
+<blockquote>
+<p>"Does that hold up once the assembled message no longer fits the dump buffer? A dump skb is allocated at max(cb-&gt;min_dump_alloc, NLMSG_GOODSIZE), and this handler sets neither cb-&gt;min_dump_alloc nor a .start callback, so the floor is NLMSG_GOODSIZE, which is SKB_WITH_OVERHEAD(PAGE_SIZE), roughly 3.7k on a 4k-page host."</p>
+</blockquote>
+<p>He quantifies the worst case: "With LAST_NFS4_OP at 75, the proc4ops-ops loop alone emits 76 nests of about 28 bytes each (~2.1k); the proc2 and proc3 nests plus the scalar block bring the total to roughly 3.5k -- already within a few hundred bytes of the floor, and growing by one nest for every NFSv4 operation added later."</p>
+<p>Lever then traces the failure mode precisely: "when an nla_put eventually fails, control reaches err_cancel, and genlmsg_cancel() trims the partial message back out, so skb-&gt;len is 0 on return. In netlink_dump(): if (nlk-&gt;dump_done_errno == -EMSGSIZE &amp;&amp; skb-&gt;len) nlk-&gt;dump_done_errno = skb-&gt;len; the skb-&gt;len test fails, so -EMSGSIZE is delivered to userspace as a terminal error rather than being taken as 'buffer full, call again'. With everything emitted under 'if (start == 0)' and no per-attribute cursor in cb-&gt;args, a retry rebuilds the same oversized message, so the dump cannot ever complete."</p>
+<p>His recommendation: "nfsd_nl_rpc_status_get_dumpit() already follows the streaming pattern the commit message describes: one entry per message, saving the cursor in cb-&gt;args and returning skb-&gt;len on EMSGSIZE. Would building this dump the same way be more robust than the single-message form?"</p>
+<p>He also raises two smaller items: (a) the proc4ops loop open-codes the same nest-building logic that <code>nfsd_nl_fill_proc_ops()</code> already implements — "Could the helper be generalized to take the per-op counter source so this is not a second copy of the same code?"; and (b) the loop emits zero-count ops while the per-version block above skips empty versions — "Is that difference intentional? Skipping zero counts here would also trim the worst-case message size above." He also notes the dump omits <code>wdeleg_getattr</code> from the netlink path even though procfs prints it: "Since the goal is to expose the statistics currently available via /proc/net/rpc/nfsd, should wdeleg_getattr get an attribute here too, so nfsstat over netlink does not drop it relative to the procfs path?"</p>
+<h3>Chuck Lever's review of patch 5/6 — CB_SEQUENCE inflation</h3>
+<p>Lever's <a href="https://lore.kernel.org/linux-nfs/a13eff8e-7444-4ba2-bcfa-a981b25af393@app.fastmail.com/">reply to patch 5</a> is shorter but flags a subtle counting bug. He first notes a comment inaccuracy: "The comment says the opcode is snapshotted before queuing, but the code captures the cb_ops pointer and reads ops-&gt;opcode after nfsd4_queue_cb() returns." He concedes the read is safe ("every cb_ops points at a file-scope static const nfsd4_callback_ops ... which outlives cb") but suggests the comment be corrected.</p>
+<p>The more important point: <strong>CB_SEQUENCE is incremented even when no callback goes on the wire</strong>. Lever traces the path:</p>
+<blockquote>
+<p>"Can this inflate the OP_CB_SEQUENCE count for callbacks that never send a CB_SEQUENCE? The increment fires whenever minorversion &gt; 0, including the ops == NULL case. The only callback with cb_ops == NULL is the null probe ... For a 4.1+ client, nfsd4_run_cb_work() drops that work item without sending any RPC."</p>
+</blockquote>
+<p>He identifies the affected scenarios: "callback-channel probes, backchannel changes, and client teardown each bump OP_CB_SEQUENCE for a minorversion &gt; 0 client even though no CB_SEQUENCE (and no callback at all) goes on the wire." His suggested fix is to move the increment inside the <code>if (ops)</code> block:</p>
+<blockquote>
+<p>"A real callback on a 4.1+ client always prepends CB_SEQUENCE, and the null probe carries cb_ops == NULL, so: if (queued) { if (ops) { nfsd_stats_cb_op_inc(nn, ops-&gt;opcode); if (minorversion &gt; 0) nfsd_stats_cb_op_inc(nn, OP_CB_SEQUENCE); } }"</p>
+</blockquote>
+<h2>Classification and Significance</h2>
+<ul>
+<li><strong>Type:</strong> This is a <strong>new feature</strong> (server-side netlink stats interface with per-netns scoping and callback-op accounting) combined with <strong>bug fixes</strong> in the statistics path:
+<ul>
+<li>The UAF in <code>nfsd4_run_cb()</code> (fixed in v6 by snapshotting).</li>
+<li>The CB_SEQUENCE undercount from v5 (addressed in v6, but Lever identifies a new overcount for null-probe cases).</li>
+<li>The <code>wdeleg_getattr</code> overcounting behavior (concurrent conflicts coalescing onto in-flight callbacks were previously counted multiple times; now counted once per queued callback).</li>
+</ul>
+</li>
+<li><strong>NFS client relevance:</strong> The work is server-side (nfsd/sunrpc), but the callback backchannel is the channel the NFS <em>client</em> receives delegation and state-change callbacks over. Accurate <code>CB_*</code> counters matter for anyone diagnosing delegation recall, CB_GETATTR storms, or forechannel/backchannel sequencing on a client. Patch 4 also touches the client's callback service code (<code>fs/nfs/callback_xdr.c</code>) during cleanup of the global counter removal.</li>
+<li><strong>Net effect:</strong> v6 resolves both prior-week blockers (UAF fixed, CB_SEQUENCE now counted), but Lever's review introduces two new concerns: (1) the single-message dump design is fragile against buffer-size growth as NFSv4 ops are added — he recommends the streaming pattern already used by <code>nfsd_nl_rpc_status_get_dumpit()</code>; and (2) the CB_SEQUENCE increment still fires for null-probe work items that never send a callback, inflating the count. A v7 will likely need to address both.</li>
+</ul>
+<h2>Key Messages This Week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260619-exportd-netlink-v6-0-ddef3499793c@kernel.org/">Jeff Layton — [PATCH v6 0/6] cover letter</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260619-exportd-netlink-v6-3-ddef3499793c@kernel.org/">Jeff Layton — Patch 3: server-stats-get netlink handler</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260619-exportd-netlink-v6-5-ddef3499793c@kernel.org/">Jeff Layton — Patch 5: count NFSv4 callback operations per netns</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/8173debc-96fb-4354-ba11-dff99b772523@app.fastmail.com/">Chuck Lever — Re: Patch 3 (dump buffer / streaming design critique)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/a13eff8e-7444-4ba2-bcfa-a981b25af393@app.fastmail.com/">Chuck Lever — Re: Patch 5 (CB_SEQUENCE inflation for null probes)</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260619-exportd-netlink-v6-0-ddef3499793c@kernel.org/">2026-06-19 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v6 0/6] nfsd/sunrpc: convert nfsstat server-side interfaces to use netlink</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260619-exportd-netlink-v6-1-ddef3499793c@kernel.org/">2026-06-19 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v6 1/6] sunrpc: add per-netns per-procedure call counts to svc_stat</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260619-exportd-netlink-v6-2-ddef3499793c@kernel.org/">2026-06-19 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v6 2/6] sunrpc: use per-net counts in svc_seq_show()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260619-exportd-netlink-v6-3-ddef3499793c@kernel.org/">2026-06-19 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v6 3/6] nfsd: implement server-stats-get netlink handler</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260619-exportd-netlink-v6-4-ddef3499793c@kernel.org/">2026-06-19 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v6 4/6] sunrpc: remove unused svc_version vs_count field</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260619-exportd-netlink-v6-5-ddef3499793c@kernel.org/">2026-06-19 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v6 5/6] nfsd: count NFSv4 callback operations per netns</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260619-exportd-netlink-v6-6-ddef3499793c@kernel.org/">2026-06-19 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v6 6/6] nfsd: export NFSv4 callback op stats via netlink</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/8173debc-96fb-4354-ba11-dff99b772523@app.fastmail.com/">2026-06-19 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v6 3/6] nfsd: implement server-stats-get netlink handler</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/a13eff8e-7444-4ba2-bcfa-a981b25af393@app.fastmail.com/">2026-06-19 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v6 5/6] nfsd: count NFSv4 callback operations per netns</a></li>
+</ul>
+  </main>
+</body>
+</html>
