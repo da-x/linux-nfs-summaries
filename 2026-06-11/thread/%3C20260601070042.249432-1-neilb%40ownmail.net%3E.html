@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Chuck Lever finds NFS4ERR_EXIST logic bug in NeilBrown&#39;s vfs_lookup_open() series; cleanup of stray fh_drop_write() acknowledged</title>
+  <meta name="description" content="Last week, NeilBrown posted an 18-patch RFC series titled &quot;VFS/nfsd: replace dentry_create()&quot;, a major VFS and nfsd refactoring that introduces vfs_lookup_open() to consolidate lookup, create, and open into a single call path. The series…">
+  <meta property="og:title" content="Chuck Lever finds NFS4ERR_EXIST logic bug in NeilBrown&#39;s vfs_lookup_open() series; cleanup of stray fh_drop_write() acknowledged">
+  <meta property="og:description" content="Last week, NeilBrown posted an 18-patch RFC series titled &quot;VFS/nfsd: replace dentry_create()&quot;, a major VFS and nfsd refactoring that introduces vfs_lookup_open() to consolidate lookup, create, and open into a single call path. The series…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-11T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Chuck Lever finds NFS4ERR_EXIST logic bug in NeilBrown&#39;s vfs_lookup_open() series; cleanup of stray fh_drop_write() acknowledged">
+  <meta name="twitter:description" content="Last week, NeilBrown posted an 18-patch RFC series titled &quot;VFS/nfsd: replace dentry_create()&quot;, a major VFS and nfsd refactoring that introduces vfs_lookup_open() to consolidate lookup, create, and open into a single call path. The series…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-11</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Chuck Lever finds NFS4ERR_EXIST logic bug in NeilBrown's vfs_lookup_open() series; cleanup of stray fh_drop_write() acknowledged</h1>
+<h2>Summary</h2>
+<h1>Chuck Lever Reviews Patches 16 &amp; 17 of NeilBrown's <code>vfs_lookup_open()</code> Series: Logic Bug and Cleanup</h1>
+<h2>Context (bridging prior week)</h2>
+<p>Last week, NeilBrown posted an <a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-1-neilb@ownmail.net//">18-patch RFC series</a> titled <em>"VFS/nfsd: replace dentry_create()"</em>, a major VFS and nfsd refactoring that introduces <code>vfs_lookup_open()</code> to consolidate lookup, create, and open into a single call path. The series was motivated by a deadlock NeilBrown discovered in his earlier 53-patch directory-locking RFC when re-exporting NFS filesystems. Jori Koolstra reviewed patches 01–05 (granting three Reviewed-by tags and raising questions on 04 and 05), but the nfsd-specific patches 06–18 had not yet received review.</p>
+<p>This week, NFS maintainer <strong>Chuck Lever</strong> turned his attention to two of those nfsd patches — <a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-17-neilb@ownmail.net/">PATCH 16/18</a> and <a href="https://lore.kernel.org/linux-nfs/20260601070042.249432-18-neilb@ownmail.net/">PATCH 17/18</a> — producing a pair of findings that range from a cosmetic cleanup to a genuine protocol-breaking logic bug.</p>
+<h2>Classification</h2>
+<p>This is a <strong>VFS API refactoring with correctness implications for the NFSv4 server</strong>. The patches under review are not new features or protocol changes in themselves; they restructure nfsd's internal open/create path to use the new <code>vfs_lookup_open()</code> interface. However, the logic bug Chuck Lever found would have broken NFSv4 OPEN semantics for a common client operation (CLAIM_NULL opens of existing files), making this effectively a <strong>bug-fix review</strong> as much as a refactoring review.</p>
+<h2>This Week's Discussion</h2>
+<h3>1. Stray <code>fh_drop_write()</code> in PATCH 16/18 (cosmetic)</h3>
+<p>On Friday, June 5, Chuck Lever <a href="https://lore.kernel.org/linux-nfs/b86f4070-c2b8-4989-b956-ad0f40f88acb@app.fastmail.com/">reviewed PATCH 16/18</a>, which switches <code>nfsd4_create_file()</code> to use <code>vfs_lookup_open()</code>. He spotted an asymmetry in the write-access accounting:</p>
+<blockquote>
+<p>"This fh_want_write() is removed, but ... the 'matching' fh_drop_write remains. Harmless since nothing has set fhp-&gt;fh_want_write, but should be cleaned up."</p>
+</blockquote>
+<p>The patch removes the <code>fh_want_write(fhp)</code> call (because <code>vfs_lookup_open()</code> now handles write-access internally) but leaves the corresponding <code>fh_drop_write(fhp)</code> in place. Chuck correctly notes this is harmless — dropping a write access that was never taken is a no-op — but it's dead code that should be removed for cleanliness.</p>
+<p>NeilBrown <a href="https://lore.kernel.org/linux-nfs/178096585114.3392745.13448656265781184569@noble.neil.brown.name/">acknowledged the finding on Monday, June 9</a> with a brief:</p>
+<blockquote>
+<p>"Thanks for catching that!"</p>
+</blockquote>
+<p>This is a straightforward cleanup, not a functional bug.</p>
+<h3>2. NFS4ERR_EXIST logic bug in PATCH 17/18 (functional)</h3>
+<p>The more significant finding came in Chuck Lever's <a href="https://lore.kernel.org/linux-nfs/2f5da5fd-442f-4889-af15-58f9b5d68d71@app.fastmail.com/">review of PATCH 17/18</a>, which extends <code>vfs_lookup_open()</code> usage to non-creating open requests (i.e., plain OPEN operations where the file already exists). Chuck identified a logic error in the refactored <code>do_open_lookup()</code>:</p>
+<blockquote>
+<p>"Logic bug: Pre-series, the non-create case takes do_open_lookup()'s else branch and succeeds; post-series, do_open_lookup() calls nfsd4_open_file() unconditionally. Every CLAIM_NULL open of an existing file fails with NFS4ERR_EXIST."</p>
+</blockquote>
+<p>This is a serious protocol-level regression. In NFSv4, <code>NFS4_OPEN_NOCREATE</code> (the "non-creating" open mode) is the standard way clients open files they already know exist — it's the default for most OPEN operations. If every such open returns <code>NFS4ERR_EXIST</code>, effectively all non-creating opens would fail, rendering the server unusable for normal file access. The bug stems from the refactoring making <code>nfsd4_open_file()</code> (which contains create-specific logic including an existence check) run unconditionally, even when no creation was requested.</p>
+<p>NeilBrown <a href="https://lore.kernel.org/linux-nfs/178096703408.3392745.3772559791386922644@noble.neil.brown.name/">confirmed the bug on June 9</a> and proposed a concrete fix:</p>
+<blockquote>
+<p>"yes - that is bad. I think</p>
+<pre><code>	if (!open-&gt;op_created &amp;&amp;
+-	    createmode == NFS4_CREATE_UNCHECKED) {
++	    (open-&gt;op_create == NFS4_OPEN_NOCREATE ||
++	     createmode == NFS4_CREATE_UNCHECKED)) {
+		/* NFSv4 protocol requires change attributes
+		 * even though no change happened.
+		 */
+</code></pre>
+<p>is what I wanted to do."</p>
+</blockquote>
+<p>The fix adds <code>open-&gt;op_create == NFS4_OPEN_NOCREATE</code> as an additional condition for the non-creating path, so that plain opens of existing files correctly skip the create-specific error handling. NeilBrown also noted a related cleanup:</p>
+<blockquote>
+<p>"I've also move the clearing of ATTR_SIZE down to where we know we did created the file, so no trunc is needed."</p>
+</blockquote>
+<p>This moves the <code>ATTR_SIZE</code> clearing (which effectively performs a truncate-to-zero) from a position where it would run on all opens to one where it only runs when a file was actually created — another correctness improvement that prevents unintended truncation of existing files.</p>
+<p>NeilBrown closed with: "Thanks a lot for the review."</p>
+<h2>Key Technical Arguments</h2>
+<ol>
+<li>
+<p><strong>Unconditional call path is dangerous</strong>: The core lesson from the PATCH 17/18 bug is that refactoring <code>do_open_lookup()</code> to route all opens through <code>nfsd4_open_file()</code> (which was designed with create semantics in mind) requires careful gating on the open mode. The pre-refactor code had an explicit else branch for non-creating opens; collapsing that into a single path without adjusting the internal conditions silently broke the most common client operation.</p>
+</li>
+<li>
+<p><strong>Write-access accounting must stay balanced</strong>: The PATCH 16/18 finding, while cosmetic, reinforces a general principle in nfsd: <code>fh_want_write()</code> / <code>fh_drop_write()</code> pairs must be kept in lockstep. Removing one side without the other is safe only because the drop is a no-op when nothing was taken — but it's confusing dead code that could mask a future real imbalance.</p>
+</li>
+<li>
+<p><strong>ATTR_SIZE clearing scope</strong>: NeilBrown's additional fix to move <code>ATTR_SIZE</code> clearing down into the create-only path addresses a subtle correctness issue: clearing the size attribute on a non-creating open would truncate an existing file to zero, which is clearly wrong. This was likely another latent consequence of the same "unconditional path" refactoring.</p>
+</li>
+</ol>
+<h2>Impact on NFS Clients</h2>
+<p>While this is server-side code, the implications for NFS clients are direct and severe:</p>
+<ul>
+<li><strong>CLAIM_NULL opens</strong>: The logic bug in PATCH 17/18 would have broken the most common NFSv4 OPEN operation. Any client performing a standard open of an existing file (the default <code>NFS4_OPEN_NOCREATE</code> mode) would have received <code>NFS4ERR_EXIST</code>. This is not an edge case — it is the primary path for file access on NFSv4 servers.</li>
+<li><strong>File truncation risk</strong>: The ATTR_SIZE clearing issue, had it shipped, could have silently truncated files opened without create intent — a data-loss scenario for any client.</li>
+<li><strong>Re-export correctness</strong>: The broader series (from last week) targets deadlock fixes for NFS re-export scenarios. Getting the non-create open path right is essential for the refactoring to be safe in those environments.</li>
+</ul>
+<h2>Status and Outlook</h2>
+<p>As of the end of this week's window:</p>
+<ol>
+<li><strong>PATCH 16/18</strong>: One cosmetic cleanup identified (stray <code>fh_drop_write()</code>), acknowledged by NeilBrown. No functional issues found.</li>
+<li><strong>PATCH 17/18</strong>: One significant logic bug (NFS4ERR_EXIST on all non-creating opens) identified and confirmed, with a concrete fix proposed by NeilBrown. An additional ATTR_SIZE scoping fix was also noted.</li>
+<li>The series remains in RFC stage. Patches 06–15 and 18 have not yet received review from Chuck Lever or other nfsd maintainers.</li>
+<li>A revised version of the series is expected, incorporating both fixes.</li>
+</ol>
+<h2>Messages This Week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/2f5da5fd-442f-4889-af15-58f9b5d68d71@app.fastmail.com/">2026-06-05 Chuck Lever — Re: [PATCH 17/18] (NFS4ERR_EXIST logic bug)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/b86f4070-c2b8-4989-b956-ad0f40f88acb@app.fastmail.com/">2026-06-05 Chuck Lever — Re: [PATCH 16/18] (stray fh_drop_write cleanup)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178096585114.3392745.13448656265781184569@noble.neil.brown.name/">2026-06-09 NeilBrown — Re: [PATCH 16/18] (acknowledgment)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178096703408.3392745.3772559791386922644@noble.neil.brown.name/">2026-06-09 NeilBrown — Re: [PATCH 17/18] (bug confirmation + fix proposal)</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/2f5da5fd-442f-4889-af15-58f9b5d68d71@app.fastmail.com/">2026-06-05 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 17/18] nfsd: use vfs_lookup_open() for non-creating open requests too.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/b86f4070-c2b8-4989-b956-ad0f40f88acb@app.fastmail.com/">2026-06-05 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 16/18] nfsd: switch nfsd4_create_file() to use vfs_lookup_open()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178096585114.3392745.13448656265781184569@noble.neil.brown.name/">2026-06-09 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> —  Re: [PATCH 16/18] nfsd: switch nfsd4_create_file() to use vfs_lookup_open()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178096703408.3392745.3772559791386922644@noble.neil.brown.name/">2026-06-09 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH 17/18] nfsd: use vfs_lookup_open() for non-creating open requests too.</a></li>
+</ul>
+  </main>
+</body>
+</html>

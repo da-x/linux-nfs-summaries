@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>svcrdma Contiguous Pages Regression: Hammerspace Provides Profiling Data; GFP_NOWAIT Fix Proven Insufficient</title>
+  <meta name="description" content="Classification: Bug fix / performance regression (server-side svcrdma over NFS-over-RDMA)">
+  <meta property="og:title" content="svcrdma Contiguous Pages Regression: Hammerspace Provides Profiling Data; GFP_NOWAIT Fix Proven Insufficient">
+  <meta property="og:description" content="Classification: Bug fix / performance regression (server-side svcrdma over NFS-over-RDMA)">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-11T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="svcrdma Contiguous Pages Regression: Hammerspace Provides Profiling Data; GFP_NOWAIT Fix Proven Insufficient">
+  <meta name="twitter:description" content="Classification: Bug fix / performance regression (server-side svcrdma over NFS-over-RDMA)">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-11</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>svcrdma Contiguous Pages Regression: Hammerspace Provides Profiling Data; GFP_NOWAIT Fix Proven Insufficient</h1>
+<h2>Summary</h2>
+<h1>svcrdma Contiguous Pages Regression: Detailed Profiling and Failed First Fix Attempt</h1>
+<p><strong>Classification:</strong> Bug fix / performance regression (server-side <code>svcrdma</code> over NFS-over-RDMA)</p>
+<h2>This Week's Activity</h2>
+<p>The thread continued its active debugging phase on June 5, with Jonathan Flynn from Hammerspace providing detailed profiling data in response to Mike Snitzer's <a href="https://lore.kernel.org/linux-nfs/aiHlPmeZq3WgMwoJ@kernel.org/">June 4 regression report</a>. Flynn's message <a href="https://lore.kernel.org/linux-nfs/3cb119b4b2a8aada30c0c60286778a54@mail.gmail.com/">RE: [PATCH v4] svcrdma: Use contiguous pages for RDMA Read sink buffers</a> supplied the underlying performance evidence that Snitzer had referenced, including fio results, perf reports, and flamegraphs hosted on a shared OneDrive link.</p>
+<h3>The Profiling Evidence</h3>
+<p>Flynn's data confirmed and refined Snitzer's initial diagnosis. The flamegraph showed that the allocator-heavy call stack rooted at <code>svc_rdma_build_read_segment_contig()</code> remained dominant in the regressed configuration, with <code>alloc_pages_noprof()</code> and <code>rmqueue_buddy()</code> accounting for a significant portion of CPU samples. This pointed to the higher-order page allocation path — specifically the buddy allocator's queue operations — as the source of the contention that Snitzer had initially attributed broadly to "spinlock" overhead.</p>
+<h3>Chuck Lever's First Fix Attempt (Same Day)</h3>
+<p>Within minutes of Flynn's data, Chuck Lever posted a targeted fix in a <a href="https://lore.kernel.org/linux-nfs/20260605223118.75092-1-cel@kernel.org/">separate but directly related thread</a>:</p>
+<blockquote>
+<p>"svc_rdma_alloc_read_pages() passes __GFP_NORETRY, which limits the allocator to a single round of direct reclaim and asynchronous compaction per attempt. Under memory pressure or fragmentation that round can take a long time, and the fallback loop repeats it at each order, multiplying the stall while the RPC waits for its Read sink buffer."</p>
+</blockquote>
+<p>Lever's proposed fix replaced <code>__GFP_NORETRY</code> with <code>GFP_NOWAIT</code>, reasoning that:</p>
+<blockquote>
+<p>"The contiguous allocation is opportunistic: when it fails, Read sink buffers come from the pages already in rq_pages[]. Direct reclaim effort buys little here. Allocate with GFP_NOWAIT instead, which omits __GFP_DIRECT_RECLAIM so the allocator takes pages only from the free lists and returns NULL immediately when none are available."</p>
+</blockquote>
+<p>He was candid about his uncertainty:</p>
+<blockquote>
+<p>"Given the perf symbol resolution inaccuracies I can't swear this will fix the issue, but here's a stab at it."</p>
+</blockquote>
+<h3>Flynn's Rapid Test Result: Fix Proven Insufficient</h3>
+<p>Flynn turned around a test within 42 minutes of Lever posting the patch. His <a href="https://lore.kernel.org/linux-nfs/01eb014a108d59a6312cd23379abb49b@mail.gmail.com/">reply</a> delivered the verdict:</p>
+<blockquote>
+<p>"Unfortunately, the GFP_NOWAIT change did not materially affect either throughput or the perf profile. The allocator-heavy stack rooted at svc_rdma_build_read_segment_contig() remains dominant, with alloc_pages_noprof() and rmqueue_buddy() continuing to account for a significant portion of the samples, similar to the original regressed build."</p>
+</blockquote>
+<p>This was a critical negative result: it ruled out direct reclaim as the primary bottleneck. The problem lies deeper in the buddy allocator's higher-order allocation path itself — the <code>rmqueue_buddy()</code> spinlock contention that Snitzer had flagged is inherent to requesting large contiguous pages under high concurrency, not an artifact of the GFP flags triggering reclaim.</p>
+<h2>Evolution of the Discussion (Bridge from Prior Weeks)</h2>
+<ul>
+<li><strong>March 19:</strong> Chuck Lever posted <a href="https://lore.kernel.org/linux-nfs/20260319133610.2556826-1-cel@kernel.org/">PATCH v4</a>, a performance optimization to reduce DMA mappings from 16 to 1 for 64 KB READ payloads by using physically contiguous page allocations.</li>
+<li><strong>March 17:</strong> Christoph Hellwig raised concerns about the size limit scaling with page size; Lever addressed these in v4.</li>
+<li><strong>June 4:</strong> Mike Snitzer reported the patch (merged as commit <code>18755b8c2f241</code> in 7.1) causes a ~60% WRITE throughput regression (24.2 GB/s vs 60.6 GB/s) on high-end RDMA, with spinlock contention dominating the flamegraph.</li>
+<li><strong>June 5:</strong> Flynn provided detailed profiling data; Lever's first fix attempt (GFP_NOWAIT) was tested and found insufficient within the hour.</li>
+</ul>
+<h2>Current Status and Significance</h2>
+<p>The debugging has narrowed considerably: the bottleneck is confirmed to be in the buddy allocator's higher-order page allocation path (<code>alloc_pages_noprof()</code> → <code>rmqueue_buddy()</code>), not in direct reclaim. This means the fix will likely need to address the fundamental approach — possibly per-CPU pre-allocated contiguous buffers, a different memory pool strategy, or reducing the allocation order — rather than simply adjusting GFP flags.</p>
+<p>The rapid turnaround (regression report at ~00:00 UTC June 4, profiling data and failed fix by 23:13 UTC June 5) reflects the tight collaboration between Hammerspace's test infrastructure and Oracle's NFS development team. The <code>Fixes:</code> tag in Lever's patch (<code>Fixes: 18755b8c2f24</code>) confirms this is being tracked as a regression fix for the 7.1 merge window commit, with implications for stable backporting if not resolved before the next RC.</p>
+<h2>Messages This Week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/3cb119b4b2a8aada30c0c60286778a54@mail.gmail.com/">2026-06-05 Jonathan Flynn <a href="mailto:jonathan.flynn@hammerspace.com">jonathan.flynn@hammerspace.com</a> — RE: [PATCH v4] svcrdma: Use contiguous pages for RDMA Read sink buffers</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/3cb119b4b2a8aada30c0c60286778a54@mail.gmail.com/">2026-06-05 Jonathan Flynn <a href="mailto:jonathan.flynn@hammerspace.com">jonathan.flynn@hammerspace.com</a> — RE: [PATCH v4] svcrdma: Use contiguous pages for RDMA Read sink buffers</a></li>
+</ul>
+  </main>
+</body>
+</html>

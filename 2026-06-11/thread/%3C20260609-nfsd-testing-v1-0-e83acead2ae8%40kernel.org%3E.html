@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Jeff Layton&#39;s 19-patch nfsd bugfix series for v7.3; Chuck Lever reviews the localio ref leak</title>
+  <meta name="description" content="On Tuesday, June 9, Jeff Layton posted a 19-patch series titled &quot;nfsd: more bugfixes&quot; to linux-nfs, aimed at the v7.3 merge window. The cover letter is refreshingly candid about provenance:">
+  <meta property="og:title" content="Jeff Layton&#39;s 19-patch nfsd bugfix series for v7.3; Chuck Lever reviews the localio ref leak">
+  <meta property="og:description" content="On Tuesday, June 9, Jeff Layton posted a 19-patch series titled &quot;nfsd: more bugfixes&quot; to linux-nfs, aimed at the v7.3 merge window. The cover letter is refreshingly candid about provenance:">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-11T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Jeff Layton&#39;s 19-patch nfsd bugfix series for v7.3; Chuck Lever reviews the localio ref leak">
+  <meta name="twitter:description" content="On Tuesday, June 9, Jeff Layton posted a 19-patch series titled &quot;nfsd: more bugfixes&quot; to linux-nfs, aimed at the v7.3 merge window. The cover letter is refreshingly candid about provenance:">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-11</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Jeff Layton's 19-patch nfsd bugfix series for v7.3; Chuck Lever reviews the localio ref leak</h1>
+<h2>Summary</h2>
+<h2>Jeff Layton posts a 19-patch "nfsd: more bugfixes" series targeting v7.3</h2>
+<p>On Tuesday, June 9, Jeff Layton posted <a href="https://lore.kernel.org/linux-nfs/20260609-nfsd-testing-v1-0-e83acead2ae8@kernel.org/">a 19-patch series titled "nfsd: more bugfixes"</a> to linux-nfs, aimed at the v7.3 merge window. The cover letter is refreshingly candid about provenance:</p>
+<blockquote>
+<p>"This is a pile of bugfixes found via LLM inspection. Most of these don't seem to be easily triggerable or require specific conditions, but they're still bugs nonetheless. Please consider these for v7.3."</p>
+</blockquote>
+<p>Every patch in the series carries an <code>Assisted-by: Claude:claude-opus-4-8</code> tag, making this one of the more prominent examples yet of LLM-assisted kernel auditing landing on a major subsystem list. The series touches 19 files with 182 insertions and 46 deletions, spanning nfsd, lockd, sunrpc, and (in patch 01) the client-side <code>fs/nfs/localio.c</code>.</p>
+<h3>Highlights of the bugfixes</h3>
+<p>The series is a grab-bag of correctness fixes rather than a single feature, but several stand out for their severity:</p>
+<ul>
+<li>
+<p><strong>Reference-count leak in LOCALIO</strong> (<a href="https://lore.kernel.org/linux-nfs/20260609-nfsd-testing-v1-1-e83acead2ae8@kernel.org/">PATCH 01/19</a>): Two early-return paths in <code>nfs_local_doio()</code> fail to drop the <code>nfsd_file</code> reference, which "pins the associated net namespace reference, blocking network namespace teardown, and holds a reference on the exported filesystem, preventing unmount." This is the only patch that touches client-side code (<code>fs/nfs/localio.c</code>).</p>
+</li>
+<li>
+<p><strong>Out-of-bounds read via netlink</strong> (<a href="https://lore.kernel.org/linux-nfs/20260609-nfsd-testing-v1-2-e83acead2ae8@kernel.org/">PATCH 02/19</a>): <code>nfsd4_release_compoundargs()</code> leaves <code>opcnt</code> stale after freeing the dynamic ops buffer, so the RPC status dumpit handler can read up to 16 entries from an 8-element inline array and "leak[s] it to userspace via netlink."</p>
+</li>
+<li>
+<p><strong>Use-after-free in sunrpc</strong> (<a href="https://lore.kernel.org/linux-nfs/20260609-nfsd-testing-v1-5-e83acead2ae8@kernel.org/">PATCH 05/19</a>): <code>svc_rqst_free()</code> frees <code>rq_argp</code> and <code>rq_resp</code> synchronously while the <code>svc_rqst</code> itself is freed via <code>kfree_rcu()</code>, leaving a window where RCU readers (e.g. <code>nfsd_nl_rpc_status_get_dumpit()</code>) can dereference already-freed buffers.</p>
+</li>
+<li>
+<p><strong>Grace-period denial-of-service</strong> (<a href="https://lore.kernel.org/linux-nfs/20260609-nfsd-testing-v1-13-e83acead2ae8@kernel.org/">PATCH 13/19</a>): <code>clients_still_reclaiming()</code> mixes CLOCK_REALTIME and CLOCK_BOOTTIME, so the deadline comparison "is always false — it would take ~54 years of uptime for BOOTTIME to exceed the REALTIME-derived deadline." As Layton puts it: "any client can hold the server in grace indefinitely by sending CLAIM_PREVIOUS OPEN requests, blocking all non-reclaim operations for all other clients."</p>
+</li>
+<li>
+<p><strong>RCU protection for lockd ops</strong> (<a href="https://lore.kernel.org/linux-nfs/20260609-nfsd-testing-v1-17-e83acead2ae8@kernel.org/">PATCH 17/19</a>): <code>nlmsvc_ops</code> is published/cleared with plain stores while lockd dereferences it unguarded, so "a stale load after rmmod nfsd results in either a NULL deref or a module-text use-after-free."</p>
+</li>
+</ul>
+<p>Other fixes cover missing memory barriers in the rpc_status seqcount retry (PATCH 03), netlink dumpit error handling (PATCH 04), unchecked <code>nfsd4_acl_to_attr()</code> return in CREATE (PATCH 06), missing filehandle validation in DELEGRETURN (PATCH 07), unvalidated <code>nseconds</code> in TIME_DELEG decode paths (PATCH 08), premature <code>NFS4_OO_CONFIRMED</code> on failed CLAIM_PREVIOUS opens (PATCH 09), a version-mismatch loop bug in <code>nfsd_acl_init_request()</code> (PATCH 10), an unconditional <code>FL_SLEEP</code> for all lock types (PATCH 11), missing <code>fh_want_write()</code> in the early-verified SETATTR path (PATCH 12), atomicity of <code>somebody_reclaimed</code> (PATCH 14), reclaim LOCK after RECLAIM_COMPLETE (PATCH 15), sockaddr length validation in listener_set (PATCH 16), debugfs init ordering (PATCH 18), and DRC shrinker initialization order (PATCH 19).</p>
+<h3>Chuck Lever's review of the localio patch</h3>
+<p>The only reply this week came from NFS maintainer Chuck Lever on Wednesday, June 10, who focused exclusively on <a href="https://lore.kernel.org/linux-nfs/20260609-nfsd-testing-v1-1-e83acead2ae8@kernel.org/">PATCH 01/19</a>. In his <a href="https://lore.kernel.org/linux-nfs/e2c27654-4344-46cd-8bab-dfe0af6e0db0@app.fastmail.com/">reply</a>, he raised two practical points:</p>
+<blockquote>
+<p>"I don't seem to have commit e77c464c31b3 in my tree. Should this be <code>Fixes: 70ba381e1a43 ("nfs: add LOCALIO support")</code>?"</p>
+</blockquote>
+<p>And, noting the patch only modifies a client-side file:</p>
+<blockquote>
+<p>"This updates only a client-side source file. Should it go through Anna/Trond's trees? Or were you thinking that, since the leak impacts only NFS server behavior, I should take it?"</p>
+</blockquote>
+<p>Layton <a href="https://lore.kernel.org/linux-nfs/e9e15b646bf18a18da6b30e4aee528f07f5e5d1a.camel@kernel.org/">responded</a> confirming the corrected Fixes tag — "Yeah, that introduced the first of the leaks, I think" — and was accommodating on the routing question: "I'm fine if Anna or Trond want to take this one."</p>
+<h3>Status</h3>
+<p>As of the end of this week's window, only patch 01 has received review; the remaining 18 patches are awaiting maintainer attention. The series is explicitly a bugfix collection (no new features, no protocol changes), and the discussion so far has been limited to the localio reference leak and its routing through the correct maintainer tree.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260609-nfsd-testing-v1-0-e83acead2ae8@kernel.org/">2026-06-09 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 00/19] nfsd: more bugfixes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260609-nfsd-testing-v1-1-e83acead2ae8@kernel.org/">2026-06-09 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 01/19] nfs/localio: fix nfsd_file ref leak on nfs_local_doio() init failure</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260609-nfsd-testing-v1-2-e83acead2ae8@kernel.org/">2026-06-09 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 02/19] nfsd: clear opcnt on compound arg release to prevent OOB read</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260609-nfsd-testing-v1-3-e83acead2ae8@kernel.org/">2026-06-09 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 03/19] nfsd: add missing read barrier to rpc_status_get dumpit seqcount retry</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260609-nfsd-testing-v1-4-e83acead2ae8@kernel.org/">2026-06-09 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 04/19] nfsd: fix netlink dumpit error handling for rpc_status_get</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260609-nfsd-testing-v1-5-e83acead2ae8@kernel.org/">2026-06-09 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 05/19] sunrpc: defer rq_argp and rq_resp free until after RCU grace period</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260609-nfsd-testing-v1-6-e83acead2ae8@kernel.org/">2026-06-09 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 06/19] nfsd: check nfsd4_acl_to_attr() return value in nfsd4_create()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260609-nfsd-testing-v1-7-e83acead2ae8@kernel.org/">2026-06-09 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 07/19] nfsd: add filehandle match check to nfsd4_delegreturn()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260609-nfsd-testing-v1-8-e83acead2ae8@kernel.org/">2026-06-09 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 08/19] nfsd: validate nseconds in TIME_DELEG decode paths</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260609-nfsd-testing-v1-9-e83acead2ae8@kernel.org/">2026-06-09 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 09/19] nfsd: remove premature NFS4_OO_CONFIRMED in CLAIM_PREVIOUS path</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260609-nfsd-testing-v1-10-e83acead2ae8@kernel.org/">2026-06-09 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 10/19] nfsd: fix version mismatch loops in nfsd_acl_init_request()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260609-nfsd-testing-v1-11-e83acead2ae8@kernel.org/">2026-06-09 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 11/19] nfsd: fix FL_SLEEP being set unconditionally for all LOCK types</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260609-nfsd-testing-v1-12-e83acead2ae8@kernel.org/">2026-06-09 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 12/19] nfsd: add fh_want_write() for early-verified SETATTR in nfsd_proc_setattr()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260609-nfsd-testing-v1-13-e83acead2ae8@kernel.org/">2026-06-09 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 13/19] nfsd: fix clock domain mismatch in clients_still_reclaiming()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260609-nfsd-testing-v1-14-e83acead2ae8@kernel.org/">2026-06-09 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 14/19] nfsd: use test_and_clear_bit for somebody_reclaimed to prevent lost update</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260609-nfsd-testing-v1-15-e83acead2ae8@kernel.org/">2026-06-09 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 15/19] nfsd: reject reclaim LOCK after RECLAIM_COMPLETE</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260609-nfsd-testing-v1-16-e83acead2ae8@kernel.org/">2026-06-09 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 16/19] nfsd: validate sockaddr length per family in listener_set</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260609-nfsd-testing-v1-17-e83acead2ae8@kernel.org/">2026-06-09 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 17/19] lockd, nfsd: RCU-protect nlmsvc_ops dispatch</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260609-nfsd-testing-v1-18-e83acead2ae8@kernel.org/">2026-06-09 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 18/19] nfsd: move nfsd_debugfs_init() after nfsd4_init_slabs() in init_nfsd()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260609-nfsd-testing-v1-19-e83acead2ae8@kernel.org/">2026-06-09 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 19/19] nfsd: initialize DRC hash table before registering shrinker</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/e2c27654-4344-46cd-8bab-dfe0af6e0db0@app.fastmail.com/">2026-06-10 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 01/19] nfs/localio: fix nfsd_file ref leak on nfs_local_doio() init failure</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/e9e15b646bf18a18da6b30e4aee528f07f5e5d1a.camel@kernel.org/">2026-06-10 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 01/19] nfs/localio: fix nfsd_file ref leak on nfs_local_doio() init failure</a></li>
+</ul>
+  </main>
+</body>
+</html>

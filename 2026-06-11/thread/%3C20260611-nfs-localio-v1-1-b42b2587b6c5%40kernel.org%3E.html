@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Jeff Layton sends the client-side localio ref-leak fix separately to the NFS client tree</title>
+  <meta name="description" content="This thread consists of a single message posted on Thursday, June 11: Jeff Layton&#39;s standalone patch titled &quot;nfs/localio: fix nfsd_file ref leak on nfs_local_doio() init failure.&quot; It is the direct follow-through from a routing decision…">
+  <meta property="og:title" content="Jeff Layton sends the client-side localio ref-leak fix separately to the NFS client tree">
+  <meta property="og:description" content="This thread consists of a single message posted on Thursday, June 11: Jeff Layton&#39;s standalone patch titled &quot;nfs/localio: fix nfsd_file ref leak on nfs_local_doio() init failure.&quot; It is the direct follow-through from a routing decision…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-11T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Jeff Layton sends the client-side localio ref-leak fix separately to the NFS client tree">
+  <meta name="twitter:description" content="This thread consists of a single message posted on Thursday, June 11: Jeff Layton&#39;s standalone patch titled &quot;nfs/localio: fix nfsd_file ref leak on nfs_local_doio() init failure.&quot; It is the direct follow-through from a routing decision…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-11</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Jeff Layton sends the client-side localio ref-leak fix separately to the NFS client tree</h1>
+<h2>Summary</h2>
+<h1>Jeff Layton spins off the client-side localio ref-leak fix as a standalone patch</h1>
+<h2>Context: this is the split-out of PATCH 01/19 from Layton's "nfsd: more bugfixes" series</h2>
+<p>This thread consists of a single message posted on Thursday, June 11: <a href="https://lore.kernel.org/linux-nfs/20260611-nfs-localio-v1-1-b42b2587b6c5@kernel.org/">Jeff Layton's standalone patch</a> titled "nfs/localio: fix nfsd_file ref leak on nfs_local_doio() init failure." It is the direct follow-through from a routing decision made two days earlier in <a href="https://lore.kernel.org/linux-nfs/20260609-nfsd-testing-v1-0-e83acead2ae8@kernel.org/">Layton's 19-patch "nfsd: more bugfixes" v1 series</a>, where this same fix arrived as PATCH 01/19.</p>
+<p>In that earlier thread, NFS maintainer Chuck Lever <a href="https://lore.kernel.org/linux-nfs/e2c27654-4344-46cd-8bab-dfe0af6e0db0@app.fastmail.com/">flagged the patch's client-side provenance</a>:</p>
+<blockquote>
+<p>"This updates only a client-side source file. Should it go through Anna/Trond's trees? Or were you thinking that, since the leak impacts only NFS server behavior, I should take it?"</p>
+</blockquote>
+<p>Layton <a href="https://lore.kernel.org/linux-nfs/e9e15b646bf18a18da6b30e4aee528f07f5e5d1a.camel@kernel.org//">agreed</a> to route it through the client tree, and on June 11 he did exactly that — both sending this standalone patch here and <a href="https://lore.kernel.org/linux-nfs/20260611-nfsd-testing-v2-0-5b90e276f2d9@kernel.org/">resending his series as a 21-patch v2 with the localio fix dropped</a>, explaining: "I also dropped the localio patch from the series since that should probably go through the NFS client tree. I'll send it separately."</p>
+<h2>What the bug is</h2>
+<p>This is a <strong>bug fix</strong> — specifically a reference-count leak in the client-side LOCALIO path (<code>fs/nfs/localio.c</code>), not a new feature or protocol change. Layton's commit message identifies two early-return paths in <code>nfs_local_doio()</code> that fail to release the <code>nfsd_file</code> (localio) reference passed in by the caller:</p>
+<blockquote>
+<p>"Two early return paths in nfs_local_doio() fail to release the localio (nfsd_file) reference passed in by the caller"</p>
+</blockquote>
+<p>The two leaking paths are:</p>
+<ol>
+<li><strong>Zero-count fast path</strong> — when <code>hdr-&gt;args.count</code> is zero, the function returns 0 without calling <code>nfs_local_file_put()</code>.</li>
+<li><strong><code>nfs_local_iocb_init()</code> failure</strong> — on errors like <code>-ENOMEM</code> from allocation or <code>-EOPNOTSUPP</code> if the file lacks <code>read_iter</code>/<code>write_iter</code>, the function returns the error "without releasing localio or completing the hdr lifecycle."</li>
+</ol>
+<p>The consequences are significant for both namespace and mount teardown:</p>
+<blockquote>
+<p>"A leaked nfsd_file pins the associated net namespace reference, blocking network namespace teardown, and holds a reference on the exported filesystem, preventing unmount."</p>
+</blockquote>
+<h2>The fix</h2>
+<p>The patch is small — 13 insertions and 3 deletions in <code>fs/nfs/localio.c</code>. Per Layton's description:</p>
+<blockquote>
+<p>"Fix the zero-count path by adding the missing nfs_local_file_put() call. Fix the iocb init failure path by jumping to a new cleanup label that releases localio, sets hdr-&gt;task.tk_status, and calls nfs_local_hdr_release() -- matching the existing error handling pattern for the post-iocb error path."</p>
+</blockquote>
+<p>The <code>Fixes:</code> tag points at <code>e77c464c31b3</code> ("nfs/nfsd: add 'local io' support"), though in the v1 thread Chuck Lever <a href="https://lore.kernel.org/linux-nfs/e2c27654-4344-46cd-8bab-dfe0af6e0db0@app.fastmail.com//">noted</a> that he didn't have that commit in his tree and suggested <code>70ba381e1a43</code> ("nfs: add LOCALIO support") instead. Layton <a href="https://lore.kernel.org/linux-nfs/e9e15b646bf18a18da6b30e4aee528f07f5e5d1a.camel@kernel.org//">confirmed</a>: "Yeah, that introduced the first of the leaks, I think." The standalone patch as posted here still carries the original <code>Fixes: e77c464c31b3</code> tag.</p>
+<h2>Provenance and status</h2>
+<p>Like the rest of Layton's recent bugfix work, this patch carries an <code>Assisted-by: Claude:claude-opus-4-8</code> tag — part of a broader pattern of LLM-assisted kernel auditing producing real fixes on linux-nfs. The cover note is candid about its origin:</p>
+<blockquote>
+<p>"I had originally sent this as part of a pile of nfsd patches, but Chuck pointed out that this was client side."</p>
+</blockquote>
+<p>As of the end of this week's window (2026-06-11), the patch has just been posted and no replies from Anna Schumaker or Trond Myklebust have yet landed. It is awaiting review in the NFS client tree for v7.3.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260611-nfs-localio-v1-1-b42b2587b6c5@kernel.org/">2026-06-11 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH] nfs/localio: fix nfsd_file ref leak on nfs_local_doio() init failure</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260611-nfs-localio-v1-1-b42b2587b6c5@kernel.org/">2026-06-11 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH] nfs/localio: fix nfsd_file ref leak on nfs_local_doio() init failure</a></li>
+</ul>
+  </main>
+</body>
+</html>

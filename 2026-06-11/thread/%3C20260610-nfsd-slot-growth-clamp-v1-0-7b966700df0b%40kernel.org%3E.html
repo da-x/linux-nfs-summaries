@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSv4.1 slot-growth clamp RFC: capping DRC slot growth at the thread ceiling</title>
+  <meta name="description" content="On June 11, Chuck Lever posted a five-patch RFC titled &quot;Stop NFSv4.1 slot-growth heuristic from rewarding busy clients.&quot; The series is a direct spin-off of Ben Coddington&#39;s per-client fair-queue dispatch RFC and the discussion it triggered…">
+  <meta property="og:title" content="NFSv4.1 slot-growth clamp RFC: capping DRC slot growth at the thread ceiling">
+  <meta property="og:description" content="On June 11, Chuck Lever posted a five-patch RFC titled &quot;Stop NFSv4.1 slot-growth heuristic from rewarding busy clients.&quot; The series is a direct spin-off of Ben Coddington&#39;s per-client fair-queue dispatch RFC and the discussion it triggered…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-11T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSv4.1 slot-growth clamp RFC: capping DRC slot growth at the thread ceiling">
+  <meta name="twitter:description" content="On June 11, Chuck Lever posted a five-patch RFC titled &quot;Stop NFSv4.1 slot-growth heuristic from rewarding busy clients.&quot; The series is a direct spin-off of Ben Coddington&#39;s per-client fair-queue dispatch RFC and the discussion it triggered…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-11</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSv4.1 slot-growth clamp RFC: capping DRC slot growth at the thread ceiling</h1>
+<h2>Summary</h2>
+<h1>NFSv4.1 slot-growth clamp: a 5-patch RFC to stop rewarding busy clients</h1>
+<h2>What landed this week</h2>
+<p>On June 11, <a href="https://lore.kernel.org/linux-nfs/20260610-nfsd-slot-growth-clamp-v1-0-7b966700df0b@kernel.org/">Chuck Lever posted a five-patch RFC</a> titled "Stop NFSv4.1 slot-growth heuristic from rewarding busy clients." The series is a direct spin-off of <a href="https://lore.kernel.org/linux-nfs/cover.1780498019.git.bcodding@hammerspace.com/">Ben Coddington's per-client fair-queue dispatch RFC</a> and the discussion it triggered with Neil Brown over the prior week — but it deliberately carves out a piece that "holds no matter which design wins."</p>
+<p>The core problem, as Lever frames it in the cover letter:</p>
+<blockquote>
+<p>"a single busy NFSv4.1 client, opening many connections against a large slot table, can keep enough requests in flight to monopolize the nfsd thread pool and starve its peers"</p>
+</blockquote>
+<p>And the specific defect this series targets:</p>
+<blockquote>
+<p>"nfsd4_sequence() grows a session's slot table by 20% every time the client reaches its highest slot, so it hands the client already keeping the most threads busy a still larger table; one session can climb toward 2048 slots on a server with far fewer threads to run them."</p>
+</blockquote>
+<p>This is a <strong>bug fix / heuristic correction</strong> rather than a new feature or protocol change. Lever is explicit that it "removes a perverse incentive" and is "not slot admission control." The dynamic-slot machinery stays intact; the series only caps on-demand growth at the point where added slots stop buying concurrency.</p>
+<h2>The five patches</h2>
+<p>The series splits into three categories — plumbing, accounting cleanup, and the actual fix:</p>
+<p><strong>1. <a href="https://lore.kernel.org/linux-nfs/20260610-nfsd-slot-growth-clamp-v1-1-7b966700df0b@kernel.org/">SUNRPC: Add svc_serv_maxthreads()</a></strong> — a new lock-free accessor that sums <code>sp_nrthrmax</code> across every pool, exposing the service's <em>stable</em> thread ceiling (as opposed to the running count, which "reflects recent demand, not the service's capacity"). Lever converts the existing hand-rolled sum in <code>nfsd_nrthreads()</code> to use it, giving the export an in-tree consumer and removing a duplicate dependency on <code>svc_serv</code> internals.</p>
+<p><strong>2. <a href="https://lore.kernel.org/linux-nfs/20260610-nfsd-slot-growth-clamp-v1-2-7b966700df0b@kernel.org/">NFSD: Count slot 0 in nfsd_total_target_slots</a></strong> — an accounting cleanup. The counter previously summed <code>target_slots - 1</code> across sessions, with the "minus slot 0" correction open-coded at every alloc/free site. Lever relocates that correction to the single consumer (the shrinker's count callback), giving <code>nfsd_total_target_slots</code> "the full-target meaning its name implies."</p>
+<p><strong>3. <a href="https://lore.kernel.org/linux-nfs/20260610-nfsd-slot-growth-clamp-v1-3-7b966700df0b@kernel.org/">NFSD: Clean up documenting comment for reduce_session_slots()</a></strong> — typo fixes and dropping kdoc-style on a static function.</p>
+<p><strong>4. <a href="https://lore.kernel.org/linux-nfs/20260610-nfsd-slot-growth-clamp-v1-4-7b966700df0b@kernel.org/">NFSD: Document and rename the NFSv4.1 session slot shrinker callbacks</a></strong> — renames the shrinker callback functions to prevent reuse by generic code and adds kdoc documenting their API contracts.</p>
+<p><strong>5. <a href="https://lore.kernel.org/linux-nfs/20260610-nfsd-slot-growth-clamp-v1-5-7b966700df0b@kernel.org/">NFSD: Bound on-demand DRC slot growth by the thread ceiling</a></strong> — the actual fix, capping <code>nfsd4_sequence()</code>'s 20% growth at <code>svc_serv_maxthreads()</code>.</p>
+<h2>Key technical arguments</h2>
+<p>Lever's cover letter makes two design points "worth checking against the diffs," and patch 5/5 elaborates both:</p>
+<p><strong>Per-session cap, not per-namespace.</strong> A shared budget across a namespace's sessions "breaks at the floor": every active session permanently holds slot 0 (never reclaimable), so once the session count alone reaches the thread ceiling, those floors exhaust a shared budget and end up "pinning the one busy client small while the pool sits idle." Since "a session cannot use another's slots," capping each independently is "the natural choice."</p>
+<p><strong>The ceiling is sunrpc-owned, and it's the configured max, not the live count.</strong> Maximum sustainable concurrency is a property of <code>svc_serv</code>/<code>svc_pool</code>, so the accessor lives in sunrpc. Crucially, Lever compares against the <em>configured</em> maximum rather than the running thread count:</p>
+<blockquote>
+<p>"nfsd sizes its pool dynamically, and gating on the live count would deny a client resuming from idle the slots it needs before the pool scales back up."</p>
+</blockquote>
+<p><strong>The RTT rationale.</strong> The cap is justified by the observation that a slot "ties up an nfsd thread only during the processing," not for the whole round trip. On a short round trip, "one slot per thread keeps the pool busy and further slots add only backlog." Lever concedes that across a high-RTT link extra slots <em>do</em> raise throughput by masking latency — but argues that is "the client's call to make by sizing its session at CREATE_SESSION, not a reason for the server to grow every busy session toward 2048."</p>
+<h2>The review: fast and favorable</h2>
+<p>The discussion this week was brisk and consensus-driven, with two reviewers weighing in within hours of the posting.</p>
+<p><strong>Neil Brown</strong> reviewed patches 2/5 and 4/5. On patch 2/5 he caught a leftover inconsistency — Lever had described the old <code>from ?: 1</code> ternary as "an unexplained fudge," yet left an unexplained one in the new code:</p>
+<blockquote>
+<p>"You reasonably describe 'from ?: 1' as an unexplained fudge ... yet here it still is with no explanation :-)"</p>
+</blockquote>
+<p>He nonetheless approved it: "But that is a minor detail and I do like the patch. Reviewed-by: NeilBrown." On patch 4/5 he suggested adding a note that slot zero is not reclaimable so the <code>nfsd_total_sessions</code> subtraction reads clearly, then extended his sign-off across the board:</p>
+<blockquote>
+<p>"and you can add that to all patches in series. A definite improvement!"</p>
+</blockquote>
+<p><strong>Jeff Layton</strong> reviewed the whole series and endorsed it, picking up Neil Brown's nit about the ternary assignment:</p>
+<blockquote>
+<p>"This makes a lot of sense. It'd be nice to clean up or comment the nit Neil pointed out with the ternary assignment, but otherwise you can add: Reviewed-by: Jeff Layton"</p>
+</blockquote>
+<p><strong>Chuck Lever</strong> closed the loop, committing to address both reviewers' specific comments before merging:</p>
+<blockquote>
+<p>"Thanks for the look. I'll address your specific comments before applying these to nfsd-testing."</p>
+</blockquote>
+<h2>Nature and significance</h2>
+<p>This is a <strong>bug fix / heuristic correction</strong> in the NFSv4.1 server (nfsd) slot-accounting path, not a protocol change or new feature. It corrects an incentive that runs backwards: the client already saturating the thread pool was being rewarded with a larger slot table. The fix caps on-demand DRC slot growth at the sunrpc-reported thread ceiling, per session.</p>
+<p>For <strong>NFS client</strong> developers, the practical takeaway is about fairness and predictable behavior rather than any client-side change:</p>
+<ul>
+<li>No protocol or client-side negotiation changes — clients still size their sessions directly at CREATE_SESSION (bounded by <code>NFSD_MAX_SLOTS_PER_SESSION</code>), so existing client behavior is unaffected.</li>
+<li>A greedy NFSv4.1 client can no longer inflate its session table toward 2048 slots on a server with far fewer threads, reducing the chance that one busy client monopolizes the pool and starves peers — the exact starvation scenario Coddington's fair-queueing RFC targets at the dispatch layer.</li>
+<li>Lever is careful to scope this: "Enforcing per-client fairness against thread starvation belongs in the dispatch layer, not in slot accounting." This series removes the server-side amplifier; the larger fair-queueing discussion continues separately.</li>
+</ul>
+<h2>Final conclusions</h2>
+<p>By end of day June 11 the RFC had collected <strong>Reviewed-by tags from both Neil Brown and Jeff Layton</strong>, with only minor comment-level nits outstanding (the unexplained <code>from ?: 1</code> ternary, and a suggested kdoc note about slot-zero non-reclaimability). Lever committed to address those before applying the series to nfsd-testing. The design — per-session cap against the configured sunrpc thread ceiling, leaving dynamic slots otherwise intact — was accepted without substantive objection.</p>
+<p>(Note: two further replies from Ben Coddington and Chuck Lever landed on June 15, outside this week's window.)</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260610-nfsd-slot-growth-clamp-v1-1-7b966700df0b@kernel.org/">2026-06-11 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 1/5] SUNRPC: Add svc_serv_maxthreads() to report the thread ceiling</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260610-nfsd-slot-growth-clamp-v1-0-7b966700df0b@kernel.org/">2026-06-11 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 0/5] RFC: Stop NFSv4.1 slot-growth heuristic from rewarding busy clients</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260610-nfsd-slot-growth-clamp-v1-2-7b966700df0b@kernel.org/">2026-06-11 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 2/5] NFSD: Count slot 0 in nfsd_total_target_slots</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260610-nfsd-slot-growth-clamp-v1-3-7b966700df0b@kernel.org/">2026-06-11 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 3/5] NFSD: Clean up documenting comment for reduce_session_slots()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260610-nfsd-slot-growth-clamp-v1-4-7b966700df0b@kernel.org/">2026-06-11 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 4/5] NFSD: Document and rename the NFSv4.1 session slot shrinker callbacks</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260610-nfsd-slot-growth-clamp-v1-5-7b966700df0b@kernel.org/">2026-06-11 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 5/5] NFSD: Bound on-demand DRC slot growth by the thread ceiling</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178114865356.3002522.17708266499271377287@noble.neil.brown.name/">2026-06-11 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH 2/5] NFSD: Count slot 0 in nfsd_total_target_slots</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178114882392.3002522.3941860594407359120@noble.neil.brown.name/">2026-06-11 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH 4/5] NFSD: Document and rename the NFSv4.1 session slot shrinker callbacks</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/084128a7dcd3e10edfc5ce0bef77a39ea7f5b260.camel@kernel.org/">2026-06-11 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 0/5] RFC: Stop NFSv4.1 slot-growth heuristic from rewarding busy clients</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/3ee10d50-d6e2-40a5-86f8-915e1a17656d@kernel.org/">2026-06-11 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 4/5] NFSD: Document and rename the NFSv4.1 session slot shrinker callbacks</a></li>
+</ul>
+  </main>
+</body>
+</html>

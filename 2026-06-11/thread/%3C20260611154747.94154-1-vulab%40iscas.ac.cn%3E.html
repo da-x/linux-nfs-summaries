@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>pnfs: proposed LAYOUTSTATS refcount fix NACKed by Trond Myklebust over use-after-free risk</title>
+  <meta name="description" content="A short but pointed exchange this week on the Linux NFS client side. WenTao Liang (vulab@iscas.ac.cn) posted a one-patch bug fix targeting the pNFS LAYOUTSTATS reporting path in fs/nfs/nfs42proc.c, and Trond Myklebust — the Linux NFS…">
+  <meta property="og:title" content="pnfs: proposed LAYOUTSTATS refcount fix NACKed by Trond Myklebust over use-after-free risk">
+  <meta property="og:description" content="A short but pointed exchange this week on the Linux NFS client side. WenTao Liang (vulab@iscas.ac.cn) posted a one-patch bug fix targeting the pNFS LAYOUTSTATS reporting path in fs/nfs/nfs42proc.c, and Trond Myklebust — the Linux NFS…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-11T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="pnfs: proposed LAYOUTSTATS refcount fix NACKed by Trond Myklebust over use-after-free risk">
+  <meta name="twitter:description" content="A short but pointed exchange this week on the Linux NFS client side. WenTao Liang (vulab@iscas.ac.cn) posted a one-patch bug fix targeting the pNFS LAYOUTSTATS reporting path in fs/nfs/nfs42proc.c, and Trond Myklebust — the Linux NFS…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-11</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>pnfs: proposed LAYOUTSTATS refcount fix NACKed by Trond Myklebust over use-after-free risk</h1>
+<h2>Summary</h2>
+<h1>pnfs: proposed LAYOUTSTATS refcount fix NACKed by Trond Myklebust over use-after-free risk</h1>
+<p>A short but pointed exchange this week on the Linux NFS client side. WenTao Liang (vulab@iscas.ac.cn) posted a one-patch bug fix targeting the pNFS LAYOUTSTATS reporting path in <code>fs/nfs/nfs42proc.c</code>, and Trond Myklebust — the Linux NFS client maintainer — NACKed it within roughly two hours, arguing that the proposed change would introduce a "massive use-after-free."</p>
+<h2>Classification</h2>
+<p>This is a <strong>bug fix</strong> discussion (not a new feature or protocol change). The patch targets an alleged reference-count leak in <code>pnfs_report_layoutstat()</code>, with a <code>Fixes:</code> tag pointing at commit <code>be3a5d233922</code> ("NFSv.2/pnfs Add a LAYOUTSTATS rpc function") and a <code>Cc: stable@vger.kernel.org</code> line, indicating the author considered it a regression fix suitable for stable backports.</p>
+<h2>The proposed fix</h2>
+<p>In <a href="https://lore.kernel.org/linux-nfs/20260611154747.94154-1-vulab@iscas.ac.cn/">the original patch</a>, Liang described the failure mode in detail:</p>
+<blockquote>
+<p>"When pnfs_report_layoutstat() calls pnfs_get_layout_hdr() and passes the reference through the inode field of the layoutstats data to nfs42_proc_layoutstats_generic(), if rpc_run_task() in that function fails (IS_ERR), nfs42_proc_layoutstats_generic() returns immediately without releasing the reference. This leaks the layout header reference, leaks the allocated data, and leaves the NFS_INO_LAYOUTSTATS flag stuck on the inode, preventing further layoutstat reporting."</p>
+</blockquote>
+<p>His proposed remedy was to call <code>nfs42_layoutstat_release(data)</code> before returning on the <code>rpc_run_task()</code> error path, mirroring the existing cleanup that already runs when the inode is missing. The diff touched only <code>fs/nfs/nfs42proc.c</code> (3 insertions, 1 deletion).</p>
+<h2>The maintainer's rebuttal</h2>
+<p>Trond Myklebust replied <a href="https://lore.kernel.org/linux-nfs/9a42893cb1c829b943bd40dbb55151e97499916a.camel@kernel.org/">in a terse NACK</a>, quoting the relevant snippet of the patch around <code>return PTR_ERR(task);</code> and stating:</p>
+<blockquote>
+<p>"NACK! If you'd bothered to read the code, you would have found that rpc_run_task() already cleans up on failure. This patch just introduces a massive use-after-free."</p>
+</blockquote>
+<p>The core technical disagreement is about <strong>who owns the cleanup responsibility</strong> when <code>rpc_run_task()</code> fails. Liang's premise was that <code>nfs42_proc_layoutstats_generic()</code> bails out early without releasing the layout-header reference and the allocated layoutstats data, leaving the <code>NFS_INO_LAYOUTSTATS</code> inode flag set so no further LAYOUTSTATS reports can be issued. Myklebust's counter is that the RPC layer (<code>rpc_run_task()</code>) already performs the necessary teardown on failure, so adding an explicit <code>nfs42_layoutstat_release(data)</code> at that site would release the structure a second time — i.e., a double-free / use-after-free rather than a leak fix.</p>
+<h2>Evolution and status</h2>
+<ul>
+<li><strong>06-11 15:47 UTC</strong> — Liang posts v1 of the patch, framed as a stable-worthy refcount/data leak fix for <code>pnfs_report_layoutstat()</code>.</li>
+<li><strong>06-11 17:36 UTC</strong> — Myklebust NACKs, citing that <code>rpc_run_task()</code> already cleans up on failure and that the proposed extra release would cause a use-after-free.</li>
+</ul>
+<p>No further messages landed in this thread before the end of the window, so the patch is <strong>not accepted</strong> as posted. The underlying question — whether there <em>is</em> still a real leak when <code>rpc_run_task()</code> fails (e.g., around the <code>NFS_INO_LAYOUTSTATS</code> flag or the allocated layoutstats data) versus whether the RPC layer's cleanup fully covers it — remains open and would need to be resolved in a follow-up revision if Liang wishes to pursue the fix. For readers of the NFS client tree, the practical takeaway is that the LAYOUTSTATS error path in <code>fs/nfs/nfs42proc.c</code> should not be patched along the lines of v1 without first reconciling with the RPC task cleanup semantics that Myklebust pointed to.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260611154747.94154-1-vulab@iscas.ac.cn/">2026-06-11 WenTao Liang <a href="mailto:vulab@iscas.ac.cn">vulab@iscas.ac.cn</a> — [PATCH] pnfs: fix refcount leak in pnfs_report_layoutstat()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/9a42893cb1c829b943bd40dbb55151e97499916a.camel@kernel.org/">2026-06-11 Trond Myklebust <a href="mailto:trondmy@kernel.org">trondmy@kernel.org</a> — Re: [PATCH] pnfs: fix refcount leak in pnfs_report_layoutstat()</a></li>
+</ul>
+  </main>
+</body>
+</html>

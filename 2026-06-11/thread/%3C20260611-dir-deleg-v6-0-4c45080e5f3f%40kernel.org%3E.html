@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CB_NOTIFY dir-delegation: v6 NFSD series posted with folded-in fixes; Lever flags XDR enum leak</title>
+  <meta name="description" content="This week the long-running CB_NOTIFY directory-delegation thread reached its next milestone: Jeff Layton posted the v6 NFSD series on June 11 — a 20-patch set (down from 21 in v5, with the earlier fix patches folded into their respective…">
+  <meta property="og:title" content="CB_NOTIFY dir-delegation: v6 NFSD series posted with folded-in fixes; Lever flags XDR enum leak">
+  <meta property="og:description" content="This week the long-running CB_NOTIFY directory-delegation thread reached its next milestone: Jeff Layton posted the v6 NFSD series on June 11 — a 20-patch set (down from 21 in v5, with the earlier fix patches folded into their respective…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-11T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="CB_NOTIFY dir-delegation: v6 NFSD series posted with folded-in fixes; Lever flags XDR enum leak">
+  <meta name="twitter:description" content="This week the long-running CB_NOTIFY directory-delegation thread reached its next milestone: Jeff Layton posted the v6 NFSD series on June 11 — a 20-patch set (down from 21 in v5, with the earlier fix patches folded into their respective…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-11</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>CB_NOTIFY dir-delegation: v6 NFSD series posted with folded-in fixes; Lever flags XDR enum leak</h1>
+<h2>Summary</h2>
+<h1>CB_NOTIFY Directory Delegation: v6 NFSD Series Posted, Review Continues</h1>
+<h2>Overview</h2>
+<p>This week the long-running <code>CB_NOTIFY</code> directory-delegation thread reached its next milestone: Jeff Layton <a href="https://lore.kernel.org/linux-nfs/20260611-dir-deleg-v6-0-4c45080e5f3f@kernel.org/">posted the v6 NFSD series</a> on June 11 — a 20-patch set (down from 21 in v5, with the earlier fix patches folded into their respective commits) that adds RFC8881bis <code>CB_NOTIFY</code> callback support to Linux nfsd for directory delegations. The series is explicitly targeted at <strong>v7.3</strong>, continuing the punt Chuck Lever established when he <a href="https://lore.kernel.org/linux-nfs/bf852bf8-2d80-4b12-8d7c-bb0770c8b379@app.fastmail.com/">began reviewing v4 last week</a>.</p>
+<p>This is a <strong>new protocol feature</strong> — not a bug fix — but the v6 repost itself carries several important <strong>bug fixes</strong> that were discovered during Lever's in-order review of v5 last week, and Lever immediately resumed his line-by-line scrutiny with a new finding on patch 02/20.</p>
+<h2>Bridge from Prior Weeks</h2>
+<p>As <a href="https://lore.kernel.org/linux-nfs/20260522-dir-deleg-v5-0-542cddfad576@kernel.org/">summarized last week</a>, Lever had completed a deep-dive review of v5 patches 04–10, surfacing three concrete bugs (a rename TOCTOU race, an RCU use-after-free on <code>fi_deleg_file</code>, and a missing lease-type check) plus an architectural XDR debate that was resolved in Layton's favor via private discussion. The v6 repost is the direct product of that review: all of those findings are now folded into their respective patches.</p>
+<h2>Key Technical Arguments</h2>
+<h3>The v6 repost — what changed</h3>
+<p>Layton opened with a terse but telling summary: "This version of the patchset fixes up yet more problems that Sashiko and Chuck flagged during review. Progress!" He reiterated his gating condition for upstream merge:</p>
+<blockquote>
+<p>"They seem to work fine with those tests, but I don't think we'll want to merge these until we have a complete client-side implementation to test against."</p>
+</blockquote>
+<p>The v6 changelog confirms the folded-in fixes from last week's review:</p>
+<ul>
+<li><strong>Tightened RCU handling on <code>fi_deleg_file</code></strong> (the UAF Lever flagged) — now with a detailed commit message explaining the race: "Concurrent accesses from workqueue callbacks -- such as CB_NOTIFY -- can dereference a NULL pointer if they race with this teardown." The patch also fixes an error-path lease leak that would have caused "a use-after-free once the leaked lease is later broken."</li>
+<li><strong>Rename name snapshot</strong> (the TOCTOU bug) — now "take snapshot of new dentry name when creating event" rather than at callback-prepare time.</li>
+<li><strong><code>nfsd_fsnotify_recalc_mask()</code> moved to <code>filecache.c</code></strong> per Lever's argument that it "is accessing and modifying the internals of an nfsd_file."</li>
+<li><strong>Encoding failure now triggers delegation recall</strong> — a new safety behavior: if CB_NOTIFY encoding fails, the server recalls the affected delegation rather than dropping the event silently.</li>
+<li><strong>New <code>nfm_recalc_mutex</code></strong> on the fsnotify mark to serialize concurrent recalculation from parallel delegation add/remove operations.</li>
+</ul>
+<h3>Patch 02/20 — Lever's new XDR finding</h3>
+<p>Lever <a href="https://lore.kernel.org/linux-nfs/9119f5c0-cf25-4f30-bad2-b928a2db239d@app.fastmail.com/">resumed review within hours of the v6 posting</a>, flagging a wire-safety issue in the regenerated XDR files:</p>
+<blockquote>
+<p>"This value can be leaked onto the wire. The basic enum encoder checks that these values are part of the .x before sticking them on the wire."</p>
+</blockquote>
+<p>The specific problem: <code>NFS4ERR_FIRST_FREE</code> (used to determine the numeric value for <code>NFSERR_EOF</code>) is a hand-rolled constant not present in the <code>.x</code> grammar file, so the xdrgen enum encoder's validation would reject it. Lever suggested an interim fix modeled on lockd's internal error codes:</p>
+<blockquote>
+<p>"A better interim approach might be to select an impossible value for NFSERR_EOF, as is done for the internal NLM error status codes."</p>
+</blockquote>
+<p>He also made a structural request about <code>pragma public</code> directives:</p>
+<blockquote>
+<p>"Let's add the 'pragma public' directives in the patches where they are first needed, instead of here. As subsequent patches are modified, the need for these directives might vanish."</p>
+</blockquote>
+<p>This is a forward-looking maintainability point — keeping the XDR grammar file minimal until a specific patch actually requires a symbol to be exposed.</p>
+<h3>Patch 03/20 — spec stability caveat retained</h3>
+<p>The RFC8881bis flag definitions carry an honest risk acknowledgment that Layton preserved from earlier versions:</p>
+<blockquote>
+<p>"There is some risk here -- RFC8881bis is still a working group document, and has been for years. The changes to directory delegations have been stable for the last year or so however, so the hope is that those parts won't change (much)."</p>
+</blockquote>
+<h3>Patch 20/20 — signed filehandle fix in CB_NOTIFY</h3>
+<p>The final patch contains a subtle but important correctness fix for exports with <code>NFSEXP_SIGN_FH</code>:</p>
+<blockquote>
+<p>"The child filehandle returned in these notifications is composed by setup_notify_fhandle() without going through fh_compose(), so it does not get a MAC appended. On exports configured with NFSEXP_SIGN_FH the client would then get back an unsigned filehandle that fh_verify() rejects as stale."</p>
+</blockquote>
+<p>The fix passes the delegation's export down to <code>setup_notify_fhandle()</code> and appends the MAC via <code>fh_append_mac()</code>, dropping the filehandle attribute entirely if signing fails — "rather than handing out an unusable one." This is directly client-visible: without it, any client holding a directory delegation on a signed-fh export would see spurious stale-filehandle errors.</p>
+<h2>Evolution of the Discussion</h2>
+<p>The thread's multi-week arc is now clearly converging:</p>
+<ol>
+<li><strong>Week of May 15</strong> — VFS-side patches merged into <code>vfs-7.2.directory.delegations</code>.</li>
+<li><strong>Week of May 28</strong> — v4/v5 NFSD series posted; Lever begins review, punts to v7.3.</li>
+<li><strong>Week of June 5–11 (prior summary)</strong> — Lever's deep-dive review of v5 patches 04–10: rename TOCTOU bug, RCU UAF, lease-type check, XDR architecture debate.</li>
+<li><strong>This week (June 11)</strong> — v6 repost incorporating all reviewed fixes; Lever immediately resumes with a new XDR enum-leak finding on patch 02/20.</li>
+</ol>
+<p>The review is progressing in order and the series is shrinking (21→20 patches) as fixes get folded in rather than appended. The remaining unreviewed territory is patches 11–20, which cover the attribute-encoding infrastructure and the final CB_NOTIFY payload assembly.</p>
+<h2>Implications for NFS Client Development</h2>
+<ul>
+<li><strong>The signed-filehandle fix (patch 20/20) is client-critical.</strong> Any future Linux client implementation of <code>CB_NOTIFY</code> would hit spurious stale-FH errors on <code>NFSEXP_SIGN_FH</code> exports without this server-side fix. This is the kind of bug that only manifests in production configurations and would be extremely difficult to debug from the client side.</li>
+<li><strong>The encoding-failure-recalls-delegation behavior</strong> (new in v6) gives clients a simpler correctness model: if the server can't encode a notification, it will recall the delegation rather than silently dropping events. Client code need not handle "missing notifications" as a normal case.</li>
+<li><strong>The <code>NOTIFY4_*</code> flags and XDR structures remain the client's first dependency.</strong> Anna Schumaker's client tree still needs patch 03/20 (and the regenerated <code>nfs4_1.h</code>) before any client-side <code>CB_NOTIFY</code> decoder can be written. The v7.3 timeline gives both sides roughly a full merge cycle to mature in tandem.</li>
+<li><strong>Layton's testing caveat is significant:</strong> "I don't think we'll want to merge these until we have a complete client-side implementation to test against." This means the server and client will land together, and the client work is on the critical path for this feature reaching production.</li>
+</ul>
+<h2>Status</h2>
+<ul>
+<li><strong>NFSD patches (v6):</strong> Posted June 11; Lever has begun review of patch 02/20 (XDR enum leak). Patches 03–20 remain to be reviewed in this cycle.</li>
+<li><strong>Open items:</strong> NFSERR_EOF value handling per Lever's suggestion; <code>pragma public</code> placement; continued in-order review of remaining patches.</li>
+<li><strong>Client-side implementation:</strong> Still pending; remains the gating dependency for final upstream merge in v7.3.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260611-dir-deleg-v6-0-4c45080e5f3f@kernel.org/">2026-06-11 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v6 00/20] nfsd: add support for CB_NOTIFY callbacks in directory delegations</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260611-dir-deleg-v6-1-4c45080e5f3f@kernel.org/">2026-06-11 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v6 01/20] nfsd: check fl_lmops in nfsd_breaker_owns_lease()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260611-dir-deleg-v6-2-4c45080e5f3f@kernel.org/">2026-06-11 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v6 02/20] nfsd: add protocol support for CB_NOTIFY</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260611-dir-deleg-v6-3-4c45080e5f3f@kernel.org/">2026-06-11 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v6 03/20] nfs_common: add new NOTIFY4_* flags proposed in RFC8881bis</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260611-dir-deleg-v6-4-4c45080e5f3f@kernel.org/">2026-06-11 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v6 04/20] nfsd: allow nfsd to get a dir lease with an ignore mask</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260611-dir-deleg-v6-5-4c45080e5f3f@kernel.org/">2026-06-11 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v6 05/20] nfsd: update the fsnotify mark when setting or removing a dir delegation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260611-dir-deleg-v6-6-4c45080e5f3f@kernel.org/">2026-06-11 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v6 06/20] nfsd: make nfsd4_callback_ops-&gt;prepare operation bool return</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260611-dir-deleg-v6-7-4c45080e5f3f@kernel.org/">2026-06-11 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v6 07/20] nfsd: add callback encoding and decoding linkages for CB_NOTIFY</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260611-dir-deleg-v6-8-4c45080e5f3f@kernel.org/">2026-06-11 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v6 08/20] nfsd: use RCU to protect fi_deleg_file</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260611-dir-deleg-v6-9-4c45080e5f3f@kernel.org/">2026-06-11 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v6 09/20] nfsd: add data structures for handling CB_NOTIFY</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260611-dir-deleg-v6-10-4c45080e5f3f@kernel.org/">2026-06-11 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v6 10/20] nfsd: add notification handlers for dir events</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260611-dir-deleg-v6-11-4c45080e5f3f@kernel.org/">2026-06-11 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v6 11/20] nfsd: apply the notify mask to the delegation when requested</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260611-dir-deleg-v6-12-4c45080e5f3f@kernel.org/">2026-06-11 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v6 12/20] nfsd: add helper to marshal a fattr4 from completed args</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260611-dir-deleg-v6-13-4c45080e5f3f@kernel.org/">2026-06-11 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v6 13/20] nfsd: allow nfsd4_encode_fattr4_change() to work with no export</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260611-dir-deleg-v6-14-4c45080e5f3f@kernel.org/">2026-06-11 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v6 14/20] nfsd: send basic file attributes in CB_NOTIFY</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260611-dir-deleg-v6-15-4c45080e5f3f@kernel.org/">2026-06-11 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v6 15/20] nfsd: allow encoding a filehandle into fattr4 without a svc_fh</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260611-dir-deleg-v6-16-4c45080e5f3f@kernel.org/">2026-06-11 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v6 16/20] nfsd: add a fi_connectable flag to struct nfs4_file</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260611-dir-deleg-v6-17-4c45080e5f3f@kernel.org/">2026-06-11 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v6 17/20] nfsd: add the filehandle to returned attributes in CB_NOTIFY</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260611-dir-deleg-v6-18-4c45080e5f3f@kernel.org/">2026-06-11 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v6 18/20] nfsd: properly track requested child attributes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260611-dir-deleg-v6-19-4c45080e5f3f@kernel.org/">2026-06-11 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v6 19/20] nfsd: track requested dir attributes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260611-dir-deleg-v6-20-4c45080e5f3f@kernel.org/">2026-06-11 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v6 20/20] nfsd: add support to CB_NOTIFY for dir attribute changes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/9119f5c0-cf25-4f30-bad2-b928a2db239d@app.fastmail.com/">2026-06-11 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v6 02/20] nfsd: add protocol support for CB_NOTIFY</a></li>
+</ul>
+  </main>
+</body>
+</html>

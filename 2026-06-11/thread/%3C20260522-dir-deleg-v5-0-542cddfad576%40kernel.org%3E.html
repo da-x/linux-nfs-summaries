@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CB_NOTIFY dir-delegation: Lever&#39;s deep-dive review of v5 patches 04–10, rename TOCTOU bug found</title>
+  <meta name="description" content="This week the CB_NOTIFY directory-delegation thread moved from &quot;series applied&quot; to &quot;serious line-by-line review.&quot; Continuing the in-order scrutiny he announced last week (where he punted the series to v7.3), nfsd maintainer Chuck Lever…">
+  <meta property="og:title" content="CB_NOTIFY dir-delegation: Lever&#39;s deep-dive review of v5 patches 04–10, rename TOCTOU bug found">
+  <meta property="og:description" content="This week the CB_NOTIFY directory-delegation thread moved from &quot;series applied&quot; to &quot;serious line-by-line review.&quot; Continuing the in-order scrutiny he announced last week (where he punted the series to v7.3), nfsd maintainer Chuck Lever…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-11T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="CB_NOTIFY dir-delegation: Lever&#39;s deep-dive review of v5 patches 04–10, rename TOCTOU bug found">
+  <meta name="twitter:description" content="This week the CB_NOTIFY directory-delegation thread moved from &quot;series applied&quot; to &quot;serious line-by-line review.&quot; Continuing the in-order scrutiny he announced last week (where he punted the series to v7.3), nfsd maintainer Chuck Lever…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-11</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>CB_NOTIFY dir-delegation: Lever's deep-dive review of v5 patches 04–10, rename TOCTOU bug found</h1>
+<h2>Summary</h2>
+<h1>CB_NOTIFY Directory Delegation: Lever's Deep-Dive Review of v5 Patches 04–10</h1>
+<h2>Overview</h2>
+<p>This week the <code>CB_NOTIFY</code> directory-delegation thread moved from "series applied" to "serious line-by-line review." Continuing the in-order scrutiny he announced last week (where he <a href="https://lore.kernel.org/linux-nfs/bf852bf8-2d80-4b12-8d7c-bb0770c8b379@app.fastmail.com/">punted the series to v7.3</a>), nfsd maintainer Chuck Lever worked through patches 04, 05, 07, 08, 09, and 10 of Jeff Layton's <a href="https://lore.kernel.org/linux-nfs/20260522-dir-deleg-v5-0-542cddfad576@kernel.org//">v5 NFSD series</a>, posting seven review messages on June 8 and receiving six responses from Layton on June 10.</p>
+<p>The discussion is about a <strong>new protocol feature</strong> — RFC8881bis <code>CB_NOTIFY</code> callback support for NFSv4 directory delegations — but the review surfaced several genuine <strong>bug fixes</strong> (a rename time-of-check-to-time-of-use race, an RCU use-after-free, and a missing lease-type check) alongside architectural debates about XDR encoding. Lever is clearly using LLM reviewers ("Sashiko," "gpt-5.5," and "Claude") as a first pass, then validating and extending their findings by hand.</p>
+<h2>Bridge from Prior Weeks</h2>
+<p>As <a href="https://lore.kernel.org/linux-nfs/20260522-dir-deleg-v4-0-2acb883ac6bc@kernel.org//">summarized last week</a>, Layton posted the 21-patch v5 NFSD series on May 22 (a clean rebase onto Christian Brauner's already-merged VFS directory-delegation patches, with six Sashiko-flagged fixes over v4), and Lever applied it to <code>nfsd-testing</code> on May 23. The review of patch 03/21 began the prior week. This week picks up at patch 04 and runs through patch 10.</p>
+<h2>Key Technical Arguments, Patch by Patch</h2>
+<h3>Patch 04 — dir lease with an ignore mask</h3>
+<p>Lever's first message <a href="https://lore.kernel.org/linux-nfs/f1c139cf-c95c-430a-8896-fc857f7b06c5@app.fastmail.com/">cleared a false positive</a>: both Sashiko and his own gpt-5.5 review flagged that <code>nfsd_get_dir_deleg()</code> reads a <em>response</em> field (<code>gddr_notification[0]</code>) rather than a request field, but he judged it correct — though the commit message must explain why:</p>
+<blockquote>
+<p>"Both Sashiko and my own gpt-5.5 review noted the use of a response field here rather than a request field, but that is a false positive finding. The commit message needs to explain why the use of gddr_notification[0] is correct."</p>
+</blockquote>
+<p>He also flagged an unrelated whitespace cleanup (<code>kernel_setlease(...)</code> reformat) as out of scope: "This last edit appears to be a clean-up that is unrelated to the purpose of the patch."</p>
+<h3>Patch 05 — fsnotify mark recalculation</h3>
+<p>Lever <a href="https://lore.kernel.org/linux-nfs/e0e995e9-8272-44f6-b2e0-9e61ed0eef3b@app.fastmail.com/">asked for rationale over restatement</a>: "This commit message repeats what the diff below says. Can it instead explain why this change is necessary?" He questioned whether <code>nfsd_fsnotify_recalc_mask()</code> should live in <code>fs/nfsd/filecache.c</code>, and supplied an edit removing a now-obsolete kerneldoc note ("does not set up any sort of async notifications").</p>
+<p>Layton <a href="https://lore.kernel.org/linux-nfs/dd5836b365946641824dbde5b6edc5395271617d.camel@kernel.org/">responded</a> with the actual rationale — "as new delegations are added or removed, the mask of events that nfsd requires from the VFS layer can change, since clients can request notifications of different events" — and folded in the kerneldoc edit. On placement he argued for keeping it static in <code>nfs4state.c</code> ("The only caller is in this file"), but Lever <a href="https://lore.kernel.org/linux-nfs/6f0dab5e-dd60-4a82-b04f-4e3b168ce137@app.fastmail.com/">pushed back</a> that the function "is accessing and modifying the internals of an nfsd_file — it contains local knowledge about how the filecache manages fs notifications," so <code>filecache.c</code> is the better home.</p>
+<h3>Patch 07 — CB_NOTIFY encode/decode linkages (the XDR debate)</h3>
+<p>This became the week's most substantive architectural exchange. Lever <a href="https://lore.kernel.org/linux-nfs/35918046-66e3-4361-adc3-bce328ce9821@app.fastmail.com/">objected</a> to placing a client-side argument encoder in server-side code:</p>
+<blockquote>
+<p>"What is problematic in the longer-term is that this is a client-side encoder (since this is the server's NFSv4 callback client). xdrgen_encode_CB_NOTIFY4args() is an argument encoder, which is client-side functionality, but it resides in fs/nfsd/nfs4xdr_gen.c, which is server-side. Let's not mix these purposes."</p>
+</blockquote>
+<p>He proposed open-coding the top level (stateid, fh, count) and delegating only the per-event complexity to <code>xdrgen_encode_notify4</code>, with a <code>pragma public notify4;</code> in <code>nfs4_1.x</code>. Layton <a href="https://lore.kernel.org/linux-nfs/fc7d4edb03fbb359746d75942cc4867c280f8c39.camel@kernel.org/">resisted</a>: "I'd really rather not go back to open-coding the encoders and decoders, particularly since CB_NOTIFY has one of the most complex argument structures in the protocol."</p>
+<p>Lever <a href="https://lore.kernel.org/linux-nfs/5610f997-bc3f-4c20-b3ee-7567dfd3fe4a@app.fastmail.com/">clarified the calling-convention distinction</a> — "encode argument" is client-side, "decode argument" server-side, etc., because "the client-side and server-side XDR implementation for the top level arguments and results ... have different calling conventions -- eg, server side wants to see a struct svc_rqst *" — and pointed Layton at his own follow-up patch: "Go look at how I implemented this in the subsequent patch. You can use the xdrgen notify4 encoder, that's where all the complexity is."</p>
+<h3>Patch 08 — RCU protection of fi_deleg_file (bug fix)</h3>
+<p>Lever <a href="https://lore.kernel.org/linux-nfs/a01b83d8-1767-4220-a845-075bcac1cc84@app.fastmail.com/">flagged a use-after-free</a> in the error path, suggesting <code>rcu_dereference_protected()</code> "to avoid the Sashiko-reported UAF finding," plus a nit to use <code>RCU_INIT_POINTER(fp-&gt;fi_deleg_file, NULL)</code> for consistency. This is a real concurrency bug: <code>fi_deleg_file</code> can be NULLed by <code>put_deleg_file()</code> during delegation teardown while an in-flight CB_NOTIFY workqueue callback still dereferences it.</p>
+<h3>Patch 09 — data structures (style debate)</h3>
+<p>Lever <a href="https://lore.kernel.org/linux-nfs/566fd48c-bf10-4974-9ee4-1afc30b7a69c@app.fastmail.com/">nitpicked C++-style comments</a>. Layton <a href="https://lore.kernel.org/linux-nfs/eb2ddc1f6810926b7aadc9a68465f784b47a66fd.camel@kernel.org/">pushed back on the checkpatch rule itself</a>, noting "the code is littered with this comment style anyway, including a bunch of the new // SPDX- header comments," and that the cited coding-style document "says nothing about C99 comments. I move that we ignore checkpatch here."</p>
+<h3>Patch 10 — notification handlers (rename TOCTOU bug + several fixes)</h3>
+<p>The richest set of findings. Lever <a href="https://lore.kernel.org/linux-nfs/344ed039-86ce-4125-8476-2e5d22e40fdc@app.fastmail.com/">posted a long review</a> that included:</p>
+<ul>
+<li>A <strong>serialization fix</strong> for the in-flight callback drain — the <code>nfsd4_run_cb_notify(ncn)</code> check must be paired with a spinlock read of <code>ncn-&gt;ncn_evt_cnt</code> to avoid missing events queued while the callback was running.</li>
+<li>A <strong>cross-directory rename guard</strong> he inserted himself: "FS_RENAME fires on the source directory even for a cross-dir rename ... NOTIFY4_RENAME_ENTRY describes an in-place rename, so reporting it here would advertise a name absent from this directory."</li>
+<li>A <strong>missing lease-type check</strong>: without <code>if (fl-&gt;fl_lmops != &amp;nfsd_lease_mng_ops) continue;</code>, "the loop treats every lease on the inode as an nfsd delegation unconditionally."</li>
+<li>KDoc and <code>pr_warn</code> wording cleanups.</li>
+</ul>
+<p>Then, in a <a href="https://lore.kernel.org/linux-nfs/efdade0b-38f2-4e5e-b6dc-567d9eea97a9@app.fastmail.com/">second message</a>, Lever escalated to what he called the week's most important finding — a <strong>time-of-use (TOCTOU) bug in rename name capture</strong>, which all three LLM reviewers independently identified:</p>
+<blockquote>
+<p>"nrn_old_entry uses nne-&gt;ne_name, which alloc_nfsd_notify_event() copied when fsnotify delivered the rename. nrn_new_entry instead reads the live dentry via take_dentry_name_snapshot() at callback-prepare time, which can run long after the event was queued. ... d_move() reuses the same dentry and rewrites d_name in place, so a second rename of the entry before the queued callback encodes leaves the dget'd ne_dentry carrying the later name. An A-&gt;B event then encodes as A-&gt;C, and a client holding the directory delegation applies the wrong old-&gt;new mapping to its cache."</p>
+</blockquote>
+<p>He explicitly stopped his minor edits here — "This is why I stopped the minor editing here and decided it was time for you to consider restructuring (or not)" — and noted he had not yet reviewed patches 11–21.</p>
+<p>Layton's <a href="https://lore.kernel.org/linux-nfs/943d41eb654e6b56906b956cea59efd0d0f39717.camel@kernel.org/">responses</a> were constructive: he confirmed the XDR decision ("Chuck and I had a private discussion and I think we're going to keep this calling xdrgen_encode_CB_NOTIFY4args() for now. I am dropping the WARN_ON_ONCE though"), accepted the rename guard and kdoc fixes, but pushed back on the lease-type check as redundant — "should_notify_deleg() calls nfsd_breaker_owns_lease(), which already checks this before doing anything else" — and was still evaluating the callback-drain serialization ("I'll run it by Claude").</p>
+<p>On the TOCTOU bug, Layton <a href="https://lore.kernel.org/linux-nfs/3f347e690dce92781fee0ea4787d8feb19517cc8.camel@kernel.org/">agreed</a> and committed to a fix: "That sounds legit. We probably need to snapshot the name sooner, when we create the event. I'll spin something up." He also resolved Lever's open concern about memory exhaustion during restructuring: "if that happens we'll just recall the delegation. That's always the remedy when there are problems here."</p>
+<h2>Evolution of the Discussion</h2>
+<p>The thread has now completed a clear three-week arc:</p>
+<ol>
+<li><strong>Week of May 15</strong> — VFS-side patches merged into <code>vfs-7.2.directory.delegations</code>.</li>
+<li><strong>Week of May 28</strong> — v5 NFSD series posted and applied to <code>nfsd-testing</code>.</li>
+<li><strong>This week (June 5–11)</strong> — Lever's substantive in-order review of patches 04–10, surfacing one architectural XDR debate (resolved in Layton's favor via a private discussion), three concrete bug fixes (rename TOCTOU, RCU UAF, missing lease-type check), and a batch of commit-message/style cleanups. A v5.x repost incorporating these changes is now clearly the next step before the v7.3 merge window.</li>
+</ol>
+<h2>Implications for NFS Client Development</h2>
+<p>Although this is server-side work, it directly shapes the Linux client:</p>
+<ul>
+<li><strong>The rename TOCTOU bug is a client-visible correctness issue.</strong> If left unfixed, a client holding a directory delegation would apply a wrong old→new name mapping to its cache after a rapid double-rename — exactly the kind of silent data-staleness bug that makes <code>CB_NOTIFY</code> dangerous. Fixing it server-side (snapshotting both names at event-creation time) protects every future client implementation.</li>
+<li><strong>The XDR header is shared.</strong> The <code>notify4</code> encoding path and the <code>NOTIFY4_*</code> flags in <code>nfs4_1.h</code> are the same structures Anna Schumaker's client tree will decode; the decision to keep <code>xdrgen_encode_CB_NOTIFY4args()</code> while using <code>xdrgen_encode_notify4</code> for the per-event payload affects what the client can expect on the wire.</li>
+<li><strong>Layton's gating condition still holds:</strong> the server code should not merge until a complete client-side implementation exists to test against, and the v7.3 punt gives both sides time to mature in tandem.</li>
+</ul>
+<h2>Status</h2>
+<ul>
+<li><strong>NFSD patches (v5):</strong> Applied to <code>nfsd-testing</code>; Lever has reviewed through patch 10/21 this week. Patches 11–21 remain unreviewed.</li>
+<li><strong>Open items for next repost:</strong> rename-name snapshot fix, RCU UAF fix in the error path, callback-drain serialization (Layton still evaluating), commit-message rationale updates, and the <code>filecache.c</code> placement question.</li>
+<li><strong>Client-side implementation:</strong> Still pending; remains the gating dependency for final upstream merge.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/f1c139cf-c95c-430a-8896-fc857f7b06c5@app.fastmail.com/">2026-06-08 Chuck Lever — Re: [PATCH v5 04/21] allow nfsd to get a dir lease with an ignore mask</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/e0e995e9-8272-44f6-b2e0-9e61ed0eef3b@app.fastmail.com/">2026-06-08 Chuck Lever — Re: [PATCH v5 05/21] update the fsnotify mark when setting or removing a dir delegation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/35918046-66e3-4361-adc3-bce328ce9821@app.fastmail.com/">2026-06-08 Chuck Lever — Re: [PATCH v5 07/21] add callback encoding and decoding linkages for CB_NOTIFY</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/a01b83d8-1767-4220-a845-075bcac1cc84@app.fastmail.com/">2026-06-08 Chuck Lever — Re: [PATCH v5 08/21] use RCU to protect fi_deleg_file</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/566fd48c-bf10-4974-9ee4-1afc30b7a69c@app.fastmail.com/">2026-06-08 Chuck Lever — Re: [PATCH v5 09/21] add data structures for handling CB_NOTIFY</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/344ed039-86ce-4125-8476-2e5d22e40fdc@app.fastmail.com/">2026-06-08 Chuck Lever — Re: [PATCH v5 10/21] add notification handlers for dir events</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/efdade0b-38f2-4e5e-b6dc-567d9eea97a9@app.fastmail.com/">2026-06-08 Chuck Lever — Re: [PATCH v5 10/21] add notification handlers for dir events (rename TOCTOU)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/dd5836b365946641824dbde5b6edc5395271617d.camel@kernel.org/">2026-06-10 Jeff Layton — Re: [PATCH v5 05/21] update the fsnotify mark when setting or removing a dir delegation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/6f0dab5e-dd60-4a82-b04f-4e3b168ce137@app.fastmail.com/">2026-06-10 Chuck Lever — Re: [PATCH v5 05/21] update the fsnotify mark when setting or removing a dir delegation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/fc7d4edb03fbb359746d75942cc4867c280f8c39.camel@kernel.org/">2026-06-10 Jeff Layton — Re: [PATCH v5 07/21] add callback encoding and decoding linkages for CB_NOTIFY</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/5610f997-bc3f-4c20-b3ee-7567dfd3fe4a@app.fastmail.com/">2026-06-10 Chuck Lever — Re: [PATCH v5 07/21] add callback encoding and decoding linkages for CB_NOTIFY</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/eb2ddc1f6810926b7aadc9a68465f784b47a66fd.camel@kernel.org/">2026-06-10 Jeff Layton — Re: [PATCH v5 09/21] add data structures for handling CB_NOTIFY</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/943d41eb654e6b56906b956cea59efd0d0f39717.camel@kernel.org/">2026-06-10 Jeff Layton — Re: [PATCH v5 10/21] add notification handlers for dir events</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/3f347e690dce92781fee0ea4787d8feb19517cc8.camel@kernel.org/">2026-06-10 Jeff Layton — Re: [PATCH v5 10/21] add notification handlers for dir events (rename TOCTOU)</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/f1c139cf-c95c-430a-8896-fc857f7b06c5@app.fastmail.com/">2026-06-08 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v5 04/21] nfsd: allow nfsd to get a dir lease with an ignore mask</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/e0e995e9-8272-44f6-b2e0-9e61ed0eef3b@app.fastmail.com/">2026-06-08 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v5 05/21] nfsd: update the fsnotify mark when setting or removing a dir delegation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/35918046-66e3-4361-adc3-bce328ce9821@app.fastmail.com/">2026-06-08 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v5 07/21] nfsd: add callback encoding and decoding linkages for CB_NOTIFY</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/a01b83d8-1767-4220-a845-075bcac1cc84@app.fastmail.com/">2026-06-08 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v5 08/21] nfsd: use RCU to protect fi_deleg_file</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/566fd48c-bf10-4974-9ee4-1afc30b7a69c@app.fastmail.com/">2026-06-08 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v5 09/21] nfsd: add data structures for handling CB_NOTIFY</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/344ed039-86ce-4125-8476-2e5d22e40fdc@app.fastmail.com/">2026-06-08 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v5 10/21] nfsd: add notification handlers for dir events</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/efdade0b-38f2-4e5e-b6dc-567d9eea97a9@app.fastmail.com/">2026-06-08 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v5 10/21] nfsd: add notification handlers for dir events</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/dd5836b365946641824dbde5b6edc5395271617d.camel@kernel.org/">2026-06-10 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v5 05/21] nfsd: update the fsnotify mark when setting or removing a dir delegation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/6f0dab5e-dd60-4a82-b04f-4e3b168ce137@app.fastmail.com/">2026-06-10 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v5 05/21] nfsd: update the fsnotify mark when setting or removing a dir delegation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/fc7d4edb03fbb359746d75942cc4867c280f8c39.camel@kernel.org/">2026-06-10 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v5 07/21] nfsd: add callback encoding and decoding linkages for CB_NOTIFY</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/5610f997-bc3f-4c20-b3ee-7567dfd3fe4a@app.fastmail.com/">2026-06-10 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v5 07/21] nfsd: add callback encoding and decoding linkages for CB_NOTIFY</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/eb2ddc1f6810926b7aadc9a68465f784b47a66fd.camel@kernel.org/">2026-06-10 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v5 09/21] nfsd: add data structures for handling CB_NOTIFY</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/943d41eb654e6b56906b956cea59efd0d0f39717.camel@kernel.org/">2026-06-10 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v5 10/21] nfsd: add notification handlers for dir events</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/3f347e690dce92781fee0ea4787d8feb19517cc8.camel@kernel.org/">2026-06-10 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v5 10/21] nfsd: add notification handlers for dir events</a></li>
+</ul>
+  </main>
+</body>
+</html>

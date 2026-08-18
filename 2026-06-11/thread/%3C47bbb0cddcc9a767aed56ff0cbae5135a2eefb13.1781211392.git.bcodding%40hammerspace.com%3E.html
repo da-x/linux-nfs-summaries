@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSv4: include MAY_WRITE in open permission mask for O_TRUNC</title>
+  <meta name="description" content="This week (ending 2026-06-11) the thread consists of a single message: a one-shot patch from Benjamin Coddington fixing a POSIX compliance bug in the NFSv4 client&#39;s local open-authorization path. No replies have landed yet, so there is no…">
+  <meta property="og:title" content="NFSv4: include MAY_WRITE in open permission mask for O_TRUNC">
+  <meta property="og:description" content="This week (ending 2026-06-11) the thread consists of a single message: a one-shot patch from Benjamin Coddington fixing a POSIX compliance bug in the NFSv4 client&#39;s local open-authorization path. No replies have landed yet, so there is no…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-11T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSv4: include MAY_WRITE in open permission mask for O_TRUNC">
+  <meta name="twitter:description" content="This week (ending 2026-06-11) the thread consists of a single message: a one-shot patch from Benjamin Coddington fixing a POSIX compliance bug in the NFSv4 client&#39;s local open-authorization path. No replies have landed yet, so there is no…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-11</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSv4: include MAY_WRITE in open permission mask for O_TRUNC</h1>
+<h2>Summary</h2>
+<h2>NFSv4 client: O_TRUNC must demand write permission even on read-only opens</h2>
+<p>This week (ending 2026-06-11) the thread consists of a single message: a one-shot patch from <a href="https://lore.kernel.org/linux-nfs/47bbb0cddcc9a767aed56ff0cbae5135a2eefb13.1781211392.git.bcodding@hammerspace.com/">Benjamin Coddington</a> fixing a POSIX compliance bug in the NFSv4 client's local open-authorization path. No replies have landed yet, so there is no discussion to summarize beyond the patch itself — but the technical content is meaty and worth reporting.</p>
+<h3>Classification: bug fix (POSIX/authorization), not a protocol change</h3>
+<p>This is squarely a <strong>bug fix</strong> in NFSv4 client development, not a new feature or protocol change. It corrects how the client authorizes <code>open()</code> calls it satisfies locally from a cached write delegation, and it carries a <code>Cc: stable@vger.kernel.org</code> tag — a signal that maintainers expect this to be backported to stable trees.</p>
+<h3>The bug, in Coddington's words</h3>
+<p>The patch targets <code>nfs_open_permission_mask()</code>, which builds the access mask handed to <code>nfs_may_open()</code> — "the local authorization gate for OPENs the client serves itself from a cached write delegation via the <code>can_open_delegated()</code> path in <code>nfs4_try_open_cached()</code>." The flaw:</p>
+<blockquote>
+<p>"The mask is derived from O_ACCMODE alone, so an open(O_RDONLY | O_TRUNC) against a file the caller cannot write requests only MAY_READ and passes the local check."</p>
+</blockquote>
+<p>That is, when a process opens a file read-only <em>with</em> <code>O_TRUNC</code>, the client's local permission check only asks for <code>MAY_READ</code> and lets the open through — even though the caller has no write permission on the file.</p>
+<h3>Why it matters: the delegation loophole</h3>
+<p>The dangerous part is what happens next. Because the OPEN is satisfied locally from a cached <strong>write</strong> delegation, the truncation is then issued to the server as <code>SETATTR(size=0)</code> over the delegation stateid — and the server happily accepts it under standard write-delegation semantics. In other words, the client's local gate lets through an operation the server would have rejected had it been forced to check permissions itself:</p>
+<blockquote>
+<p>"The OPEN is then satisfied locally and the truncation is issued to the server as a SETATTR(size=0) over the delegation stateid, which the server accepts under standard write-delegation semantics. POSIX requires that this open fail with EACCES."</p>
+</blockquote>
+<p>So a caller without write permission can effectively zero out a file it cannot write, purely because the client's local shortcut under-reports the access being requested. This is a real privilege/authorization hole in the delegation fast path — exactly the kind of subtle divergence between "what the client checks locally" and "what the server would enforce" that delegation code is notorious for introducing.</p>
+<h3>The fix</h3>
+<p>The remedy is minimal and surgical (2 lines added to <code>fs/nfs/dir.c</code>): always fold <code>MAY_WRITE</code> into the mask whenever <code>O_TRUNC</code> is set, so the local check matches what the server would have enforced:</p>
+<blockquote>
+<p>"Include MAY_WRITE in the mask whenever O_TRUNC is set so the local check matches the access the server would have enforced."</p>
+</blockquote>
+<p>POSIX grounds the change: "POSIX requires write permission to truncate a file, so an open() that specifies O_TRUNC must be authorized for write access regardless of the O_ACCMODE access mode."</p>
+<h3>Attribution and status</h3>
+<p>The fix was suggested by Trond Myklebust (<code>Suggested-by: trondmy@kernel.org</code>), underscoring that this is a known class of delegation-authorization subtlety. Signed off by Coddington and cc'd to stable, the patch is in its first posting with no review or maintainer response yet as of the end of the window.</p>
+<h3>Bottom line</h3>
+<p>A tight, well-motivated client-side authorization fix: the NFSv4 client was under-checking permissions on <code>O_RDONLY | O_TRUNC</code> opens served from cached write delegations, allowing a non-writer to truncate a file it cannot write. The two-line change closes the gap between local and server-side enforcement. Watch for review/merge in the coming days.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/47bbb0cddcc9a767aed56ff0cbae5135a2eefb13.1781211392.git.bcodding@hammerspace.com/">2026-06-11 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — [PATCH] NFSv4: include MAY_WRITE in open permission mask for O_TRUNC</a></li>
+</ul>
+  </main>
+</body>
+</html>

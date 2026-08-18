@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>svcrdma: Contiguous Read sink buffer regression — fix fails, revert lands in nfsd-next</title>
+  <meta name="description" content="Type: Bug fix (regression from a performance optimization) — ultimately resolved by reverting the offending commit.">
+  <meta property="og:title" content="svcrdma: Contiguous Read sink buffer regression — fix fails, revert lands in nfsd-next">
+  <meta property="og:description" content="Type: Bug fix (regression from a performance optimization) — ultimately resolved by reverting the offending commit.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-11T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="svcrdma: Contiguous Read sink buffer regression — fix fails, revert lands in nfsd-next">
+  <meta name="twitter:description" content="Type: Bug fix (regression from a performance optimization) — ultimately resolved by reverting the offending commit.">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-11</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>svcrdma: Contiguous Read sink buffer regression — fix fails, revert lands in nfsd-next</h1>
+<h2>Summary</h2>
+<h1>svcrdma: Cap Read sink allocations at PAGE_ALLOC_COSTLY_ORDER — regression confirmed, revert queued</h1>
+<p><strong>Type:</strong> Bug fix (regression from a performance optimization) — ultimately resolved by reverting the offending commit.</p>
+<h2>Background</h2>
+<p>This thread picks up a nasty NFS/RDMA server-side throughput regression introduced by commit <code>18755b8c2f24</code> ("svcrdma: Use contiguous pages for RDMA Read sink buffers"). On a 128-core single-NUMA-node server driving dual 400 Gb/s links with 640 nfsd threads, WRITE throughput collapsed from <strong>73.9 GiB/s to 30.3 GiB/s</strong>, while server CPU utilization jumped from 8.5% to 76% and 73% of all CPU cycles landed in <code>native_queued_spin_lock_slowpath</code>.</p>
+<h2>The proposed fix (and why it failed)</h2>
+<p>On June 6, Chuck Lever posted a patch <a href="https://lore.kernel.org/linux-nfs/20260606035722.83175-1-cel@kernel.org/">capping the contiguous sink allocation order at <code>PAGE_ALLOC_COSTLY_ORDER</code></a>, reasoning that:</p>
+<blockquote>
+<p>"The page allocator serves allocations only up to PAGE_ALLOC_COSTLY_ORDER (3) from its per-CPU page lists; SVC_RDMA_CONTIG_MAX_ORDER is 4, so every contiguous sink buffer allocation falls through to rmqueue_buddy() and acquires the zone lock."</p>
+</blockquote>
+<p>The idea was that order-3 chunks would stay on the fast per-CPU path while still collapsing eight per-page bvecs into one.</p>
+<p>Jonathan Flynn tested it the same day and reported <a href="https://lore.kernel.org/linux-nfs/65a2cdb132b0c28e69a29955e3bd37e7@mail.gmail.com/">the fix made things worse, not better</a>:</p>
+<blockquote>
+<p>"Unfortunately, it did not improve the regression. Throughput was slightly worse than the previous GFP_NOWAIT test, measuring 25.4 GiB/s."</p>
+</blockquote>
+<p>His flamegraph data told the real story: while <code>alloc_pages_noprof()</code> time dropped from 58% to 40%, a new hotspot appeared — <code>svc_rdma_read_complete()</code> and <code>folios_put_refs()</code> each jumped from ~7% to ~16%. The allocation-side lock contention was merely being displaced onto the release side.</p>
+<h2>Root cause identified, revert decided</h2>
+<p>Chuck Lever <a href="https://lore.kernel.org/linux-nfs/096a2b91-7a19-48da-a06a-dc60e7150956@app.fastmail.com/">responded on June 7</a> with a clear diagnosis:</p>
+<blockquote>
+<p>"The two failed fixes demonstrate that the current folio allocator is not up to the task -- the problem appears to be on the release side, where the individual pages have to be merged back into an order-4 compound page. I don't yet see a straightforward way to make it work."</p>
+</blockquote>
+<p>Given proximity to v7.1-rc7, he added a revert of <code>18755b8c2f24</code> to nfsd-next:</p>
+<blockquote>
+<p>"Since we're right up against v7.1-rc7, I've added a patch to nfsd-next to revert 18755b8c2f24 -- it will get pulled back into 7.1.y as soon as the v7.2 merge window closes in three weeks."</p>
+</blockquote>
+<p>Jonathan Flynn <a href="https://lore.kernel.org/linux-nfs/511ac3ff2c4bd019aa2670b2dd1bb0c8@mail.gmail.com/">agreed and thanked Chuck</a>, offering to help test future iterations:</p>
+<blockquote>
+<p>"If you continue exploring this area in the future and still see promise in the contiguous allocation approach, I'd be happy to help test additional changes as time permits."</p>
+</blockquote>
+<h2>Key takeaways for NFS/RDMA developers</h2>
+<ul>
+<li><strong>The contiguous-page optimization is shelved.</strong> The revert lands in nfsd-next now and will backport to 7.1.y after the v7.2 merge window closes (~mid-July).</li>
+<li><strong>The bottleneck is deeper than allocation.</strong> Both the <code>GFP_NOWAIT</code> workaround and the order-cap fix failed because the real cost is on the <em>release</em> path — merging individual pages back into compound folios in <code>svc_rdma_read_complete()</code> / <code>folios_put_refs()</code>. Any future attempt at this optimization will need to address that side.</li>
+<li><strong>Performance regression testing at scale matters.</strong> Jonathan Flynn's shared test bundle (with flamegraphs) was instrumental in proving the fix ineffective and pinpointing the release-side hotspot.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260606035722.83175-1-cel@kernel.org/">2026-06-06 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH] svcrdma: Cap Read sink allocations at PAGE_ALLOC_COSTLY_ORDER</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/65a2cdb132b0c28e69a29955e3bd37e7@mail.gmail.com/">2026-06-06 Jonathan Flynn <a href="mailto:jonathan.flynn@hammerspace.com">jonathan.flynn@hammerspace.com</a> — RE: [PATCH] svcrdma: Cap Read sink allocations at PAGE_ALLOC_COSTLY_ORDER</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/096a2b91-7a19-48da-a06a-dc60e7150956@app.fastmail.com/">2026-06-07 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH] svcrdma: Cap Read sink allocations at PAGE_ALLOC_COSTLY_ORDER</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/511ac3ff2c4bd019aa2670b2dd1bb0c8@mail.gmail.com/">2026-06-07 Jonathan Flynn <a href="mailto:jonathan.flynn@hammerspace.com">jonathan.flynn@hammerspace.com</a> — RE: [PATCH] svcrdma: Cap Read sink allocations at PAGE_ALLOC_COSTLY_ORDER</a></li>
+</ul>
+  </main>
+</body>
+</html>

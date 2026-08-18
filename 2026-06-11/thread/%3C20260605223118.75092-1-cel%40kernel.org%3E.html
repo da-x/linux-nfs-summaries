@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>svcrdma GFP_NOWAIT Fix for Read Sink Buffers: Tested and Found Insufficient</title>
+  <meta name="description" content="Classification: Bug fix / performance regression (server-side svcrdma over NFS-over-RDMA)">
+  <meta property="og:title" content="svcrdma GFP_NOWAIT Fix for Read Sink Buffers: Tested and Found Insufficient">
+  <meta property="og:description" content="Classification: Bug fix / performance regression (server-side svcrdma over NFS-over-RDMA)">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-11T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="svcrdma GFP_NOWAIT Fix for Read Sink Buffers: Tested and Found Insufficient">
+  <meta name="twitter:description" content="Classification: Bug fix / performance regression (server-side svcrdma over NFS-over-RDMA)">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-11</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>svcrdma GFP_NOWAIT Fix for Read Sink Buffers: Tested and Found Insufficient</h1>
+<h2>Summary</h2>
+<h1>svcrdma GFP_NOWAIT Fix for Read Sink Buffers: Tested and Found Insufficient</h1>
+<p><strong>Classification:</strong> Bug fix / performance regression (server-side <code>svcrdma</code> over NFS-over-RDMA)</p>
+<h2>Overview</h2>
+<p>This thread is a short, focused exchange — three messages in under an hour on June 5 — representing Chuck Lever's first targeted fix attempt for the svcrdma contiguous-page allocation regression reported by Mike Snitzer and Hammerspace. The patch was posted, tested rapidly by Jonathan Flynn at Hammerspace, and found insufficient, narrowing the debugging focus to the buddy allocator's higher-order path itself.</p>
+<h2>Background (Bridge from Prior Weeks)</h2>
+<p>The root cause traces back to commit <code>18755b8c2f24</code> ("svcrdma: Use contiguous pages for RDMA Read sink buffers"), merged in 7.1, which reduced DMA mappings from 16 to 1 for 64 KB READ payloads by allocating physically contiguous page sets. In early June, Mike Snitzer reported a ~60% WRITE throughput regression (24.2 GB/s vs 60.6 GB/s) on high-end RDMA hardware, with spinlock contention in the buddy allocator dominating flamegraphs. Jonathan Flynn from Hammerspace then provided detailed profiling data confirming that <code>svc_rdma_build_read_segment_contig()</code> → <code>alloc_pages_noprof()</code> → <code>rmqueue_buddy()</code> was the dominant cost path.</p>
+<h2>This Week's Activity (June 5)</h2>
+<h3>Chuck Lever Posts the Fix</h3>
+<p>Within minutes of Flynn's profiling data, Chuck Lever posted a targeted patch <a href="https://lore.kernel.org/linux-nfs/20260605223118.75092-1-cel@kernel.org/">svcrdma: Avoid direct reclaim when allocating Read sink buffers</a>. The technical argument was precise:</p>
+<blockquote>
+<p>"svc_rdma_alloc_read_pages() passes __GFP_NORETRY, which limits the allocator to a single round of direct reclaim and asynchronous compaction per attempt. Under memory pressure or fragmentation that round can take a long time, and the fallback loop repeats it at each order, multiplying the stall while the RPC waits for its Read sink buffer."</p>
+</blockquote>
+<p>The fix replaced <code>__GFP_NORETRY</code> with <code>GFP_NOWAIT</code>, on the reasoning that:</p>
+<blockquote>
+<p>"The contiguous allocation is opportunistic: when it fails, Read sink buffers come from the pages already in rq_pages[]. Direct reclaim effort buys little here. Allocate with GFP_NOWAIT instead, which omits __GFP_DIRECT_RECLAIM so the allocator takes pages only from the free lists and returns NULL immediately when none are available."</p>
+</blockquote>
+<p>Lever noted that <code>GFP_NOWAIT</code> retains <code>__GFP_KSWAPD_RECLAIM</code>, so a failed attempt still wakes kswapd to replenish higher-order pages in the background. He drew a parallel to existing kernel code: "skb_page_frag_refill() takes the same approach for its opportunistic high-order allocation."</p>
+<p>He was notably candid about his uncertainty:</p>
+<blockquote>
+<p>"Given the perf symbol resolution inaccuracies I can't swear this will fix the issue, but here's a stab at it."</p>
+</blockquote>
+<p>The patch carried a <code>Fixes:</code> tag pointing to the original commit and a <code>Reported-by:</code> for Jonathan Flynn.</p>
+<h3>Flynn Acknowledges and Commits to Testing</h3>
+<p>Flynn replied <a href="https://lore.kernel.org/linux-nfs/32141f1303369612966329d18bc37c0d@mail.gmail.com/">within eight minutes</a>:</p>
+<blockquote>
+<p>"Thanks Chuck, give me a few to test it out!"</p>
+</blockquote>
+<h3>Flynn's Negative Result (42 Minutes Later)</h3>
+<p>Flynn's <a href="https://lore.kernel.org/linux-nfs/01eb014a108d59a6312cd23379abb49b@mail.gmail.com/">follow-up</a>, delivered just 42 minutes after the patch was posted, was a clear negative:</p>
+<blockquote>
+<p>"Unfortunately, the GFP_NOWAIT change did not materially affect either throughput or the perf profile. The allocator-heavy stack rooted at svc_rdma_build_read_segment_contig() remains dominant, with alloc_pages_noprof() and rmqueue_buddy() continuing to account for a significant portion of the samples, similar to the original regressed build."</p>
+</blockquote>
+<p>Flynn shared updated fio results, perf reports, and a flamegraph in a <code>gfp-nowait</code> directory on his OneDrive link, and also added a flamegraph for the original regressed configuration at <code>rpcrdma-regression/regressed/phase2/server</code>.</p>
+<h2>Key Technical Takeaways</h2>
+<ol>
+<li>
+<p><strong>Direct reclaim is not the bottleneck.</strong> The GFP_NOWAIT experiment definitively ruled out direct reclaim as the primary source of the stall. The problem lies deeper in the buddy allocator's higher-order allocation path — specifically <code>rmqueue_buddy()</code> spinlock contention inherent to requesting large contiguous pages under high concurrency.</p>
+</li>
+<li>
+<p><strong>The fix will need a structural change.</strong> Since adjusting GFP flags does not help, the eventual solution likely requires one of: per-CPU pre-allocated contiguous buffer pools, a slab-style allocator for fixed-size RDMA sink buffers, reducing the allocation order, or a fundamentally different approach to providing contiguous memory for RDMA READ operations.</p>
+</li>
+<li>
+<p><strong>Rapid test-and-iterate cycle.</strong> The entire patch → test → negative-result cycle completed in under an hour (22:31 UTC to 23:13 UTC), reflecting the tight collaboration between Hammerspace's production-grade test infrastructure and Oracle's NFS development team.</p>
+</li>
+</ol>
+<h2>Current Status</h2>
+<p>The thread is effectively closed with a negative result. The debugging has narrowed considerably, and the next iteration of the fix will need to address the fundamental allocation strategy rather than GFP flag tuning. The <code>Fixes:</code> tag confirms this is being tracked as a regression for stable backporting if not resolved before the next RC.</p>
+<h2>Messages This Week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260605223118.75092-1-cel@kernel.org/">2026-06-05 Chuck Lever — [PATCH] svcrdma: Avoid direct reclaim when allocating Read sink buffers</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/32141f1303369612966329d18bc37c0d@mail.gmail.com/">2026-06-05 Jonathan Flynn — RE: (acknowledgment, "give me a few to test it out")</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/01eb014a108d59a6312cd23379abb49b@mail.gmail.com/">2026-06-05 Jonathan Flynn — RE: (negative test result with profiling data)</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260605223118.75092-1-cel@kernel.org/">2026-06-05 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH] svcrdma: Avoid direct reclaim when allocating Read sink buffers</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/32141f1303369612966329d18bc37c0d@mail.gmail.com/">2026-06-05 Jonathan Flynn <a href="mailto:jonathan.flynn@hammerspace.com">jonathan.flynn@hammerspace.com</a> — RE: [PATCH] svcrdma: Avoid direct reclaim when allocating Read sink buffers</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/01eb014a108d59a6312cd23379abb49b@mail.gmail.com/">2026-06-05 Jonathan Flynn <a href="mailto:jonathan.flynn@hammerspace.com">jonathan.flynn@hammerspace.com</a> — RE: [PATCH] svcrdma: Avoid direct reclaim when allocating Read sink buffers</a></li>
+</ul>
+  </main>
+</body>
+</html>

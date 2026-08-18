@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>xprtrdma: Convert Send Buffer Free List to llist for Reduced Lock Contention</title>
+  <meta name="description" content="Classification: Performance improvement / lock contention fix (client-side xprtrdma over NFS-over-RDMA)">
+  <meta property="og:title" content="xprtrdma: Convert Send Buffer Free List to llist for Reduced Lock Contention">
+  <meta property="og:description" content="Classification: Performance improvement / lock contention fix (client-side xprtrdma over NFS-over-RDMA)">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-11T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="xprtrdma: Convert Send Buffer Free List to llist for Reduced Lock Contention">
+  <meta name="twitter:description" content="Classification: Performance improvement / lock contention fix (client-side xprtrdma over NFS-over-RDMA)">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-11</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>xprtrdma: Convert Send Buffer Free List to llist for Reduced Lock Contention</h1>
+<h2>Summary</h2>
+<h1>xprtrdma: Convert Send Buffer Free List to llist — Reducing Spinlock Contention on the NFS/RDMA Client</h1>
+<p><strong>Classification:</strong> Performance improvement / lock contention fix (client-side <code>xprtrdma</code> over NFS-over-RDMA)</p>
+<h2>Overview</h2>
+<p>This thread consists of a single patch posted by Chuck Lever on June 5, with no replies in this week's window. The patch targets a well-understood scalability bottleneck in the NFS/RDMA client: spinlock contention on <code>rb_lock</code> between the request submission path and the transport completion path when managing the send buffer free list. It is a focused, self-contained change that modernizes an internal data structure to eliminate lock acquisition on the hot return path.</p>
+<h2>The Patch</h2>
+<p>In <a href="https://lore.kernel.org/linux-nfs/20260605204033.62894-1-cel@kernel.org/">xprtrdma: Convert send buffer free list to llist</a>, Lever identified the problem precisely:</p>
+<blockquote>
+<p>"rpcrdma_buffer_get() and rpcrdma_buffer_put() both take rb_lock to pop/push from the rb_send_bufs free list. Under high I/O concurrency (e.g., nconnect=N with small random writes), this spinlock is contended between the request submission path and the transport completion path."</p>
+</blockquote>
+<p>The fix replaces the traditional <code>list_head</code> with an <code>llist_head</code> (the kernel's lockless singly-linked list):</p>
+<blockquote>
+<p>"Replace the list_head with an llist_head. The put side uses lockless llist_add(), which is safe for concurrent producers. The get side retains the spinlock to satisfy the llist single-consumer contract portably; submitters continue to serialize there. Completion handlers returning buffers no longer contend on rb_lock, eliminating contention on the return path."</p>
+</blockquote>
+<p>This is a classic producer-consumer pattern: multiple completion handlers (producers) can concurrently push freed send buffers onto the list without any lock, while a single consumer (the submission path) pops them under the existing spinlock. The net effect is that the most frequent operation — returning a buffer after an RDMA send completes — becomes completely lock-free.</p>
+<h2>Design Rationale and Precedent</h2>
+<p>Lever was careful to justify why <code>rb_lock</code> is retained on the get side rather than going fully lockless, and drew on existing code in the same structure:</p>
+<blockquote>
+<p>"rb_lock remains for the MR free list and the tracking lists used during setup and teardown. rb_free_reps already uses llist_head, so the llist idiom is established in this structure."</p>
+</blockquote>
+<p>He then made an important distinction about the locking model versus the data structure:</p>
+<blockquote>
+<p>"The precedent is the data structure, not the locking: rb_free_reps serializes its single consumer through the re_receiving gate in rpcrdma_post_recvs, whereas rb_send_bufs serializes its consumer with rb_lock. Both satisfy the llist single-consumer contract."</p>
+</blockquote>
+<p>This shows that the conversion is a natural evolution of an already-established pattern within <code>rpc_rdma_priv</code>, not an ad-hoc choice. The <code>rb_free_reps</code> list (for receive buffers) had previously been converted to <code>llist_head</code> using a different consumer-serialization mechanism; this patch extends the same data structure idiom to the send buffer pool with a simpler, more conventional spinlock-based consumer gate.</p>
+<h2>Context: NFS/RDMA Client Scalability Work</h2>
+<p>This patch is part of a broader effort by Lever and the Oracle NFS team to improve scalability of the <code>xprtrdma</code> client under high-concurrency workloads. The mention of "nconnect=N with small random writes" points directly to the multi-connection (NFSv4.1+ session trunking) feature that allows a single NFS client to open multiple RDMA connections to a server, dramatically increasing I/O parallelism. With more concurrent operations in flight, every per-transport lock becomes a scaling bottleneck.</p>
+<p>The change is small — 18 insertions and 22 deletions across <code>verbs.c</code> and <code>xprt_rdma.h</code> — but targets a code path that executes on every single RDMA send completion, making it one of the hottest spots in the client under sustained I/O.</p>
+<h2>Current Status</h2>
+<p>As of the end of this week's window (June 12), the patch has been posted but has not yet received review comments or an ack from Trond Myklebust or other maintainers. No follow-up revisions have appeared. Given the small scope and clear rationale, it is likely to be picked up in the next merge window if no objections are raised.</p>
+<h2>Messages This Week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260605204033.62894-1-cel@kernel.org/">2026-06-05 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH] xprtrdma: Convert send buffer free list to llist</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260605204033.62894-1-cel@kernel.org/">2026-06-05 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH] xprtrdma: Convert send buffer free list to llist</a></li>
+</ul>
+  </main>
+</body>
+</html>

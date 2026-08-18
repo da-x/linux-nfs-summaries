@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>jbd2/kmalloc follow-up: the kvalloc() detour, Wilcox&#39;s &quot;please don&#39;t try to help,&quot; and Rapoport on the road to retiring __get_free_pages()</title>
+  <meta name="description" content="Type: API modernization / cleanup (with a side-conversation about memory-allocator design). Not a new feature or protocol change. Status: The underlying 17-patch series was already merged into vfs-7.2.misc on May 27; this week&#39;s activity…">
+  <meta property="og:title" content="jbd2/kmalloc follow-up: the kvalloc() detour, Wilcox&#39;s &quot;please don&#39;t try to help,&quot; and Rapoport on the road to retiring __get_free_pages()">
+  <meta property="og:description" content="Type: API modernization / cleanup (with a side-conversation about memory-allocator design). Not a new feature or protocol change. Status: The underlying 17-patch series was already merged into vfs-7.2.misc on May 27; this week&#39;s activity…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-11T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="jbd2/kmalloc follow-up: the kvalloc() detour, Wilcox&#39;s &quot;please don&#39;t try to help,&quot; and Rapoport on the road to retiring __get_free_pages()">
+  <meta name="twitter:description" content="Type: API modernization / cleanup (with a side-conversation about memory-allocator design). Not a new feature or protocol change. Status: The underlying 17-patch series was already merged into vfs-7.2.misc on May 27; this week&#39;s activity…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-11</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>jbd2/kmalloc follow-up: the kvalloc() detour, Wilcox's "please don't try to help," and Rapoport on the road to retiring __get_free_pages()</h1>
+<h2>Summary</h2>
+<h1>jbd2 <code>__get_free_pages()</code> → <code>kmalloc()</code>: post-merge follow-up — the kvalloc() detour, Wilcox's "please don't try to help," and Rapoport on the road to retiring <code>__get_free_pages()</code></h1>
+<p><strong>Type:</strong> API modernization / cleanup (with a side-conversation about memory-allocator design). Not a new feature or protocol change.
+<strong>Status:</strong> The underlying 17-patch series was already merged into <code>vfs-7.2.misc</code> on May 27; this week's activity is the tail end of the technical follow-up on <code>[PATCH 10/17]</code> (jbd2) plus a clarifying exchange about the long-term goal of the broader effort.</p>
+<h2>Bridge to prior weeks</h2>
+<p>The 17-patch "[PATCH 00/17] fs: replace __get_free_pages() call with kmalloc()" series was posted by Mike Rapoport on May 23 and applied by Christian Brauner to <code>vfs-7.2.misc</code> on May 27 (week ending 2026-05-28). Two patches touched the <strong>NFS client</strong> — <code>[PATCH 05/17]</code> swapping a temporary page for <code>kmalloc()</code> in <code>nfs_show_devname()</code>, and <code>[PATCH 06/17]</code> removing genuinely dead <code>page</code>/<code>page2</code> buffers in the NFSv4 transport-replacement path (<code>nfs4_replace_transport()</code>). The following week (ending 2026-06-04) saw Theodore Ts'o reopen the jbd2 patch to probe allocator semantics, with Rapoport confirming there is no memory overhead at order == 1 and that <code>kmalloc()</code> ≥ <code>PAGE_SIZE</code> always returns contiguous, page-aligned memory. Wilcox pushed back on Ts'o's idea of a kmalloc→vmalloc fallback, arguing allocator deficiencies should be fixed at the source. This week picks up from there.</p>
+<h2>This week's discussion (June 5–11)</h2>
+<h3>The "kvalloc()" detour — and its correction</h3>
+<p>The jbd2 design question Ts'o had raised last week — whether a filesystem could ask for physically contiguous pages with a fallback to vmalloc-style allocation — <a href="https://lore.kernel.org/linux-nfs/20260605093332.7b067876@pumpkin//">resurfaced when David Laight chimed in</a>, quoting Ts'o's suggestion of using <code>kmalloc()</code> with flags to prevent forced reclaim/compaction and falling back to <code>vmalloc()</code>:</p>
+<blockquote>
+<p>"There is already kvalloc(). I'm not sure how hard that tries to get kmalloc() to succeed."</p>
+</blockquote>
+<p>This was a misremembering of the API name. <a href="https://lore.kernel.org/linux-nfs/aiKcAIbzz3z9vN9a@pc636//">Uladzislau Rezki quickly corrected him</a>:</p>
+<blockquote>
+<p>"I assume you mean kvmalloc()? kvalloc() is something unknown to me."</p>
+</blockquote>
+<p>The correction was well-taken — <code>kvmalloc()</code> is the real kernel API that attempts <code>kmalloc()</code> first and falls back to <code>vmalloc()</code> on failure, which is exactly the pattern Ts'o had been groping toward.</p>
+<h3>Wilcox shuts down the fallback idea (again)</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/aiM3f08bsBM8gD8y@casper.infradead.org//">Matthew Wilcox responded to Laight's suggestion with characteristic bluntness</a>:</p>
+<blockquote>
+<p>"Please don't try to help."</p>
+</blockquote>
+<p>This was a pointed reference to the fact that <code>kvmalloc()</code> — while it exists — is precisely the kind of fallback mechanism Wilcox had argued against in his previous week's message. His position, restated last week, was that callers should not build their own kmalloc→vmalloc fallbacks; instead, allocator deficiencies should be fixed at the source via higher-level allocation APIs. The "Please don't try to help" remark effectively closed this sub-thread: the jbd2 conversion as merged is fine, and no further changes are needed.</p>
+<h3>Zi Yan asks about the end goal</h3>
+<p>Separately from the jbd2-specific debate, <a href="https://lore.kernel.org/linux-nfs/3FD8E1FD-6E18-46D9-AE93-00FA1A66C775@nvidia.com//">Zi Yan (NVIDIA) asked Rapoport a broader question</a> about the 17-patch series:</p>
+<blockquote>
+<p>"Is the goal to get rid of __get_free_page(s)()?"</p>
+</blockquote>
+<p>This was a fair question given that the cover letter described the series as "a (small) part of larger work." Rapoport <a href="https://lore.kernel.org/linux-nfs/aip7Y3UHmXsdX8OH@kernel.org//">answered definitively on June 11</a>:</p>
+<blockquote>
+<p>"Yes, eventually."</p>
+</blockquote>
+<p>He then provided useful context on how the effort evolved:</p>
+<blockquote>
+<p>"My initial intention a few month ago was to remove the ugly casts, but then willy pointed out that Linus objected to something like this and it looks like more than a decade old technical debt."</p>
+</blockquote>
+<p>Rapoport laid out the practical scope of the remaining work:</p>
+<blockquote>
+<p>"Since there are more than 600 or those it will take a while to convert suitable gfp calls to kmalloc. Afterwards we can re-evaluate what APIs we want to provide for allocations that must have actual pages."</p>
+</blockquote>
+<p>This is significant because it signals that the kernel community is committed to a multi-release effort to retire direct page allocator calls, with the end state being a cleaner API boundary between "I need a slab object" and "I genuinely need raw pages." The reference to Linus's objection (linked in Rapoport's message) underscores that this is not merely cosmetic — it addresses a longstanding design wart in the kernel's memory allocation layer.</p>
+<h2>Key takeaways</h2>
+<ul>
+<li><strong>The jbd2 sub-thread is effectively closed.</strong> The <code>kvmalloc()</code>/<code>kvalloc()</code> naming mix-up was corrected, and Wilcox's "Please don't try to help" put a firm stop to any further discussion of fallback paths for the jbd2 patch. The conversion as merged stands.</li>
+<li><strong>The broader goal is confirmed:</strong> Rapoport explicitly stated that the end goal is to eliminate <code>__get_free_page(s)()</code> from the kernel, with 600+ call sites still to convert. This is a multi-release effort, not a one-shot cleanup.</li>
+<li><strong>Design direction clarified:</strong> After the bulk conversion is done, the community will "re-evaluate what APIs we want to provide for allocations that must have actual pages." This suggests future work on higher-level allocation APIs (in the direction Wilcox sketched last week) rather than ad-hoc fallbacks in individual callers.</li>
+</ul>
+<h2>Relevance to NFS client development</h2>
+<p>The direct NFS impact was last week's merge, but this week reinforces its safety and places it in a larger context:</p>
+<ul>
+<li>The <code>kmalloc()</code>-based allocations now in <code>nfs_show_devname()</code> (PATCH 05/17) and the cleaned-up <code>nfs4_replace_transport()</code> (PATCH 06/17) rest on the same allocator guarantees Rapoport confirmed last week — no memory overhead at order == 1, contiguous page-aligned memory for sizes ≥ <code>PAGE_SIZE</code>.</li>
+<li>The confirmed long-term goal of retiring <code>__get_free_pages()</code> means NFS client code that still uses direct page allocator calls (there are several in the I/O and transport paths) will eventually need to be converted as well. The 600+ call sites Rapoport cited include filesystem and network stack code, so NFS developers should expect follow-up conversion patches in future merge windows.</li>
+<li>Wilcox's guiding principle — prefer fixing the allocator over sprinkling fallback paths through caller code — is a useful heuristic for any future NFS client memory-allocation changes. If an allocation pattern in the NFS client feels like it needs a kmalloc→vmalloc fallback, the right response is likely to fix the allocator or use a higher-level API, not to build the fallback inline.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260605093332.7b067876@pumpkin//">2026-06-05 David Laight <a href="mailto:david.laight.linux@gmail.com">david.laight.linux@gmail.com</a> — Re: [PATCH 10/17] jbd2: replace __get_free_pages() with kmalloc()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aiKcAIbzz3z9vN9a@pc636//">2026-06-05 Uladzislau Rezki <a href="mailto:urezki@gmail.com">urezki@gmail.com</a> — Re: [PATCH 10/17] jbd2: replace __get_free_pages() with kmalloc()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/3FD8E1FD-6E18-46D9-AE93-00FA1A66C775@nvidia.com//">2026-06-05 Zi Yan <a href="mailto:ziy@nvidia.com">ziy@nvidia.com</a> — Re: [PATCH 00/17] replace __get_free_pages() call with kmalloc()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aiM3f08bsBM8gD8y@casper.infradead.org//">2026-06-05 Matthew Wilcox <a href="mailto:willy@infradead.org">willy@infradead.org</a> — Re: [PATCH 10/17] jbd2: replace __get_free_pages() with kmalloc()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aip7Y3UHmXsdX8OH@kernel.org//">2026-06-11 Mike Rapoport <a href="mailto:rppt@kernel.org">rppt@kernel.org</a> — Re: [PATCH 00/17] replace __get_free_pages() call with kmalloc()</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260605093332.7b067876@pumpkin/">2026-06-05 David Laight <a href="mailto:david.laight.linux@gmail.com">david.laight.linux@gmail.com</a> — Re: [PATCH 10/17] jbd2: replace __get_free_pages() with kmalloc()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aiKcAIbzz3z9vN9a@pc636/">2026-06-05 Uladzislau Rezki <a href="mailto:urezki@gmail.com">urezki@gmail.com</a> — Re: [PATCH 10/17] jbd2: replace __get_free_pages() with kmalloc()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/3FD8E1FD-6E18-46D9-AE93-00FA1A66C775@nvidia.com/">2026-06-05 Zi Yan <a href="mailto:ziy@nvidia.com">ziy@nvidia.com</a> — Re: [PATCH 00/17] replace __get_free_pages() call with kmalloc()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aiM3f08bsBM8gD8y@casper.infradead.org/">2026-06-05 Matthew Wilcox <a href="mailto:willy@infradead.org">willy@infradead.org</a> — Re: [PATCH 10/17] jbd2: replace __get_free_pages() with kmalloc()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aip7Y3UHmXsdX8OH@kernel.org/">2026-06-11 Mike Rapoport <a href="mailto:rppt@kernel.org">rppt@kernel.org</a> — Re: [PATCH 00/17] replace __get_free_pages() call with kmalloc()</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TLS session tags for NFSD: v1 posted, review on netlink shape and tagset data structure</title>
+  <meta name="description" content="On Friday, Chuck Lever posted PATCH 0/9 &quot;Deliver TLS session tags to upper-layer consumers (NFSD)&quot;, a nine-patch series that lets the userspace handshake agent (tlshd) evaluate TLS client certificates against admin-defined policy and hand…">
+  <meta property="og:title" content="TLS session tags for NFSD: v1 posted, review on netlink shape and tagset data structure">
+  <meta property="og:description" content="On Friday, Chuck Lever posted PATCH 0/9 &quot;Deliver TLS session tags to upper-layer consumers (NFSD)&quot;, a nine-patch series that lets the userspace handshake agent (tlshd) evaluate TLS client certificates against admin-defined policy and hand…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-11T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="TLS session tags for NFSD: v1 posted, review on netlink shape and tagset data structure">
+  <meta name="twitter:description" content="On Friday, Chuck Lever posted PATCH 0/9 &quot;Deliver TLS session tags to upper-layer consumers (NFSD)&quot;, a nine-patch series that lets the userspace handshake agent (tlshd) evaluate TLS client certificates against admin-defined policy and hand…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-11</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>TLS session tags for NFSD: v1 posted, review on netlink shape and tagset data structure</h1>
+<h2>Summary</h2>
+<h1>TLS session tags delivered to NFSD — v1 series under review</h1>
+<h2>What was posted this week</h2>
+<p>On Friday, Chuck Lever posted <a href="https://lore.kernel.org/linux-nfs/20260605-tls-session-tags-v1-0-47bd1d94d552@oracle.com/">PATCH 0/9 "Deliver TLS session tags to upper-layer consumers (NFSD)"</a>, a nine-patch series that lets the userspace handshake agent (tlshd) evaluate TLS client certificates against admin-defined policy and hand back opaque string tags, which NFSD then uses for per-export access control. The series spans net/handshake/, lib/ (a new generic container), SUNRPC, and fs/nfsd/, touching 29 files with roughly 1,205 insertions.</p>
+<p>This is primarily a <strong>new feature</strong> (certificate-based, tag-driven export authorization for NFSD over mTLS), but it also carries a <strong>bug fix</strong> at the head of the series: patch 1 closes a pre-existing privilege-check gap in the handshake DONE netlink command, with a <code>Fixes:</code> tag pointing at the original NETLINK service commit.</p>
+<p>Chuck's cover letter frames four architectural choices, two of which are worth quoting for context:</p>
+<blockquote>
+<p>"The tagging vocabulary is opaque to the kernel. tlshd decides what each tag means; the handshake layer and its consumers only test membership. This keeps x.509 out of the kernel and lets policy evolve at userspace speed."</p>
+</blockquote>
+<blockquote>
+<p>"DONE gains a privilege check (patch 1) as a prerequisite, not as cleanup. Without it, an unprivileged process guessing a sockfd could submit a forged DONE and effectively grant or deny tag membership for a real handshake."</p>
+</blockquote>
+<h2>The bug fix: DONE missing GENL_ADMIN_PERM</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260605-tls-session-tags-v1-1-47bd1d94d552@oracle.com/">PATCH 1/9</a> notes that ACCEPT already requires <code>GENL_ADMIN_PERM</code> but DONE has no privilege check at all — the fd lookup only confirms a pending request exists, it does not authenticate the sender. Chuck describes the exposure precisely:</p>
+<blockquote>
+<p>"An unprivileged process that guesses or observes a valid sockfd can therefore submit a DONE with HANDSHAKE_A_DONE_STATUS == 0, leaving the kernel consumer to proceed as if the handshake succeeded."</p>
+</blockquote>
+<p>The fix is two lines (adding the admin-perm check) plus a yaml spec update. Jeff Layton reviewed it quickly on Saturday:</p>
+<blockquote>
+<p>"Seems like this ought to go in ahead of the rest of the set? tlshd generally runs as root anyway so I don't forsee a problem just doing this: Reviewed-by: Jeff Layton" <a href="https://lore.kernel.org/linux-nfs/87300aef395fb7fbfee84f30dcec83118f68ba56.camel@kernel.org/">Layton's reply</a>.</p>
+</blockquote>
+<p>Hannes Reinecke followed up on Monday with a matching <a href="https://lore.kernel.org/linux-nfs/e578fbb5-2184-4052-a9db-b363ae758e3c@suse.de/">Reviewed-by</a>. So patch 1 is effectively ready to land independently of the rest.</p>
+<h2>The feature: plumbing tags from tlshd to NFSD exports</h2>
+<p>The series' design, in brief:</p>
+<ul>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260605-tls-session-tags-v1-2-47bd1d94d552@oracle.com/">PATCH 2/9</a></strong> adds the <code>HANDSHAKE_A_DONE_TAG</code> netlink attribute so tlshd can return a tag list on a successful handshake. Chuck's motivating example: restrict an export to clients whose certificate Issuer contains "O=Oracle" — tlshd parses the cert, assigns an "oraclegroup" tag, and NFSD simply tests membership. "NFSD needs no knowledge of x.509 certificates."</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260605-tls-session-tags-v1-3-47bd1d94d552@oracle.com/">PATCH 3/9</a></strong> introduces a generic <code>tagset</code> library (sorted array of string pointers) with O(N+M) merge-based intersection, split out so NFSD can reuse it without churn in net/handshake/.</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260605-tls-session-tags-v1-4-47bd1d94d552@oracle.com/">PATCH 4/9</a></strong> collects tags from the DONE downcall and publishes them to the consumer's completion callback. Because the genl family runs DONE with <code>parallel_ops</code>, Chuck splits <code>handshake_complete()</code> into a try/finish pair so exactly one concurrent DONE wins the gate; duplicates get <code>-EBUSY</code>. Over-cap tag lists are truncated with a single <code>pr_warn_once</code> rather than failing the handshake — "tearing down a handshake the operator almost certainly wants to keep is a worse outcome than dropping a few tags."</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260605-tls-session-tags-v1-5-47bd1d94d552@oracle.com/">PATCH 5/9</a></strong> adds a kunit test for that completion-gate idempotency.</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260605-tls-session-tags-v1-6-47bd1d94d552@oracle.com/">PATCH 6/9</a></strong> advertises <code>HANDSHAKE_MAX_SESSIONTAGS</code> as <code>HANDSHAKE_A_ACCEPT_MAX_TAGS</code> on every ACCEPT reply so tlshd can size its tag list against the kernel's runtime limit.</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260605-tls-session-tags-v1-7-47bd1d94d552@oracle.com/">PATCH 7/9</a></strong> is the SUNRPC piece: save the tags in <code>svc_xprt</code>, and harden against a second handshake on the same transport clobbering tags other workers are reading — <code>svcauth_tls_accept()</code> now refuses AUTH_TLS on a transport that already carries a TLS session, and <code>svc_tcp_handshake()</code> rechecks the session flag under <code>XPT_BUSY</code>.</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260605-tls-session-tags-v1-8-47bd1d94d552@oracle.com/">PATCH 8/9</a></strong> implements NFSD export tagging: exports with an <code>allow_tags</code> list grant access only when the mTLS session carries at least one matching tag; untagged exports keep existing behavior. The combination is validated — "svc_export_parse() rejects an allow_tags list paired with any other xprtsec mode, making the administrator state the combination explicitly rather than allowing a default xprtsec setting to silently expose the export."</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260605-tls-session-tags-v1-9-47bd1d94d552@oracle.com/">PATCH 9/9</a></strong> adds <code>allow_tags</code> to the netlink svc-export interface, closing a gap where "nfsd_nl_parse_one_export() always left ex_allow_tags empty, and check_xprtsec_policy() then granted any authenticated peer."</li>
+</ul>
+<h2>Review discussion: netlink shape and the tagset container</h2>
+<p>Jeff Layton raised a process issue on Saturday — he could not get the series to apply cleanly and asked what tree it was based on <a href="https://lore.kernel.org/linux-nfs/cbb8bf9325d5877d8e736b42f2ffde01dc7e2739.camel@kernel.org/">in his cover-letter reply</a>. Chuck answered that the base commit was from a long-lived testing branch, with the candid admission:</p>
+<blockquote>
+<p>"That's some old shit. I will rebase it before posting it again." <a href="https://lore.kernel.org/linux-nfs/ca63fcf5-8d3d-4ee5-ac62-fd0af937cf87@app.fastmail.com/">Lever's reply</a></p>
+</blockquote>
+<p>So a v2 is expected; nothing in this week's thread has been queued for merge beyond the standalone patch 1.</p>
+<p>The substantive technical debate came from Hannes Reinecke on Monday, focused on two patches:</p>
+<p><strong>On the netlink protocol (patch 2):</strong> Hannes questioned why tags are individual string attributes rather than a nested attribute list — "we <em>can</em> have nested tags... Wouldn't it be better to make 'tags' a nested tag (ie a list of tags) such that we can avoid parsing in the caller/consumer?" <a href="https://lore.kernel.org/linux-nfs/40199ef9-416e-4a58-908a-ed514dfd6ff2@suse.de/">Reinecke's comment</a>. Chuck replied after digesting the point, explaining that the attribute is already declared <code>"multi-attr: true"</code> — tlshd emits one <code>HANDSHAKE_A_DONE_TAG</code> per tag and "the parsing you are worried about does not happen." He argued nesting only earns its keep for structured records with sub-fields, while a tag is a single string. Hannes was satisfied: "Ah. So one can have several 'tag' attributes in one 'done' downcall? That's perfect. So you can add my: Reviewed-by" <a href="https://lore.kernel.org/linux-nfs/f967eb48-9e54-497a-b5dc-ade6fa6c49d3@suse.de/">Reinecke's follow-up</a>.</p>
+<p><strong>On the tagset data structure (patch 3):</strong> Hannes pushed back harder, calling the sorted-array design overcomplicated — "Isn't this overcomplicating matters? In the end, this a list of strings. Wouldn't a simple rbtree holding the strings be sufficient?" He also objected to the name: "don't name it tagset. That will be confusing the hell of out of any storage folks, where a tagset is something completely different." <a href="https://lore.kernel.org/linux-nfs/922040b0-f87e-484d-9f7b-78098024ad04@suse.de/">Reinecke's comment</a>.</p>
+<p>Chuck defended the design on performance grounds, arguing that intersection — not lookup — is the primary operation: "Keeping a set of tags in a list or in an r-b tree would require MxN look up operations to compute that intersection." On naming he conceded ground, suggesting "Stringset?" <a href="https://lore.kernel.org/linux-nfs/2dc23995-3ff9-4714-ac6c-d70255b15687@app.fastmail.com/">Lever's reply</a>.</p>
+<p>Hannes accepted the rename ("Better.") and said runtime was of no concern given the 64-tag cap, offering to prototype an rbtree version <a href="https://lore.kernel.org/linux-nfs/d14fff89-3c7b-40ea-9380-e8c37499916e@suse.de/">Reinecke's reply</a>. Chuck pushed back with concrete numbers on a busy NFS server: with 5 session tags × 5 export allow-tags, an rbtree intersection means "25 lookups, each O(log(5))" versus O(10) for the merge; at the 64-tag maximum it's "4000+ lookups, each O(log(64))" versus O(128). He added that "r-b trees are notoriously non-optimal in terms of memory access efficiency," and noted a forward-looking wrinkle: "TLS session tags have no support for PSK -- there are no data items inside the shared keys on which to match a tag. We might find something else to match on, though, who knows?" <a href="https://lore.kernel.org/linux-nfs/98b7f6ef-3c1d-4af0-86d0-cad6d1f29b1c@app.fastmail.com/">Lever's final reply</a>.</p>
+<h2>Where things stand</h2>
+<ul>
+<li><strong>Patch 1 (DONE privilege fix):</strong> Reviewed-by from both Layton and Reinecke; ready to land ahead of the rest.</li>
+<li><strong>Patches 2/9:</strong> Reviewed-by from Reinecke after the multi-attr clarification.</li>
+<li><strong>Patches 3/9:</strong> Open discussion — rename to "stringset" agreed in principle; sorted-array vs rbtree debate unresolved, with Chuck holding the line on intersection performance and Hannes willing to prototype an alternative.</li>
+<li><strong>Overall series:</strong> Needs a rebase (v1 was based on a stale testing branch per Chuck's own admission) before a v2 posting. No netlink maintainer decision yet on protocol shape; Chuck deferred that call to Jakub Kicinski.</li>
+</ul>
+<p>For NFS client/server developers, the takeaway is that NFSD is moving from boolean TLS peer identity toward fine-grained, certificate-policy-driven export authorization — with all x.509 parsing deliberately kept in userspace and only opaque tag membership tested in-kernel.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260605-tls-session-tags-v1-0-47bd1d94d552@oracle.com/">2026-06-05 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 0/9] Deliver TLS session tags to upper-layer consumers (NFSD)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260605-tls-session-tags-v1-1-47bd1d94d552@oracle.com/">2026-06-05 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 1/9] handshake: Require admin permission for DONE command</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260605-tls-session-tags-v1-2-47bd1d94d552@oracle.com/">2026-06-05 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 2/9] handshake: Add tags to "done" downcall</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260605-tls-session-tags-v1-3-47bd1d94d552@oracle.com/">2026-06-05 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 3/9] lib: Add a "tagset" data structure</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260605-tls-session-tags-v1-4-47bd1d94d552@oracle.com/">2026-06-05 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 4/9] handshake: Pick up session tags passed during the DONE downcall</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260605-tls-session-tags-v1-5-47bd1d94d552@oracle.com/">2026-06-05 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 5/9] handshake: Add a kunit test for the completion gate</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260605-tls-session-tags-v1-6-47bd1d94d552@oracle.com/">2026-06-05 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 6/9] handshake: advertise the session-tag cap to user space</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260605-tls-session-tags-v1-7-47bd1d94d552@oracle.com/">2026-06-05 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 7/9] SUNRPC: Copy the TLS session tags when they are available</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260605-tls-session-tags-v1-9-47bd1d94d552@oracle.com/">2026-06-05 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 9/9] NFSD: Add allow_tags to the netlink export interface</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260605-tls-session-tags-v1-8-47bd1d94d552@oracle.com/">2026-06-05 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 8/9] NFSD: Implement export tagging</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/87300aef395fb7fbfee84f30dcec83118f68ba56.camel@kernel.org/">2026-06-06 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 1/9] handshake: Require admin permission for DONE command</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/cbb8bf9325d5877d8e736b42f2ffde01dc7e2739.camel@kernel.org/">2026-06-06 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 0/9] Deliver TLS session tags to upper-layer consumers (NFSD)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ca63fcf5-8d3d-4ee5-ac62-fd0af937cf87@app.fastmail.com/">2026-06-06 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 0/9] Deliver TLS session tags to upper-layer consumers (NFSD)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/e578fbb5-2184-4052-a9db-b363ae758e3c@suse.de/">2026-06-09 Hannes Reinecke <a href="mailto:hare@suse.de">hare@suse.de</a> — Re: [PATCH 1/9] handshake: Require admin permission for DONE command</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/40199ef9-416e-4a58-908a-ed514dfd6ff2@suse.de/">2026-06-09 Hannes Reinecke <a href="mailto:hare@suse.de">hare@suse.de</a> — Re: [PATCH 2/9] handshake: Add tags to "done" downcall</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/922040b0-f87e-484d-9f7b-78098024ad04@suse.de/">2026-06-09 Hannes Reinecke <a href="mailto:hare@suse.de">hare@suse.de</a> — Re: [PATCH 3/9] lib: Add a "tagset" data structure</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/2dc23995-3ff9-4714-ac6c-d70255b15687@app.fastmail.com/">2026-06-09 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 3/9] lib: Add a "tagset" data structure</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/7b5276ff-cceb-446c-97ec-65ad80689495@app.fastmail.com/">2026-06-09 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 2/9] handshake: Add tags to "done" downcall</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/f967eb48-9e54-497a-b5dc-ade6fa6c49d3@suse.de/">2026-06-10 Hannes Reinecke <a href="mailto:hare@suse.de">hare@suse.de</a> — Re: [PATCH 2/9] handshake: Add tags to "done" downcall</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/d14fff89-3c7b-40ea-9380-e8c37499916e@suse.de/">2026-06-10 Hannes Reinecke <a href="mailto:hare@suse.de">hare@suse.de</a> — Re: [PATCH 3/9] lib: Add a "tagset" data structure</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/98b7f6ef-3c1d-4af0-86d0-cad6d1f29b1c@app.fastmail.com/">2026-06-10 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 3/9] lib: Add a "tagset" data structure</a></li>
+</ul>
+  </main>
+</body>
+</html>

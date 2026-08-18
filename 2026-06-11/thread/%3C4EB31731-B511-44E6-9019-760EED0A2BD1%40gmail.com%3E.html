@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>[BUG] KASAN slab-use-after-free in xprt_put (new report, no reply yet)</title>
+  <meta name="description" content="Status this week: A single, unreplied bug report opened the thread. No maintainer or developer has responded within the 2026-06-05 → 2026-06-12 window, so there is no discussion evolution to track yet — just the initial report and its…">
+  <meta property="og:title" content="[BUG] KASAN slab-use-after-free in xprt_put (new report, no reply yet)">
+  <meta property="og:description" content="Status this week: A single, unreplied bug report opened the thread. No maintainer or developer has responded within the 2026-06-05 → 2026-06-12 window, so there is no discussion evolution to track yet — just the initial report and its…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-11T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="[BUG] KASAN slab-use-after-free in xprt_put (new report, no reply yet)">
+  <meta name="twitter:description" content="Status this week: A single, unreplied bug report opened the thread. No maintainer or developer has responded within the 2026-06-05 → 2026-06-12 window, so there is no discussion evolution to track yet — just the initial report and its…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-11</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>[BUG] KASAN slab-use-after-free in xprt_put (new report, no reply yet)</h1>
+<h2>Summary</h2>
+<h2>[BUG] KASAN: slab-use-after-free in <code>xprt_put</code> — new client-side race report</h2>
+<p><strong>Status this week:</strong> A single, unreplied bug report opened the thread. No maintainer or developer has responded within the 2026-06-05 → 2026-06-12 window, so there is no discussion evolution to track yet — just the initial report and its KASAN trace.</p>
+<h3>What was reported</h3>
+<p>Shuangpeng Bai opened the thread on 2026-06-07 with a KASAN slab-use-after-free hit in the SunRPC transport layer while testing current upstream:</p>
+<blockquote>
+<p>"I hit the following KASAN report while testing current upstream kernel: KASAN: slab-use-after-free in xprt_put on commit: e8c2f9fdadee7cbc75134dc463c1e0d856d6e5c7 (May 25 2026)"</p>
+</blockquote>
+<p>This is squarely an <strong>NFS client bug fix</strong> matter — the fault lives in <code>net/sunrpc/xprt.c</code> and <code>net/sunrpc/clnt.c</code>, the shared SunRPC client machinery that underpins NFS. It is not a protocol change or new feature; it is a lifetime/reference-counting defect on the transport object.</p>
+<h3>The technical core of the trace</h3>
+<p>The crash is a <strong>write of size 4</strong> to an already-freed 2048-byte <code>kmalloc-2k</code> slab object, attributed to the <code>rpc_free_client_work</code> workqueue:</p>
+<blockquote>
+<p>"BUG: KASAN: slab-use-after-free in xprt_put … Write of size 4 at addr ffff8881092e1000 by task kworker/1:0/24"
+"Workqueue: events rpc_free_client_work"</p>
+</blockquote>
+<p>The call path is short and telling:</p>
+<pre><code>xprt_put (net/sunrpc/xprt.c:2195)
+rpc_free_client_work (net/sunrpc/clnt.c:991)
+process_scheduled_works / worker_thread / kthread
+</code></pre>
+<p><code>xprt_put()</code> drops the transport's <code>kref</code>, and that final put lands on a transport whose slab object had already been reclaimed. The free side is an RCU-deferred slab release, which is the key to reading this as a <strong>race between RCU-delayed freeing and a late reference drop</strong>:</p>
+<blockquote>
+<p>"Freed by task 0 on cpu 1 at 165.626544s: … __rcu_free_sheaf_prepare → rcu_free_sheaf → rcu_core"
+"The buggy address is located 0 bytes inside of freed 2048-byte region [ffff8881092e1000, ffff8881092e1800)"</p>
+</blockquote>
+<p>In other words, the transport object was released through the RCU grace-period path (~5 seconds before the fault), and a subsequent <code>xprt_put()</code> from the client-teardown work item then wrote into that freed memory. The likely shape of the bug is a missing/early reference or an ordering problem between RCU-deferred transport destruction and the <code>rpc_free_client_work</code> teardown sequence — i.e., a use-after-free in the NFS/SunRPC <strong>client</strong> transport lifecycle.</p>
+<h3>Reproduction &amp; cooperation offered</h3>
+<p>The reporter made it easy to act on, providing a minimal diagnostic patch (delays + prints only) to make the race reproducible, plus a reproducer and <code>.config</code>:</p>
+<blockquote>
+<p>"To help trigger the bug more reliably, we applied a minimal diagnostic patch that only adds delays and print statements. The reproducer and .config files are here."
+"I'm happy to test debug patches or provide additional information."</p>
+</blockquote>
+<p>Reproducer/config: https://gist.github.com/shuangpengbai/98a27c1e3c0dc5489f117efa7c254593 — reported on QEMU (Ubuntu 24.04 guest, i440FX), so it is a plain software race rather than hardware-specific.</p>
+<h3>Where things stand / what to watch for</h3>
+<ul>
+<li><strong>No fix or analysis posted yet</strong> in this window; the thread is awaiting maintainer triage from the SunRPC/NFS client maintainers.</li>
+<li>The interesting follow-up will be whether the root cause is (a) an RCU-grace-period vs. workqueue ordering gap, or (b) a missing reference keeping the transport alive across <code>rpc_free_client_work</code>.</li>
+<li>Worth cross-referencing with prior KASAN UAF reports in the same area (e.g., earlier <code>nfs_local_call_*</code> slab-use-after-free reports and svcrdma lifecycle fixes), which suggest this corner of RPC object teardown has been a recurring trouble spot.</li>
+</ul>
+<p><strong>Bottom line:</strong> A fresh, well-documented NFS/SunRPC <strong>client-side</strong> use-after-free in the transport reference-counting path (<code>xprt_put</code> via <code>rpc_free_client_work</code>), with a reliable reproducer offered — but no technical discussion or patch had landed by the end of this week.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/4EB31731-B511-44E6-9019-760EED0A2BD1@gmail.com/">2026-06-07 Shuangpeng <a href="mailto:shuangpeng.kernel@gmail.com">shuangpeng.kernel@gmail.com</a> — [BUG] KASAN: slab-use-after-free in xprt_put</a></li>
+</ul>
+  </main>
+</body>
+</html>

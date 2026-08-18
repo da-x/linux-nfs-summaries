@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>xprtsock: annotate shared socket callbacks with READ_ONCE/WRITE_ONCE</title>
+  <meta name="description" content="The week&#39;s activity in this thread consists of a single, self-contained bug-fix patch from Runyu Xiao (Soochow University), posted on 2026-06-11 and addressed to the net tree rather than mainline feature development. The patch closes a…">
+  <meta property="og:title" content="xprtsock: annotate shared socket callbacks with READ_ONCE/WRITE_ONCE">
+  <meta property="og:description" content="The week&#39;s activity in this thread consists of a single, self-contained bug-fix patch from Runyu Xiao (Soochow University), posted on 2026-06-11 and addressed to the net tree rather than mainline feature development. The patch closes a…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-06-11T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="xprtsock: annotate shared socket callbacks with READ_ONCE/WRITE_ONCE">
+  <meta name="twitter:description" content="The week&#39;s activity in this thread consists of a single, self-contained bug-fix patch from Runyu Xiao (Soochow University), posted on 2026-06-11 and addressed to the net tree rather than mainline feature development. The patch closes a…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-06-11</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>xprtsock: annotate shared socket callbacks with READ_ONCE/WRITE_ONCE</h1>
+<h2>Summary</h2>
+<h2>xprtsock callback visibility fix lands as a single-patch net submission</h2>
+<p>The week's activity in this thread consists of a single, self-contained bug-fix patch from Runyu Xiao (Soochow University), posted on 2026-06-11 and addressed to the <code>net</code> tree rather than mainline feature development. The patch closes a long-standing memory-visibility gap in the SUNRPC client transport layer that has been present since the original client-side transport switch was merged.</p>
+<h3>What kind of change this is</h3>
+<p>This is squarely a <strong>bug fix</strong>, not a new feature or protocol change. It does not alter any NFS wire behavior; it only adds <code>READ_ONCE()</code>/<code>WRITE_ONCE()</code> annotations to shared socket callback pointers in <code>net/sunrpc/xprtsock.c</code>. The patch carries a <code>Fixes:</code> tag pointing at the ancient commit that introduced the pattern:</p>
+<blockquote>
+<p>"Fixes: a246b0105bbd ("[PATCH] RPC: introduce client-side transport switch")" <a href="https://lore.kernel.org/linux-nfs/20260611053556.2432448-1-runyu.xiao@seu.edu.cn/">Runyu Xiao's patch</a></p>
+</blockquote>
+<p>The <code>[PATCH net]</code> prefix signals the author's intent to get this into a stable backport cycle rather than waiting for the next merge window.</p>
+<h3>The technical argument</h3>
+<p>The core of Xiao's write-up describes how xprtsock takes over a live socket and later hands it back, using plain stores on callback pointers that other CPUs may still be reading:</p>
+<blockquote>
+<p>"xprtsock replaces and restores sk-&gt;sk_data_ready and sk-&gt;sk_write_space on live sockets with plain stores, and xs_udp_do_set_buffer_size() invokes sk-&gt;sk_write_space via a plain load." <a href="https://lore.kernel.org/linux-nfs/20260611053556.2432448-1-runyu.xiao@seu.edu.cn/">patch body</a></p>
+</blockquote>
+<p>He frames the fix as bringing xprtsock into line with an established kernel-wide contract for shared callback pointers, explicitly invoking prior art:</p>
+<blockquote>
+<p>"These callback pointers are shared with generic socket and protocol paths that may read or invoke them concurrently, so xprtsock needs the same READ_ONCE()/WRITE_ONCE() callback visibility contract that the validated 4022 family applied elsewhere." <a href="https://lore.kernel.org/linux-nfs/20260611053556.2432448-1-runyu.xiao@seu.edu.cn/">patch body</a></p>
+</blockquote>
+<p>The concrete failure mode he describes is a stale-snapshot race during teardown:</p>
+<blockquote>
+<p>"When SUNRPC takes over an AF_LOCAL, UDP, or TCP socket and later restores the lower-socket callbacks during teardown, another CPU may still hold an earlier callback snapshot. The plain replace/restore pattern leaves the same visibility hole as the validated 4022 family, so a stale snapshot can still invoke xs_data_ready() or xs_udp_write_space() after the live callback fields have already been restored to the lower-socket handlers." <a href="https://lore.kernel.org/linux-nfs/20260611053556.2432448-1-runyu.xiao@seu.edu.cn/">patch body</a></p>
+</blockquote>
+<h3>The actual change</h3>
+<p>The fix is deliberately narrow and surgical — 11 insertions and 9 deletions in a single file:</p>
+<blockquote>
+<p>"Use WRITE_ONCE() for the shared sk_data_ready and sk_write_space stores in xs_local_finish_connecting(), xs_udp_finish_connecting(), xs_tcp_finish_connecting(), and xs_restore_old_callbacks(). Use READ_ONCE() for the direct sk_write_space invocation in xs_udp_do_set_buffer_size(). This matches the required callback visibility contract while leaving adjacent sk_state_change and sk_error_report handling unchanged." <a href="https://lore.kernel.org/linux-nfs/20260611053556.2432448-1-runyu.xiao@seu.edu.cn/">patch body</a></p>
+</blockquote>
+<p>The explicit note that <code>sk_state_change</code> and <code>sk_error_report</code> are left alone is worth flagging: the author is signaling to reviewers that he has scoped the change tightly to the two callbacks xprtsock actually swaps in and out, and is not doing a blanket annotation sweep of every socket field. That restraint typically makes a <code>net</code>-tree patch easier to accept.</p>
+<h3>Discussion state</h3>
+<p>As of the close of this week's window (2026-06-11), the thread contains only the initial patch posting — no replies, no review comments, and no maintainer ack from Trond Myklebust or Anna Schumaker have landed yet. There is also no prior-week history for this thread in the summary archive; it is a fresh single-message thread. The "4022 family" referenced in the cover letter does not appear elsewhere on linux-nfs within the search window, suggesting it points to an external (likely netdev or generic-kernel) series that established the callback-visibility precedent Xiao is now applying to SUNRPC.</p>
+<h3>Why it matters for NFS client development</h3>
+<p>Although small, this kind of fix matters because xprtsock sits at the boundary between the RPC layer and the kernel's generic socket code. The <code>xs_data_ready()</code> and <code>xs_udp_write_space()</code> callbacks are invoked from network softirq context on whatever CPU happens to be processing the packet, while <code>xs_restore_old_callbacks()</code> runs in process context during transport teardown. Without the once-accessors, a compiler or aggressive CPU reordering could let a softirq on another core observe a torn or stale pointer — invoking an RPC callback after the transport has already been handed back to the lower protocol, which is precisely the kind of use-after-free-adjacent bug that is hardest to reproduce and diagnose in production NFS clients.</p>
+<p>The patch is signed off by the author only at this point and awaits review; given its small diff and clear <code>Fixes:</code> tag, it is a strong candidate for quick acceptance into the next <code>-net</code> pull.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260611053556.2432448-1-runyu.xiao@seu.edu.cn/">2026-06-11 Runyu Xiao <a href="mailto:runyu.xiao@seu.edu.cn">runyu.xiao@seu.edu.cn</a> — [PATCH net] sunrpc: xprtsock: annotate shared socket callbacks with READ_ONCE/WRITE_ONCE</a></li>
+</ul>
+  </main>
+</body>
+</html>
