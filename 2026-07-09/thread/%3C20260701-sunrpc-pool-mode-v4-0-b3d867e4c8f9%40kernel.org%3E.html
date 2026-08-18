@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>sunrpc pool_mode v4: Fixes tag accepted, tracepoint promised, sv_nrpools debate winds down</title>
+  <meta name="description" content="Type: Server-side bug fix + cleanup in the sunrpc (NFS server) layer. Not an NFS client feature or protocol change — this concerns how nfsd schedules RPC work across NUMA pools on the server, but with direct reliability consequences for…">
+  <meta property="og:title" content="sunrpc pool_mode v4: Fixes tag accepted, tracepoint promised, sv_nrpools debate winds down">
+  <meta property="og:description" content="Type: Server-side bug fix + cleanup in the sunrpc (NFS server) layer. Not an NFS client feature or protocol change — this concerns how nfsd schedules RPC work across NUMA pools on the server, but with direct reliability consequences for…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-09T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="sunrpc pool_mode v4: Fixes tag accepted, tracepoint promised, sv_nrpools debate winds down">
+  <meta name="twitter:description" content="Type: Server-side bug fix + cleanup in the sunrpc (NFS server) layer. Not an NFS client feature or protocol change — this concerns how nfsd schedules RPC work across NUMA pools on the server, but with direct reliability consequences for…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-09</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>sunrpc pool_mode v4: Fixes tag accepted, tracepoint promised, sv_nrpools debate winds down</h1>
+<h2>Summary</h2>
+<h1>sunrpc pool_mode v4: the review round closes out</h1>
+<p><strong>Type:</strong> Server-side bug fix + cleanup in the sunrpc (NFS server) layer. Not an NFS client feature or protocol change — this concerns how <code>nfsd</code> schedules RPC work across NUMA pools on the server, but with direct reliability consequences for any client talking to a multi-NUMA NFS server.</p>
+<h2>Bridging prior weeks (brief)</h2>
+<p>The thread has been running since mid-June. <a href="https://lore.kernel.org/linux-nfs/20260625-sunrpc-pool-mode-v2-1-4f512b6e1ee8@kernel.org/">v2 landed June 25</a> and v3 on June 29, both dominated by Chuck Lever's warning that with <code>nrservs &lt; number of NUMA nodes</code>, trailing pools end up with zero threads and the enqueue path has no fallback — a connection landing on an empty pool would hang indefinitely. NeilBrown and Layton converged on a "belt-and-braces" plan: guarantee ≥1 thread per CPU-bearing node, honor explicit userland arrays as-is, and add a queueing-path fallback to a populated pool. <a href="https://lore.kernel.org/linux-nfs/20260701-sunrpc-pool-mode-v4-0-b3d867e4c8f9@kernel.org/">v4 landed July 1</a> as a four-patch set, dropping the RCU patch from v3 and folding the pooled-service gate directly into patch 2/4. Last week's summary covered NeilBrown's rapid-fire review of all four patches (all <code>Reviewed-by</code>) and Layton's response pass, which ended with the <code>Fixes:</code> tag saga still open: both the original author (<code>0f0257eaa5d2</code>) and reviewer (<code>3262c816a3d7</code>) had the wrong commit, and Layton had just proposed <code>bfd241600a3b</code> ("knfsd: make rpc threads pools numa aware") after an LLM-assisted trace.</p>
+<h2>This week's activity (July 3–9)</h2>
+<p>Three messages this week, all closing out open items from last week's review round. The pace has slowed markedly — this is the tail of a review cycle rather than new debate.</p>
+<h3>NeilBrown accepts the <code>Fixes:</code> tag and presses on the fallback path (July 3)</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/178305016681.27465.3325737287555850173@noble.neil.brown.name/">NeilBrown replied to Layton's July 2 follow-up</a> on patch 1/4, conceding the <code>Fixes:</code> correction:</p>
+<blockquote>
+<p>That is certainly credible - thanks.</p>
+</blockquote>
+<p>He then pushed back on Layton's plan to add only a tracepoint for the "no pool has any threads" fallback path, asking for more context in the code:</p>
+<blockquote>
+<p>and a comment explaining when this might happen?</p>
+</blockquote>
+<p>NeilBrown also raised a subtle edge case that neither of them had fully addressed — what happens if an admin explicitly requests zero threads on some pools:</p>
+<blockquote>
+<p>The start-up window makes sense - as long as we start a thread on each pool it should be safe. But if we don't (if the admin request zero on some pools) we can still get stuck. Is there something simple we can do about that, or does the admin get to keep both halves?</p>
+</blockquote>
+<p>On shutdown, he confirmed the ordering is fine: "And on shutdown the threads stop before the sockets are cleaned up - but they do get cleaned up, so all good."</p>
+<h3>NeilBrown pushes back on Layton's <code>sv_nrpools</code> performance argument (July 3)</h3>
+<p>In a <a href="https://lore.kernel.org/linux-nfs/178305132973.27465.1946356721236703804@noble.neil.brown.name/">reply to patch 2/4</a>, NeilBrown accepted Layton's single-node counterexample (which showed <code>sv_is_pooled</code> can't be derived from <code>sv_nrpools</code>) but rejected the performance rationale for keeping the field:</p>
+<blockquote>
+<p>Agree. We have to keep sv_is_pooled (it implies a reference to svc_pool_map). I'm not convinced that we need sv_nrpools.</p>
+</blockquote>
+<p>On Layton's concern that converting <code>sv_nrpools</code> accesses to read from <code>svc_pool_map</code> would add cost on the receive path, NeilBrown argued the opposite:</p>
+<blockquote>
+<p>svc_pool_map is a single global that is read-mostly, so no dereference, easy to predict. During receive we need to access svc_pool_map anyway to map CPU to POOL. So the svc_pool_map.npools will have to be pulled into cache anyway.</p>
+</blockquote>
+<p>He then gracefully backed off: "But if you don't like it, I won't push it on you." This is a classic kernel-reviewing courtesy — NeilBrown made his case but explicitly left the decision to the author, signaling the simplification is a "nice to have" rather than a blocker.</p>
+<h3>Layton closes the loop (July 6)</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/7c27731fdb20928f8a8bedc5c286cde20057aef2.camel@kernel.org/">Jeff Layton's reply</a> on July 6 addressed NeilBrown's three points from the patch 1/4 thread:</p>
+<p>On the tracepoint + comment request, he simply agreed: "Sure, I'll add one."</p>
+<p>On the admin-requested-zero-threads edge case, Layton clarified that the fix already handles it — the tradeoff is performance, not correctness:</p>
+<blockquote>
+<p>Well, no. This patch makes sure that RPCs are always routed to a pool with CPUs. They might end up doing cross-NUMA calls and performance might suck, but it shouldn't get stuck.</p>
+</blockquote>
+<p>This is an important clarification for the record: the fallback path in <code>svc_pool_for_cpu()</code> doesn't just handle the transient startup/shutdown window — it's a general safety net that also covers misconfiguration (admin explicitly setting zero threads on some pools). The cost is cross-NUMA RPC dispatch, which hurts latency but never hangs.</p>
+<p>On shutdown ordering, he confirmed: "Correct."</p>
+<p>He closed with "Thanks again for the review," signaling the review round is complete.</p>
+<h2>Key technical arguments &amp; evolution</h2>
+<ol>
+<li>
+<p><strong>The <code>Fixes:</code> tag saga is finally settled.</strong> After three rounds (Layton's original <code>0f0257eaa5d2</code>, NeilBrown's suggested <code>3262c816a3d7</code>, Layton's corrected <code>bfd241600a3b</code>), NeilBrown accepted the final answer. The bug was introduced by the NUMA-awareness patch, not the initial pool-splitting patch. This matters for backporting: the fix needs to go into kernels containing <code>bfd241600a3b</code>.</p>
+</li>
+<li>
+<p><strong>The fallback path is now explicitly a general safety net, not just a startup/shutdown workaround.</strong> NeilBrown's question about admin-requested zero threads forced Layton to clarify that the populated-pool routing in patch 1/4 covers all cases where a pool has no threads — transient (startup/shutdown) or persistent (misconfiguration). The guarantee is "it shouldn't get stuck," even if cross-NUMA performance suffers.</p>
+</li>
+<li>
+<p><strong>The <code>sv_nrpools</code> simplification debate is effectively over, with NeilBrown conceding the point.</strong> NeilBrown made a reasonable case that <code>svc_pool_map.npools</code> would already be in cache during receive (since the CPU-to-pool mapping requires it anyway), but Layton's single-node counterexample was decisive. The field stays; the cleanup is deferred to a future patch if anyone wants to take it on.</p>
+</li>
+<li>
+<p><strong>A tracepoint and explanatory comment are now promised for v5.</strong> NeilBrown's request for "a comment explaining when this might happen" plus Layton's agreement ("Sure, I'll add one") means the fallback path will be better documented in the next revision.</p>
+</li>
+</ol>
+<h2>Relevance to NFS client development</h2>
+<p>While this is server-side sunrpc code, the stakes for clients remain concrete:</p>
+<ul>
+<li><strong>The starvation fix (patch 1/4) prevents indefinite connection hangs.</strong> A client connecting to an NFS server with fewer nfsd threads than NUMA nodes — or one misconfigured with zero threads on some pools — would previously have its transport enqueued on an empty pool and hang forever. With this fix, the work is routed to a populated pool. This is a direct reliability improvement for any client talking to a multi-NUMA NFS server.</li>
+<li><strong>The pernode default (patch 2/4) alters NUMA behavior for all NFS servers.</strong> Services that previously ran with a single global pool now get one pool per NUMA node by default, giving proper thread affinity and NUMA-local memory allocation. Clients on multi-NUMA hosts will see improved latency characteristics.</li>
+<li><strong>The modulus elimination (patch 4/4) improves enqueue latency</strong> on busy servers handling many concurrent client connections.</li>
+</ul>
+<h2>Final status (as of window close)</h2>
+<p>The v4 series is <strong>fully reviewed and the review round is closed</strong>. All four patches carry NeilBrown's <code>Reviewed-by</code>. The open items are now purely mechanical:</p>
+<ul>
+<li>Layton will add a tracepoint and explanatory comment for the "no pool has any threads" fallback path in v5.</li>
+<li>Layton will adopt NeilBrown's cleaner thread-floor formulation for patch 3/4 in v5 (agreed last week).</li>
+<li>The <code>Fixes:</code> tag for patch 1/4 is confirmed as <code>bfd241600a3b</code>.</li>
+<li>The <code>sv_nrpools</code> simplification is deferred.</li>
+</ul>
+<p>No v5 has been posted within this window, and no new patches or objections have appeared. The series appears close to merge-ready, pending the small v5 tweaks and the NFS maintainer's final sign-off. The thread is in a quiet holding pattern.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/178305016681.27465.3325737287555850173@noble.neil.brown.name/">2026-07-03 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v4 1/4] sunrpc: route to a populated pool in svc_pool_for_cpu()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178305132973.27465.1946356721236703804@noble.neil.brown.name/">2026-07-03 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v4 2/4] sunrpc: hardcode pool_mode to pernode, remove other modes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/7c27731fdb20928f8a8bedc5c286cde20057aef2.camel@kernel.org/">2026-07-06 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v4 1/4] sunrpc: route to a populated pool in svc_pool_for_cpu()</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/178305016681.27465.3325737287555850173@noble.neil.brown.name/">2026-07-03 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> —  Re: [PATCH v4 1/4] sunrpc: route to a populated pool in svc_pool_for_cpu()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178305132973.27465.1946356721236703804@noble.neil.brown.name/">2026-07-03 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> —  Re: [PATCH v4 2/4] sunrpc: hardcode pool_mode to pernode, remove other modes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/7c27731fdb20928f8a8bedc5c286cde20057aef2.camel@kernel.org/">2026-07-06 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v4 1/4] sunrpc: route to a populated pool in svc_pool_for_cpu()</a></li>
+</ul>
+  </main>
+</body>
+</html>

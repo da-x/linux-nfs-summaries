@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS Direct I/O folio debate: path forward agreed — expose get_contig_folio_len()</title>
+  <meta name="description" content="This week&#39;s activity is a continuation of the review discussion around patch 6/7 (&quot;Optimize direct I/O to use folios for requests&quot;) in Pranjal Shrivastava&#39;s (Google) seven-patch series &quot;nfs: Modernize Direct I/O path&quot;. The series is an…">
+  <meta property="og:title" content="NFS Direct I/O folio debate: path forward agreed — expose get_contig_folio_len()">
+  <meta property="og:description" content="This week&#39;s activity is a continuation of the review discussion around patch 6/7 (&quot;Optimize direct I/O to use folios for requests&quot;) in Pranjal Shrivastava&#39;s (Google) seven-patch series &quot;nfs: Modernize Direct I/O path&quot;. The series is an…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-09T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS Direct I/O folio debate: path forward agreed — expose get_contig_folio_len()">
+  <meta name="twitter:description" content="This week&#39;s activity is a continuation of the review discussion around patch 6/7 (&quot;Optimize direct I/O to use folios for requests&quot;) in Pranjal Shrivastava&#39;s (Google) seven-patch series &quot;nfs: Modernize Direct I/O path&quot;. The series is an…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-09</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS Direct I/O folio debate: path forward agreed — expose get_contig_folio_len()</h1>
+<h2>Summary</h2>
+<h1>NFS Direct I/O Folio Debate: Path Forward Agreed on <code>get_contig_folio_len()</code></h1>
+<h2>Classification</h2>
+<p>This week's activity is a continuation of the review discussion around <strong>patch 6/7</strong> ("Optimize direct I/O to use folios for requests") in Pranjal Shrivastava's (Google) seven-patch series <strong>"nfs: Modernize Direct I/O path"</strong>. The series is an architectural refactor of the NFS <em>client</em> <code>O_DIRECT</code> path — migrating from the legacy <code>iov_iter_get_pages_alloc2()</code> API to the modern <code>iov_iter_extract_pages()</code> API and making requests folio-based — with two embedded bug fixes (a data-corruption fix in <code>nfs_direct_extract_pages()</code> and an early-unpin / bytes-accounting defect). It is groundwork for PCI Peer-to-Peer DMA (P2PDMA), not a protocol change.</p>
+<h2>Bridge from prior weeks</h2>
+<p>The central dispute, opened when the v2 series was posted on June 16, concerns whether patch 6's assumption — that every page returned by <code>iov_iter_extract_pages()</code> belongs to a valid folio so <code>page_folio()</code> is safe — holds across all memory types. Trond Myklebust, Christoph Hellwig, and Matthew Wilcox pushed back, noting the MM invariant "every page is part of a folio" has important exceptions (slab, vmalloc, iomem). Last week (week ending 2026-07-02), Hellwig <a href="https://lore.kernel.org/linux-nfs/aj4iiD5C_yyLeb3U@infradead.org/">de-escalated the immediate concern</a> for NFS specifically — GUP-pinned user pages are always valid folios, so the slab/vmalloc edge cases Wilcox flagged are not reachable through the direct-I/O user pinning mechanism. However, Hellwig's caveat about kvec iterators kept a latent architectural gap alive:</p>
+<blockquote>
+<p>"Also if iov_iter_extract_bvecs was used on kvec or bvec iters we could run into the slab problem. The block usage currently makes sure bvec iters are not handed to iov_iter_extract_bvecs, but there is no such thing for kvec vectors, although no one is using them for direct I/O right now. Not that I'd want to rely on that in the long run."</p>
+</blockquote>
+<h2>This week: four messages (July 3–8)</h2>
+<p>The discussion this week moves from <em>diagnosis</em> to <em>prescription</em>. The author and Hellwig converge on a concrete plan for resolving the <code>page_folio()</code> impasse.</p>
+<h3>July 3 — Pranjal confirms the bvec path shares the same latent risk</h3>
+<p>Pranjal <a href="https://lore.kernel.org/linux-nfs/akevQfFVteCOD6LM@google.com/">replies</a> to Hellwig's previous-week clarification, adding a "+1" and sharpening his earlier observation that the block layer's own <code>iov_iter_extract_bvecs()</code> path has the same exposure:</p>
+<blockquote>
+<p>"I see that extract_bvecs also rely on user memory to have valid folios even if we were to re-use parts of it (get_contig_folio_len) it still relies on page_folio() as detailed in the other reply."</p>
+</blockquote>
+<p>He then probes the kvec-iterator caveat with a practical question:</p>
+<blockquote>
+<p>"Do we have use-cases for a kernel user for direct I/O ? (Just curious to know if there's something on the horizon)."</p>
+</blockquote>
+<p>This is a pointed way of asking whether the latent fragility Hellwig flagged is merely theoretical or whether it represents a real, near-term threat that should influence how the NFS patch is structured.</p>
+<h3>July 3 — Hellwig: kernel-side direct I/O is not hypothetical</h3>
+<p>Hellwig <a href="https://lore.kernel.org/linux-nfs/akfAgy52s_Gch2KG@infradead.org/">answers</a> within an hour, making clear the kvec concern is not academic:</p>
+<blockquote>
+<p>"Plenty. Basically any storage on file driver, or storage / file system server: loop, zloop, nvmet, scsi target and nfsd ar the ones I know off by head."</p>
+</blockquote>
+<p>This is a significant data point for the broader discussion. It means the "no one uses kvec iterators for direct I/O" convention Hellwig did not want to rely on is already broken in spirit — <code>nfsd</code> itself (the NFS <em>server</em>) is a kernel-side user of direct I/O, as are loop, zloop, nvmet, and SCSI target. The iov_iter/block-layer gap is therefore not a hypothetical future risk but a present one, even if no current code path triggers the slab assertion.</p>
+<h3>July 7 — Pranjal proposes two concrete paths forward</h3>
+<p>After acknowledging Hellwig's list of kernel-side users ("Ack. I see! Thanks!"), Pranjal <a href="https://lore.kernel.org/linux-nfs/akzsO_vmYX_7Umjd@google.com/">pivots</a> to asking for a decision on the technical resolution:</p>
+<blockquote>
+<p>"Regarding the page_folio impasse, how do you suggest we proceed? Should I expose and use get_contig_folio_len() from bvec? Or should I move the NFS helper into the iov_iter lib? (or both)."</p>
+</blockquote>
+<p>He also asks a process question about series structure:</p>
+<blockquote>
+<p>"Also, do you suggest sending the Folio move as a standalone patch if it is blocking the rest of the series or do we prefer keeping these in a single series?"</p>
+</blockquote>
+<p>This is a constructive de-escalation. Rather than continuing to argue about whether the <code>page_folio()</code> assumption is safe (a question that has been thoroughly litigated over three weeks), Pranjal is asking Hellwig to pick a concrete implementation path so he can post a v3. The two options he presents are:</p>
+<ol>
+<li><strong>Expose <code>get_contig_folio_len()</code> from the block layer</strong> and have NFS call it directly — reusing existing, battle-tested code without changing any library APIs.</li>
+<li><strong>Move the NFS folio-grouping helper into <code>lib/iov_iter.c</code></strong> — a larger API change that would shield all filesystems from having to reason about folio semantics, addressing the broader architectural concern Wilcox raised.</li>
+</ol>
+<h3>July 8 — Hellwig endorses option 1 and suggests splitting the series</h3>
+<p>Hellwig <a href="https://lore.kernel.org/linux-nfs/ak4A6IEmWNi27I2d@infradead.org/">responds</a> with a clear endorsement of the first approach:</p>
+<blockquote>
+<p>"Sounds like the best way forward for now."</p>
+</blockquote>
+<p>This is a meaningful resolution. After three weeks of debate about whether <code>page_folio()</code> is safe, the maintainers have converged on a pragmatic answer: NFS should reuse the block layer's <code>get_contig_folio_len()</code> helper rather than hand-rolling its own folio grouping or relying on the "every page is a folio" invariant. The "for now" qualifier is important — it leaves open the possibility of a longer-term iov_iter API change (option 2) but defers that decision to a future discussion, unblocking the immediate series.</p>
+<p>On the process question, Hellwig admits he did not fully parse the terminology:</p>
+<blockquote>
+<p>"Sorry if I'm thick, but I'm not sure what 'folio' move means."</p>
+</blockquote>
+<p>But he offers clear guidance on the underlying question (whether to split the series):</p>
+<blockquote>
+<p>"In doubt if you think you can get a series merged quicker without a later part I'd split it."</p>
+</blockquote>
+<p>This is a merge-oriented signal: Hellwig prefers getting the uncontroversial parts of the series (the API migration, the two bug fixes, the pin-aware infrastructure) landed rather than holding them hostage to the folio-grouping patch. If patch 6's refactoring to use <code>get_contig_folio_len()</code> introduces cross-subsystem dependencies (e.g., exporting a block-layer function), splitting it out as a standalone prerequisite patch would let the rest of the series proceed independently.</p>
+<h2>Key technical arguments this week</h2>
+<ol>
+<li>
+<p><strong>The bvec extractor shares the same latent risk.</strong> Pranjal's "+1" and his observation that <code>get_contig_folio_len()</code> "still relies on page_folio()" confirm that the block layer's own extraction path is not immune to the slab/vmalloc concern — it simply works in practice because GUP-pinned user pages are always valid folios. This validates the reviewers' original guidance ("stick to what the block code does") while acknowledging the underlying fragility.</p>
+</li>
+<li>
+<p><strong>Kernel-side direct I/O is a real, present use case.</strong> Hellwig's list (loop, zloop, nvmet, scsi target, nfsd) elevates the kvec-iterator concern from theoretical to practical. The "no one uses them" convention is not a reliable long-term invariant, which strengthens the case for eventually hardening the iov_iter abstraction — but does not block the immediate NFS fix.</p>
+</li>
+<li>
+<p><strong><code>get_contig_folio_len()</code> is the agreed-upon path forward.</strong> After three weeks of debate, the maintainers have settled on reusing the block layer's helper rather than either (a) relying on the <code>page_folio()</code> invariant or (b) making a larger iov_iter API change. This is a pragmatic, minimal-diff resolution that unblocks the series.</p>
+</li>
+<li>
+<p><strong>Series splitting is endorsed.</strong> Hellwig's "I'd split it" guidance suggests the folio-grouping patch (or the prerequisite of exporting <code>get_contig_folio_len()</code>) may be sent as a standalone patch, with the rest of the modernization series proceeding independently. This is a common kernel development pattern for reducing review burden and enabling incremental merge.</p>
+</li>
+</ol>
+<h2>Evolution of the discussion (three-week arc)</h2>
+<ul>
+<li><strong>Week 1 (June 16–18):</strong> Series posted; Trond Myklebust, Hellwig, and Wilcox push back on the <code>page_folio()</code> assumption. Reviewers advise reusing block-layer code.</li>
+<li><strong>Week 2 (June 19–25):</strong> Author accepts the critique but surfaces a wrinkle: the bvec extractor has the same risk. Asks whether iov_iter should export a safe helper. Hellwig de-escalates for NFS specifically (GUP-pinned pages are safe) but flags the kvec gap.</li>
+<li><strong>Week 3 (July 3–8, this week):</strong> Author and Hellwig converge on a concrete plan: expose and use <code>get_contig_folio_len()</code>. Kernel-side direct I/O confirmed as a real use case. Series splitting endorsed to unblock merge.</li>
+</ul>
+<h2>Final conclusions and where things stand</h2>
+<p>The central technical dispute over patch 6 is now <strong>effectively resolved</strong>. The agreed path forward is for Pranjal to refactor the NFS folio-grouping logic to call <code>get_contig_folio_len()</code> from the block layer, rather than hand-rolling folio grouping or relying on the <code>page_folio()</code> invariant. Hellwig's "Sounds like the best way forward for now" is a clear endorsement that unblocks the author to post a v3.</p>
+<p>The broader architectural question — whether <code>lib/iov_iter.c</code> should eventually export a safe helper (or hide folio semantics entirely) from all filesystems — remains open but is explicitly deferred ("for now"). Hellwig's confirmation that kernel-side direct I/O users exist (loop, zloop, nvmet, scsi target, nfsd) keeps this question relevant for future work.</p>
+<p>No new patches have been posted this week. The expectation is that Pranjal will post a <strong>v3</strong> incorporating:</p>
+<ul>
+<li>Refactored patch 6 using <code>get_contig_folio_len()</code> (possibly as a standalone prerequisite patch).</li>
+<li>Updated CC lists (linux-rdma, linux-pci) as agreed in the prior week.</li>
+<li>Full xfstests quick-suite results in the cover letter.</li>
+</ul>
+<p>The thread remains <strong>open</strong> pending that v3 posting and subsequent review.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/akevQfFVteCOD6LM@google.com/">2026-07-03 Pranjal Shrivastava <a href="mailto:praan@google.com">praan@google.com</a> — Re: [PATCH v2 6/7] nfs: Optimize direct I/O to use folios for requests</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/akfAgy52s_Gch2KG@infradead.org/">2026-07-03 Christoph Hellwig <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [PATCH v2 6/7] nfs: Optimize direct I/O to use folios for requests</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/akzsO_vmYX_7Umjd@google.com/">2026-07-07 Pranjal Shrivastava <a href="mailto:praan@google.com">praan@google.com</a> — Re: [PATCH v2 6/7] nfs: Optimize direct I/O to use folios for requests</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ak4A6IEmWNi27I2d@infradead.org/">2026-07-08 Christoph Hellwig <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [PATCH v2 6/7] nfs: Optimize direct I/O to use folios for requests</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/akevQfFVteCOD6LM@google.com/">2026-07-03 Pranjal Shrivastava <a href="mailto:praan@google.com">praan@google.com</a> — Re: [PATCH v2 6/7] nfs: Optimize direct I/O to use folios for requests</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/akfAgy52s_Gch2KG@infradead.org/">2026-07-03 Christoph Hellwig <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [PATCH v2 6/7] nfs: Optimize direct I/O to use folios for requests</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/akzsO_vmYX_7Umjd@google.com/">2026-07-07 Pranjal Shrivastava <a href="mailto:praan@google.com">praan@google.com</a> — Re: [PATCH v2 6/7] nfs: Optimize direct I/O to use folios for requests</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ak4A6IEmWNi27I2d@infradead.org/">2026-07-08 Christoph Hellwig <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [PATCH v2 6/7] nfs: Optimize direct I/O to use folios for requests</a></li>
+</ul>
+  </main>
+</body>
+</html>
