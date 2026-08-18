@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RFC for null root/cwd in fs_struct rejected by Brauner on security grounds</title>
+  <meta name="description" content="This week&#39;s activity centers on a single, short-lived thread: an RFC patch series (not a bug fix) from John Ericson proposing that kernel tasks be allowed to run with a NULL root directory and/or working directory in struct fs_struct. The…">
+  <meta property="og:title" content="RFC for null root/cwd in fs_struct rejected by Brauner on security grounds">
+  <meta property="og:description" content="This week&#39;s activity centers on a single, short-lived thread: an RFC patch series (not a bug fix) from John Ericson proposing that kernel tasks be allowed to run with a NULL root directory and/or working directory in struct fs_struct. The…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-02T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="RFC for null root/cwd in fs_struct rejected by Brauner on security grounds">
+  <meta name="twitter:description" content="This week&#39;s activity centers on a single, short-lived thread: an RFC patch series (not a bug fix) from John Ericson proposing that kernel tasks be allowed to run with a NULL root directory and/or working directory in struct fs_struct. The…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-02</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>RFC for null root/cwd in fs_struct rejected by Brauner on security grounds</h1>
+<h2>Summary</h2>
+<h1>RFC: Support tasks with a null root or cwd — shot down on day one</h1>
+<h2>What this is</h2>
+<p>This week's activity centers on a single, short-lived thread: an <strong>RFC patch series</strong> (not a bug fix) from John Ericson proposing that kernel tasks be allowed to run with a NULL root directory and/or working directory in <code>struct fs_struct</code>. The motivation is explicitly about building <em>less-privileged, more cheaply spawned</em> processes — a prelude to nulling out namespace fields and to a new non-fork-exec process-spawning API. It landed on linux-nfs only tangentially; the real home of this discussion is the general kernel mailing list, but it crossed over here because <code>struct fs_struct</code> touches filesystem code that NFS developers care about (path resolution, <code>*at(2)</code> lookups, <code>getcwd</code>, <code>/proc/PID/root</code>).</p>
+<h2>The proposal</h2>
+<p>Ericson posted a three-patch RFC on 2026-06-29:</p>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260629065934.1425479-1-John.Ericson@Obsidian.Systems/">Patch 0/3 (cover letter)</a> — frames the motivation and explicitly notes that "nothing creates such a task yet" and that this is a <em>dead-code</em> demonstration patch, ahead of future UAPI work.</li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260629065934.1425479-2-John.Ericson@Obsidian.Systems/">Patch 1/3</a> — adds documentation to <code>struct fs_struct</code> fields.</li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260629065934.1425479-3-John.Ericson@Obsidian.Systems/">Patch 2/3</a> — the actual implementation: teaches <code>namei</code>, <code>d_path</code>, <code>fhandle</code>, <code>cachefiles</code>, and <code>/proc</code> readers to cope with a NULL root or cwd instead of dereferencing it.</li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260629065934.1425479-4-John.Ericson@Obsidian.Systems/">Patch 3/3</a> — adds a KUnit test suite gated by <code>CONFIG_NULL_ROOT_CWD_KUNIT_TEST</code>.</li>
+</ul>
+<p>The cover letter is unusually candid about its own status:</p>
+<blockquote>
+<p>"It may not be appropriate to submit such a 'dead-code' patch, but I wanted to demonstrate just how easy this change is (along with at least a unit test to exercise it), before getting into UAPI designs."</p>
+</blockquote>
+<p>Ericson also acknowledged the strongest known alternative — using the new "nullfs" for root/cwd:</p>
+<blockquote>
+<p>"So far in the linked discussion, the alternative that best addresses my motivation is using the new 'nullfs' for the root directory and cwd. Practically, that is almost as good... The downside is simply that we would like those operations also to fail."</p>
+</blockquote>
+<p>The core technical argument of patch 2/3 is that a task with no root cannot use absolute pathnames (its <code>..</code> climbs to the mount root instead), and a task with no cwd cannot use <code>AT_FDCWD</code>-relative lookups — but descriptor-anchored <code>*at(2)</code> calls keep working. The setter side (<code>chdir</code>, <code>chroot</code>, <code>pivot_root</code>) needs no changes because they already resolve via <code>filename_lookup(AT_FDCWD, ...)</code> and would simply fail.</p>
+<h2>The reaction</h2>
+<p>VFS maintainer Christian Brauner replied within ~2 hours on the same day, and his verdict was unambiguous:</p>
+<blockquote>
+<p>"No, absolutely we're not going to have tasks with struct path's in their struct fs_struct that have NULL members in them. struct path is used insanely widely in the kernel this is just an open invitation for a slew of security bugs. Not going to happen."
+— <a href="https://lore.kernel.org/linux-nfs/20260629-defizit-typisch-maulkorb-53953a5a8510@brauner/">Brauner, 2026-06-29</a></p>
+</blockquote>
+<p>The objection is architectural rather than stylistic: <code>struct path</code> is one of the most widely dereferenced types in the entire kernel, and introducing a NULL-member variant into <code>fs_struct</code> would require auditing every single consumer — an audit that, by definition, cannot be completed safely. Ericson's patch only fixes the handful of readers he identified (namei, d_path, fhandle, cachefiles, proc); Brauner's point is that there are many more, and any missed one is a potential NULL-deref or worse.</p>
+<h2>Where this leaves NFS</h2>
+<p>For NFS client developers specifically, the practical takeaway is small but worth noting:</p>
+<ol>
+<li><strong>No change to path resolution semantics.</strong> The RFC would have altered <code>path_init()</code> / <code>nd_jump_root()</code> behavior for <code>AT_FDCWD</code> and absolute paths — code paths that NFS's dentry/lookup machinery interacts with on every RPC round-trip. That change is now dead, so existing NFS assumptions about non-NULL root/cwd remain valid.</li>
+<li><strong>The "nullfs" alternative survives.</strong> Ericson himself flagged nullfs as the near-equivalent approach. If a future UAPI (e.g., Li Chen's embryonic-process spawning work) wants to give sandboxed processes an empty root, nullfs is the path that VFS maintainers are more likely to accept — and that would be transparent to NFS clients since it's just another filesystem mounted at <code>/</code>.</li>
+<li><strong>No bug fix here.</strong> This was a new-feature RFC that was rejected before any implementation could land. There is no regression, no workaround needed, and no follow-up patch expected in the near term.</li>
+</ol>
+<h2>Bottom line</h2>
+<p>The thread opened and closed in a single day. Ericson's RFC was a deliberate probe — he wanted to show how small the diff would be before investing in UAPI design — and Brauner's response drew a firm line: NULL members inside <code>struct path</code> fields of <code>fs_struct</code> are not acceptable. The discussion is effectively over for this approach; any future work on minimally-privileged process spawning will need to route around it, most likely via nullfs or by keeping root/cwd always populated and restricting access through other mechanisms (seccomp, LSMs, or the embryonic-process model itself).</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260629065934.1425479-1-John.Ericson@Obsidian.Systems/">2026-06-29 John Ericson <a href="mailto:John.Ericson@Obsidian.Systems">John.Ericson@Obsidian.Systems</a> — [RFC PATCH 0/3] fs: support tasks with a null root or cwd</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260629065934.1425479-2-John.Ericson@Obsidian.Systems/">2026-06-29 John Ericson <a href="mailto:John.Ericson@Obsidian.Systems">John.Ericson@Obsidian.Systems</a> — [RFC PATCH 1/3] fs: Add documentation to some <code>struct fs_struct</code> fields</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260629065934.1425479-3-John.Ericson@Obsidian.Systems/">2026-06-29 John Ericson <a href="mailto:John.Ericson@Obsidian.Systems">John.Ericson@Obsidian.Systems</a> — [RFC PATCH 2/3] fs: support tasks with a null root or cwd</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260629065934.1425479-4-John.Ericson@Obsidian.Systems/">2026-06-29 John Ericson <a href="mailto:John.Ericson@Obsidian.Systems">John.Ericson@Obsidian.Systems</a> — [RFC PATCH 3/3] fs: add KUnit tests for tasks with a null root or cwd</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260629-defizit-typisch-maulkorb-53953a5a8510@brauner/">2026-06-29 Christian Brauner <a href="mailto:brauner@kernel.org">brauner@kernel.org</a> — Re: [RFC PATCH 2/3] fs: support tasks with a null root or cwd</a></li>
+</ul>
+  </main>
+</body>
+</html>

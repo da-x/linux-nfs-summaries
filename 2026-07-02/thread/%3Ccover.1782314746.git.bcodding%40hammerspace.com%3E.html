@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SUNRPC sparse-flow dispatch: NeilBrown weighs in, re-arm trigger collapses under load, Lever pivots to decaying credit</title>
+  <meta name="description" content="This is a continuation of a new feature / performance improvement RFC — not a protocol change and not a traditional bug fix. The series targets the nfsd/SUNRPC server-side transport dispatcher to establish a latency floor for interactive…">
+  <meta property="og:title" content="SUNRPC sparse-flow dispatch: NeilBrown weighs in, re-arm trigger collapses under load, Lever pivots to decaying credit">
+  <meta property="og:description" content="This is a continuation of a new feature / performance improvement RFC — not a protocol change and not a traditional bug fix. The series targets the nfsd/SUNRPC server-side transport dispatcher to establish a latency floor for interactive…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-02T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="SUNRPC sparse-flow dispatch: NeilBrown weighs in, re-arm trigger collapses under load, Lever pivots to decaying credit">
+  <meta name="twitter:description" content="This is a continuation of a new feature / performance improvement RFC — not a protocol change and not a traditional bug fix. The series targets the nfsd/SUNRPC server-side transport dispatcher to establish a latency floor for interactive…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-02</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>SUNRPC sparse-flow dispatch: NeilBrown weighs in, re-arm trigger collapses under load, Lever pivots to decaying credit</h1>
+<h2>Summary</h2>
+<h1>SUNRPC Sparse-Flow Dispatch: The Re-Arm Problem Collapses, and the Design Splits</h1>
+<h2>Classification</h2>
+<p>This is a continuation of a <strong>new feature / performance improvement</strong> RFC — not a protocol change and not a traditional bug fix. The series targets the nfsd/SUNRPC <em>server-side</em> transport dispatcher to establish a latency floor for interactive NFS clients. However, this week's discussion is where the design's central assumption (the exact-zero re-arm trigger) was stress-tested and found to be brittle, forcing a genuine fork in the road over how the scheduler should behave.</p>
+<h2>Bridge from Last Week</h2>
+<p>As of <a href="https://lore.kernel.org/linux-nfs/d8efb4f7-fd91-453e-a6fd-1427bdab1cc0@app.fastmail.com/">last week's summary</a>, Benjamin Coddington had posted the three-patch RFC (June 24) and Chuck Lever had delivered substantive review: a deferred-close routing bug in Patch 2/3, a sashiko-flagged pre-existing issue to fix as a prerequisite, and — most consequentially — an open empirical question about whether an interactive flow actually reaches <code>xpt_nr_rqsts == 0</code> often enough <em>under contention</em> to keep its 64-credit budget refilled. Lever had run an uncontended kprobe (depth==0 at ~25.6%) and asked Coddington to repeat it under load. This week is the resolution of that question, plus a fresh voice entering the debate.</p>
+<h2>The Week's Arc</h2>
+<h3>NeilBrown enters — reframe "batch" as the special case (June 26)</h3>
+<p>Neil Brown posted two replies on June 26, bringing a distinct perspective to what had been a Coddington/Lever exchange. In his <a href="https://lore.kernel.org/linux-nfs/178244194881.27465.15942469476886027226@noble.neil.brown.name/">reply to the cover letter</a>, he proposed inverting the mental model:</p>
+<blockquote>
+<p>"I wonder if we should make 'batch' the special case, rather than 'interactive'. I don't think this makes a big difference to the code (there are still two queues and everyone starts out interactive) but it might change how we think about it."</p>
+</blockquote>
+<p>He pushed back on the 64-request budget as a unit of measurement, arguing for time-based detection:</p>
+<blockquote>
+<p>"I would wait a lot longer than 64 requests before considering an xprt to be 'batch', and I would probably want to measure it in seconds rather than requests. Maybe 10-15 seconds."</p>
+</blockquote>
+<p>Brown also raised the practical concern that the classification signal could misfire on legitimate interactive use — multiple sessions on one client masquerading as batch — and suggested gathering statistics before committing:</p>
+<blockquote>
+<p>"I wonder how easy it would be for a client to accidentally start appearing to be 'batch'. Multiple interactive sessions on the one client could incorrectly trigger the batch detection."
+"Maybe it would be useful to collect some statistics of what a 'batch' stream typically looks like (OP mix, concurrency,...) as there may be a better signal to look for than xpt_nr_rqsts."</p>
+</blockquote>
+<p>In his <a href="https://lore.kernel.org/linux-nfs/178244301603.27465.15071583882673669213@noble.neil.brown.name/">reply to Patch 2/3</a>, Brown objected to deferring the bulk-queue starvation bound to "later work," arguing a minimal fairness mechanism should ship from the start:</p>
+<blockquote>
+<p>"I don't feel comfortable completely leaving this for later work. I think some minimal solution should be present from the start. Possibly we could simple alternate between interactive and batch. This would effectively defeat the unfairness created by using nconnect but otherwise share resources fairly well."</p>
+</blockquote>
+<h3>Coddington's pivot — per-client round-robin, or a BPF hook (June 29)</h3>
+<p>Coddington responded to Brown on June 29 in <a href="https://lore.kernel.org/linux-nfs/666496E4-D0EB-44A1-88CD-CD9C5BE0FBB1@hammerspace.com/">this message</a>, acknowledging the heuristic risk and signaling real doubt about the dual-queue approach:</p>
+<blockquote>
+<p>"I'm not sure I can appropriately characterize what batch looks like. I'm afraid I'll end up creating a heuristic monster that will hunt us down in the future."
+"I'm starting to think that per-client round-robin is suddenly looking simpler to understand and will do the right thing in most cases, but I haven't really given up on this dual-queue setup yet."</p>
+</blockquote>
+<p>He then floated an escape hatch that would sidestep the design dispute entirely:</p>
+<blockquote>
+<p>"Here's another crazy idea: instead of letting me break this for everyone, let's leave the current behavior untouched and create a bpf interface so folks like me can inject their desired scheduler from userspace."</p>
+</blockquote>
+<h3>The decisive data — the re-arm trigger collapses (June 29)</h3>
+<p>The most consequential message of the week was Coddington's <a href="https://lore.kernel.org/linux-nfs/69C1992C-2759-46E3-90F6-B9B54012D829@hammerspace.com/">reply to Lever's probe request</a>. He confirmed Lever's re-arm worry without even needing the test, then had a "clanker" (an automated/remote test agent) run it anyway. The result was unambiguous and shaped as a sharp step function rather than a gradual fade:</p>
+<blockquote>
+<p>"I ran it, and it collapses -- but as a sharp step, not a gradual fade, which I think is the useful part of the answer."</p>
+</blockquote>
+<p>The re-arm rate by victim window (W = fixed RPCs held in flight):</p>
+<pre><code>    W=1 (strictly serial)   depth0 = 100%    credit stays 63
+    W=2                     depth0 =  0.4%   credit pinned at 0
+    W=4                     depth0 =  0.1%   credit pinned at 0
+    W=8                     depth0 =  0.2%   credit pinned at 0
+</code></pre>
+<blockquote>
+<p>"So the whole thing hinges on the transport going <em>completely</em> empty. A strictly serial flow re-arms on every single enqueue and rides the high queue forever. The moment a flow keeps even two RPCs continuously in flight, the exact-zero condition essentially stops occurring: it spends its 64 within the first ~64 enqueues and then lives in the bulk queue -- depth&gt;=1 runs are not 'longer than 64', they're unbounded."</p>
+</blockquote>
+<p>The latency cost of that demotion (victim per-op p50, ms) showed the cliff biting only once the bulk queue is deep:</p>
+<pre><code>    W    floor   K=4    K=8    K=16
+    1     14      14     16     17     &lt;- serial: protected at every K
+    2     26      25     37     26     &lt;- marginal, right on the edge
+    3     20      19     24     39
+    4     17      17     28     52     &lt;- == aggressor: fully demoted
+    6     16      17     42     79
+    8     16      19     57    106     &lt;- worse than the aggressor
+</code></pre>
+<p>Coddington's read of the data pointed at Lever's earlier floated fix — a low-watermark refill:</p>
+<blockquote>
+<p>"So I read this as the argument for the low-watermark refill you floated: re-arm when depth drops below a small threshold rather than at exactly 0. A watermark of even 2-4 would move the W=1 column's behavior out to cover the modestly-pipelined flows, while still excluding a real bulk client... It doesn't reintroduce identity and it's a one-line change to the refill condition."</p>
+</blockquote>
+<h3>Lever's counter — watermarks are just cliffs in different spots (June 29)</h3>
+<p>Lever's <a href="https://lore.kernel.org/linux-nfs/864fe01e-a284-4066-bbe9-cbe4ed90f1ed@app.fastmail.com/">closing reply</a> reframed the entire problem and pushed past the watermark model. His first insight corrected the metric that matters: because the budget <em>resets</em> to a full 64 on every idle transition (it doesn't accumulate), a flow only needs to hit zero once per 64 high-priority dispatches to stay protected — not to sustain a high depth==0 fraction:</p>
+<blockquote>
+<p>"The first is that the budget resets to a full SVC_XPRT_HI_BURST every time the transport idles; it doesn't accumulate. So a flow doesn't need a high depth==0 fraction to stay protected, but rather it only needs to hit zero once per 64 high-priority dispatches."
+"0.4% is below 1/64 (~1.6%), so the flow runs dry between idle moments and falls to the bulk queue. Your uncontended histogram sat at 25.6%, which is 16x above that line."</p>
+</blockquote>
+<p>This led him to demand real-workload data before changing anything, since the synthetic victim was deliberately worst-case:</p>
+<blockquote>
+<p>"The synthetic victim refills instantly and idles as rarely as it can, so it answers a question we already knew the answer to... Before changing anything I'd want the same depth==0 probe under load against a real workload: a cold tree walk, git status, a build's header reads, instead of the fixed-window generator. If those stay above 1.6%, exact-zero is fine and we'd be polishing a non-problem."</p>
+</blockquote>
+<p>His second insight was the more provocative one — that a watermark does not soften the cliff, it merely relocates it:</p>
+<blockquote>
+<p>"Because the credit resets to full whenever the trigger fires, the trigger is binary per flow: a flow either re-arms often enough to live on the high queue forever, or it spends its 64 once and settles in the bulk queue. Exact-zero puts that split between W=1 and W=2. A watermark of N doesn't soften the split, it slides it to between W=N and W=N+1."
+"So fixed vs derived is really just picking where to stand the cliff, not /whether/ there's a cliff."</p>
+</blockquote>
+<p>Lever's proposed way out was to make protection <em>decay</em> rather than snap off — replace the reset-to-64 with a fractional top-up on idle:</p>
+<blockquote>
+<p>"If what we actually want is for protection to fade as a flow gets busier rather than snap off at a line, the budget has to decay instead of reset... A flow with frequent gaps tops up faster than it spends and keeps its place. A flow that idles rarely bleeds down and slides into the bulk queue gradually, in proportion to how backlogged it really is."</p>
+</blockquote>
+<p>He closed by asking for a three-way comparison across his existing harness axes — exact-zero (the RFC), a fixed watermark, and a decaying credit:</p>
+<blockquote>
+<p>"I'd love three lines on your axes: exact-zero (the RFC), a fixed watermark, and a decaying credit. My bet is the first two are cliffs in different spots and the third is a ramp. If the ramp lands where we want the protected band to sit, it answers the fixed-vs-derived question by making it moot."
+"Let's get the real-workload depth==0 numbers first, because if they stay high under load, none of the rest matters."</p>
+</blockquote>
+<h2>Key Technical Arguments</h2>
+<ol>
+<li>
+<p><strong>The exact-zero re-arm trigger is brittle for pipelined flows.</strong> The week's central finding: a flow holding even two RPCs continuously in flight essentially never crosses <code>xpt_nr_rqsts == 0</code> under contention (depth==0 fraction drops from ~25.6% uncontended to ~0.1–0.4% under load), so it spends its 64-credit budget once and is demoted wholesale to the bulk queue.</p>
+</li>
+<li>
+<p><strong>The correct metric is "hit zero ≥ once per 64 dispatches," not a high depth==0 fraction.</strong> Lever reframed Coddington's collapse: protection requires crossing ~1.6% (1/64), and the synthetic victim was constructed to fail that test by design.</p>
+</li>
+<li>
+<p><strong>Watermarks relocate the cliff rather than removing it.</strong> Because the budget resets on each idle transition, any fixed threshold produces a binary residency split; choosing between exact-zero and a derived watermark is "picking where to stand the cliff."</p>
+</li>
+<li>
+<p><strong>Decaying credit as the principled alternative.</strong> Lever's ramp model — top up a <em>fraction</em> of the budget on idle rather than resetting to 64 — would make protection fade proportionally with backlog instead of snapping off, dissolving the fixed-vs-derived debate.</p>
+</li>
+<li>
+<p><strong>Brown's orthogonal concerns:</strong> time-based (not request-count) batch detection, guarding against false-positive "batch" classification from multiple interactive sessions, and shipping a minimal inter-tier fairness bound now rather than deferring it.</p>
+</li>
+</ol>
+<h2>Evolution of the Discussion</h2>
+<p>The thread moved through three distinct phases this week:</p>
+<ul>
+<li><strong>Reframing (June 26):</strong> Brown introduced an alternative framing ("batch" as special case) and flagged false-positive risk, widening the debate beyond Coddington/Lever.</li>
+<li><strong>Empirical collapse + design doubt (June 29 AM):</strong> Coddington's data confirmed Lever's re-arm worry as a hard step function, and he openly wavered — considering per-client round-robin or even a BPF userspace scheduler hook rather than shipping the dual-queue mechanism.</li>
+<li><strong>Reframing the fix (June 29 PM):</strong> Lever turned the collapse into an argument that <em>neither</em> exact-zero nor a watermark is right, proposing decaying credit as the "ramp" and demanding real-workload validation before any change.</li>
+</ul>
+<h2>Final Conclusions / State of Play</h2>
+<p>No patch was merged or revised this week; the series remains at RFC stage with the design in active flux. The concrete open items heading into next week are:</p>
+<ol>
+<li><strong>Real-workload depth==0 data under load</strong> (cold tree walk, <code>git status</code>, build header reads) — Lever's gating condition: "if they stay high under load, none of the rest matters."</li>
+<li><strong>A three-axis sweep</strong> (exact-zero vs fixed watermark vs decaying credit) on Coddington's existing harness to test whether the decay model produces a usable ramp.</li>
+<li>Carried over from last week: the deferred-close routing fix and the sashiko-flagged pre-existing issue for v1.</li>
+</ol>
+<p>The discussion has not yet converged on a final mechanism; the most likely direction, per Lever, is a decaying-credit variant of Patch 3/3 — but only if real-workload numbers first confirm the re-arm problem exists outside the synthetic worst case.</p>
+<h2>NFS Client Development Relevance</h2>
+<p>Although this is server-side (nfsd/sunrpc) work, its stakes for the <strong>NFS client</strong> are direct: it determines whether interactive client operations — <code>stat</code>, <code>open</code>, directory listings, page faults — keep a latency floor when a bulk client saturates the server. This week's data sharpened the risk in a client-specific way: <em>aggressively pipelined</em> clients (a v4.1 client keeping its slot table full, an app doing async I/O, or heavy readahead) are exactly the flows that get demoted wholesale by the exact-zero trigger — "which demotes wholesale the first time it sustains a couple RPCs under load." In other words, the very clients that use modern pipelining most effectively could paradoxically lose the protection this RFC is meant to provide. The decaying-credit direction Lever favors would directly address that, but until real-workload data lands, client behavior under contention remains an open question rather than a settled fix.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/178244194881.27465.15942469476886027226@noble.neil.brown.name/">2026-06-26 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH RFC 0/3] SUNRPC: a latency floor for interactive clients via sparse-flow dispatch</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178244301603.27465.15071583882673669213@noble.neil.brown.name/">2026-06-26 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> —  Re: [PATCH RFC 2/3] SUNRPC: dispatch idle transports ahead of backlogged ones</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/666496E4-D0EB-44A1-88CD-CD9C5BE0FBB1@hammerspace.com/">2026-06-29 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — Re: [PATCH RFC 0/3] SUNRPC: a latency floor for interactive clients via sparse-flow dispatch</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/69C1992C-2759-46E3-90F6-B9B54012D829@hammerspace.com/">2026-06-29 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — Re: [PATCH RFC 0/3] SUNRPC: a latency floor for interactive clients via sparse-flow dispatch</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/864fe01e-a284-4066-bbe9-cbe4ed90f1ed@app.fastmail.com/">2026-06-29 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH RFC 0/3] SUNRPC: a latency floor for interactive clients via sparse-flow dispatch</a></li>
+</ul>
+  </main>
+</body>
+</html>

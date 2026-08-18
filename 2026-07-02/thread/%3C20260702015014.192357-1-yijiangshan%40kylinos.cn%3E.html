@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS: fix folio dereference before NULL check in nfs_inode_remove_request()</title>
+  <meta name="description" content="This week&#39;s activity on this thread is limited to a single event: Jiangshan Yi (KylinOS) posted a one-patch bug fix on July 2 targeting the NFS client writeback path in fs/nfs/write.c. As of the close of this week&#39;s window, no maintainer…">
+  <meta property="og:title" content="NFS: fix folio dereference before NULL check in nfs_inode_remove_request()">
+  <meta property="og:description" content="This week&#39;s activity on this thread is limited to a single event: Jiangshan Yi (KylinOS) posted a one-patch bug fix on July 2 targeting the NFS client writeback path in fs/nfs/write.c. As of the close of this week&#39;s window, no maintainer…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-02T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS: fix folio dereference before NULL check in nfs_inode_remove_request()">
+  <meta name="twitter:description" content="This week&#39;s activity on this thread is limited to a single event: Jiangshan Yi (KylinOS) posted a one-patch bug fix on July 2 targeting the NFS client writeback path in fs/nfs/write.c. As of the close of this week&#39;s window, no maintainer…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-02</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS: fix folio dereference before NULL check in nfs_inode_remove_request()</h1>
+<h2>Summary</h2>
+<h1>NFS: Fix Folio Dereference Before NULL Check in <code>nfs_inode_remove_request()</code></h1>
+<h2>Overview</h2>
+<p>This week's activity on this thread is limited to a single event: <strong>Jiangshan Yi</strong> (KylinOS) posted <a href="https://lore.kernel.org/linux-nfs/20260702015014.192357-1-yijiangshan@kylinos.cn/">a one-patch bug fix</a> on July 2 targeting the NFS client writeback path in <code>fs/nfs/write.c</code>. As of the close of this week's window, <strong>no maintainer or reviewer has yet replied</strong>, so the discussion is at its very first stage — a fresh submission awaiting review.</p>
+<h2>Classification: Bug Fix (Client-Side)</h2>
+<p>This is squarely a <strong>bug fix</strong> in the <strong>NFS client</strong>, not a new feature or protocol change. It corrects a latent NULL-pointer dereference in <code>nfs_inode_remove_request()</code>, a function on the writeback completion path that detaches an I/O request from its inode's list of pending requests.</p>
+<h2>The Technical Argument</h2>
+<p>The core of the patch is a classic "deref-before-check" ordering bug. Jiangshan Yi walks through the defect precisely, showing how the existing code reads <code>folio-&gt;mapping</code> (and takes <code>mapping-&gt;i_private_lock</code>) <em>before</em> it ever validates that <code>folio</code> is non-NULL:</p>
+<blockquote>
+<p>"The presence of the 'if (likely(folio))' check shows the code already assumes folio can be NULL. However, folio was dereferenced before that check"</p>
+</blockquote>
+<p>He lays out the offending sequence with inline annotations to make the ordering mistake obvious:</p>
+<blockquote>
+<p>"folio = nfs_page_to_folio(req-&gt;wb_head);
+mapping = folio-&gt;mapping;                       /* deref <em>/
+spin_lock(&amp;mapping-&gt;i_private_lock);
+if (likely(folio)) {                            /</em> too late */"</p>
+</blockquote>
+<p>The root cause is that <code>nfs_page_to_folio()</code> "returns NULL when the PG_FOLIO flag is not set on req-&gt;wb_head." Because the dereference, the lock acquisition, and the <code>folio_end_dropbehind(folio)</code> call all happen before the guard, a NULL folio would crash the kernel before the safety check is ever reached — "rendering the check useless," as Yi puts it.</p>
+<p>The fix is minimal and behavior-preserving: move the <code>folio-&gt;mapping</code> read, the <code>i_private_lock</code> section, and the <code>folio_end_dropbehind()</code> call <em>inside</em> the <code>if (likely(folio))</code> block so the folio "is only dereferenced after it has been confirmed non-NULL." Yi is explicit that this is a no-op for the common case: "The behaviour is unchanged when folio is non-NULL." The diff touches just 11 lines in one file (6 insertions, 5 deletions).</p>
+<h2>Context and Evolution: A Recurring Bug, and a Dropbehind Footprint</h2>
+<p>Two threads of context are worth flagging for the record.</p>
+<p><strong>1. This function has been flagged before.</strong> A near-identical fix was proposed by <strong>Baolin Liu</strong> (also KylinOS) in October 2025 — "[PATCH v1] NFS: Fix possible NULL pointer dereference in <code>nfs_inode_remove_request()</code>"](https://lore.kernel.org/linux-nfs/20251012083957.532330-1-liubaolin12138@163.com/) — which diagnosed the same defect with strikingly similar language:</p>
+<blockquote>
+<p>"nfs_page_to_folio(req-&gt;wb_head) may return NULL in certain conditions, but the function dereferences folio-&gt;mapping and calls folio_end_dropbehind(folio) unconditionally. This may cause a NULL pointer dereference crash."</p>
+</blockquote>
+<p>That earlier patch carried the same 11-line footprint (6 insertions, 5 deletions). Jiangshan Yi's submission this week appears to be a fresh re-raise of the same underlying issue in <code>fs/nfs/write.c</code>, suggesting the bug has persisted in the tree and is being revisited by the KylinOS team.</p>
+<p><strong>2. The dropbehind hook ties into recent VFS work.</strong> The presence of <code>folio_end_dropbehind()</code> in this path links the fix to the broader <code>RWF_DONTCACHE</code> / drop-behind writeback effort that landed for v7.2 (the Jeff Layton series, confirmed merged into Christian Brauner's <code>vfs-7.2.writeback</code> branch earlier this year). That work added the dropbehind flag and its lifecycle helpers to folios; this NFS patch is a downstream consequence of ensuring those new helpers are only invoked on valid folios in the client's writeback completion path.</p>
+<h2>Final Conclusions</h2>
+<p>At present there is <strong>no conclusion from reviewers</strong> — the thread consists solely of Jiangshan Yi's initial submission <a href="https://lore.kernel.org/linux-nfs/20260702015014.192357-1-yijiangshan@kylinos.cn/">posted July 2</a>. The patch presents a clean, well-justified ordering fix for a genuine NULL-dereference hazard in the NFS client, and it is now awaiting review from the NFS maintainers (Trond Myklebust / Anna Schumaker) and the broader writeback community. Given its small scope and the prior art from Baolin Liu's October 2025 patch, the key open question for next week is whether this resubmission will be picked up quickly or folded into a more complete treatment of the same latent bug.</p>
+<h2>Messages This Week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260702015014.192357-1-yijiangshan@kylinos.cn/">2026-07-02 Jiangshan Yi <a href="mailto:yijiangshan@kylinos.cn">yijiangshan@kylinos.cn</a> — [PATCH] NFS: fix folio dereference before NULL check in nfs_inode_remove_request()</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260702015014.192357-1-yijiangshan@kylinos.cn/">2026-07-02 Jiangshan Yi <a href="mailto:yijiangshan@kylinos.cn">yijiangshan@kylinos.cn</a> — [PATCH] NFS: fix folio dereference before NULL check in nfs_inode_remove_request()</a></li>
+</ul>
+  </main>
+</body>
+</html>

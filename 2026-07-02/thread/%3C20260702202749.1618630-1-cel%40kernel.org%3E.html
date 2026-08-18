@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd stable-6.12.y: CB_GETATTR change-detection fix and layout stid leak fix queued</title>
+  <meta name="description" content="On Thursday, July 2, Chuck Lever posted a two-patch stable backport series targeting the 6.12.y kernel for the Linux NFS server (nfsd). Both patches are bug fixes — one correcting protocol-compliant file-change detection in delegation…">
+  <meta property="og:title" content="nfsd stable-6.12.y: CB_GETATTR change-detection fix and layout stid leak fix queued">
+  <meta property="og:description" content="On Thursday, July 2, Chuck Lever posted a two-patch stable backport series targeting the 6.12.y kernel for the Linux NFS server (nfsd). Both patches are bug fixes — one correcting protocol-compliant file-change detection in delegation…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-02T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd stable-6.12.y: CB_GETATTR change-detection fix and layout stid leak fix queued">
+  <meta name="twitter:description" content="On Thursday, July 2, Chuck Lever posted a two-patch stable backport series targeting the 6.12.y kernel for the Linux NFS server (nfsd). Both patches are bug fixes — one correcting protocol-compliant file-change detection in delegation…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-02</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd stable-6.12.y: CB_GETATTR change-detection fix and layout stid leak fix queued</h1>
+<h2>Summary</h2>
+<h1>nfsd 6.12.y stable series: delegation change detection + layout stateid teardown</h1>
+<h2>What happened this week</h2>
+<p>On Thursday, July 2, Chuck Lever posted a two-patch stable backport series targeting the 6.12.y kernel for the Linux NFS server (nfsd). Both patches are bug fixes — one correcting protocol-compliant file-change detection in delegation callbacks, and the other fixing a use-after-free in pNFS layout stateid teardown. The series was queued for 6.12.y within hours by stable maintainer Sasha Levin.</p>
+<h2>Patch 1/2: Fix file change detection in CB_GETATTR (bug fix / protocol compliance)</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260702202749.1618630-1-cel@kernel.org/">Submitted by Chuck Lever</a>, authored by Scott Mayhew, this patch corrects how nfsd determines whether a client holding a write delegation has modified a file when the server issues a CB_GETATTR callback.</p>
+<p>The core technical argument is grounded in RFC 8881 (NFSv4.2), section 10.4.3:</p>
+<blockquote>
+<p>"What section 10.4.3 of RFC 8881 does say is that the server should compare the <em>current</em> file size with the size reported by the client holding the delegation in the CB_GETATTR reply, and if they differ to treat it as a modification regardless of the change attribute retrieved via the CB_GETATTR."</p>
+</blockquote>
+<p>The previous code compared a <strong>cached</strong> file size (stored in the delegation record) against the client-reported size. As Mayhew explains, this was incorrect:</p>
+<blockquote>
+<p>"Doing otherwise would cause the server to believe the client holding the delegation has a modified version of the file, even if the client flushed the modifications to the server prior to the CB_GETATTR."</p>
+</blockquote>
+<p>This had a notable side effect: spurious mtime/ctime/change-attribute updates on every subsequent CB_GETATTR even when no actual writes occurred. The fix modifies <code>nfsd4_deleg_getattr_conflict()</code> to obtain the current file size via <code>i_size_read()</code> rather than relying on the stale cached value. The <code>ncf_cur_fsize</code> field is retained as a convenience for returning the size to <code>nfsd4_encode_fattr4()</code>, but is no longer used for change detection.</p>
+<p>The patch also adds logic to skip the <code>nfs4_cb_fattr</code> field checks when the delegation was recalled (i.e., the client didn't respond to CB_GETATTR at all).</p>
+<p>Chuck Lever noted a minor adaptation for the 6.12.y tree: <code>[ cel: no deleg_ts in 6.12.y; dropped the now-dead ncf_cur_fsize init ]</code>.</p>
+<h2>Patch 2/2: Release layout stid on setlease failure (bug fix / use-after-free)</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260702202749.1618630-2-cel@kernel.org/">Submitted by Chuck Lever</a>, authored by Chris Mason, this patch fixes a dangling-pointer bug in the pNFS layout stateid error path.</p>
+<p>The technical problem is precisely described:</p>
+<blockquote>
+<p>"nfs4_alloc_stid() publishes the new stid into cl-&gt;cl_stateids via idr_alloc_cyclic() under cl_lock before returning to nfsd4_alloc_layout_stateid(). When nfsd4_layout_setlease() then fails, the error path frees the layout stateid directly with kmem_cache_free() without ever calling idr_remove(), leaving the IDR slot pointing at freed slab memory. Any subsequent IDR walker (states_show, client teardown) dereferences the dangling pointer."</p>
+</blockquote>
+<p>The fix replaces the manual <code>nfsd_file_put + put_nfs4_file + kmem_cache_free</code> cleanup with a single <code>nfs4_put_stid(stp)</code> call, which properly removes the IDR slot under <code>cl_lock</code>, dispatches <code>sc_free</code> to release the layout file via <code>nfsd4_close_layout()</code>, and drops the <code>nfs4_file</code> reference.</p>
+<p>This is a straightforward three-line change (1 insertion, 3 deletions) in <code>fs/nfsd/nfs4layouts.c</code>. The original bug was introduced by commit c5c707f96fc9 ("nfsd: implement pNFS layout recalls").</p>
+<p>Chuck Lever adapted the patch for 6.12.y: <code>[ cel: no ls_fence_work in 6.12.y; dropped INIT_DELAYED_WORK hunk ]</code>.</p>
+<h2>Authorship correction</h2>
+<p>Shortly after posting, <a href="https://lore.kernel.org/linux-nfs/75ee89cc-490d-4ba4-b6fa-32f5a2b62379@app.fastmail.com/">Lever sent a follow-up</a> noting:</p>
+<blockquote>
+<p>"Please note: The correct Author for this patch is 'Chris Mason <a href="mailto:clm@meta.com">clm@meta.com</a>'"</p>
+</blockquote>
+<p>This was a minor metadata correction — the Signed-off-by chain already included Chris Mason, but the Author header needed to be explicit.</p>
+<h2>Resolution</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/2026070315-stable-reply-0007@kernel.org/">Sasha Levin confirmed</a> within hours:</p>
+<blockquote>
+<p>"Queued the series for 6.12.y, with the author of 2/2 fixed up to Chris Mason per your follow-up. Thanks!"</p>
+</blockquote>
+<h2>Assessment</h2>
+<p>This thread represents routine but important stable maintenance work on the NFS server side. Both patches address real correctness issues:</p>
+<ol>
+<li><strong>CB_GETATTR fix</strong> — a protocol-compliance bug that could cause unnecessary metadata churn and false modification detection, affecting any NFSv4.2 deployment using write delegations with CB_GETATTR callbacks.</li>
+<li><strong>Layout stid fix</strong> — a memory-safety bug (use-after-free via dangling IDR pointer) in the pNFS layout recall path, triggered only when <code>nfsd4_layout_setlease()</code> fails after stateid allocation. While narrow in trigger conditions, the consequence is a kernel oops or worse if any code walks the stateid IDR.</li>
+</ol>
+<p>Neither patch introduces new features or protocol changes; both are targeted bug fixes with clear upstream provenance and appropriate stable backport annotations. The rapid turnaround (posted 20:27 UTC, queued by 02:05 UTC the next day) reflects the well-oiled workflow between nfsd maintainers and the stable tree.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260702202749.1618630-2-cel@kernel.org/">2026-07-02 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 6.12.y 2/2] nfsd: release layout stid on setlease failure</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260702202749.1618630-1-cel@kernel.org/">2026-07-02 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 6.12.y 1/2] nfsd: fix file change detection in CB_GETATTR</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/75ee89cc-490d-4ba4-b6fa-32f5a2b62379@app.fastmail.com/">2026-07-02 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 6.12.y 2/2] nfsd: release layout stid on setlease failure</a></li>
+</ul>
+  </main>
+</body>
+</html>

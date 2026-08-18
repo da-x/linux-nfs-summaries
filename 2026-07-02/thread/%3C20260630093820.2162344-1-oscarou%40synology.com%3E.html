@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>lockd: refcount NLM_SHARE access/deny modes — v1/v2 reviewed, idempotency concern raised</title>
+  <meta name="description" content="Type: Bug fix (server-side NLM share tracking), with a protocol/robustness angle.">
+  <meta property="og:title" content="lockd: refcount NLM_SHARE access/deny modes — v1/v2 reviewed, idempotency concern raised">
+  <meta property="og:description" content="Type: Bug fix (server-side NLM share tracking), with a protocol/robustness angle.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-02T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="lockd: refcount NLM_SHARE access/deny modes — v1/v2 reviewed, idempotency concern raised">
+  <meta name="twitter:description" content="Type: Bug fix (server-side NLM share tracking), with a protocol/robustness angle.">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-02</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>lockd: refcount NLM_SHARE access/deny modes — v1/v2 reviewed, idempotency concern raised</h1>
+<h2>Summary</h2>
+<h1>lockd: refcount NLM_SHARE access/deny modes</h1>
+<p><strong>Type:</strong> Bug fix (server-side NLM share tracking), with a protocol/robustness angle.</p>
+<h2>The reported bug</h2>
+<p>Oscar Ou of Synology opened the thread on 2026-06-30 with <a href="https://lore.kernel.org/linux-nfs/20260630093820.2162344-1-oscarou@synology.com/">a patch</a> describing a long-standing defect in the Linux lockd server's handling of NLM_SHARE / NLM_UNSHARE:</p>
+<blockquote>
+<p>"When an NFSv3/NLM client issues multiple NLM_SHARE calls from a single host for the same (file, owner) tuple, the current implementation overwrites the recorded access and deny modes with the latest pair. A subsequent NLM_UNSHARE then drops the entire entry, even if other grants were implicitly subsumed by the most recent SHARE."</p>
+</blockquote>
+<p>Oscar noted this is "particularly visible to Windows-style clients that map each open of a file to a distinct NLM_SHARE, all carrying the same NLM owner handle," and walked through a four-step scenario where an RW/deny-W reservation silently disappears after a second R/deny-N share overwrites it. The v1 fix tracked each of the four <code>fsh_access</code> / <code>fsh_mode</code> values with a small per-value refcount, recomputed <code>s_access</code>/<code>s_mode</code> as the union of positive buckets, and extended NLM_UNSHARE to carry the access/deny modes so the correct buckets could be decremented.</p>
+<h2>Chuck Lever's v1 review — three concrete nits</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/d8c309bb-37f8-4465-8abf-ba34db499ae1@app.fastmail.com/">Chuck Lever's reply</a> the same afternoon was a dense, code-level review that rejected v1 as written but pointed the way forward:</p>
+<ol>
+<li>
+<p><strong>Wrong locking claim.</strong> Oscar's commit message said the per-file <code>f_mutex</code> "continues to serialise share manipulation." Chuck showed this is inaccurate — <code>nlm_lookup_file()</code> in <code>fs/lockd/svcsubs.c</code> drops <code>file-&gt;f_mutex</code> before returning, so by the time <code>nlmsvc_share_file()</code> runs it is not held. The real reason no extra locking is needed:</p>
+<blockquote>
+<p>"What actually serialises these requests is that lockd runs a single service thread (<code>svc_set_num_threads(serv, 0, 1)</code> in <code>fs/lockd/svc.c</code>), so the conclusion that the arrays need no extra locking holds."</p>
+</blockquote>
+</li>
+<li>
+<p><strong>Commit-message invariant mismatch.</strong> Because the recompute loop starts at <code>v = 1</code>, bucket index 0 (<code>fsa_NONE</code> / <code>fsm_DN</code>) is written but never read, so an entry can be freed while <code>s_access_counts[0]</code> or <code>s_mode_counts[0]</code> is still non-zero. Chuck flagged that the wording "the entry is freed only when every bucket has reached zero" is "slightly stronger than the code."</p>
+</li>
+<li>
+<p><strong>Out-of-bounds write from a remote client.</strong> The most serious issue:</p>
+<blockquote>
+<p>"A remote NLMv4 client can drive access or mode out of {0..3} here and write past <code>s_access_counts[]</code> / <code>s_mode_counts[]</code>. There are one or two other spots with the same issue. Thus your patch can't be applied as written."</p>
+</blockquote>
+<p>Chuck announced he would post a companion patch regenerating the NLMv4 XDR decoders to prevent exactly this, and asked about a <code>Fixes:</code> tag — noting the bug dates back to commit <code>1da177e4c3f4</code> ("Linux-2.6.12-rc2") but "a proper fix will need both the regeneration patch and this one to be applied."</p>
+</li>
+</ol>
+<h2>v2 — cleanups, plus a process lesson</h2>
+<p>Oscar's <a href="https://lore.kernel.org/linux-nfs/20260701052645.2213483-1-oscarou@synology.com/">v2</a> addressed both review points: the commit message now says the entry "is freed once s_access and s_mode are both zero," and the incorrect <code>f_mutex</code> claim was dropped from both the message and the comment on <code>nlm_recompute_share()</code>. The patch is marked "Applies on top of 'lockd: Regenerate NLMv4 XDR code' by Chuck Lever" and deliberately carries no <code>Fixes:</code> tag, with Oscar explaining that "a Fixes: tag would mislead -stable backporters."</p>
+<p>Chuck's <a href="https://lore.kernel.org/linux-nfs/bdce0570-b584-444b-b78e-a5a2cc5b85ad@app.fastmail.com/">reply to v2</a> opened with a process note — two of the more instructive bits of contributor guidance in this week's digest:</p>
+<blockquote>
+<p>"1. New thread per revision — no In-Reply-To: back to the old version. Post v2 as its own top-level thread; don't reply-to the v1 cover or any v1 patch."</p>
+</blockquote>
+<p>He explained that b4 and patchwork group threads by reference chain, so threading v2 under v1 makes <code>b4 am</code> "pick up stale patches" and lets maintainers who "apply the latest" grab the wrong blobs. Second: use <code>[PATCH v2]</code>, not RESEND — "RESEND is only for re-sending an /unchanged/ series that got no response."</p>
+<h2>The idempotency problem — where the discussion lands</h2>
+<p>The substantive core of Chuck's v2 review was a deeper protocol concern he had not raised in v1: <strong>NLM has no duplicate reply cache</strong>, so every request handler must be idempotent. He walked through <code>nlmsvc_dispatch()</code> and noted that LOCK, UNLOCK, CANCEL, FREE_ALL, and SM_NOTIFY are all built around that invariant — "a replayed request lands on the same state." The refcount design breaks it in both directions:</p>
+<ul>
+<li>
+<p><strong>Replayed SHARE</strong> over UDP (lost reply → client retransmit) increments the bucket a second time, so a single matching UNSHARE leaves <code>s_access_counts[3] = 1</code> and "the entry is never freed" — potentially leaving a stale share reservation that denies later conflicting opens until the host is torn down.</p>
+</li>
+<li>
+<p><strong>Replayed UNSHARE</strong> decrements a still-positive bucket, so a retransmit can free the entry while the client still holds a second open with the same (access, deny) pair:</p>
+<blockquote>
+<p>"Here the client still holds open #2, but its reservation is gone, so a conflicting open from another owner would now be granted. Can a retransmitted UNSHARE release a grant the client still holds?"</p>
+</blockquote>
+</li>
+</ul>
+<p>Chuck proposed an alternative — track the <em>set</em> of held (access, deny) combinations with a 16-bit mask rather than per-value counts:</p>
+<pre><code>SHARE(a, d):   held_mask |=  BIT((a &lt;&lt; 2) | d);
+UNSHARE(a, d): held_mask &amp;= ~BIT((a &lt;&lt; 2) | d);
+</code></pre>
+<p>Setting or clearing a bit is idempotent, so retransmits land on the same state. He acknowledged the tradeoff — two opens with an identical (access, deny) pair collapse to one bit — but argued it stays within RFC 1813, which "does not require that repeated identical SHAREs from one owner survive an equal number of UNSHAREs," and whose duplicate-request discussion (section 4.5) treats non-idempotent requests as something a reply cache must guard, "which lockd does not run for NLM."</p>
+<p>He closed with the verdict on the refcount approach:</p>
+<blockquote>
+<p>"The bottom line is that after more consideration, IMO the reference count approach is not going to work, in particular because NLM still operates on unreliable network transports like UDP. Consider the above direction not as a mandate but as a possible approach that might address the issue you've reported while avoiding introducing non-idempotency."</p>
+</blockquote>
+<h2>Status at end of week</h2>
+<p>The thread ends with Chuck's idempotency critique outstanding — no v3 has been posted, and no ack or fix is in the tree. The underlying bug (SHARE/UNSHARE state corruption for multi-open NLM clients) remains unfixed upstream; the path forward appears to be a mask-based redesign plus Chuck's pending XDR-regeneration patch that closes the remote out-of-bounds write.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260630093820.2162344-1-oscarou@synology.com/">2026-06-30 Oscar Ou <a href="mailto:oscarou@synology.com">oscarou@synology.com</a> — [PATCH] lockd: refcount NLM_SHARE access/deny modes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/d8c309bb-37f8-4465-8abf-ba34db499ae1@app.fastmail.com/">2026-06-30 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH] lockd: refcount NLM_SHARE access/deny modes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260701052645.2213483-1-oscarou@synology.com/">2026-07-01 Oscar Ou <a href="mailto:oscarou@synology.com">oscarou@synology.com</a> — [PATCH v2] lockd: refcount NLM_SHARE access/deny modes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/bdce0570-b584-444b-b78e-a5a2cc5b85ad@app.fastmail.com/">2026-07-01 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v2] lockd: refcount NLM_SHARE access/deny modes</a></li>
+</ul>
+  </main>
+</body>
+</html>

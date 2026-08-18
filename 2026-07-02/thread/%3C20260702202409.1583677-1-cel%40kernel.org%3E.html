@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd stable backports: delegated-attribute mtime/ctime on COPY/CLONE and layout stid leak fix</title>
+  <meta name="description" content="Type: Bug fixes (three separate regressions, all targeted for the 6.18.y stable tree) Participants: Chuck Lever (submitter), Olga Kornievskaia (author of patches 1–2), Chris Mason (author of patch 3), Jeff Layton (reviewer), Sasha Levin…">
+  <meta property="og:title" content="nfsd stable backports: delegated-attribute mtime/ctime on COPY/CLONE and layout stid leak fix">
+  <meta property="og:description" content="Type: Bug fixes (three separate regressions, all targeted for the 6.18.y stable tree) Participants: Chuck Lever (submitter), Olga Kornievskaia (author of patches 1–2), Chris Mason (author of patch 3), Jeff Layton (reviewer), Sasha Levin…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-02T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd stable backports: delegated-attribute mtime/ctime on COPY/CLONE and layout stid leak fix">
+  <meta name="twitter:description" content="Type: Bug fixes (three separate regressions, all targeted for the 6.18.y stable tree) Participants: Chuck Lever (submitter), Olga Kornievskaia (author of patches 1–2), Chris Mason (author of patch 3), Jeff Layton (reviewer), Sasha Levin…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-02</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd stable backports: delegated-attribute mtime/ctime on COPY/CLONE and layout stid leak fix</h1>
+<h2>Summary</h2>
+<h2>nfsd 6.18.y Stable Backport Series: Delegated-Attribute Timestamps and a pNFS Layout Stateid Leak</h2>
+<p><strong>Type:</strong> Bug fixes (three separate regressions, all targeted for the 6.18.y stable tree)
+<strong>Participants:</strong> Chuck Lever (submitter), Olga Kornievskaia (author of patches 1–2), Chris Mason (author of patch 3), Jeff Layton (reviewer), Sasha Levin (stable maintainer)</p>
+<hr />
+<h3>Overview</h3>
+<p>On Thursday, July 2, 2026, NFS server maintainer Chuck Lever posted a three-patch series targeting the <strong>6.18.y stable tree</strong> to fix two distinct classes of bugs in <code>nfsd</code>. The first two patches address incorrect mtime/ctime handling on the COPY and CLONE operations when delegated attributes are outstanding; the third fixes a use-after-free / dangling-pointer bug in the pNFS layout stateid teardown path. All three were queued for stable within hours.</p>
+<hr />
+<h3>Patches 1 &amp; 2: mtime/ctime Updates on CLONE and COPY with Delegated Attributes</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260702202409.1583677-1-cel@kernel.org/">The first patch</a> and <a href="https://lore.kernel.org/linux-nfs/20260702202409.1583677-2-cel@kernel.org/">its companion for COPY</a> are authored by Olga Kornievskaia (Red Hat) and backport upstream commits <code>2863bac7f4</code> and <code>4183cf383b</code> respectively.</p>
+<p><strong>The bug:</strong> When a client opens a file with delegated attributes, the server opens it with the <code>NOCMTIME</code> flag so that modifying operations do not update mtime/ctime — this prevents the server's attribute view from drifting out of sync with the client's delegated copy. However, COPY and CLONE are special: they modify the <em>destination</em> file on the server side without the client holding a delegation on it. As Lever's cover description explains:</p>
+<blockquote>
+<p>"When delegated attributes are given on open, the file is opened with NOCMTIME and modifying operations do not update mtime/ctime as to not get out-of-sync with the client's delegated view. However, for COPY operation, the server should update its view of mtime/ctime and reflect that in any GETATTR queries."</p>
+</blockquote>
+<p>Both patches carry <code>Fixes: e5e9b24ab8fa ("nfsd: freeze c/mtime updates with outstanding WRITE_ATTRS delegation")</code>, identifying the original commit that introduced the over-broad suppression.</p>
+<p><strong>Technical detail (patch 1/3, CLONE):</strong> The fix touches <code>fs/nfsd/nfs4proc.c</code>, <code>fs/nfsd/nfs4state.c</code>, and <code>state.h</code> (33 insertions, 15 deletions). It ensures the CLONE path explicitly updates mtime/ctime on the destination file's nfsd_file even when the source is opened with NOCMTIME. Lever noted in a bracketed annotation:</p>
+<blockquote>
+<p>"[ cel: 9be4b7e74eb7 and 3daab3112f03 are missing from linux-6.18.y ]"</p>
+</blockquote>
+<p>indicating that two prerequisite commits had not been picked up by the stable tree, requiring this patch to be self-contained for 6.18.y.</p>
+<p><strong>Technical detail (patch 2/3, COPY):</strong> A smaller change (11 insertions, 1 deletion) in <code>fs/nfsd/nfs4proc.c</code> and <code>fs/nfsd/xdr4.h</code>, applying the same mtime/ctime correction to the NFSv4.2 COPY operation path.</p>
+<hr />
+<h3>Patch 3: Release Layout stid on setlease Failure (Use-After-Free Fix)</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260702202409.1583677-3-cel@kernel.org/">The third patch</a> is authored by Chris Mason (Meta), reviewed by Jeff Layton, and backports upstream commit <code>30d55c8aab</code>. This is the most technically involved fix in the series.</p>
+<p><strong>The bug:</strong> A dangling-pointer / use-after-free in the pNFS layout stateid error path. Lever's description walks through the call chain:</p>
+<blockquote>
+<p>"nfs4_alloc_stid() publishes the new stid into cl-&gt;cl_stateids via idr_alloc_cyclic() under cl_lock before returning to nfsd4_alloc_layout_stateid(). When nfsd4_layout_setlease() then fails, the error path frees the layout stateid directly with kmem_cache_free() without ever calling idr_remove(), leaving the IDR slot pointing at freed slab memory. Any subsequent IDR walker (states_show, client teardown) dereferences the dangling pointer."</p>
+</blockquote>
+<p>The fix replaces the ad-hoc <code>kmem_cache_free()</code> cleanup with a proper <code>nfs4_put_stid(stp)</code> call, which correctly removes the IDR slot under <code>cl_lock</code> and dispatches the full stateid destructor.</p>
+<p><strong>A secondary issue:</strong> The standard teardown path (<code>nfsd4_free_layout_stateid</code>) calls <code>delayed_work_pending(&amp;ls-&gt;ls_fence_work)</code>, but on 6.18.y the <code>INIT_DELAYED_WORK()</code> for that work struct had not yet been hoisted above the <code>setlease</code> call (that hoist was part of a separate upstream commit not present in 6.18.y). Lever noted:</p>
+<blockquote>
+<p>"[ cel: drop fence_work init hoist absent from 6.18.y ]"</p>
+</blockquote>
+<p>so the stable backport is trimmed to just the <code>nfs4_put_stid()</code> replacement (net change: 1 insertion, 3 deletions in <code>fs/nfsd/nfs4layouts.c</code>).</p>
+<p><strong>AI-assisted development:</strong> Notably, the patch carries an unusual tag — <code>Assisted-by: kres (claude-opus-4-7)</code> — indicating AI tooling was used in developing or verifying the fix. This is one of the first instances of such a tag appearing on a mainline/stable NFS server patch.</p>
+<p><strong>Author correction:</strong> Twenty minutes after posting, Lever sent <a href="https://lore.kernel.org/linux-nfs/920c6ce7-fbb5-4651-afb6-1c025add5716@app.fastmail.com/">a brief follow-up</a> clarifying:</p>
+<blockquote>
+<p>"Please note: The correct Author for this patch is 'Chris Mason <a href="mailto:clm@meta.com">clm@meta.com</a>'"</p>
+</blockquote>
+<p>This was a minor metadata fix to ensure proper attribution in the stable tree.</p>
+<hr />
+<h3>Resolution</h3>
+<p>Stable maintainer Sasha Levin confirmed acceptance <a href="https://lore.kernel.org/linux-nfs/2026070315-stable-reply-0006@kernel.org/">the following morning</a>:</p>
+<blockquote>
+<p>"Queued the series for 6.18.y, with the author of 3/3 fixed up to Chris Mason per your follow-up. Thanks!"</p>
+</blockquote>
+<p>All three patches are now queued for the next 6.18.y stable release.</p>
+<hr />
+<h3>Significance for NFS Server Development</h3>
+<ul>
+<li><strong>Delegated-attribute correctness:</strong> The COPY/CLONE mtime/ctime fixes close a gap where server-side file modifications could leave stale timestamps visible to other clients, violating POSIX expectations around attribute coherence.</li>
+<li><strong>pNFS robustness:</strong> The layout stid leak fix eliminates a potential kernel crash (dangling pointer dereference in <code>states_show</code> or client teardown) that could be triggered by a failed lease acquisition on a pNFS layout — a rare but serious reliability bug.</li>
+<li><strong>Stable-tree hygiene:</strong> Lever's bracketed annotations documenting which upstream commits are missing from 6.18.y exemplify careful backport engineering, ensuring the stable patches remain self-contained and correct in isolation.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260702202409.1583677-2-cel@kernel.org/">2026-07-02 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 6.18.y 2/3] nfsd: update mtime/ctime on COPY in presence of delegated attributes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260702202409.1583677-1-cel@kernel.org/">2026-07-02 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 6.18.y 1/3] nfsd: update mtime/ctime on CLONE in presense of delegated attributes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260702202409.1583677-3-cel@kernel.org/">2026-07-02 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 6.18.y 3/3] nfsd: release layout stid on setlease failure</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/920c6ce7-fbb5-4651-afb6-1c025add5716@app.fastmail.com/">2026-07-02 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 6.18.y 3/3] nfsd: release layout stid on setlease failure</a></li>
+</ul>
+  </main>
+</body>
+</html>

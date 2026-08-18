@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS Direct I/O folio debate: Hellwig clarifies slab/vmalloc exposure for direct-I/O user pinning</title>
+  <meta name="description" content="Type: New feature / architectural refactor of the NFS client direct-I/O path (not a protocol change), with two embedded bug fixes. This week&#39;s single message is Christoph Hellwig&#39;s long-overdue reply to the folio-safety question that has…">
+  <meta property="og:title" content="NFS Direct I/O folio debate: Hellwig clarifies slab/vmalloc exposure for direct-I/O user pinning">
+  <meta property="og:description" content="Type: New feature / architectural refactor of the NFS client direct-I/O path (not a protocol change), with two embedded bug fixes. This week&#39;s single message is Christoph Hellwig&#39;s long-overdue reply to the folio-safety question that has…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-02T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS Direct I/O folio debate: Hellwig clarifies slab/vmalloc exposure for direct-I/O user pinning">
+  <meta name="twitter:description" content="Type: New feature / architectural refactor of the NFS client direct-I/O path (not a protocol change), with two embedded bug fixes. This week&#39;s single message is Christoph Hellwig&#39;s long-overdue reply to the folio-safety question that has…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-02</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS Direct I/O folio debate: Hellwig clarifies slab/vmalloc exposure for direct-I/O user pinning</h1>
+<h2>Summary</h2>
+<h1>NFS Direct I/O Folio Debate — Hellwig's Clarification on Slab/Vmalloc Exposure</h1>
+<p><strong>Type:</strong> New feature / architectural refactor of the NFS <em>client</em> direct-I/O path (not a protocol change), with two embedded bug fixes. This week's single message is Christoph Hellwig's long-overdue reply to the folio-safety question that has been the thread's central open item for over a week.</p>
+<h2>Bridge from prior weeks</h2>
+<p>The thread traces back to <strong>[PATCH v2 0/7] "nfs: Modernize Direct I/O path"](https://lore.kernel.org/linux-nfs/20260616134000.2733403-1-praan@google.com/)</strong> posted by Pranjal Shrivastava (Google) on June 16, a seven-patch series migrating NFS <code>O_DIRECT</code> from the legacy <code>iov_iter_get_pages_alloc2()</code> API to the modern <code>iov_iter_extract_pages()</code> API and making requests folio-based. The series is groundwork for PCI Peer-to-Peer DMA (P2PDMA) and fixes two real bugs: a data-corruption bug in <code>nfs_direct_extract_pages()</code> (incorrect intra-page offset) and an early-unpin / bytes-accounting defect in the direct read/write loop.</p>
+<p>The central technical dispute, which opened on June 16–18, concerns <strong>patch 6/7</strong> ("Optimize direct I/O to use folios for requests"): whether it is safe to assume that every page returned by <code>iov_iter_extract_pages()</code> belongs to a valid folio and therefore <code>page_folio()</code> will work. Trond Myklebust, Christoph Hellwig, and Matthew Wilcox pushed back, noting the MM invariant "every page is part of a folio" has important exceptions (slab, vmalloc, iomem). Last week (June 19), Pranjal <a href="https://lore.kernel.org/linux-nfs/ajU2xJ1BAqqtog8T@google.com//">accepted the critique</a> but raised a pointed counter-observation: the block layer's own <code>iov_iter_extract_bvecs()</code> path also calls <code>page_folio()</code> via <code>get_contig_folio_len()</code> without additional slab/vmalloc checks, and he asked whether the iov_iter library should export a safe helper for all filesystems.</p>
+<h2>This week: Hellwig's reply (2026-06-26)</h2>
+<p>After noting he had been slow to respond — &gt; "[sorry, dropped the ball a bit on this due to overload]" — Christoph Hellwig <a href="https://lore.kernel.org/linux-nfs/aj4iiD5C_yyLeb3U@infradead.org//">replied</a> directly to the question Pranjal posed last week about whether the bvec extractor shares the same slab/vmalloc risk.</p>
+<p>Hellwig's answer is nuanced. He concedes that in the general case, Wilcox's concern is valid:</p>
+<blockquote>
+<p>"True." (referring to Wilcox's point that treating slab pages as folios would trip assertions)</p>
+</blockquote>
+<p>But he immediately narrows the scope of the problem for NFS specifically:</p>
+<blockquote>
+<p>"But also not relevant for direct I/O user pinning. If we stopped having valid folios for anything mapped into userspace, iov_iter_extract_bvecs would run into problems, and we had the discussion before that at least right now it would be hard to fix."</p>
+</blockquote>
+<p>This is a significant clarification: for the <em>specific use case</em> of NFS direct I/O — where user-space pages are pinned via GUP — the slab/vmalloc concern does not apply. The dangerous cases (slab, vmalloc) are kernel-internal memory types that would not appear in a user-pinned <code>iov_iter</code> for direct I/O.</p>
+<p>Hellwig then adds a forward-looking caveat about kvec iterators:</p>
+<blockquote>
+<p>"Also if iov_iter_extract_bvecs was used on kvec or bvec iters we could run into the slab problem. The block usage currently makes sure bvec iters are not handed to iov_iter_extract_bvecs, but there is no such thing for kvec vectors, although no one is using them for direct I/O right now. Not that I'd want to rely on that in the long run."</p>
+</blockquote>
+<p>This last sentence — "Not that I'd want to rely on that in the long run" — is telling. Hellwig is acknowledging a latent fragility in the broader iov_iter/block layer architecture: the safety of <code>iov_iter_extract_bvecs()</code> for kvec iterators currently depends on an informal convention (no one uses them for direct I/O) rather than an enforced invariant. This validates Pranjal's earlier question about whether the abstraction should be made more robust at the library level.</p>
+<h2>Assessment and where things stand</h2>
+<p>Hellwig's reply effectively <strong>de-escalates the immediate concern</strong> for patch 6: the folio-grouping logic in NFS direct I/O is safe for the user-pinning path it actually handles, because GUP-pinned user pages are always valid folios. The slab/vmalloc edge cases that Wilcox flagged are not reachable through the direct-I/O user pinning mechanism.</p>
+<p>However, Hellwig's caveat about kvec iterators keeps the broader architectural question alive. The discussion now has two distinct threads:</p>
+<ol>
+<li><strong>Patch 6 as written is likely acceptable</strong> — the folio assumption holds for user-pinned pages in direct I/O.</li>
+<li><strong>The iov_iter/block layer abstraction has a latent gap</strong> for non-user-memory iterators (kvec), which Hellwig does not want to rely on long-term but does not propose fixing in this series.</li>
+</ol>
+<p>No new patches have been posted this week, and no merge decision has been recorded. The thread remains open, with the expectation that Pranjal will post a v3 incorporating the CC-list fixes, full xfstests results, and potentially minor adjustments to patch 6's comments or structure based on this clarification.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/aj4iiD5C_yyLeb3U@infradead.org/">2026-06-26 Christoph Hellwig <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [PATCH v2 6/7] nfs: Optimize direct I/O to use folios for requests</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd 6.6.y stable backports: write-verifier rotation on deferred writeback errors, layout stid leak on setlease failure</title>
+  <meta name="description" content="This is a compact two-patch series posted by Chuck Lever on 2026-07-02 for the 6.6.y stable tree, both tagged Cc: stable@vger.kernel.org. The thread contains no review discussion within the window — it is a backport submission, with Sasha…">
+  <meta property="og:title" content="nfsd 6.6.y stable backports: write-verifier rotation on deferred writeback errors, layout stid leak on setlease failure">
+  <meta property="og:description" content="This is a compact two-patch series posted by Chuck Lever on 2026-07-02 for the 6.6.y stable tree, both tagged Cc: stable@vger.kernel.org. The thread contains no review discussion within the window — it is a backport submission, with Sasha…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-02T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd 6.6.y stable backports: write-verifier rotation on deferred writeback errors, layout stid leak on setlease failure">
+  <meta name="twitter:description" content="This is a compact two-patch series posted by Chuck Lever on 2026-07-02 for the 6.6.y stable tree, both tagged Cc: stable@vger.kernel.org. The thread contains no review discussion within the window — it is a backport submission, with Sasha…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-02</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd 6.6.y stable backports: write-verifier rotation on deferred writeback errors, layout stid leak on setlease failure</h1>
+<h2>Summary</h2>
+<h1>nfsd 6.6.y stable backports: write-verifier rotation and layout-stid teardown</h1>
+<h2>This week's activity (2026-06-26 → 2026-07-03)</h2>
+<p>This is a compact two-patch series posted by Chuck Lever on 2026-07-02 for the <strong>6.6.y stable tree</strong>, both tagged <code>Cc: stable@vger.kernel.org</code>. The thread contains no review discussion within the window — it is a backport submission, with Sasha Levin's standard stable-queue acknowledgement landing just outside the window on 2026-07-04. Both patches fix server-side nfsd bugs that have direct, observable consequences for NFS clients: one silently violates the UNSTABLE+COMMIT durability contract; the other leaves a dangling pointer in the per-client stateid IDR after a pNFS layout setlease failure.</p>
+<h2>Patch 1/2 — release layout stid on setlease failure</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260702214135.533354-1-cel@kernel.org/">Posted by Chuck Lever</a>, authored by <strong>Chris Mason (Meta)</strong> and reviewed by Jeff Layton. This is a <strong>bug fix</strong> for a use-after-free / dangling-IDR-slot in the pNFS layout stateid path, backported from upstream commit <code>30d55c8aabb2</code> (<code>Fixes: c5c707f96fc9 "nfsd: implement pNFS layout recalls"</code>).</p>
+<p>The core defect, as described in the patch body:</p>
+<blockquote>
+<p>"nfs4_alloc_stid() publishes the new stid into cl-&gt;cl_stateids via idr_alloc_cyclic() under cl_lock before returning to nfsd4_alloc_layout_stateid(). When nfsd4_layout_setlease() then fails, the error path frees the layout stateid directly with kmem_cache_free() without ever calling idr_remove(), leaving the IDR slot pointing at freed slab memory. Any subsequent IDR walker (states_show, client teardown) dereferences the dangling pointer."</p>
+</blockquote>
+<p>The correct teardown for an IDR-published stid is <code>nfs4_put_stid()</code>, which removes the IDR slot under <code>cl_lock</code> and dispatches <code>sc_free</code> (<code>nfsd4_free_layout_stateid</code>) to release <code>ls-&gt;ls_file</code> via <code>nfsd4_close_layout()</code>. A second, subtler issue blocked that switch:</p>
+<blockquote>
+<p>"nfsd4_free_layout_stateid() unconditionally inspects ls-&gt;ls_fence_work via delayed_work_pending() under ls_lock, but INIT_DELAYED_WORK(&amp;ls-&gt;ls_fence_work, ...) currently runs only after the setlease call. On the setlease-failure path the destructor would touch an uninitialized delayed_work."</p>
+</blockquote>
+<p>The fix hoists the <code>ls_fenced</code> / <code>ls_fence_delay</code> / <code>INIT_DELAYED_WORK</code> initialization above the <code>nfsd4_layout_setlease()</code> call and replaces the manual <code>nfsd_file_put + put_nfs4_file + kmem_cache_free</code> cleanup with a single <code>nfs4_put_stid(stp)</code>. Chuck's 6.6.y adaptation note is worth flagging:</p>
+<blockquote>
+<p>"[ cel: no ls_fence_work in 6.6.y; dropped INIT_DELAYED_WORK hunk ]"</p>
+</blockquote>
+<p>so the backport is a minimal 1-line net change in <code>fs/nfsd/nfs4layouts.c</code> (1 insertion, 3 deletions) — just the switch to <code>nfs4_put_stid()</code>.</p>
+<p><strong>Client impact:</strong> pNFS clients that exercise layout recalls / setlease failures against a 6.6.y server would otherwise hit a dangling-pointer dereference in <code>states_show</code> or at client teardown — a potential kernel oops on the <em>server</em> side, but one that can also surface as spurious NFSv4 stateid errors to clients mid-session.</p>
+<h2>Patch 2/2 — reset write verifier on deferred writeback errors</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260702214135.533354-2-cel@kernel.org/">Posted by Chuck Lever</a>, authored by <strong>Jeff Layton</strong> and <strong>reported by Chris Mason (Meta)</strong>. This is a <strong>bug fix</strong> for a silent data-loss path in the NFSv3/v4 UNSTABLE+COMMIT durability contract, backported from upstream commit <code>2090b05803fa</code> (<code>Fixes: 555dbf1a9aac "nfsd: Replace use of rwsem with errseq_t"</code>).</p>
+<p>The defect:</p>
+<blockquote>
+<p>"nfsd_vfs_write() and nfsd_commit() both call filemap_check_wb_err() to detect deferred writeback errors, but neither rotates the server's write verifier (nn-&gt;writeverf) when this check fails. Every other durable-storage-failure path in these functions calls commit_reset_write_verifier() before returning an error."</p>
+</blockquote>
+<p>The consequence is precisely the kind of silent data corruption that makes NFS durability bugs so serious:</p>
+<blockquote>
+<p>"The missing rotation means clients holding UNSTABLE write data under the current verifier will COMMIT, receive the unchanged verifier back, and conclude their data is durable — silently dropping data that failed writeback. This violates the UNSTABLE+COMMIT durability contract (RFC 1813 §3.3.7, RFC 8881 §18.32)."</p>
+</blockquote>
+<p>The fix adds <code>commit_reset_write_verifier()</code> calls at both <code>filemap_check_wb_err()</code> error sites, matching the pattern already used by adjacent error paths in the same functions. The helper internally filters <code>-EAGAIN</code> and <code>-ESTALE</code>, so the calls are unconditionally safe. Chuck's 6.6.y adaptation note:</p>
+<blockquote>
+<p>"[ cel: 6.6.y predates the commit_reset_write_verifier() helper (v6.7); open-coded nfsd_reset_write_verifier() and the reset tracepoint at both sites, matching the other reset paths in these functions ]"</p>
+</blockquote>
+<p>so the backport is a small open-coded change in <code>fs/nfsd/vfs.c</code> (8 insertions, 1 deletion).</p>
+<p><strong>Client impact:</strong> This is the more consequential of the two for NFS clients. Any client that issues UNSTABLE writes and then COMMITs — the standard pattern for buffered NFSv3 and NFSv4.0/4.1 data writes — against a 6.6.y server whose backing storage has a deferred writeback error would previously receive an unchanged verifier, treat the data as durable, and silently lose it. After this fix, the verifier rotates on the failure path, so the client's subsequent COMMIT returns a different verifier and the client correctly detects that the data was <em>not</em> durably committed (per RFC 1813 §3.3.7 / RFC 8881 §18.32), allowing it to retry or surface the error to userspace.</p>
+<h2>Evolution of the discussion</h2>
+<p>The thread is a pure backport submission — no in-window review, debate, or pushback. The two patches were posted together at 21:41 UTC on 2026-07-02 as a single <code>PATCH 6.6.y</code> series. Sasha Levin's standard stable-queue acknowledgement for the layout-stid patch landed just outside this week's window (2026-07-04, <a href="https://lore.kernel.org/linux-nfs/2026070315-stable-reply-0008@kernel.org/">Re: [PATCH 6.6.y 1/2] nfsd: release layout stid on setlease failure</a>), indicating the series was accepted into the stable queue without modification.</p>
+<p>Notable context for readers tracking this week's broader nfsd activity: both patches carry <code>Assisted-by: kres (claude-opus-4-6 / claude-opus-4-7)</code> tags, and both are Meta-reported/originated (Chris Mason reported the verifier bug; Chris Mason authored the layout-stid fix). This is part of a broader pattern this week of nfsd stability work landing in stable trees alongside the client-side lockd GRANTED_MSG fix summarized separately.</p>
+<h2>Final conclusions</h2>
+<ul>
+<li><strong>Type:</strong> Two independent <strong>bug fixes</strong> for nfsd, backported to 6.6.y.</li>
+<li><strong>Patch 1 (layout stid):</strong> Use-after-free / dangling IDR slot on <code>nfsd4_layout_setlease()</code> failure; fixed by switching the error path to <code>nfs4_put_stid()</code>. Minimal 6.6.y delta because <code>ls_fence_work</code> does not exist in that tree.</li>
+<li><strong>Patch 2 (write verifier):</strong> Silent data loss on deferred writeback errors during UNSTABLE+COMMIT; fixed by rotating <code>nn-&gt;writeverf</code> at both <code>filemap_check_wb_err()</code> error sites, matching adjacent error paths. Open-coded for 6.6.y since the v6.7 helper is not present.</li>
+<li><strong>Status:</strong> Posted to stable; Sasha Levin's queue acknowledgement received (just outside this week's window). No in-window review discussion.</li>
+<li><strong>Client impact:</strong> Patch 2 is the higher-severity fix for NFS clients — it closes a silent data-loss path that violates the RFC-mandated UNSTABLE+COMMIT durability contract. Patch 1 prevents server-side crashes / spurious stateid errors on pNFS layout setlease failures.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260702214135.533354-1-cel@kernel.org/">2026-07-02 Chuck Lever — [PATCH 6.6.y 1/2] nfsd: release layout stid on setlease failure</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260702214135.533354-2-cel@kernel.org/">2026-07-02 Chuck Lever — [PATCH 6.6.y 2/2] nfsd: reset write verifier on deferred writeback errors</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260702214135.533354-2-cel@kernel.org/">2026-07-02 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 6.6.y 2/2] nfsd: reset write verifier on deferred writeback errors</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260702214135.533354-1-cel@kernel.org/">2026-07-02 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 6.6.y 1/2] nfsd: release layout stid on setlease failure</a></li>
+</ul>
+  </main>
+</body>
+</html>

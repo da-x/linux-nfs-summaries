@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RFC: Injecting PID namespace into NFS machinename for multi-tenant debugging</title>
+  <meta name="description" content="Thread: [PATCH 0/1] inject process namespace into machinename field Week ending: 2026-07-02 Status: RFC / discussion-trigger — not intended for mainline merge Type: New feature (debuggability improvement to the NFS/sunrpc client)">
+  <meta property="og:title" content="RFC: Injecting PID namespace into NFS machinename for multi-tenant debugging">
+  <meta property="og:description" content="Thread: [PATCH 0/1] inject process namespace into machinename field Week ending: 2026-07-02 Status: RFC / discussion-trigger — not intended for mainline merge Type: New feature (debuggability improvement to the NFS/sunrpc client)">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-02T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="RFC: Injecting PID namespace into NFS machinename for multi-tenant debugging">
+  <meta name="twitter:description" content="Thread: [PATCH 0/1] inject process namespace into machinename field Week ending: 2026-07-02 Status: RFC / discussion-trigger — not intended for mainline merge Type: New feature (debuggability improvement to the NFS/sunrpc client)">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-02</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>RFC: Injecting PID namespace into NFS machinename for multi-tenant debugging</h1>
+<h2>Summary</h2>
+<h1>RFC: Injecting PID Namespace into NFS machinename Field</h1>
+<p><strong>Thread:</strong> [PATCH 0/1] inject process namespace into machinename field<br />
+<strong>Week ending:</strong> 2026-07-02<br />
+<strong>Status:</strong> RFC / discussion-trigger — not intended for mainline merge<br />
+<strong>Type:</strong> New feature (debuggability improvement to the NFS/sunrpc client)</p>
+<h2>Overview</h2>
+<p>DES's Tigran Mkrtchyan posted a single-patch RFC on 2026-06-26 proposing that the Linux NFS client embed the caller's PID namespace identifier into the <code>machinename</code> field of the RPC auth-Unix credential, so that NFS servers can distinguish requests originating from different containers or batch-system jobs running as the same user. The patch touches only <code>net/sunrpc/auth_unix.c</code> (+25/−2).</p>
+<h2>Motivation and Problem Statement</h2>
+<p>Tigran framed the problem clearly in his <a href="https://lore.kernel.org/linux-nfs/20260626125216.1467845-1-tigran.mkrtchyan@desy.de/">cover letter</a>:</p>
+<blockquote>
+<p>"On large shared machines often multiple jobs of a same user run in parallel. For debugging, it's usually impossible to identify requests coming from different processes."</p>
+</blockquote>
+<p>He noted that batch schedulers such as HTCondor and SLURM launch each job inside its own PID namespace, so the namespace inode number is a natural discriminator. He was equally explicit about the patch's status:</p>
+<blockquote>
+<p>"This path don't intended to land into the kernel, but more trigger a discussion and collect some ideas."</p>
+</blockquote>
+<h2>The Patch (Technical Detail)</h2>
+<p>The <a href="https://lore.kernel.org/linux-nfs/20260626125216.1467845-2-tigran.mkrtchyan@desy.de/">RFC patch</a> modifies the sunrpc auth-Unix credential construction path in <code>net/sunrpc/auth_unix.c</code>. The core logic:</p>
+<ul>
+<li>At credential-setup time, check whether the current process is in a non-initial PID namespace (<code>pid_ns != &amp;init_pid_ns</code>).</li>
+<li>If so, format the nodename as <code>&lt;pid_ns_inum&gt;@&lt;current-hostname&gt;</code> using <code>snprintf</code> into a local buffer (<code>ns_aware_nodename</code>), and use that prefixed string as the machinename sent to the server.</li>
+<li>If the process is in the init namespace, fall through to the existing behavior (plain hostname).</li>
+</ul>
+<p>The diff is small (25 insertions, 2 deletions) and self-contained within the credential path.</p>
+<h2>Review: Jeff Layton's Concerns</h2>
+<p>NFS maintainer Jeff Layton <a href="https://lore.kernel.org/linux-nfs/7290d0262d782c0c3b26b8167975face1ae91053.camel@kernel.org/">replied</a> within roughly an hour, flagging a correctness concern by pointing to automated review comments from Sashiko:</p>
+<blockquote>
+<p>"FYI, Sashiko has some comments on this that seem valid: … Fetching the user namespace ID might not be correct in some async ops."</p>
+</blockquote>
+<p>Layton quoted the key patch lines — the <code>init_pid_ns</code> guard and the <code>snprintf</code> into <code>ns_aware_nodename</code> — to anchor his concern. The issue he raised is a classic sunrpc threading hazard: the auth-Unix credential's machinename is computed once at RPC client setup, but the process context (and thus the "current" PID namespace) may differ from the context in which subsequent async RPCs are actually executed. If the namespace is captured at the wrong point, the machinename could be stale or wrong for operations issued from a different task/namespace.</p>
+<h2>Tigran's Response and Thread Close</h2>
+<p>Tigran <a href="https://lore.kernel.org/linux-nfs/1951524341.2815907.1782483707418.JavaMail.zimbra@desy.de/">replied</a> the same day (14:21 UTC, ~17 minutes after Layton's note). His reply was brief and acknowledged the feedback; no further patch revision or extended technical debate followed within this week's window.</p>
+<h2>Assessment</h2>
+<table><thead><tr><th>Aspect</th><th>Detail</th></tr></thead><tbody>
+<tr><td><strong>Category</strong></td><td>New feature (client-side debuggability), explicitly RFC</td></tr>
+<tr><td><strong>NFS client relevance</strong></td><td>Modifies <code>net/sunrpc/auth_unix.c</code> — the credential/nodename path used by all NFSv3/v4 clients over TCP/UDP</td></tr>
+<tr><td><strong>Bug fix?</strong></td><td>No; it is a proposed enhancement, not a regression fix</td></tr>
+<tr><td><strong>Protocol impact</strong></td><td>None to the wire protocol itself; only changes the <em>content</em> of the existing <code>machinename</code> string in auth_unix credentials</td></tr>
+<tr><td><strong>Mainline prospects</strong></td><td>Low in the near term — author stated it was not intended to land; the async-namespace correctness concern raised by Layton/Sashiko would need resolution before any serious submission</td></tr>
+<tr><td><strong>Open questions</strong></td><td>Whether the namespace should be captured at credential creation vs. per-RPC; whether user-ns vs. pid-ns is the right identifier; how servers should parse the <code>inum@host</code> format</td></tr>
+</tbody></table>
+<h2>Key Takeaways for NFS Client Developers</h2>
+<ol>
+<li><strong>The machinename field in auth_unix is a de-facto extension point.</strong> It is a free-form string that servers already log and display, making it a low-risk channel for embedding extra client context (namespace ID, cgroup label, job name) without any protocol change.</li>
+<li><strong>Async credential staleness is a real constraint.</strong> Any per-process metadata injected at RPC-client setup time must be audited against the fact that sunrpc work queues and async callbacks may execute in a different task context — exactly the concern Layton surfaced via Sashiko's review.</li>
+<li><strong>The discussion remains open.</strong> No consensus was reached this week; Tigran acknowledged the feedback but no v2 patch or design refinement has been posted as of 2026-07-02.</li>
+</ol>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260626125216.1467845-1-tigran.mkrtchyan@desy.de/">2026-06-26 Tigran Mkrtchyan <a href="mailto:tigran.mkrtchyan@desy.de">tigran.mkrtchyan@desy.de</a> — [PATCH 0/1] inject process namespace into machinename field</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260626125216.1467845-2-tigran.mkrtchyan@desy.de/">2026-06-26 Tigran Mkrtchyan <a href="mailto:tigran.mkrtchyan@desy.de">tigran.mkrtchyan@desy.de</a> — [PATCH 1/1] [RFC] sunrpc: inject process namespace into machinename field</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/7290d0262d782c0c3b26b8167975face1ae91053.camel@kernel.org/">2026-06-26 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 1/1] [RFC] sunrpc: inject process namespace into machinename field</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/1951524341.2815907.1782483707418.JavaMail.zimbra@desy.de/">2026-06-26 "Mkrtchyan, Tigran" <a href="mailto:tigran.mkrtchyan@desy.de">tigran.mkrtchyan@desy.de</a> — Re: [PATCH 1/1] [RFC] sunrpc: inject process namespace into machinename field</a></li>
+</ul>
+  </main>
+</body>
+</html>

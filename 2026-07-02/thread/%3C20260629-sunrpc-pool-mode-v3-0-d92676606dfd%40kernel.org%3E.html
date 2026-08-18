@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>sunrpc pool_mode v3: starvation fix lands, RCU race surfaces a deeper design debate</title>
+  <meta name="description" content="Type: Server-side bug fix + cleanup in the sunrpc (NFS server) layer. This is not an NFS client feature or protocol change — it concerns how nfsd schedules RPC work across NUMA pools on the server. The week&#39;s most important artifact is a…">
+  <meta property="og:title" content="sunrpc pool_mode v3: starvation fix lands, RCU race surfaces a deeper design debate">
+  <meta property="og:description" content="Type: Server-side bug fix + cleanup in the sunrpc (NFS server) layer. This is not an NFS client feature or protocol change — it concerns how nfsd schedules RPC work across NUMA pools on the server. The week&#39;s most important artifact is a…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-02T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="sunrpc pool_mode v3: starvation fix lands, RCU race surfaces a deeper design debate">
+  <meta name="twitter:description" content="Type: Server-side bug fix + cleanup in the sunrpc (NFS server) layer. This is not an NFS client feature or protocol change — it concerns how nfsd schedules RPC work across NUMA pools on the server. The week&#39;s most important artifact is a…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-02</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>sunrpc pool_mode v3: starvation fix lands, RCU race surfaces a deeper design debate</h1>
+<h2>Summary</h2>
+<h1>sunrpc pool_mode v3: the empty-pool starvation fix ships, and an RCU race sparks a design fight</h1>
+<p><strong>Type:</strong> Server-side bug fix + cleanup in the sunrpc (NFS server) layer. This is <em>not</em> an NFS client feature or protocol change — it concerns how <code>nfsd</code> schedules RPC work across NUMA pools on the server. The week's most important artifact is a genuine <strong>bug fix</strong>: a latent request-starvation bug that becomes reachable once the "global" pool escape hatch is removed, plus a newly-surfaced <strong>use-after-free / NULL-deref race</strong> in the lockless pool-map reader.</p>
+<h2>Bridging prior weeks (brief)</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260625-sunrpc-pool-mode-v2-1-4f512b6e1ee8@kernel.org/">Jeff Layton posted v2 on June 25</a>, and last week's thread was dominated by Chuck Lever's warning that with <code>nrservs &lt; number of NUMA nodes</code>, trailing pools end up with zero threads and the enqueue path has no fallback — a connection landing on an empty pool would hang indefinitely. NeilBrown and Layton converged on a "belt-and-braces" plan: guarantee ≥1 thread per CPU-bearing node during auto-distribution, honor explicit userland per-pool arrays as-is, and add a queueing-path fallback to a populated pool. That plan is exactly what v3 delivers.</p>
+<h2>This week's activity (June 29 – July 1)</h2>
+<h3>The v3 series lands (June 29)</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260629-sunrpc-pool-mode-v3-0-d92676606dfd@kernel.org/">Jeff Layton posted v3</a> as a four-patch set, explicitly building on last week's discussion:</p>
+<blockquote>
+<p>The other three patches address what is a shortcoming of the existing code -- namely that the server can be configured to schedule RPCs to pools with no threads in them. The first patch addresses this problem: if the chosen pool has no threads, then choose another that does.</p>
+</blockquote>
+<p>The four patches are:</p>
+<ol>
+<li><strong>Route to a populated pool</strong> (<a href="https://lore.kernel.org/linux-nfs/20260629-sunrpc-pool-mode-v3-1-d92676606dfd@kernel.org/">1/4</a>) — the core starvation fix, carrying <code>Fixes: 0f0257eaa5d2</code>. It makes <code>svc_pool_for_cpu()</code> skip threadless pools and fall back to a populated one. Layton is candid about the tradeoff: "This trades NUMA locality for a guarantee that the work is actually serviced."</li>
+<li><strong>Hardcode pool_mode to pernode</strong> (<a href="https://lore.kernel.org/linux-nfs/20260629-sunrpc-pool-mode-v3-2-d92676606dfd@kernel.org/">2/4</a>) — removes the <code>SVC_POOL_AUTO/GLOBAL/PERCPU/PERNODE</code> enum, the mode-selection heuristic, and all mode-based switch statements (−215/+49 lines). The module parameter and netlink interface are preserved for backward compatibility; writing any previously-accepted value "succeeds silently," reading always returns "pernode." Notably this patch carries an <code>Assisted-by: Claude:claude-opus-4-8</code> tag.</li>
+<li><strong>Guarantee a thread per CPU-bearing node</strong> (<a href="https://lore.kernel.org/linux-nfs/20260629-sunrpc-pool-mode-v3-3-d92676606dfd@kernel.org/">3/4</a>) — floors each CPU-bearing node's pool at one thread during auto-distribution, while leaving explicit <code>svc_set_pool_threads()</code> callers (who may set a pool to zero) unchanged.</li>
+<li><strong>Eliminate a modulus from the enqueue path</strong> (<a href="https://lore.kernel.org/linux-nfs/20260629-sunrpc-pool-mode-v3-4-d92676606dfd@kernel.org/">4/4</a>) — a micro-optimization that "trades a ~20-30 cycle operation that isn't pipelined and monopolizes the divider for a ~1 cycle well-predicted branch."</li>
+</ol>
+<h3>An RCU race surfaces (June 30)</h3>
+<p>The plot thickened with <a href="https://lore.kernel.org/linux-nfs/20260630124847.289974-1-jlayton@kernel.org/">PATCH 5/4</a>, a fix Layton added on the strength of an external review:</p>
+<blockquote>
+<p>Sashiko pointed out this (preexisting) problem during review of the other 4 in the series. I figure we might as well fix it too while we're in here.</p>
+</blockquote>
+<p>The bug: <code>svc_pool_map_get_node()</code> reads the global pool map <strong>without holding <code>svc_pool_map_mutex</code></strong> and dereferences <code>m-&gt;pool_to[]</code>, but that array is published and torn down with no synchronization against this lockless reader. Two distinct hazards:</p>
+<ul>
+<li><code>svc_pool_map_get()</code> bumps <code>m-&gt;count</code> to one <em>before</em> <code>pool_to[]</code> is allocated, so a concurrent reader can see the map as "in use" while <code>pool_to[]</code> is still NULL (or half-built) and oops.</li>
+<li><code>svc_pool_map_put()</code> frees <code>pool_to[]</code> as soon as the last reference drops, so a reader mid-dereference can use-after-free it.</li>
+</ul>
+<p>Because <code>svc_new_thread()</code> takes this lockless path for <em>every</em> service — including unpooled ones like lockd that hold no map reference — the race is genuinely live during another service's start/stop. Layton's fix publishes <code>pool_to[]</code> via <code>rcu_assign_pointer()</code> only after it's fully built, reads it under <code>rcu_read_lock()</code>, and defers teardown with <code>kfree_rcu_mightsleep()</code>.</p>
+<h3>Chuck Lever's review: nits + a backport call (June 30)</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/3f46fdf3-553f-489f-9259-e98e3e1fb9e5@app.fastmail.com/">Chuck Lever's detailed review</a> of patch 2/4 raised several precise points:</p>
+<ul>
+<li><strong>A behavioral regression in the parameter parser.</strong> <code>sysfs_match_string()</code> compares whole strings, whereas the old code matched prefixes. "An input like 'globalx' that the old code accepted is now rejected with -EINVAL." He notes this contradicts the commit message's claim that "Writing any previously-accepted value succeeds silently," though only prefix-extended (undocumented) strings are affected.</li>
+<li><strong>A stale kdoc comment.</strong> With percpu removed, "cpus to pools" now contradicts the struct field comments the same patch corrected.</li>
+<li><strong>Dead code.</strong> In <code>svc_pool_map_set_cpumask()</code>, "<code>pool_to[pidx]</code> is dereferenced before the <code>m-&gt;count == 0</code> check, so if count were ever 0 the NULL deref has already happened and the WARN/return can never fire." The <code>sv_nrpools &gt; 1</code> gate at the call site keeps it safe, making the guard dead.</li>
+<li><strong>The key structural suggestion</strong> — gate on whether the service holds a map reference: "An unpooled service (sv_nrpools == 1) could then take numa_mem_id() without reading the shared map."</li>
+</ul>
+<p>And his most consequential line for the series' fate:</p>
+<blockquote>
+<p>For the series as a whole, let's consider moving 5/4 to the front. It looks like a fix that might want to be backported.</p>
+</blockquote>
+<h3>NeilBrown pushes back on the RCU approach (July 1)</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/178287060141.27465.14090245730909314119@noble.neil.brown.name/">NeilBrown replied to the RCU patch</a> with a design objection, arguing the RCU machinery is overkill:</p>
+<blockquote>
+<p>I don't think this is the best approach. The problem only occurs when svc_create() is used as when svc_create_pooled() is used, svc_pool_map_get() is called early so a reference is held to svc_pool_map.</p>
+</blockquote>
+<p>His alternative is simpler and mirrors Chuck's gating idea: since <code>svc_new_thread()</code> is the <em>only</em> caller of <code>svc_pool_map_get_node()</code>, just check <code>pool-&gt;sv_is_pooled</code> and only consult the map when it's true, otherwise use <code>NUMA_NO_NODE</code>. He sketched a patch to that effect.</p>
+<h2>Key technical arguments &amp; evolution</h2>
+<ol>
+<li><strong>The starvation bug is now fixed in-tree (pending merge).</strong> The v3 series directly implements last week's belt-and-braces consensus: per-node thread floor for auto-distribution + enqueue-path fallback to a populated pool, with explicit userland arrays still honored. This is the headline bug fix of the week.</li>
+<li><strong>A preexisting memory-safety race got exposed by the cleanup.</strong> Making pernode the default means the lockless <code>pool_to[]</code> reader now runs for <em>every</em> server (the old global mode returned <code>numa_mem_id()</code> and never touched the array). That turned a dormant bug into an active one — and it's the kind of fix Chuck flags as backport-worthy.</li>
+<li><strong>Two competing fixes for the same race.</strong> Layton chose RCU (<code>rcu_assign_pointer</code>/<code>rcu_read_lock</code>/<code>kfree_rcu_mightsleep</code>); both NeilBrown and Chuck independently argued for a lighter-weight gate on <code>sv_nrpools &gt; 1</code> / <code>sv_is_pooled</code>, which would let unpooled services bypass the shared map entirely. This is where the discussion stands — unresolved as of the window's end.</li>
+<li><strong>Subtle edge case that keeps recurring:</strong> non-pooled services (lockd, NFS callback) are created via <code>svc_create()</code> with <code>npools = 1</code> and never call <code>svc_pool_map_get()</code>, so their <code>m-&gt;count</code> is whatever a pooled nfsd left behind — any code in the shared path must tolerate zero-count / NULL-pointer state.</li>
+</ol>
+<h2>Final status (as of window close)</h2>
+<p>The v3 series is posted and largely converges on last week's design; the open item is <strong>how to fix the <code>pool_to[]</code> race</strong> — RCU (Layton, 5/4) vs. a pooled-service gate (NeilBrown/Chuck). Chuck has also recommended reordering so the race fix leads the series for potential backporting. No v4 or resolution has landed within this window; expect Layton to reconcile the two approaches next.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260629-sunrpc-pool-mode-v3-0-d92676606dfd@kernel.org/">2026-06-29 Jeff Layton — [PATCH v3 0/4] sunrpc: hardcode pool_mode to pernode, remove other modes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260629-sunrpc-pool-mode-v3-1-d92676606dfd@kernel.org/">2026-06-29 Jeff Layton — [PATCH v3 1/4] sunrpc: route to a populated pool in svc_pool_for_cpu()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260629-sunrpc-pool-mode-v3-2-d92676606dfd@kernel.org/">2026-06-29 Jeff Layton — [PATCH v3 2/4] sunrpc: hardcode pool_mode to pernode, remove other modes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260629-sunrpc-pool-mode-v3-3-d92676606dfd@kernel.org/">2026-06-29 Jeff Layton — [PATCH v3 3/4] sunrpc: guarantee a thread per CPU-bearing node when auto-distributing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260629-sunrpc-pool-mode-v3-4-d92676606dfd@kernel.org/">2026-06-29 Jeff Layton — [PATCH v3 4/4] sunrpc: eliminate a modulus operation from the enqueueing codepath</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260630124847.289974-1-jlayton@kernel.org/">2026-06-30 Jeff Layton — [PATCH 5/4] sunrpc: protect the svc_pool_map pool_to[] array with RCU</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/3f46fdf3-553f-489f-9259-e98e3e1fb9e5@app.fastmail.com/">2026-06-30 Chuck Lever — Re: [PATCH v3 2/4] sunrpc: hardcode pool_mode to pernode, remove other modes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178287060141.27465.14090245730909314119@noble.neil.brown.name/">2026-07-01 NeilBrown — Re: [PATCH 5/4] sunrpc: protect the svc_pool_map pool_to[] array with RCU</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260629-sunrpc-pool-mode-v3-0-d92676606dfd@kernel.org/">2026-06-29 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3 0/4] sunrpc: hardcode pool_mode to pernode, remove other modes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260629-sunrpc-pool-mode-v3-1-d92676606dfd@kernel.org/">2026-06-29 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3 1/4] sunrpc: route to a populated pool in svc_pool_for_cpu()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260629-sunrpc-pool-mode-v3-2-d92676606dfd@kernel.org/">2026-06-29 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3 2/4] sunrpc: hardcode pool_mode to pernode, remove other modes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260629-sunrpc-pool-mode-v3-3-d92676606dfd@kernel.org/">2026-06-29 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3 3/4] sunrpc: guarantee a thread per CPU-bearing node when auto-distributing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260629-sunrpc-pool-mode-v3-4-d92676606dfd@kernel.org/">2026-06-29 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3 4/4] sunrpc: eliminate a modulus operation from the enqueueing codepath</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260630124847.289974-1-jlayton@kernel.org/">2026-06-30 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 5/4] sunrpc: protect the svc_pool_map pool_to[] array with RCU</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/3f46fdf3-553f-489f-9259-e98e3e1fb9e5@app.fastmail.com/">2026-06-30 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v3 2/4] sunrpc: hardcode pool_mode to pernode, remove other modes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178287060141.27465.14090245730909314119@noble.neil.brown.name/">2026-07-01 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> —  Re: [PATCH 5/4] sunrpc: protect the svc_pool_map pool_to[] array with RCU</a></li>
+</ul>
+  </main>
+</body>
+</html>

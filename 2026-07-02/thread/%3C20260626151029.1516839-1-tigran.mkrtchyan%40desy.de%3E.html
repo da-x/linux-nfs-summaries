@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RFC: Injecting PID namespace into NFSv4 COMPOUND tag for multi-tenant debugging</title>
+  <meta name="description" content="Thread: [PATCH] [RFC] nfs4: inject process namespace into COMPOUND tag Week ending: 2026-07-02 (window 2026-06-26 → 2026-07-03) Type: New feature / debuggability improvement to the NFSv4 client — explicitly marked RFC, not a bug fix…">
+  <meta property="og:title" content="RFC: Injecting PID namespace into NFSv4 COMPOUND tag for multi-tenant debugging">
+  <meta property="og:description" content="Thread: [PATCH] [RFC] nfs4: inject process namespace into COMPOUND tag Week ending: 2026-07-02 (window 2026-06-26 → 2026-07-03) Type: New feature / debuggability improvement to the NFSv4 client — explicitly marked RFC, not a bug fix…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-02T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="RFC: Injecting PID namespace into NFSv4 COMPOUND tag for multi-tenant debugging">
+  <meta name="twitter:description" content="Thread: [PATCH] [RFC] nfs4: inject process namespace into COMPOUND tag Week ending: 2026-07-02 (window 2026-06-26 → 2026-07-03) Type: New feature / debuggability improvement to the NFSv4 client — explicitly marked RFC, not a bug fix…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-02</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>RFC: Injecting PID namespace into NFSv4 COMPOUND tag for multi-tenant debugging</h1>
+<h2>Summary</h2>
+<h1>RFC: Injecting PID Namespace into the NFSv4 COMPOUND Tag</h1>
+<p><strong>Thread:</strong> [PATCH] [RFC] nfs4: inject process namespace into COMPOUND tag<br />
+<strong>Week ending:</strong> 2026-07-02 (window 2026-06-26 → 2026-07-03)<br />
+<strong>Type:</strong> New feature / debuggability improvement to the NFSv4 client — explicitly marked RFC, not a bug fix<br />
+<strong>Status:</strong> Open; maintainer review raised two concrete issues (compile/scope, buffered-write semantics). No v2 posted this week.</p>
+<h2>Bridge from prior context</h2>
+<p>This is a sibling of another Tigran Mkrtchyan RFC posted the same morning (2026-06-26) that proposed embedding the PID namespace in the <strong>auth_unix machinename</strong> field instead (<a href="https://lore.kernel.org/linux-nfs/20260626125216.1467845-1-tigran.mkrtchyan@desy.de/">see companion summary</a>). That earlier thread drew a correctness objection from Jeff Layton about async credential staleness. The COMPOUND-tag variant in this thread is Tigran's follow-up attempt to solve the same multi-tenant debugging problem through a different, per-RPC channel — the <code>tag41</code> field of the NFSv4 COMPOUND header — which avoids the auth-credential caching issue because the tag is encoded at RPC-send time. The idea is credited as <a href="https://lore.kernel.org/linux-nfs/20260626151029.1516839-1-tigran.mkrtchyan@desy.de/">Suggested-by: Chuck Lever</a>.</p>
+<h2>Motivation</h2>
+<p>Tigran opened the RFC with the same framing he used in the machinename thread:</p>
+<blockquote>
+<p>"On large shared machines often multiple jobs of a same user run in parallel. For debugging, it's usually impossible to identify requests coming from different processes."</p>
+</blockquote>
+<p>He highlighted that batch schedulers such as HTCondor and SLURM launch each job inside its own PID namespace, so the namespace inode number is a natural per-job discriminator that can be surfaced on the server side for log correlation. To make the benefit concrete he included a Wireshark-style trace showing how requests from two jobs would otherwise look identical:</p>
+<blockquote>
+<p>"192.168.122.150 → 192.168.178.69 NFS 260 V4 Call GETATTR FH: 0xd5ffb2cb …<br />
+192.168.122.150 → 192.168.178.69 NFS 284 V4 Call ns:4026532507 GETATTR FH: 0xd67b66a5"</p>
+</blockquote>
+<p>The <code>ns:&lt;inum&gt;</code> prefix on the COMPOUND tag is what would let an operator tell which job issued which RPC.</p>
+<h2>The patch (technical detail)</h2>
+<p>The <a href="https://lore.kernel.org/linux-nfs/20260626151029.1516839-1-tigran.mkrtchyan@desy.de/">RFC patch</a> touches three files:</p>
+<ul>
+<li><code>fs/nfs/nfs4xdr.c</code> — at COMPOUND encoding time, if the task has a non-zero <code>tk_ns_inum</code>, format <code>"ns:&lt;inum&gt;"</code> into a local <code>char ns_tag[NFS4_MAXTAGLEN + 1]</code> and assign it to <code>hdr-&gt;tag</code> / <code>hdr-&gt;taglen</code>.</li>
+<li><code>include/linux/sunrpc/sched.h</code> — adds a new <code>tk_ns_inum</code> field to the RPC task struct.</li>
+<li><code>net/sunrpc/sched.c</code> — populates <code>task-&gt;tk_ns_inum = pid_ns-&gt;ns.inum;</code> during task setup.</li>
+</ul>
+<p>This is intentionally minimal: no protocol change, just reusing the existing free-form COMPOUND tag (which servers are already required to log) as a debug channel.</p>
+<h2>Review: Trond Myklebust's two objections</h2>
+<p>Linux NFS client maintainer Trond Myklebust <a href="https://lore.kernel.org/linux-nfs/fb81ad5a850160daab7092a8289bc626862f6072.camel@kernel.org/">replied</a> on 2026-06-28 with two concrete technical objections.</p>
+<p><strong>1. The patch does not compile / has a scope bug.</strong> Trond flagged the local buffer:</p>
+<blockquote>
+<p>"Hmm.... This has not been compile tested."</p>
+</blockquote>
+<p>and then pinpointed the lifetime issue:</p>
+<blockquote>
+<p>"<code>ns_tag</code> is only scoped to this block. I suggest that instead of assigning to <code>hdr-&gt;taglen</code> and <code>hdr-&gt;tag</code>, you just do the assignment to <code>hdr-&gt;replen</code> + call to <code>encode_string()</code> here, so you don't have to assign a scope limited buffer to an externally visible struct."</p>
+</blockquote>
+<p>He added a secondary note on string handling:</p>
+<blockquote>
+<p>"Note also that there is no need to NUL terminate <code>ns_tag[]</code> when <code>hdr-&gt;taglen &gt; NFS4_MAXTAGLEN</code>, since <code>encode_string()</code> does not require a nul terminated string. In addition, <code>snprintf()</code> always guarantees that the string is nul terminated, even when truncated by the buffer size :-)."</p>
+</blockquote>
+<p>The practical fix he is steering toward: encode the tag directly into the XDR stream at the point of use rather than stashing a pointer to a stack-allocated buffer on <code>hdr</code>.</p>
+<p><strong>2. Buffered writes will report the wrong namespace.</strong> Trond raised a deeper semantic issue about <em>when</em> the namespace is captured:</p>
+<blockquote>
+<p>"For buffered writes, this will tell you the pid namespace of the process that is flushing the data, not that of the process that wrote the data into the page cache. Is that what you expected?"</p>
+</blockquote>
+<p>This mirrors the async-context concern Jeff Layton raised in the companion machinename thread, but here it manifests differently: because <code>tk_ns_inum</code> is captured at task setup (i.e., when the flusher's RPC task is created), a buffered write issued by job A but flushed later by the kernel's writeback path will carry the writeback context's namespace — or none at all — rather than job A's. For the debugging use case Tigran describes, that defeats the purpose for one of the most common workload patterns on shared HPC nodes.</p>
+<h2>Author response</h2>
+<p>Tigran <a href="https://lore.kernel.org/linux-nfs/255476971.4622529.1782827306515.JavaMail.zimbra@desy.de/">replied</a> on 2026-06-30 acknowledging Trond's review. The reply is short and contains no new technical argument or a v2 patch; the thread was still open at the end of the week window with both issues (scope/compile fix, buffered-write semantics) unresolved.</p>
+<h2>Assessment</h2>
+<table><thead><tr><th>Aspect</th><th>Detail</th></tr></thead><tbody>
+<tr><td><strong>Category</strong></td><td>New feature (client-side debuggability), explicitly RFC</td></tr>
+<tr><td><strong>NFS client relevance</strong></td><td>Modifies <code>fs/nfs/nfs4xdr.c</code> and the sunrpc task struct — affects every NFSv4 COMPOUND encoding path</td></tr>
+<tr><td><strong>Bug fix?</strong></td><td>No; proposed enhancement, not a regression fix. The patch as posted does not even compile per the maintainer</td></tr>
+<tr><td><strong>Protocol impact</strong></td><td>None to the wire protocol; only changes the <em>content</em> of the existing <code>tag41</code> field, which servers already log</td></tr>
+<tr><td><strong>Mainline prospects</strong></td><td>Low near-term — needs (a) a scope/compile fix and (b) a design answer for buffered writes before it is worth resubmitting</td></tr>
+<tr><td><strong>Open questions</strong></td><td>Whether to capture namespace at RPC-send time vs. task setup; how to handle writeback-originated COMPOUNDs; whether the <code>ns:&lt;inum&gt;</code> format should be documented so servers can parse it</td></tr>
+</tbody></table>
+<h2>Key takeaways for NFS client developers</h2>
+<ol>
+<li><strong>The COMPOUND tag is a legitimate, low-risk debug channel.</strong> It is already part of the protocol and required to be logged by servers, so embedding per-process context there avoids any wire-format change — but only if the encoding is done at send time with a properly scoped buffer.</li>
+<li><strong>Per-task metadata capture is fragile in sunrpc.</strong> Both this thread and its machinename sibling surfaced the same underlying hazard: any "current process" attribute captured at task-creation or credential-setup time can be stale for async or writeback-originated RPCs. A robust design would need to either re-read the namespace at encode time or accept that buffered writes will carry the flusher's context and document that limitation.</li>
+<li><strong>The discussion is still open.</strong> As of 2026-07-02 no v2 patch has been posted; the next step depends on Tigran addressing Trond's two points, particularly the buffered-write semantics question which is a design decision rather than a code fix.</li>
+</ol>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260626151029.1516839-1-tigran.mkrtchyan@desy.de/">2026-06-26 Tigran Mkrtchyan — [PATCH] [RFC] nfs4: inject process namespace into COMPOUND tag</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/fb81ad5a850160daab7092a8289bc626862f6072.camel@kernel.org/">2026-06-28 Trond Myklebust — Re: [PATCH] [RFC] nfs4: inject process namespace into COMPOUND tag</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/255476971.4622529.1782827306515.JavaMail.zimbra@desy.de/">2026-06-30 "Mkrtchyan, Tigran" — Re: [PATCH] [RFC] nfs4: inject process namespace into COMPOUND tag</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260626151029.1516839-1-tigran.mkrtchyan@desy.de/">2026-06-26 Tigran Mkrtchyan <a href="mailto:tigran.mkrtchyan@desy.de">tigran.mkrtchyan@desy.de</a> — [PATCH] [RFC] nfs4: inject process namespace into COMPOUND tag</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/fb81ad5a850160daab7092a8289bc626862f6072.camel@kernel.org/">2026-06-28 Trond Myklebust <a href="mailto:trondmy@kernel.org">trondmy@kernel.org</a> — Re: [PATCH] [RFC] nfs4: inject process namespace into COMPOUND tag</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/255476971.4622529.1782827306515.JavaMail.zimbra@desy.de/">2026-06-30 "Mkrtchyan, Tigran" <a href="mailto:tigran.mkrtchyan@desy.de">tigran.mkrtchyan@desy.de</a> — Re: [PATCH] [RFC] nfs4: inject process namespace into COMPOUND tag</a></li>
+</ul>
+  </main>
+</body>
+</html>

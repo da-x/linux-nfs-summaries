@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>sunrpc pool_mode hardcoding: empty-pool debate and belt-and-braces fix outlined</title>
+  <meta name="description" content="Jeff Layton posted v2 of this patch on June 25, removing the long-standing SVC_POOL_AUTO/GLOBAL/PERCPU/PERNODE selection machinery from the NFS server (sunrpc) layer and making &quot;pernode&quot; the only pool mode. Chuck Lever&#39;s review that same…">
+  <meta property="og:title" content="sunrpc pool_mode hardcoding: empty-pool debate and belt-and-braces fix outlined">
+  <meta property="og:description" content="Jeff Layton posted v2 of this patch on June 25, removing the long-standing SVC_POOL_AUTO/GLOBAL/PERCPU/PERNODE selection machinery from the NFS server (sunrpc) layer and making &quot;pernode&quot; the only pool mode. Chuck Lever&#39;s review that same…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-02T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="sunrpc pool_mode hardcoding: empty-pool debate and belt-and-braces fix outlined">
+  <meta name="twitter:description" content="Jeff Layton posted v2 of this patch on June 25, removing the long-standing SVC_POOL_AUTO/GLOBAL/PERCPU/PERNODE selection machinery from the NFS server (sunrpc) layer and making &quot;pernode&quot; the only pool mode. Chuck Lever&#39;s review that same…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-02</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>sunrpc pool_mode hardcoding: empty-pool debate and belt-and-braces fix outlined</h1>
+<h2>Summary</h2>
+<h1>sunrpc: hardcode pool_mode to pernode — empty-pool edge case drives the design</h1>
+<h2>Context (bridging prior week)</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260625-sunrpc-pool-mode-v2-1-4f512b6e1ee8@kernel.org/">Jeff Layton posted v2 of this patch on June 25</a>, removing the long-standing <code>SVC_POOL_AUTO/GLOBAL/PERCPU/PERNODE</code> selection machinery from the NFS server (sunrpc) layer and making "pernode" the only pool mode. <a href="https://lore.kernel.org/linux-nfs/d50169fe-8deb-481b-83f4-a082af190ca4@app.fastmail.com/">Chuck Lever's review that same day</a> raised the central technical concern: when <code>nrservs &lt; number of NUMA nodes</code>, trailing pools end up with zero threads, and there is no fallback in the enqueue path — a connection landing on an empty pool would sit unserviced. This week's activity (all four messages landed on Friday, June 26) is entirely about working through that edge case plus a handful of code-level nits.</p>
+<p><strong>Type:</strong> Server-side cleanup / behavior change in sunrpc — not an NFS client feature or protocol change. The relevant "bug" being addressed is a latent starvation bug (work routed to a pool with no threads and never serviced) that becomes reachable once the global-pool escape hatch is removed.</p>
+<h2>This week's activity</h2>
+<h3>NeilBrown's review: code nits and a design opinion</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/178244005168.27465.2587255049421564152@noble.neil.brown.name//">NeilBrown opened this week's discussion</a> with a series of targeted code-level comments on the v2 diff, then weighed in on Chuck's empty-pool concern:</p>
+<blockquote>
+<p>"!strncmp" is one most disliked construct.... What would you think of using match_string() or even sysfs_match_string() ??</p>
+</blockquote>
+<p>On the deprecation notice (<code>pr_notice("sunrpc: the pool_mode parameter is deprecated and will be removed in a future release.\n")</code>):</p>
+<blockquote>
+<p>Which future release? How will we remember?</p>
+</blockquote>
+<p>He also suggested making the refcount decrement explicit — <code>m-&gt;count = 0</code> rather than <code>m-&gt;count--</code> — "to make it crystal clear that there are now no references," and asked whether <code>svc_pool_for_cpu()</code> could run when <code>m-&gt;count</code> is zero.</p>
+<p>On the design question, NeilBrown endorsed a per-node minimum:</p>
+<blockquote>
+<p>I think this is a good a worthwhile change. Regarding Chucks comments, I think a minimum of one thread per node, rather than a minimum of one thread total, is the sensible approach. Of course if there exist memory-only nodes, they wouldn't need a thread.</p>
+</blockquote>
+<h3>Chuck Lever pushes back on memory-only nodes</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/ac1f3b39-1541-4861-a5b1-3babbc9c1cc7@app.fastmail.com//">Chuck Lever replied</a> with a sharp follow-up that complicates NeilBrown's "skip memory-only nodes" carve-out:</p>
+<blockquote>
+<p>What happens when transport work is scheduled on a memory-only pool? Obviously there's no execution engine there, even if we do provide one or more threads.</p>
+</blockquote>
+<p>The point: a memory-only NUMA node has no CPUs to run a thread on, so the question isn't whether to <em>spawn</em> a thread there but what happens when work is <em>routed</em> there by the per-node pool selection (which keys off the running CPU / memory locality). This reframes the problem from "how many threads do we spawn" to "what do we do when the selected pool can't execute anything."</p>
+<h3>Jeff Layton's belt-and-braces solution</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/0a54bd086085ce9b19e258353a37ed953a42847b.camel@kernel.org//">Jeff Layton responded to Chuck</a> with a two-part approach, carefully preserving userland's ability to dictate per-pool thread counts:</p>
+<blockquote>
+<p>The hitch here is that we have traditionally allowed userland to dictate how many threads each pool gets. You're allowed to send down an array like this with (4 pools): <code>0 128 0 0</code>. That would give you exactly that layout (128 threads in pool 2 and none elsewhere). I think we can continue to honor that by saying that if you set a thread count of 0 in a pool then we should not spawn any threads there.</p>
+</blockquote>
+<blockquote>
+<p>Because of this, I favor a belt and bracers approach:
+1/ when min-threads is set, assign at least one thread to each node that has a cpu as a minimum, but only when we are auto-distributing threads between nodes (the typical case). This allows us to preserve the wishes of userland when it sends down a more complex pool array. We should not override the user's wishes in that case.
+2/ add in a fallback in the queueing path so that when there are no threads in a node, we queue it to a populated one. We could even add a pr_notice_once() that fires in that case to warn that the configuration is sub-optimal. The cost is an extra check for sp_nrthreads == 0 when enqueueing, but it should almost always come back false when things are properly configured.</p>
+</blockquote>
+<p>This is the most technically significant contribution of the week: it resolves both Chuck's starvation concern (fallback in the queueing path) and NeilBrown's per-node minimum (auto-distribution assigns ≥1 thread to each CPU-bearing node), while respecting explicit userland configuration. The <code>pr_notice_once()</code> is a nice touch for surfacing misconfigurations without spamming the log.</p>
+<h3>Jeff Layton addresses NeilBrown's nits</h3>
+<p>In a <a href="https://lore.kernel.org/linux-nfs/e6965a4fb187d029fe48efc0f970818be77ea464.camel@kernel.org//">separate reply</a>, Layton confirmed the code-level fixes:</p>
+<ul>
+<li><strong><code>sysfs_match_string()</code>:</strong> "Thanks. Switched to sysfs_match_string()."</li>
+<li><strong>Deprecation message:</strong> "I'll make this more vague. I'm not sure what the guidance is on removal of knobs like this. A few years, I guess?"</li>
+<li><strong><code>m-&gt;count = 0</code>:</strong> "Yep, fixed. I didn't rename the counter though. That can be future cleanup."</li>
+<li><strong>Can <code>svc_pool_for_cpu()</code> run with <code>m-&gt;count == 0</code>?</strong> This was a substantive correctness question, and Layton confirmed it can:</li>
+</ul>
+<blockquote>
+<p>Yes, it can. It's called unconditionally from svc_new_thread(), which runs for non-pooled services created via svc_create() (e.g. lockd) that never call svc_pool_map_get(). In that case m-&gt;count == 0 and m-&gt;pool_to == NULL.</p>
+</blockquote>
+<p>This is an important edge case: lockd and other non-pooled services go through <code>svc_new_thread()</code> without ever initializing the pool map, so any code in that path must tolerate a zero-count / NULL-pointer state. Layton also cross-referenced his earlier reply on the empty-pool fallback: "I responded to Chuck's reply on this point. I think that's part of a solution, but we probably also need to avoid queueing to pools (nodes) that have no threads in them, to help catch misconfigurations."</p>
+<h2>Key technical takeaways</h2>
+<ol>
+<li><strong>The starvation bug is real and now reachable.</strong> With global mode removed, a NUMA system with more nodes than <code>nrservs</code> will have empty pools, and the current enqueue path has no fallback. This is the primary bug fix driving the v3 changes.</li>
+<li><strong>The solution is layered:</strong> (a) auto-distribution guarantees ≥1 thread per CPU-bearing node; (b) explicit userland arrays are honored as-is (including zeros); (c) a queueing-path fallback routes work to a populated pool when the selected one is empty, with a one-time warning.</li>
+<li><strong>Memory-only NUMA nodes</strong> (present on some ARM64/CXL platforms) complicate the "one thread per node" rule — you can't run a thread where there's no CPU, so the fallback in the queueing path is essential, not just belt-and-braces.</li>
+<li><strong>Non-pooled services (lockd)</strong> exercise <code>svc_pool_for_cpu()</code> with an uninitialized pool map (<code>m-&gt;count == 0</code>, <code>m-&gt;pool_to == NULL</code>), a subtle edge case that must be preserved in any refactor.</li>
+</ol>
+<h2>Status</h2>
+<p>No v3 has been posted as of the end of this window. Layton has outlined a clear path forward (per-node minimum for auto-distribution + enqueue fallback + code nits fixed) and the discussion appears to have converged on the design. The thread is expected to produce a v3 in the coming days.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/178244005168.27465.2587255049421564152@noble.neil.brown.name/">2026-06-26 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> —  Re: [PATCH v2] sunrpc: hardcode pool_mode to pernode, remove other modes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ac1f3b39-1541-4861-a5b1-3babbc9c1cc7@app.fastmail.com/">2026-06-26 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v2] sunrpc: hardcode pool_mode to pernode, remove other modes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/0a54bd086085ce9b19e258353a37ed953a42847b.camel@kernel.org/">2026-06-26 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v2] sunrpc: hardcode pool_mode to pernode, remove other modes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/e6965a4fb187d029fe48efc0f970818be77ea464.camel@kernel.org/">2026-06-26 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v2] sunrpc: hardcode pool_mode to pernode, remove other modes</a></li>
+</ul>
+  </main>
+</body>
+</html>

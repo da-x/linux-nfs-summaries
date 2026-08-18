@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NeilBrown posts 10-patch nfsd4_create_file() refactor to prep for vfs_lookup_open(); Chuck Lever flags Sashiko findings and merge-ordering question</title>
+  <meta name="description" content="On July 2, NeilBrown posted a 10-patch series titled &quot;nfsd: refactor nfsd4_create_file()&quot;, targeting the nfsd-testing tree. The series is explicitly a preparatory refactoring for the larger vfs_lookup_open() effort (the 18-patch RFC that…">
+  <meta property="og:title" content="NeilBrown posts 10-patch nfsd4_create_file() refactor to prep for vfs_lookup_open(); Chuck Lever flags Sashiko findings and merge-ordering question">
+  <meta property="og:description" content="On July 2, NeilBrown posted a 10-patch series titled &quot;nfsd: refactor nfsd4_create_file()&quot;, targeting the nfsd-testing tree. The series is explicitly a preparatory refactoring for the larger vfs_lookup_open() effort (the 18-patch RFC that…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-02T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NeilBrown posts 10-patch nfsd4_create_file() refactor to prep for vfs_lookup_open(); Chuck Lever flags Sashiko findings and merge-ordering question">
+  <meta name="twitter:description" content="On July 2, NeilBrown posted a 10-patch series titled &quot;nfsd: refactor nfsd4_create_file()&quot;, targeting the nfsd-testing tree. The series is explicitly a preparatory refactoring for the larger vfs_lookup_open() effort (the 18-patch RFC that…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-02</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NeilBrown posts 10-patch nfsd4_create_file() refactor to prep for vfs_lookup_open(); Chuck Lever flags Sashiko findings and merge-ordering question</h1>
+<h2>Summary</h2>
+<h1>NeilBrown's 10-patch <code>nfsd4_create_file()</code> refactor lands; Chuck Lever raises two high-level concerns</h1>
+<h2>What happened this week</h2>
+<p>On July 2, <strong>NeilBrown</strong> posted a <a href="https://lore.kernel.org/linux-nfs/20260702014000.3397240-1-neilb@ownmail.net/">10-patch series</a> titled <em>"nfsd: refactor nfsd4_create_file()"</em>, targeting the <code>nfsd-testing</code> tree. The series is explicitly a <strong>preparatory refactoring</strong> for the larger <code>vfs_lookup_open()</code> effort (the 18-patch RFC that Christian Brauner green-lited earlier this same week in a sibling thread). NeilBrown frames the motivation clearly:</p>
+<blockquote>
+<p>"nfs4_create_file() duplicates knowledge about opening a file which exists in the VFS, mostly in lookup_open(). It does use dentry_create() which shares some code, but there is more code that could be shared."</p>
+<p>"The nfsd code doesn't get some details quite right, particularly patch 05 shows this."</p>
+<p>"I hope to introduce a new VFS interface which encapsulates more of what nfsd needs and shares more code with lookup_open(). I particularly want this as it will simplify some changes to locking rules that I am working on."</p>
+</blockquote>
+<p>So the series is <strong>not</strong> itself a protocol change or a user-visible feature. It is a <strong>server-side (nfsd) refactoring with bug-fix motivation</strong>, designed so that when the new VFS interface lands, nfsd can "switch over fairly easily." NeilBrown adds a candid caveat: <em>"Hopefully the series helps clarity even before that happens."</em></p>
+<h2>The ten patches at a glance</h2>
+<p>The series walks <code>nfsd4_create_file()</code> through a sequence of increasingly structural rearrangements. Read together, they separate NFS-specific preamble from VFS interaction, tighten locking ranges, and fix a subtle correctness gap around who actually created the file:</p>
+<ol>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260702014000.3397240-2-neilb@ownmail.net/">PATCH 01/10</a></strong> — Replaces <code>fh_fill_both_attrs()</code> with a new <code>fh_fill_post_noop()</code>. The idea: call <code>fh_fill_pre_attrs()</code> once early so "errors only need to be caught in one place," then mark pre-fetched attrs valid via the new post-noop helper when no creation happens.</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260702014000.3397240-3-neilb@ownmail.net/">PATCH 02/10</a></strong> — Moves <code>fh_want_write()</code> to just before it is actually needed, letting preamble errors "be returned immediately rather than needing to 'goto out'."</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260702014000.3397240-4-neilb@ownmail.net/">PATCH 03/10</a></strong> — Pushes more NFS-specific prep into the preamble, ahead of any VFS interaction.</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260702014000.3397240-5-neilb@ownmail.net/">PATCH 04/10</a></strong> — Unifies the <code>NFS4_CREATE_EXCLUSIVE</code> and <code>NFS4_CREATE_EXCLUSIVE4_1</code> switch cases, which were "identical except for one line which is marked 'subtle' in both cases." Guarding the setattr with <code>is_create_with_attrs()</code> lets both cases share a single <code>goto</code>, making the code "clearer and less subtle."</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260702014000.3397240-6-neilb@ownmail.net/">PATCH 05/10</a></strong> — The substantive <strong>bug fix</strong> of the series. NeilBrown explains: <em>"nfsd4_create_file() currently assumes that if a lookup failed but then a create succeeds, then the 'create' operation actually created the file. With atomic_open this may not be the case - some other actor might have created the file between the lookup and the create."</em> The fix moves <code>nfsd4_vfs_create()</code> earlier and sets <code>-&gt;op_created</code> from its result, using <code>"! -&gt;op_created"</code> to trigger <code>nfserr_exist</code> handling. It also requires changing <code>dentry_create()</code> (in <code>fs/namei.c</code>) to "reliably set FMODE_CREATED when the file was actually created," not only under <code>atomic_open</code>.</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260702014000.3397240-7-neilb@ownmail.net/">PATCH 06/10</a></strong> — Removes a redundant <code>NFSD_MAY_CREATE</code> check, since <code>dentry_create()</code> already performs it.</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260702014000.3397240-8-neilb@ownmail.net/">PATCH 07/10</a></strong> — Narrows the directory-lock range: <em>"We only need to hold the lock taken by start_creating() until the create has been attempted."</em> NeilBrown notes the current longer hold "serves no purpose," since it doesn't even prevent a racing GETATTR, SETATTR, or OPEN.</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260702014000.3397240-9-neilb@ownmail.net/">PATCH 08/10</a></strong> — Open-codes <code>nfsd4_vfs_create()</code> back into <code>nfsd4_create_file()</code>, arguing the sub-function "doesn't really add clarity" and that merging "allows for some refactoring and ultimately using a different VFS interface."</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260702014000.3397240-10-neilb@ownmail.net/">PATCH 09/10</a></strong> — Moves code out of the <code>d_really_is_negative()</code> branch, a change whose benefit "isn't immediately obvious" but will "make it easier to switch to using vfs_lookup_open()."</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260702014000.3397240-11-neilb@ownmail.net/">PATCH 10/10</a></strong> — Splits the <code>want_write</code> range: one for create/open, and a second (only if needed) for setattr on a read-only open, so write access isn't held unnecessarily across both.</li>
+</ol>
+<h2>Chuck Lever's reply: two high-level concerns</h2>
+<p>NFS maintainer <strong>Chuck Lever</strong> <a href="https://lore.kernel.org/linux-nfs/7ef0e102-19d4-49a1-bf9b-5191177c2b93@app.fastmail.com/">responded the same day</a>, with a full disclosure that <em>"I haven't looked closely at these yet."</em> He raised two points:</p>
+<ol>
+<li>
+<p><strong>A Sashiko finding.</strong> Lever points to an automated-review result, noting with dry humor:</p>
+<blockquote>
+<p>"Sashiko found something remarkable in 9 of the 10 patches in this series ... Which I commend to you for study ;-)"</p>
+</blockquote>
+<p>The fact that a static-analysis tool flagged 9 of 10 patches is a signal worth watching — it suggests a systematic issue (possibly a mechanical artifact of the refactor, or a genuine recurring mistake) that NeilBrown will need to address before the series can move forward. This is the single most important open item from this week's exchange.</p>
+</li>
+<li>
+<p><strong>Merge-ordering against the in-flight VFS series.</strong> Lever asks:</p>
+<blockquote>
+<p>"We'll need to decide how to merge these given the other related series you have in flight that targets VFS code that NFSD consumes. Are these two series truly independent?"</p>
+</blockquote>
+<p>This directly echoes the coordination problem flagged in the sibling <code>vfs_lookup_open()</code> thread, where Brauner deferred ordering against his own <code>O_CREAT|O_DIRECTORY</code> work. The question here is whether this 10-patch nfsd refactor can be merged independently of (or ahead of) the VFS interface it is preparing for — a scheduling decision that will shape the next several weeks.</p>
+</li>
+</ol>
+<h2>Evolution and context</h2>
+<p>This series sits squarely in the middle of a multi-week arc:</p>
+<ul>
+<li><strong>Prior weeks:</strong> NeilBrown's 18-patch RFC to replace <code>dentry_create()</code> with <code>vfs_lookup_open()</code> was reviewed, with Chuck Lever catching a protocol-breaking <code>NFS4ERR_EXIST</code> bug and an <code>ATTR_SIZE</code> truncation hazard in PATCH 17/18. Christian Brauner then <a href="https://lore.kernel.org/linux-nfs/20260702-kurswechsel-grundlos-erdteil-27c448aef1ec@brauner//">green-lit a resubmission</a> earlier this same week ("Yes, please resubmit").</li>
+<li><strong>This week:</strong> Rather than immediately resubmitting the VFS series, NeilBrown posted this 10-patch nfsd-side refactor — the "get it ready for switching to the new interface" work he described in the cover letter. The two efforts are coupled: this series restructures <code>nfsd4_create_file()</code> so that the later swap to <code>vfs_lookup_open()</code> is a smaller, cleaner change.</li>
+</ul>
+<p>Notably, <strong>PATCH 05/10</strong> here addresses the same class of correctness concern (who actually created the file under <code>atomic_open</code>) that was central to the earlier review, reinforcing that this refactor is doing real bug-fixing work and not just cosmetic shuffling.</p>
+<h2>Relevance to NFS client development</h2>
+<p>Although this is server-side nfsd code, the stakes for clients are concrete:</p>
+<ul>
+<li><strong>PATCH 05/10 fixes a create-race correctness gap.</strong> If another actor created the file between lookup and create (possible under <code>atomic_open</code>), the old code could misreport the outcome. Correct <code>NFS4ERR_EXIST</code> handling matters to any client relying on atomic-create semantics such as <code>NFS4_CREATE_GUARDED</code>.</li>
+<li><strong>Tighter locking (PATCH 07/10, PATCH 10/10)</strong> reduces contention on directory and mount write locks during create/open — a performance and scalability win for busy NFS servers serving many clients.</li>
+<li><strong>The unification with <code>lookup_open()</code></strong> means re-exporting servers will eventually use a create/open path consistent with local filesystems, improving the atomicity guarantees clients can depend on.</li>
+</ul>
+<h2>Status and outlook</h2>
+<p>As of the close of this week's window:</p>
+<ol>
+<li>The 10-patch series is <strong>freshly posted</strong> (July 2) against <code>nfsd-testing</code>, with no substantive per-patch review yet — only Chuck Lever's two high-level remarks.</li>
+<li>The <strong>Sashiko finding across 9/10 patches</strong> is the most urgent open item; it will likely drive the next round of discussion and a possible v2.</li>
+<li>The <strong>merge-ordering question</strong> (independent vs. coupled with the <code>vfs_lookup_open()</code> VFS series) remains unanswered and will need resolution between Lever, NeilBrown, and Brauner.</li>
+<li>No client-facing protocol change is introduced by this series itself; its value is preparatory refactoring plus a genuine create-race bug fix.</li>
+</ol>
+<p>The near-term expectation is that NeilBrown addresses the Sashiko findings and answers Lever's independence question, after which both this series and the resubmitted <code>vfs_lookup_open()</code> series will need coordinated scheduling against Brauner's pending <code>O_CREAT|O_DIRECTORY</code> work.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260702014000.3397240-1-neilb@ownmail.net/">2026-07-02 NeilBrown — [PATCH 00/10] nfsd: refactor nfsd4_create_file()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260702014000.3397240-2-neilb@ownmail.net/">2026-07-02 NeilBrown — [PATCH 01/10] replace fh_fill_both_attrs() with fh_fill_post_noop()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260702014000.3397240-3-neilb@ownmail.net/">2026-07-02 NeilBrown — [PATCH 02/10] move fh_want_write() after preamble</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260702014000.3397240-4-neilb@ownmail.net/">2026-07-02 NeilBrown — [PATCH 03/10] move more nfs-specific code into preamble</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260702014000.3397240-5-neilb@ownmail.net/">2026-07-02 NeilBrown — [PATCH 04/10] remove subtlety from nfsd4_create_file()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260702014000.3397240-6-neilb@ownmail.net/">2026-07-02 NeilBrown — [PATCH 05/10] let VFS report if file was created</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260702014000.3397240-7-neilb@ownmail.net/">2026-07-02 NeilBrown — [PATCH 06/10] remove NFSD_MAY_CREATE check</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260702014000.3397240-8-neilb@ownmail.net/">2026-07-02 NeilBrown — [PATCH 07/10] reduce range of directory lock</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260702014000.3397240-9-neilb@ownmail.net/">2026-07-02 NeilBrown — [PATCH 08/10] open-code nfsd4_vfs_create()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260702014000.3397240-10-neilb@ownmail.net/">2026-07-02 NeilBrown — [PATCH 09/10] move code out of d_really_is_negative() branch</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260702014000.3397240-11-neilb@ownmail.net/">2026-07-02 NeilBrown — [PATCH 10/10] reduce want-write range</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/7ef0e102-19d4-49a1-bf9b-5191177c2b93@app.fastmail.com/">2026-07-02 Chuck Lever — Re: [PATCH 00/10] nfsd: refactor nfsd4_create_file()</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260702014000.3397240-1-neilb@ownmail.net/">2026-07-02 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 00/10] nfsd:refactor nfsd4_create_file()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260702014000.3397240-2-neilb@ownmail.net/">2026-07-02 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 01/10] nfsd: replace fh_fill_both_attrs() with fh_fill_post_noop()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260702014000.3397240-3-neilb@ownmail.net/">2026-07-02 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 02/10] nfsd: move fh_want_write() after preamble in nfsd4_create_file()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260702014000.3397240-4-neilb@ownmail.net/">2026-07-02 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 03/10] nfsd: move more nfs-specific code into preamble of nfsd4_create_file()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260702014000.3397240-5-neilb@ownmail.net/">2026-07-02 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 04/10] nfsd: remove subtlety from nfsd4_create_file()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260702014000.3397240-6-neilb@ownmail.net/">2026-07-02 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 05/10] nfsd: in nfsd4_create_file() let VFS report if file was created.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260702014000.3397240-7-neilb@ownmail.net/">2026-07-02 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 06/10] nfsd: nfsd4_create_file(): remove NFSD_MAY_CREATE check.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260702014000.3397240-8-neilb@ownmail.net/">2026-07-02 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 07/10] nfsd: reduce range of directory lock in nfsd4_create_file()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260702014000.3397240-9-neilb@ownmail.net/">2026-07-02 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 08/10] nfsd: open-code nfsd4_vfs_create() into nfsd4_create_file()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260702014000.3397240-10-neilb@ownmail.net/">2026-07-02 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 09/10] nfsd: move some code out of the d_really_is_negative() branch in nfsd4_create_file()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260702014000.3397240-11-neilb@ownmail.net/">2026-07-02 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH 10/10] nfsd: reduce want-write range in nfsd4_create_file(</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/7ef0e102-19d4-49a1-bf9b-5191177c2b93@app.fastmail.com/">2026-07-02 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 00/10] nfsd:refactor nfsd4_create_file()</a></li>
+</ul>
+  </main>
+</body>
+</html>

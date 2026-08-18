@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd inter-server copy fixes: Neil Brown reviews the cpntf race and UAF patches</title>
+  <meta name="description" content="Last week, Jeff Layton posted a three-patch series fixing concurrency bugs in the NFSv4.2 inter-server copy offload code (COPY / COPY_NOTIFY / OFFLOAD_CANCEL) — bugs, notably, that were surfaced by LLM-assisted inspection rather than field…">
+  <meta property="og:title" content="nfsd inter-server copy fixes: Neil Brown reviews the cpntf race and UAF patches">
+  <meta property="og:description" content="Last week, Jeff Layton posted a three-patch series fixing concurrency bugs in the NFSv4.2 inter-server copy offload code (COPY / COPY_NOTIFY / OFFLOAD_CANCEL) — bugs, notably, that were surfaced by LLM-assisted inspection rather than field…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-02T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd inter-server copy fixes: Neil Brown reviews the cpntf race and UAF patches">
+  <meta name="twitter:description" content="Last week, Jeff Layton posted a three-patch series fixing concurrency bugs in the NFSv4.2 inter-server copy offload code (COPY / COPY_NOTIFY / OFFLOAD_CANCEL) — bugs, notably, that were surfaced by LLM-assisted inspection rather than field…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-02</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd inter-server copy fixes: Neil Brown reviews the cpntf race and UAF patches</h1>
+<h2>Summary</h2>
+<h1>nfsd inter-server copy fixes — Neil Brown weighs in on the LLM-found bug series</h1>
+<h2>The week at a glance</h2>
+<p>Last week, Jeff Layton posted a three-patch series fixing concurrency bugs in the NFSv4.2 inter-server copy offload code (COPY / COPY_NOTIFY / OFFLOAD_CANCEL) — bugs, notably, that were surfaced by LLM-assisted inspection rather than field reports. This week brought the first substantive review: <strong>Neil Brown</strong> replied to all three patches on June 26, delivering a mixed verdict — one patch essentially approved, and two flagged for rework. No v2 has landed within this window, so the series remains at v1 with open review comments.</p>
+<p>This is a <strong>bug-fix series</strong>, not a new feature or protocol change. All three patches carry <code>Fixes:</code> tags pointing to long-standing code (the COPY_NOTIFY introduction <code>624322f1adc5</code> and the async copy reaper <code>ac0514f4d198</code>), making them strong candidates for stable backport once merged.</p>
+<h2>Patch 1/3 — cpntf publish race: "a substantially simpler solution"</h2>
+<p>Neil Brown's <a href="https://lore.kernel.org/linux-nfs/178244560927.27465.13286940935760902704@noble.neil.brown.name/">reply to PATCH 1/3</a> is the most prescriptive of the three. He objects to the verbose inline comment added by Chris Mason's fix, arguing that "This comment seems excessive. The explanation certainly should be in the commit message, and is probably there already."</p>
+<p>More importantly, he pushes back on the <em>shape</em> of the fix — which passes <code>cs_type</code> into <code>nfs4_init_cp_state()</code> — and proposes a cleaner alternative:</p>
+<blockquote>
+<p>"A substantially simpler solution would be to <em>not</em> pass cs_type to nfs4_init_cp_state() so the type remains initialised to zero, which is invalid. Anything which finds that stateid will ignore it because they already check the type. Then callers of nfs4_init_cp_state() set the type themselves."</p>
+</blockquote>
+<p>His logic: if the stateid's <code>cs_type</code> starts at zero (an invalid value), any concurrent OFFLOAD_CANCEL lookup naturally ignores the half-published entry, so the publish race closes without the extra plumbing. This is a design-level suggestion that would reshape the patch rather than just trim it.</p>
+<h2>Patch 2/3 — UAF in cpntf statelist drain: Reviewed-by granted</h2>
+<p>Neil Brown's <a href="https://lore.kernel.org/linux-nfs/178244655384.27465.3970721725119073229@noble.neil.brown.name/">reply to PATCH 2/3</a> is the most favorable. He repeats his comment-hygiene objection ("Again, this comment doesn't belong in the final code") and notes that switching the drain loop from <code>while()</code> to <code>list_for_each_entry_safe()</code> "isn't required for this change, and isn't justified by the commit message." He prefers an explicit <code>while ((cps = list_first_entry_or_null(...)) != NULL)</code> form because it "makes it abundantly clear that the list will be emptied."</p>
+<p>But he lands on a positive verdict:</p>
+<blockquote>
+<p>"Apart from the comment, the code changes looks correct. Reviewed-by: NeilBrown <a href="mailto:neil@brown.name">neil@brown.name</a>"</p>
+</blockquote>
+<p>So Patch 2/3 is effectively cleared pending cosmetic cleanup — the UAF fix (unconditionally revoking each entry before dropping the parent's reference via <code>put_cpntf_state_unlinked_locked()</code>) has earned a reviewer's stamp of approval.</p>
+<h2>Patch 3/3 — UAF in async copy cancel and shutdown: "hard for me to follow"</h2>
+<p>The most involved patch drew the harshest review. In his <a href="https://lore.kernel.org/linux-nfs/178244862502.27465.12595193014671957687@noble.neil.brown.name/">reply to PATCH 3/3</a>, Neil Brown dissects the patch as conflating two distinct changes:</p>
+<blockquote>
+<p>"This patch seems to make two changes. One involves extra refcount on the 'copy' structure, which is probably sensible but hard for me to follow because the patch is so noisy."</p>
+</blockquote>
+<p>The second change — memory barriers around the <code>-&gt;cp_clp</code> assignment — he finds opaque:</p>
+<blockquote>
+<p>"The other is barriers around assignment of -&gt;cp_clp which doesn't make any sense to me at all, and the copious comments don't help with. A barrier is always between two things... The comments should make clear what the something else is. They don't (at least not to me)."</p>
+</blockquote>
+<p>His conclusion is a request for rework rather than approval:</p>
+<blockquote>
+<p>"I would rather two patches with less noise and more useful comments."</p>
+</blockquote>
+<h2>Assessment and outlook</h2>
+<p>The review week splits cleanly into three outcomes:</p>
+<ul>
+<li><strong>Patch 1/3</strong> — design-level pushback; Neil Brown offers a simpler alternative that avoids passing <code>cs_type</code> at all.</li>
+<li><strong>Patch 2/3</strong> — approved with a <code>Reviewed-by</code>, modulo comment cleanup and an unneeded loop-style change.</li>
+<li><strong>Patch 3/3</strong> — asked to be split into two cleaner patches, with the barrier rationale made explicit.</li>
+</ul>
+<p>A recurring theme across all three replies is Neil Brown's insistence on lean code: explanatory prose belongs in commit messages, not inline comments, and patches should do one thing clearly. The next development will be a v2 from Chris Mason / Jeff Layton addressing these points — particularly the rework of Patch 3/3 — before the series can move toward merge and stable backport.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/178244560927.27465.13286940935760902704@noble.neil.brown.name/">2026-06-26 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH 1/3] nfsd: fix cpntf publish race in nfs4_init_cp_state</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178244655384.27465.3970721725119073229@noble.neil.brown.name/">2026-06-26 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH 2/3] nfsd: fix UAF in cpntf statelist drain</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178244862502.27465.12595193014671957687@noble.neil.brown.name/">2026-06-26 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH 3/3] nfsd: fix UAF in async copy cancel and shutdown</a></li>
+</ul>
+  </main>
+</body>
+</html>
