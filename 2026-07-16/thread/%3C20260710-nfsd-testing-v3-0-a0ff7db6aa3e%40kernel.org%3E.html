@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd copy offload fixes: v3 patchset applied to nfsd-testing</title>
+  <meta name="description" content="On Friday, July 10, Jeff Layton posted the third revision of his &quot;nfsd: copy offload fixes&quot; patchset PATCH v3 00/10, and by that evening Chuck Lever had the entire ten-patch series applied to the nfsd-testing tree. The turnaround was swift…">
+  <meta property="og:title" content="nfsd copy offload fixes: v3 patchset applied to nfsd-testing">
+  <meta property="og:description" content="On Friday, July 10, Jeff Layton posted the third revision of his &quot;nfsd: copy offload fixes&quot; patchset PATCH v3 00/10, and by that evening Chuck Lever had the entire ten-patch series applied to the nfsd-testing tree. The turnaround was swift…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-16T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd copy offload fixes: v3 patchset applied to nfsd-testing">
+  <meta name="twitter:description" content="On Friday, July 10, Jeff Layton posted the third revision of his &quot;nfsd: copy offload fixes&quot; patchset PATCH v3 00/10, and by that evening Chuck Lever had the entire ten-patch series applied to the nfsd-testing tree. The turnaround was swift…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-16</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd copy offload fixes: v3 patchset applied to nfsd-testing</h1>
+<h2>Summary</h2>
+<h1>nfsd: copy offload fixes — v3 applied to nfsd-testing</h1>
+<h2>What happened this week</h2>
+<p>On Friday, July 10, Jeff Layton posted the third revision of his "nfsd: copy offload fixes" patchset <a href="https://lore.kernel.org/linux-nfs/20260710-nfsd-testing-v3-0-a0ff7db6aa3e@kernel.org/">PATCH v3 00/10</a>, and by that evening Chuck Lever had the entire ten-patch series applied to the nfsd-testing tree. The turnaround was swift — a same-day review and merge, with no objections raised on the list.</p>
+<p>This is squarely a <strong>bug-fix</strong> series, though it also includes structural refactoring aimed at preventing future lifetime bugs in NFSv4.2 inter-server copy offload (COPY / COPY_NOTIFY / OFFLOAD_CANCEL). The discussion itself was minimal: one posting of the series and one "Applied" reply. All the technical substance lives in the patch descriptions.</p>
+<h2>Background and discovery process</h2>
+<p>The cover letter is notable for its candid account of how these bugs were found:</p>
+<blockquote>
+<p>"These patches fix bugs in inter-server copy offload code noticed by LLM inspection. The first 3 were found via kres, and the next 4 fix problems that were flagged in agentic review of those patches (and some via testing)."</p>
+</blockquote>
+<p>Layton also noted that he had Claude generate a set of pynfs tests for COPY, which he planned to post separately. The v3 changes over v2 were: writing a new stateid to <code>cp_res</code> to prevent a potential bad CB_OFFLOAD call, fixing an interim regression that could cause an IDR leak, and making comments more terse.</p>
+<h2>Key technical fixes (patches 01–07)</h2>
+<p>The first seven patches address concrete, exploitable bugs in the copy offload code:</p>
+<p><strong>Patch 01 — cpntf publish race</strong> (<a href="https://lore.kernel.org/linux-nfs/20260710-nfsd-testing-v3-1-a0ff7db6aa3e@kernel.org/">PATCH v3 01/10</a>, authored by Chris Mason): <code>nfs4_alloc_init_cpntf_state()</code> published a new cpntf entry into the IDR in one lock section, then took the lock again to add it to the parent's list. In that gap, a racing OFFLOAD_CANCEL could reach <code>list_del()</code> on a zeroed <code>list_head</code>, crashing the server. The fix folds the <code>cs_type</code> assignment and <code>list_add()</code> into the same critical section as <code>idr_alloc_cyclic()</code>.</p>
+<p><strong>Patch 02 — UAF in async copy cancel/shutdown</strong> (<a href="https://lore.kernel.org/linux-nfs/20260710-nfsd-testing-v3-2-a0ff7db6aa3e@kernel.org/">PATCH v3 02/10</a>): This was the most involved fix, addressing four distinct use-after-free and double-put scenarios where teardown callers (OFFLOAD_CANCEL, <code>nfsd4_shutdown_copy</code>, <code>nfsd4_cancel_copy_by_sb</code>) raced the copy kthread. The fix reworks the entire teardown lifetime: unlinking copies under <code>async_lock</code> before freeing, giving the kthread its own reference, pinning the <code>task_struct</code>, and taking a copy reference in <code>nfsd4_send_cb_offload()</code>.</p>
+<p><strong>Patch 03 — stale IDR entry for async COPY</strong> (<a href="https://lore.kernel.org/linux-nfs/20260710-nfsd-testing-v3-3-a0ff7db6aa3e@kernel.org/">PATCH v3 03/10</a>): <code>nfsd4_copy()</code> called <code>nfs4_init_copy_state()</code> before <code>dup_copy_fields()</code>, so the IDR pointed at per-request COMPOUND buffer memory that was reused by the next request. Any IDR walker (laundromat, <code>manage_cpntf_state()</code>) would dereference garbage. Fix: duplicate fields first, then register the stateid on the stable async copy object.</p>
+<p><strong>Patch 04 — initialize cpntf stateid before publishing</strong> (<a href="https://lore.kernel.org/linux-nfs/20260710-nfsd-testing-v3-4-a0ff7db6aa3e@kernel.org/">PATCH v3 04/10</a>): <code>nfsd4_copy_notify()</code> finished initializing the cpntf state <em>after</em> it was already linked into the IDR. A racing OFFLOAD_CANCEL with a crafted clientid and guessable <code>so_id</code> could free the entry, turning subsequent reads into use-after-free.</p>
+<p><strong>Patch 05 — check client ownership on cancel</strong> (<a href="https://lore.kernel.org/linux-nfs/20260710-nfsd-testing-v3-5-a0ff7db6aa3e@kernel.org/">PATCH v3 05/10</a>): The OFFLOAD_CANCEL path freed the target cpntf state without checking ownership. Since <code>so_id</code> is allocated cyclically (guessable) and the embedded clientid is a fixed per-net value, <strong>any authenticated NFSv4.2 client could cancel and free another client's copy-notify stateid</strong>. This is effectively a security fix.</p>
+<p><strong>Patch 06 — revoke cpntf stateids before dropping reference</strong> (<a href="https://lore.kernel.org/linux-nfs/20260710-nfsd-testing-v3-6-a0ff7db6aa3e@kernel.org/">PATCH v3 06/10</a>): All three revoke paths (parent-stid drain, OFFLOAD_CANCEL, laundromat expiry) could drop the membership reference without unlinking if a concurrent holder had elevated <code>cs_count</code>, leaving the entry discoverable with its reference already consumed — a KASAN-detectable UAF. The fix adds <code>revoke_cpntf_state_locked()</code> which unhashes from the IDR and list first.</p>
+<p><strong>Patch 07 — NFS4ERR_NOTSUPP for unsupported netloc4 types</strong> (<a href="https://lore.kernel.org/linux-nfs/20260710-nfsd-testing-v3-7-a0ff7db6aa3e@kernel.org/">PATCH v3 07/10</a>): A smaller correctness fix — <code>nfsd4_decode_nl4_server()</code> returned <code>nfserr_bad_xdr</code> for NL4_NAME and NL4_URL, which are well-formed XDR. The correct response is <code>NFS4ERR_NOTSUPP</code>.</p>
+<h2>Structural refactoring (patches 08–10)</h2>
+<p>The last three patches are the "make it less problematic in the future" portion:</p>
+<p><strong>Patch 08 — split nfsd4_copy into transient and durable objects</strong> (<a href="https://lore.kernel.org/linux-nfs/20260710-nfsd-testing-v3-8-a0ff7db6aa3e@kernel.org/">PATCH v3 08/10</a>): <code>struct nfsd4_copy</code> served two roles — a transient per-COMPOUND argument and a durable heap object with a kthread, reaper linkage, and IDR stateid. That dual identity was "the root of the recent lifetime bugs." The fix introduces <code>struct nfsd4_async_copy</code> for the durable object, embedding a <code>nfsd4_copy</code> for operation parameters.</p>
+<p><strong>Patch 09 — make copy offload stateid a first-class nfs4_stid</strong> (<a href="https://lore.kernel.org/linux-nfs/20260710-nfsd-testing-v3-9-a0ff7db6aa3e@kernel.org/">PATCH v3 09/10</a>): The async COPY offload stateid was previously a <code>copy_stateid_t</code> in the per-net <code>s2s_cp_stateids</code> IDR, sharing that table with COPY_NOTIFY stateids. This patch promotes it to a first-class <code>nfs4_stid</code> (SC_TYPE_COPY) allocated from the client's <code>cl_stateids</code>, making it "per-client by construction rather than relying on a guessable cyclic id in a global table."</p>
+<p><strong>Patch 10 — drop dead COPY-vs-COPYNOTIFY type handling</strong> (<a href="https://lore.kernel.org/linux-nfs/20260710-nfsd-testing-v3-10-a0ff7db6aa3e@kernel.org/">PATCH v3 10/10</a>): Cleanup removing the now-unnecessary type-distinguishing machinery from the s2s stateid IDR. No functional change.</p>
+<h2>Resolution</h2>
+<p>Chuck Lever's reply <a href="https://lore.kernel.org/linux-nfs/178371305588.2007097.11587521927052686944.b4-ty@b4/">was brief and decisive</a>:</p>
+<blockquote>
+<p>"Applied to nfsd-testing, thanks!"</p>
+</blockquote>
+<p>All ten commits landed in nfsd-testing on the same day. The series is now a candidate for upstream merge in the next kernel development cycle.</p>
+<h2>Significance for NFS client/server development</h2>
+<p>While this series targets the <strong>server</strong> (nfsd), the bugs it fixes have direct implications for NFSv4.2 clients: the UAFs and race conditions could cause server crashes or data corruption during inter-server copy operations, which is a feature increasingly used in cloud and storage virtualization environments. The ownership-check fix (patch 05) closes what was effectively a denial-of-service vector where any authenticated client could disrupt another client's copy-notify state.</p>
+<p>The series also highlights an emerging pattern in kernel development: LLM-assisted code review (via "kres" and agentic review) catching subtle concurrency bugs that had survived traditional review for years. Layton's transparent attribution of the discovery process — including "Assisted-by: Claude" tags on individual patches — marks a notable moment in how kernel bug-finding is evolving.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260710-nfsd-testing-v3-0-a0ff7db6aa3e@kernel.org/">2026-07-10 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3 00/10] nfsd: copy offload fixes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260710-nfsd-testing-v3-1-a0ff7db6aa3e@kernel.org/">2026-07-10 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3 01/10] nfsd: fix cpntf publish race in nfs4_init_cp_state</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260710-nfsd-testing-v3-2-a0ff7db6aa3e@kernel.org/">2026-07-10 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3 02/10] nfsd: fix UAF in async copy cancel and shutdown</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260710-nfsd-testing-v3-4-a0ff7db6aa3e@kernel.org/">2026-07-10 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3 04/10] nfsd: initialize copy-notify stateid before publishing it</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260710-nfsd-testing-v3-3-a0ff7db6aa3e@kernel.org/">2026-07-10 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3 03/10] nfsd: fix stale s2s_cp_stateids IDR entry for async COPY</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260710-nfsd-testing-v3-5-a0ff7db6aa3e@kernel.org/">2026-07-10 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3 05/10] nfsd: check client ownership when cancelling a copy-notify stateid</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260710-nfsd-testing-v3-6-a0ff7db6aa3e@kernel.org/">2026-07-10 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3 06/10] nfsd: revoke copy-notify stateids before dropping their reference</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260710-nfsd-testing-v3-7-a0ff7db6aa3e@kernel.org/">2026-07-10 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3 07/10] nfsd: return NFS4ERR_NOTSUPP for unsupported netloc4 types</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260710-nfsd-testing-v3-8-a0ff7db6aa3e@kernel.org/">2026-07-10 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3 08/10] nfsd: split nfsd4_copy into transient and durable async copy objects</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260710-nfsd-testing-v3-9-a0ff7db6aa3e@kernel.org/">2026-07-10 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3 09/10] nfsd: make the copy offload stateid a first-class nfs4_stid</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260710-nfsd-testing-v3-10-a0ff7db6aa3e@kernel.org/">2026-07-10 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3 10/10] nfsd: drop dead COPY-vs-COPYNOTIFY type handling from s2s stateid IDR</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178371305588.2007097.11587521927052686944.b4-ty@b4/">2026-07-10 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v3 00/10] nfsd: copy offload fixes</a></li>
+</ul>
+  </main>
+</body>
+</html>

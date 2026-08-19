@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS client: fix delegation_hash_table slab leak on failed NFSv4 mount setup</title>
+  <meta name="description" content="A compact but consequential bug-fix thread landed in the window ending 2026-07-16. Nate Prodromou posted a single-patch fix for a kernel memory leak in the NFSv4 client, and Christoph Hellwig (hch) reviewed it within roughly ten hours. The…">
+  <meta property="og:title" content="NFS client: fix delegation_hash_table slab leak on failed NFSv4 mount setup">
+  <meta property="og:description" content="A compact but consequential bug-fix thread landed in the window ending 2026-07-16. Nate Prodromou posted a single-patch fix for a kernel memory leak in the NFSv4 client, and Christoph Hellwig (hch) reviewed it within roughly ten hours. The…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-16T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS client: fix delegation_hash_table slab leak on failed NFSv4 mount setup">
+  <meta name="twitter:description" content="A compact but consequential bug-fix thread landed in the window ending 2026-07-16. Nate Prodromou posted a single-patch fix for a kernel memory leak in the NFSv4 client, and Christoph Hellwig (hch) reviewed it within roughly ten hours. The…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-16</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS client: fix delegation_hash_table slab leak on failed NFSv4 mount setup</h1>
+<h2>Summary</h2>
+<h1>NFS client: fix delegation_hash_table slab leak on failed NFSv4 mount setup</h1>
+<h2>What happened this week</h2>
+<p>A compact but consequential bug-fix thread landed in the window ending 2026-07-16. Nate Prodromou posted a single-patch fix for a kernel memory leak in the NFSv4 client, and Christoph Hellwig (hch) reviewed it within roughly ten hours. The thread is entirely about an <strong>NFS client bug fix</strong> — no new feature or protocol change is involved.</p>
+<h2>The bug</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/SA1P220MB14925066FEE37CAC1C083DEBC8F92@SA1P220MB1492.NAMP220.PROD.OUTLOOK.COM/">In his patch submission</a>, Prodromou describes a lifetime mismatch in <code>nfs4_server_common_setup()</code>:</p>
+<blockquote>
+<p>"nfs4_server_common_setup() allocates server-&gt;delegation_hash_table first, but server-&gt;destroy - the only path that frees the table via nfs4_destroy_server() - is not assigned until the very end of the function."</p>
+</blockquote>
+<p>If any intermediate step fails — <code>is_ds_only_client()</code>, <code>nfs4_init_session()</code>, <code>nfs4_get_rootfh()</code>, or <code>nfs_probe_server()</code> — the function returns with <code>server-&gt;destroy</code> still NULL, so the caller's <code>nfs_free_server()</code> skips the destroy callback and the hash table is leaked.</p>
+<h2>Why it matters: production impact</h2>
+<p>The report stands out for its unusually concrete field evidence. Prodromou notes the leak is "trivially reachable from userspace": every failed NFSv4 mount leaks one allocation, so a persistent retry loop leaks kernel memory without bound. He documented real-world damage:</p>
+<blockquote>
+<p>"Observed in production where a Longhorn backup poller retried mount.nfs4 against an NFSv3-only server roughly 10 times per second, leaking ~3.4 GiB of unreclaimable slab (kmalloc-rnd-13-4k) per day; the node accumulated 12 GiB of leaked slab before the source was identified via the kmem:kmalloc tracepoint (call_site=nfs4_delegation_hash_alloc)."</p>
+</blockquote>
+<p>He also supplied a one-liner reproducer — loop <code>mount -t nfs4 &lt;server&gt;:/missing /mnt</code> against an NFSv3-only export and watch <code>SUnreclaim</code> in <code>/proc/meminfo</code> grow 4 KiB per iteration.</p>
+<h2>The fix</h2>
+<p>The patch frees the delegation hash table on the error paths between its allocation and the assignment of <code>server-&gt;destroy</code>. It carries:</p>
+<ul>
+<li><code>Fixes: f5b3108e6a14 ("NFS: use a hash table for delegation lookup")</code></li>
+<li><code>Cc: stable@vger.kernel.org</code> — i.e., it is flagged as a backport candidate for stable trees, appropriate given the unbounded-slab-leak severity.</li>
+</ul>
+<h2>Review and conclusion</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260715044133.GA16065@lst.de/">Christoph Hellwig replied</a> the next morning with an unqualified endorsement:</p>
+<blockquote>
+<p>"Looks good: Reviewed-by: Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a>"</p>
+</blockquote>
+<p>No objections or design debate followed in this window. The thread closes with a clean Reviewed-by on a straightforward, well-motivated client-side leak fix — a textbook example of a production-diagnosed NFS client bug (the <code>delegation_hash_table</code> slab allocation) being corrected at its root cause rather than papered over by the retrying caller.</p>
+<h2>Key messages</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/SA1P220MB14925066FEE37CAC1C083DEBC8F92@SA1P220MB1492.NAMP220.PROD.OUTLOOK.COM/">PATCH submission by Nate Prodromou</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260715044133.GA16065@lst.de/">Reviewed-by from Christoph Hellwig</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/SA1P220MB14925066FEE37CAC1C083DEBC8F92@SA1P220MB1492.NAMP220.PROD.OUTLOOK.COM/">2026-07-14 Nate Prodromou <a href="mailto:nate@prodromou.com">nate@prodromou.com</a> — [PATCH] NFS: fix delegation_hash_table leak when nfs4_server_common_setup() fails</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260715044133.GA16065@lst.de/">2026-07-15 "hch@lst.de" <a href="mailto:hch@lst.de">hch@lst.de</a> — Re: [PATCH] NFS: fix delegation_hash_table leak when nfs4_server_common_setup() fails</a></li>
+</ul>
+  </main>
+</body>
+</html>

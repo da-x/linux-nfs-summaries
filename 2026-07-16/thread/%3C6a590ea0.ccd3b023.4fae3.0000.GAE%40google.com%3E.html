@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>syzbot: task hung in nfsd_nl_cache_flush_doit (nfsd netlink lock contention)</title>
+  <meta name="description" content="On Thursday, July 16, Google&#39;s syzbot fuzzer filed a fresh report against upstream kernel 44696aa3a489 (post-merge of the input-for-v7.2-rc2 tag):">
+  <meta property="og:title" content="syzbot: task hung in nfsd_nl_cache_flush_doit (nfsd netlink lock contention)">
+  <meta property="og:description" content="On Thursday, July 16, Google&#39;s syzbot fuzzer filed a fresh report against upstream kernel 44696aa3a489 (post-merge of the input-for-v7.2-rc2 tag):">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-16T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="syzbot: task hung in nfsd_nl_cache_flush_doit (nfsd netlink lock contention)">
+  <meta name="twitter:description" content="On Thursday, July 16, Google&#39;s syzbot fuzzer filed a fresh report against upstream kernel 44696aa3a489 (post-merge of the input-for-v7.2-rc2 tag):">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-16</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>syzbot: task hung in nfsd_nl_cache_flush_doit (nfsd netlink lock contention)</h1>
+<h2>Summary</h2>
+<h1>syzbot: task hung in <code>nfsd_nl_cache_flush_doit</code> — a new netlink hang in the NFS server</h1>
+<h2>What happened this week</h2>
+<p>On Thursday, July 16, Google's syzbot fuzzer filed <a href="https://lore.kernel.org/linux-nfs/6a590ea0.ccd3b023.4fae3.0000.GAE@google.com/">a fresh report</a> against upstream kernel <code>44696aa3a489</code> (post-merge of the input-for-v7.2-rc2 tag):</p>
+<blockquote>
+<p>"INFO: task syz.3.4381:22405 blocked for more than 143 seconds."</p>
+</blockquote>
+<p>The hung task was stuck in <code>nfsd_nl_cache_flush_doit</code> at <code>fs/nfsd/nfsctl.c:2236</code>, waiting on a mutex. This is the <strong>only message in this thread within the current window</strong> — no human replies, no reproducer, and no fix have landed yet as of the end of the week.</p>
+<h2>Classification</h2>
+<p>This is a <strong>bug report</strong> (not a new feature or protocol change), and it is squarely about the <strong>NFS server's netlink control interface</strong> — the same <code>nfsd</code> generic-netlink family that has been the focus of heavy development this cycle. The hung function, <code>nfsd_nl_cache_flush_doit</code>, is the netlink handler for flushing the nfsd cache (the modern replacement for the old <code>/proc/fs/nfsd/...</code> cache-flush sysctls).</p>
+<h2>Technical analysis of the hang</h2>
+<p>The call trace and lock dump tell a clear story:</p>
+<ol>
+<li>
+<p><strong>The hung task</strong> (<code>syz.3.4381</code>, PID 22405) is blocked in <code>__mutex_lock</code> on <code>nfsd_mutex</code>:</p>
+<pre><code>nfsd_nl_cache_flush_doit+0xb5/0x1b0 fs/nfsd/nfsctl.c:2236
+</code></pre>
+<p>It holds two locks itself: the generic-netlink <code>cb_lock</code> and (per the "locks held" section) it is <em>waiting</em> for <code>nfsd_mutex</code>.</p>
+</li>
+<li>
+<p><strong>A second syzbot task</strong> (<code>syz.1.3757</code>, PID 20367) is holding <code>nfsd_mutex</code> while inside <code>nfsd_nl_listener_set_doit</code> at <code>fs/nfsd/nfsctl.c:1964</code>:</p>
+<pre><code>#1: ffffffff8ee8e5e0 (nfsd_mutex){+.+.}-{4:4}, at: nfsd_nl_listener_set_doit+0x135/0x1750 fs/nfsd/nfsctl.c:1964
+</code></pre>
+</li>
+</ol>
+<p>So the picture is a <strong>lock-contention / long-hold on <code>nfsd_mutex</code></strong>: one netlink callback (<code>listener_set</code>, which adds/removes RPC listener sockets) holds the global <code>nfsd_mutex</code> for an extended period, and a concurrent <code>cache_flush</code> netlink request blocks behind it for over 143 seconds — long enough to trip the hung-task watchdog. The kernel was also tainted with <code>[L]=SOFTLOCKUP</code>, suggesting the mutex holder itself may have been spinning or stuck in a slow path (e.g., socket teardown, or waiting on network state) while holding the lock.</p>
+<p>This is <strong>not</strong> a classic deadlock (no circular wait is visible — <code>listener_set</code> holds only <code>cb_lock</code> + <code>nfsd_mutex</code>, and <code>cache_flush</code> wants <code>nfsd_mutex</code>); it is a <strong>livelock/long-hold</strong> problem where a single coarse-grained mutex serializes all nfsd netlink operations, and one of them (<code>listener_set</code>) can block for an unbounded time.</p>
+<h2>Why this matters — and the connection to this week's other activity</h2>
+<p>This report lands in the middle of an unusually active week for the nfsd netlink interface:</p>
+<ul>
+<li><strong>The exportd/mountd netlink upcall series</strong> (Layton's v6, "nfsd/sunrpc: add support for netlink upcalls") has been under active review all cycle, with Chuck Lever and Jeff Layton re-litigating design details this week.</li>
+<li><strong>nfs-utils mountd netlink fixes</strong> were committed to <code>nfs-utils-2.9.2-rc5</code> on July 11 — notably including a fix for "mount requests could hang indefinitely" when falling back from netlink to <code>/proc</code> under SELinux, showing that netlink-path hangs in this area are a known pain point.</li>
+<li><strong>The nfsd copy-offload bugfix series</strong> (Layton's v3, applied to nfsd-testing on July 10) shows the maintainers are actively hardening nfsd's concurrency and lifetime handling.</li>
+</ul>
+<p>The <code>nfsd_mutex</code> is a long-standing global lock in <code>fs/nfsd/nfsctl.c</code> that serializes all netlink control operations (listener add/remove, cache flush, thread count changes, etc.). As the netlink interface has grown from a few handlers to a full-featured control plane (listeners, exports, stats, cache management), the coarse granularity of this single mutex is becoming a scalability and reliability liability. The syzbot report is the first concrete evidence that the problem is real: under concurrent netlink traffic, one slow handler can wedge the entire control plane.</p>
+<h2>NFS client relevance</h2>
+<p>While this is a server-side bug, its impact on <strong>NFS clients</strong> is direct:</p>
+<ul>
+<li>A hung <code>nfsd</code> control plane means that administrative operations (adding/removing listeners, flushing caches after export changes) can stall indefinitely. On a production server, this could delay the activation of new exports or the removal of stale state — both of which affect client mount and access behavior.</li>
+<li>The <code>listener_set</code> handler is what adds/removes the TCP/UDP sockets nfsd listens on. If it hangs while holding <code>nfsd_mutex</code>, new clients cannot connect and existing connections may not be serviced correctly until the lock is released.</li>
+<li>For NFSv4.2 clients using inter-server copy offload (the feature Layton's bugfix series targets this week), a wedged control plane could interfere with state management operations that depend on netlink callbacks.</li>
+</ul>
+<h2>Status and outlook</h2>
+<p>As of the end of this window:</p>
+<ul>
+<li><strong>No reproducer</strong> — syzbot explicitly states: "Unfortunately, I don't have any reproducer for this issue yet."</li>
+<li><strong>No human replies</strong> — no maintainer (Lever, Layton, or others) has acknowledged the report on the list within this week.</li>
+<li><strong>No fix posted.</strong></li>
+</ul>
+<p>The likely next steps are: (1) a maintainer triages the report and confirms it is a real issue rather than a syzbot artifact; (2) someone investigates whether <code>nfsd_nl_listener_set_doit</code> can be made to release <code>nfsd_mutex</code> during its slow paths (socket teardown, network namespace operations); (3) potentially a broader refactoring to split <code>nfsd_mutex</code> into finer-grained locks or to use RCU for read-mostly netlink state.</p>
+<p>Given the pace of nfsd netlink development this cycle, it would not be surprising to see this addressed in the next patch round — but as of now, it remains an open, unacknowledged bug report.</p>
+<h2>Key messages</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/6a590ea0.ccd3b023.4fae3.0000.GAE@google.com/">syzbot — INFO: task hung in nfsd_nl_cache_flush_doit</a> (2026-07-16)</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/6a590ea0.ccd3b023.4fae3.0000.GAE@google.com/">2026-07-16 syzbot <a href="mailto:syzbot+c7eae0eb80858a2dba0f@syzkaller.appspotmail.com">syzbot+c7eae0eb80858a2dba0f@syzkaller.appspotmail.com</a> — [syzbot] [nfs?] INFO: task hung in nfsd_nl_cache_flush_doit</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Chuck Lever hardens xdrgen diagnostics: RFC 4506/5531 semantic checks and caret alignment</title>
+  <meta name="description" content="Type: Bug-fix / tooling-hardening series for xdrgen, the Python XDR code generator that underpins both the kernel NFS client and server marshalling paths. This is not a new feature or a protocol change — it closes gaps in the front end so…">
+  <meta property="og:title" content="Chuck Lever hardens xdrgen diagnostics: RFC 4506/5531 semantic checks and caret alignment">
+  <meta property="og:description" content="Type: Bug-fix / tooling-hardening series for xdrgen, the Python XDR code generator that underpins both the kernel NFS client and server marshalling paths. This is not a new feature or a protocol change — it closes gaps in the front end so…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-16T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Chuck Lever hardens xdrgen diagnostics: RFC 4506/5531 semantic checks and caret alignment">
+  <meta name="twitter:description" content="Type: Bug-fix / tooling-hardening series for xdrgen, the Python XDR code generator that underpins both the kernel NFS client and server marshalling paths. This is not a new feature or a protocol change — it closes gaps in the front end so…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-16</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Chuck Lever hardens xdrgen diagnostics: RFC 4506/5531 semantic checks and caret alignment</h1>
+<h2>Summary</h2>
+<h1>Chuck Lever hardens xdrgen with RFC-mandated semantic checks and better error carets</h1>
+<p><strong>Type:</strong> Bug-fix / tooling-hardening series for <code>xdrgen</code>, the Python XDR code generator that underpins both the kernel NFS client and server marshalling paths. This is not a new feature or a protocol change — it closes gaps in the <em>front end</em> so malformed <code>.x</code> specifications are rejected at generation time rather than surfacing later as confusing C compiler errors (or, worse, silent runtime dispatch collisions).</p>
+<h2>Context and motivation</h2>
+<p>On Sunday, July 12, Chuck Lever posted <a href="https://lore.kernel.org/linux-nfs/20260712203451.124902-1-cel@kernel.org//">a five-patch series</a> titled "Improve diagnostic reporting." The cover letter is terse but sets the scope precisely:</p>
+<blockquote>
+<p>"Add missing detection and reporting for semantic errors specified in RFCs 4506 and 5531."</p>
+</blockquote>
+<p>The series touches 12 files with a net addition of 428 lines, most of it new semantic-check logic in <code>xdr_ast.py</code> plus six new negative test cases. It lands the same day as Lever's companion <a href="https://lore.kernel.org/linux-nfs/20260712193122.116845-1-cel@kernel.org//">five-patch "Minor fixes for xdrgen" series</a>, which fixed generated-code defects (void-handler symbol collisions, unbounded opaque/string encoders, missing 16-bit width macros). Together the two series are part of the ongoing effort to convert both the NFS client and nfsd server to generated XDR code — work that makes the generator's correctness a first-order concern for the whole sunrpc stack.</p>
+<p>The recurring theme across all five patches is <em>where</em> an error is caught: Lever repeatedly argues that the xdrgen front end is "the only place that can reject" certain malformed inputs, because they compile cleanly as C but are invalid on the wire.</p>
+<h2>Patch-by-patch breakdown</h2>
+<p><strong>1/5 — Align the error caret under tab-indented source.</strong> <a href="https://lore.kernel.org/linux-nfs/20260712203451.124902-2-cel@kernel.org//">This patch</a> fixes a cosmetic-but-frustrating bug in how xdrgen prints diagnostics. When reporting a parse or transform error, the tool echoes the offending source line and drops a caret under the bad column — but the two were computed from different tab origins:</p>
+<blockquote>
+<p>"The source line is emitted with its tab characters intact, but the caret offset is computed from a tab-expanded copy of the text ahead of the column. A terminal expands the line's leading tabs relative to the four-space output indent, while the caret math expands the same tabs from column zero, so the two disagree whenever the line is indented with tabs and the caret lands past the token it should mark."</p>
+</blockquote>
+<p>The fix renders the displayed line with its tabs already expanded so "the line and the caret share one tab origin," and folds the now-identical formatting out of both error handlers into a single helper. It's a small change (18 insertions, 8 deletions in <code>xdr_parse.py</code>) but it sets up the rest of the series: every new semantic check needs its caret to point at exactly the right token.</p>
+<p><strong>2/5 — Record the source position of each declared identifier.</strong> <a href="https://lore.kernel.org/linux-nfs/20260712203451.124902-3-cel@kernel.org//">This patch</a> is the enabling infrastructure for the semantic checks that follow. The transformer previously kept an identifier's spelling but threw away its position, retaining only the enclosing definition's location:</p>
+<blockquote>
+<p>"A caret built from that position falls on the definition keyword rather than on the identifier, because the definition production begins at the keyword."</p>
+</blockquote>
+<p>The fix stores each identifier's own line and column on every named construct — constants, enumerated types and their enumerators, structs, unions, pointers, typedefs, and RPC program/version/procedure names. The fields live on the AST base node as keyword-only arguments so lark's positional construction is unaffected; unrecorded positions simply stay zero. This is 83 insertions against 33 deletions in <code>xdr_ast.py</code>.</p>
+<p><strong>3/5 — Reject specifications that define a name twice.</strong> <a href="https://lore.kernel.org/linux-nfs/20260712203451.124902-4-cel@kernel.org//">This patch</a> enforces the RFC 4506 name-space rule:</p>
+<blockquote>
+<p>"RFC 4506 Section 6.4 places constant and type identifiers in a single name space that must be unique within a specification."</p>
+</blockquote>
+<p>Previously, a duplicate type or constant name sailed through xdrgen and only surfaced later as a C compiler error about a redefined struct or function — one that "points at generated code instead of the actual offending line in the .x source." Now the duplication is caught at the front end with a caret on the second definition.</p>
+<p><strong>4/5 — Enforce RFC 5531 name and number scoping for RPC programs.</strong> <a href="https://lore.kernel.org/linux-nfs/20260712203451.124902-5-cel@kernel.org//">This patch</a> extends the duplicate check from XDR identifiers to the RPC program model, which RFC 4506 alone does not cover:</p>
+<blockquote>
+<p>"RFC 5531 Section 12.3 completes the model: a program identifier shares the specification-wide name space with constant and type identifiers, a version name and number are unique within their program, and a procedure name and number are unique within their version."</p>
+</blockquote>
+<p>Lever flags one rule as particularly dangerous because it is <em>silent</em>:</p>
+<blockquote>
+<p>"A duplicate procedure number is more dangerous because it is silent: the two procedures emit enumerators of equal value -- valid C that compiles cleanly -- leaving a dispatch collision to surface only at run time."</p>
+</blockquote>
+<p>This is the kind of bug that would be nearly impossible to debug in a running NFS client or server, which makes front-end rejection especially valuable.</p>
+<p><strong>5/5 — Reject out-of-range program, version, and procedure numbers.</strong> <a href="https://lore.kernel.org/linux-nfs/20260712203451.124902-6-cel@kernel.org//">The final patch</a> closes the last gap: numeric range validation. RFC 5531 encodes each number as an unsigned 32-bit integer, so a valid value must fall in <code>[0, 2**32 - 1]</code>, but the grammar accepts signed decimals with no ceiling:</p>
+<blockquote>
+<p>"a negative procedure number emerges as an enumerator such as 'FOO = -5', valid C that compiles cleanly even though the wire field is an unsigned 32-bit integer. Thus the xdrgen front end is the only place that can reject the malformed value."</p>
+</blockquote>
+<p>This patch adds six new negative test files (negative and too-large program, version, and procedure numbers) to lock in the behavior.</p>
+<h2>Assessment</h2>
+<p>This is a textbook "make the tool honest" series: no runtime behavior of any already-correct specification changes, but every malformed one now fails fast with a precise, well-aligned diagnostic instead of a misleading downstream C error or — in the case of duplicate procedure numbers and out-of-range values — a silent wire-format bug. The progression is carefully sequenced: fix the caret (1/5), record identifier positions (2/5), then layer on the RFC 4506 check (3/5), the RFC 5531 scoping check (4/5), and the numeric-range check (5/5), each building on the position-tracking infrastructure from patch 2.</p>
+<p>For NFS client development specifically, the value is in <em>preventing</em> defects: as both the client and nfsd move to generated XDR code, a specification that slips past xdrgen today becomes a latent dispatch or wire-encoding bug in production tomorrow. Lever's framing — that the front end "is the only place that can reject" these values — underscores that this is defensive work ahead of the larger NFSv2/NFSv3 conversion.</p>
+<p>No replies appeared on the list within this week's window, consistent with the series being posted Sunday evening UTC and awaiting the next working week for review and queueing.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260712203451.124902-2-cel@kernel.org/">2026-07-12 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 1/5] xdrgen: Align the error caret under tab-indented source</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260712203451.124902-1-cel@kernel.org/">2026-07-12 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 0/5] xdrgen: Improve diagnostic reporting</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260712203451.124902-3-cel@kernel.org/">2026-07-12 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 2/5] xdrgen: Record the source position of each declared identifier</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260712203451.124902-4-cel@kernel.org/">2026-07-12 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 3/5] xdrgen: Reject specifications that define a name twice</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260712203451.124902-6-cel@kernel.org/">2026-07-12 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 5/5] xdrgen: Reject out-of-range program, version, and procedure numbers</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260712203451.124902-5-cel@kernel.org/">2026-07-12 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 4/5] xdrgen: Enforce RFC 5531 name and number scoping for RPC programs</a></li>
+</ul>
+  </main>
+</body>
+</html>
