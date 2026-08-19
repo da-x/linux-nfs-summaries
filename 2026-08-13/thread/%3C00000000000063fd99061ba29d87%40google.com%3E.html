@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>syzbot finds reproducer for nfsd_nl_version_get_doit hung task</title>
+  <meta name="description" content="This week’s only traffic on a two-year-old syzbot report is a new C reproducer for a hung-task stall in the NFS server netlink control path. There is still no human reply, no patch, and no #syz fix / #syz dup acknowledgement. The report is…">
+  <meta property="og:title" content="syzbot finds reproducer for nfsd_nl_version_get_doit hung task">
+  <meta property="og:description" content="This week’s only traffic on a two-year-old syzbot report is a new C reproducer for a hung-task stall in the NFS server netlink control path. There is still no human reply, no patch, and no #syz fix / #syz dup acknowledgement. The report is…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-13T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="syzbot finds reproducer for nfsd_nl_version_get_doit hung task">
+  <meta name="twitter:description" content="This week’s only traffic on a two-year-old syzbot report is a new C reproducer for a hung-task stall in the NFS server netlink control path. There is still no human reply, no patch, and no #syz fix / #syz dup acknowledgement. The report is…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-13</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>syzbot finds reproducer for nfsd_nl_version_get_doit hung task</h1>
+<h2>Summary</h2>
+<p>This week’s only traffic on a two-year-old syzbot report is a new C reproducer for a hung-task stall in the NFS <em>server</em> netlink control path. There is still no human reply, no patch, and no <code>#syz fix</code> / <code>#syz dup</code> acknowledgement. The report is a <strong>bug</strong>, not a protocol change or a client feature: <code>nfsd_nl_version_get_doit()</code> blocks uninterruptibly on <code>nfsd_mutex</code> while a sibling netlink <code>doit</code> already holds that mutex.</p>
+<h2>Prior history (brief)</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/00000000000063fd99061ba29d87@google.com/">syzbot opened the bug</a> on 24 June 2024 against upstream <code>2ccbdf43d5e7</code> (6.10-rc3-era), with no reproducer. The original hung-task watchdog fired after more than 144 seconds in:</p>
+<blockquote>
+<p>"INFO: task syz-executor.2:26515 blocked for more than 144 seconds."</p>
+</blockquote>
+<p>The 2024 stack already pointed at <code>nfsd_nl_version_get_doit</code> waiting on <code>nfsd_mutex</code> (<code>fs/nfsd/nfsctl.c:1892</code>), while another executor held the same mutex in <code>nfsd_nl_listener_set_doit</code>. The bot tagged the report <code>[nfs?]</code> and asked maintainers to add <code>Reported-by: syzbot+41bc60511c2884783c27@syzkaller.appspotmail.com</code> on any fix. That thread then went silent until this week.</p>
+<h2>This week: a C reproducer on current upstream</h2>
+<p>On 7 August 2026, <a href="https://lore.kernel.org/linux-nfs/6a752023.b50370da.49fe0.0015.GAE@google.com/">syzbot reported that it now has a reproducer</a> on current upstream (<code>fcaeecb8b0cd</code>, merge of <code>probes-fixes-v7.2-rc6</code>). Assets include a <a href="https://syzkaller.appspot.com/x/repro.c?x=135e57b9580000">C reproducer</a>, <a href="https://syzkaller.appspot.com/x/log.txt?x=10403e49580000">console log</a>, <a href="https://syzkaller.appspot.com/x/.config?x=d69870d5e052935f">kernel config</a>, and the <a href="https://syzkaller.appspot.com/bug?extid=41bc60511c2884783c27">dashboard entry</a>. The bot restated the usual fix tag:</p>
+<blockquote>
+<p>"IMPORTANT: if you fix the issue, please add the following tag to the commit:
+Reported-by: syzbot+41bc60511c2884783c27@syzkaller.appspotmail.com"</p>
+</blockquote>
+<p>The new hung-task dump is shorter (10 seconds rather than 144) but otherwise the same shape:</p>
+<blockquote>
+<p>"INFO: task syz-executor371:5953 blocked for more than 10 seconds."</p>
+</blockquote>
+<p>The blocked task is in <code>D</code> state in <code>__mutex_lock</code> from <code>nfsd_nl_version_get_doit+0x18c/0x810</code> at <code>fs/nfsd/nfsctl.c:1889</code>, reached via Generic Netlink (<code>genl_family_rcv_msg_doit</code> → <code>netlink_sendmsg</code> → <code>sendto</code>). That is the nfsd control-plane <code>NFSD_CMD_VERSION_GET</code> handler, not an NFS client RPC path.</p>
+<h2>Lock dump: <code>nfsd_mutex</code> vs. listener set</h2>
+<p>The interesting evidence is the system-wide lock list, not the hung stack itself. Two threads of the same executor both hold Generic Netlink <code>cb_lock</code> and then serialize on <code>nfsd_mutex</code>:</p>
+<ul>
+<li><code>syz-executor371/5952</code> holds <code>nfsd_mutex</code> in <code>nfsd_nl_listener_set_doit</code> (<code>fs/nfsd/nfsctl.c:1964</code>).</li>
+<li><code>syz-executor371/5953</code> (the hung task) is waiting for the same <code>nfsd_mutex</code> in <code>nfsd_nl_version_get_doit</code> (<code>fs/nfsd/nfsctl.c:1889</code>).</li>
+</ul>
+<p>In other words, a netlink <em>set</em> of NFS server listeners is sitting on the global nfsd mutex long enough that a concurrent <em>get</em> of the enabled NFS versions trips the hung-task watchdog. Both operations also take <code>cb_lock</code> in <code>genl_rcv()</code>, so the stall is a control-plane serialization problem: genetlink plus the process-wide <code>nfsd_mutex</code> that still guards nfsd start/stop, version, thread, and listener ioctls/netlink commands.</p>
+<p>The NMI backtrace captured <code>khungtaskd</code> on CPU 1 and a concurrent <code>modprobe</code> in maple-tree <code>mmap</code> validation on CPU 0. That second CPU sample looks like fuzzing noise rather than the nfsd stall; the lockdep dump is the smoking gun.</p>
+<p>syzbot closed the mail with the usual test invitation:</p>
+<blockquote>
+<p>"If you want syzbot to run the reproducer, reply with:
+<code>#syz test: git://repo/address.git branch-or-commit-hash</code>"</p>
+</blockquote>
+<p>Nobody on linux-nfs has taken that offer this week.</p>
+<h2>Not an NFS client bug</h2>
+<p>Despite the <code>[nfs?]</code> syzbot tag and this summary series’ usual client focus, the code under test is <strong>nfsd</strong>, the in-kernel NFS <em>server</em>. <code>nfsd_nl_version_get_doit()</code> lives in <code>fs/nfsd/nfsctl.c</code> and is the Generic Netlink replacement for the old <code>nfsd</code> control-channel version query. There is no NFS client (<code>fs/nfs/</code>) frame on the hung stack, no sunrpc client slot, and no mount/idmapping involvement. Client developers can treat this as adjacent server-control fallout, not a client regression.</p>
+<p>The same day, a sibling syzbot thread (<code>[syzbot] [nfs?] INFO: task hung in nfsd_nl_threads_get_doit</code>) posted a matching reproducer in which several tasks wait in <code>nfsd_nl_threads_get_doit</code> while others hold <code>nfsd_mutex</code> in <code>nfsd_nl_listener_set_doit</code>. That parallel report reinforces the diagnosis: <code>nfsd_nl_listener_set_doit()</code> can occupy <code>nfsd_mutex</code> long enough for any other nfsd netlink getter to look wedged. Historical cousins on the list include hung-task reports against <code>nfsd_nl_version_set_doit</code> and <code>nfsd_nl_listener_get_doit</code>.</p>
+<h2>Status</h2>
+<p><strong>Kind of change:</strong> bug (hung task / unbounded <code>nfsd_mutex</code> hold in nfsd Generic Netlink).</p>
+<p><strong>Evolution this week:</strong> the 2024 unreproducible report became a current-upstream C repro. The call sites have barely moved (<code>nfsctl.c:1892</code> → <code>:1889</code> for version get; listener set still around <code>:1964</code>).</p>
+<p><strong>Conclusion:</strong> none from maintainers. The thread is still waiting on an nfsd-side fix — likely shrinking the <code>nfsd_mutex</code> critical section in <code>nfsd_nl_listener_set_doit</code>, making the getters sleep killably, or otherwise preventing a netlink listener update from stalling version/thread queries. Until someone replies with a patch and <code>#syz test</code> / <code>#syz fix</code>, the reproducer stands as an open server-control deadlock/livelock under fuzzing, not a client issue.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/6a752023.b50370da.49fe0.0015.GAE@google.com/">2026-08-07 syzbot <a href="mailto:syzbot+41bc60511c2884783c27@syzkaller.appspotmail.com">syzbot+41bc60511c2884783c27@syzkaller.appspotmail.com</a> — Re: [syzbot] [nfs?] INFO: task hung in nfsd_nl_version_get_doit</a></li>
+</ul>
+  </main>
+</body>
+</html>

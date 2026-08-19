@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SUNRPC: wait for in-flight client TLS handshake callback</title>
+  <meta name="description" content="Jérémy Jean posted a bug fix for a use-after-free race in the NFS client&#39;s RPC-with-TLS handshake path. The one-commit patch, SUNRPC: wait for in-flight client TLS handshake callback, touches only net/sunrpc/xprtsock.c (+11/−1) and is…">
+  <meta property="og:title" content="SUNRPC: wait for in-flight client TLS handshake callback">
+  <meta property="og:description" content="Jérémy Jean posted a bug fix for a use-after-free race in the NFS client&#39;s RPC-with-TLS handshake path. The one-commit patch, SUNRPC: wait for in-flight client TLS handshake callback, touches only net/sunrpc/xprtsock.c (+11/−1) and is…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-13T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="SUNRPC: wait for in-flight client TLS handshake callback">
+  <meta name="twitter:description" content="Jérémy Jean posted a bug fix for a use-after-free race in the NFS client&#39;s RPC-with-TLS handshake path. The one-commit patch, SUNRPC: wait for in-flight client TLS handshake callback, touches only net/sunrpc/xprtsock.c (+11/−1) and is…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-13</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>SUNRPC: wait for in-flight client TLS handshake callback</h1>
+<h2>Summary</h2>
+<h1>SUNRPC: wait for in-flight client TLS handshake callback</h1>
+<h2>Summary</h2>
+<p>Jérémy Jean posted a <strong>bug fix</strong> for a use-after-free race in the NFS client's RPC-with-TLS handshake path. The one-commit patch, <a href="https://lore.kernel.org/linux-nfs/20260809170748.1223617-1-Jeremy.Jean@oss.cyber.gouv.fr/">SUNRPC: wait for in-flight client TLS handshake callback</a>, touches only <code>net/sunrpc/xprtsock.c</code> (+11/−1) and is tagged <code>Fixes: 75eb6af7acdf</code> ("SUNRPC: Add a TCP-with-TLS RPC transport class") with <code>Cc: stable@vger.kernel.org</code>. This is not a protocol change and not a new feature: RFC 9289 framing and the TCP-with-TLS transport class stay as they are. The change closes a cancel-versus-completion race that can free the lower transport while <code>xs_tls_handshake_done()</code> is still writing <code>xprt_err</code>.</p>
+<p>No replies landed in-window. There is no prior summary for this thread; the discussion begins and, for this week, ends with Jean's posting on 9 August.</p>
+<h2>The race: cancel loses to completion, waiter drops the callback's reference</h2>
+<p>The client already pins the lower transport for the handshake callback. <a href="https://lore.kernel.org/linux-nfs/20260809170748.1223617-1-Jeremy.Jean@oss.cyber.gouv.fr/">Jean</a> restates that contract first:</p>
+<blockquote>
+<p>"xs_tls_handshake_sync() gives xs_tls_handshake_done() a reference to the lower transport before submitting the handshake request. On timeout or signal, the synchronous waiter drops that reference after calling tls_handshake_cancel()."</p>
+</blockquote>
+<p>That drop is the bug. <code>handshake_req_cancel()</code> — the kernel handshake core behind <code>tls_handshake_cancel()</code> — returns false once <code>handshake_complete()</code> has already marked the request complete. False does <strong>not</strong> mean "the callback never ran." It means "completion won; <code>hp_done()</code> may still be in flight." Jean's diagnosis is the client analogue of the server-side cancel-loser window Chuck Lever closed in May:</p>
+<blockquote>
+<p>"handshake_req_cancel() returns false when handshake_complete() has already marked the request complete. In that case the completion callback can still be running, so dropping the callback-owned reference in the waiter can free the lower transport before xs_tls_handshake_done() stores xprt_err or drops its own reference."</p>
+</blockquote>
+<p>The write-after-free is on the lower <code>rpc_xprt</code> that the TLS connect worker uses as the inner TCP transport. <code>xs_tls_handshake_done()</code> still needs that object to store <code>xprt_err</code> and to drop the reference it was given at submit time. If the waiter has already put the last reference, the callback writes through freed memory. The trigger is ordinary: an NFS-over-TLS mount whose handshake wait is interrupted by a signal, or whose handshake times out, overlapping <code>tlshd</code> delivering the completion downcall. No peer misbehavior is required.</p>
+<h2>The fix: drain the callback, keep the timeout/signal return</h2>
+<p>Jean's 11-line change is deliberately small. When <code>tls_handshake_cancel()</code> returns false, the waiter no longer drops the callback-owned reference itself. It waits until <code>xs_tls_handshake_done()</code> signals <code>handshake_done</code> and lets the callback release its own pin:</p>
+<blockquote>
+<p>"If cancellation loses to completion, wait until xs_tls_handshake_done() signals handshake_done and let the callback release its reference. This mirrors the server-side handshake lifetime handling and keeps the timeout or signal return value unchanged."</p>
+</blockquote>
+<p>Two policy choices matter for NFS client developers:</p>
+<ol>
+<li><strong>The waiter still reports timeout or <code>-ERESTARTSYS</code>.</strong> Completing the handshake in the race does not turn a killed or timed-out <code>xs_tls_handshake_sync()</code> into success. RPC tasks and the mount path keep seeing the interrupt they already observed; only the lifetime of the lower transport is corrected.</li>
+<li><strong>The callback is the sole owner of its reference after a lost cancel.</strong> That is the same split Lever used on the server: successful cancel means the callback will not fire, so the waiter may drop; a lost cancel means the callback <em>will</em> fire, so the waiter must drain and must not drop.</li>
+</ol>
+<p>The <code>Assisted-by: Codex:gpt-5</code> tag is on the commit. Reviewers will want to treat that as provenance, not as a substitute for reading the cancel-loser path against <code>xs_tls_handshake_done()</code>.</p>
+<h2>How this sits next to earlier RPC-with-TLS lifetime work</h2>
+<p>This posting is the missing client half of a race the server already fixed.</p>
+<p>In May, Chuck Lever and Chris Mason landed a two-patch series on <code>svcsock.c</code>. Patch 1 pinned <code>svc_xprt</code> across the asynchronous TLS handshake callback; patch 2, <a href="https://lore.kernel.org/linux-nfs/20260522133907.326296-2-cel@kernel.org/">sunrpc: wait for in-flight TLS handshake callback when cancel loses race</a>, waited for <code>svc_tcp_handshake_done()</code> after a false <code>tls_handshake_cancel()</code>. Jean's subject line and commit message are the client transcription of that second patch: the client already took the pin (the analogue of Mason's <code>svc_xprt_get()</code>), but <code>xs_tls_handshake_sync()</code> still dropped that pin on the cancel-loser path.</p>
+<p>The May client series ([PATCH 0/2] Fix a few memory bugs in RPC-with-TLS) is a different lifetime bug. Lever's <code>rpc_hold_client()</code> pin and the lower-<code>rpc_clnt</code> leak fix closed use-after-free of the <em>upper</em> client across <code>connect_worker</code> and a leak of the temporary lower client on a killed <code>XPRT_LOCKED</code> wait. Those patches do not serialize <code>xs_tls_handshake_done()</code> against <code>tls_handshake_cancel()</code>. Jean's change is the remaining handshake-callback race on the lower transport itself.</p>
+<p>Same-week TLS work on the list is Chuck Lever's <a href="https://lore.kernel.org/linux-nfs/20260808-svcsock-cmsg-fixes-v3-0-62d9a631c880@kernel.org/">v3 CMSG control-record series</a>, which hardens how <code>xprtsock.c</code> classifies Alert records after handshake. That series is receive-path policy. This patch is handshake-lifetime. They share a file and a transport class; they do not share a race.</p>
+<h2>What this means for NFS client development</h2>
+<p>For anyone mounting NFS with <code>xprtsec=tls</code> / mutual TLS:</p>
+<ul>
+<li>A Ctrl-C during mount, a handshake timeout, or any other interruptible wait that races with <code>tlshd</code> completing the hello can currently free the lower TCP-with-TLS transport while <code>xs_tls_handshake_done()</code> still stores <code>xprt_err</code>. That is a write-after-free on a structure the NFS client uses for every subsequent RPC on that socket, not a benign refcount warning.</li>
+<li>The patch does not change reconnect policy, does not add a KeyUpdate path, and does not alter how <code>xs_sock_process_cmsg()</code> treats post-handshake control records. Those remain Lever's CMSG series.</li>
+<li>Because the <code>Fixes:</code> tag points at the original TCP-with-TLS transport class, the race is latent on every LTS kernel that carries RPC-with-TLS. The <code>Cc: stable@vger.kernel.org</code> is therefore load-bearing: once reviewed, this is a candidate for backport independently of the CMSG work.</li>
+</ul>
+<h2>Status at week close</h2>
+<p>Posted, not reviewed, not merged. No <code>Acked-by</code>, no <code>Reviewed-by</code>, no nits. Consensus in-window is Jean's alone: when client TLS handshake cancel loses to completion, wait for <code>xs_tls_handshake_done()</code> and let the callback drop its own reference, matching the server-side handshake lifetime handling without changing the timeout or signal return. The NFS client maintainers have not yet spoken.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260809170748.1223617-1-Jeremy.Jean@oss.cyber.gouv.fr/">2026-08-09 Jérémy Jean — [PATCH] SUNRPC: wait for in-flight client TLS handshake callback</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260809170748.1223617-1-Jeremy.Jean@oss.cyber.gouv.fr/">2026-08-09 Jérémy Jean <a href="mailto:Jeremy.Jean@oss.cyber.gouv.fr">Jeremy.Jean@oss.cyber.gouv.fr</a> — [PATCH] SUNRPC: wait for in-flight client TLS handshake callback</a></li>
+</ul>
+  </main>
+</body>
+</html>

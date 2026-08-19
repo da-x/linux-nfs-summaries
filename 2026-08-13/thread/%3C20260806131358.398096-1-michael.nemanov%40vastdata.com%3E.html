@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS client: Trond tightens ENXIO-on-symlink type check toward v3</title>
+  <meta name="description" content="This is a bug fix, not a new feature or protocol change: review of Michael Nemanov&#39;s v2 for the NFSv3 client&#39;s nfs_atomic_open_v23() path in fs/nfs/dir.c. The patch stops open(2) with O_CREAT from returning ENXIO when a cold-dcache NFSv3…">
+  <meta property="og:title" content="NFS client: Trond tightens ENXIO-on-symlink type check toward v3">
+  <meta property="og:description" content="This is a bug fix, not a new feature or protocol change: review of Michael Nemanov&#39;s v2 for the NFSv3 client&#39;s nfs_atomic_open_v23() path in fs/nfs/dir.c. The patch stops open(2) with O_CREAT from returning ENXIO when a cold-dcache NFSv3…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-13T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS client: Trond tightens ENXIO-on-symlink type check toward v3">
+  <meta name="twitter:description" content="This is a bug fix, not a new feature or protocol change: review of Michael Nemanov&#39;s v2 for the NFSv3 client&#39;s nfs_atomic_open_v23() path in fs/nfs/dir.c. The patch stops open(2) with O_CREAT from returning ENXIO when a cold-dcache NFSv3…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-13</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS client: Trond tightens ENXIO-on-symlink type check toward v3</h1>
+<h2>Summary</h2>
+<h1>NFS client: Trond tightens ENXIO-on-symlink type check toward v3</h1>
+<h2>Overview</h2>
+<p>This is a <strong>bug fix</strong>, not a new feature or protocol change: review of <a href="https://lore.kernel.org/linux-nfs/20260806131358.398096-1-michael.nemanov@vastdata.com/">Michael Nemanov's v2</a> for the NFSv3 client's <code>nfs_atomic_open_v23()</code> path in <code>fs/nfs/dir.c</code>. The patch stops <code>open(2)</code> with <code>O_CREAT</code> from returning <code>ENXIO</code> when a cold-dcache NFSv3 lookup lands on an existing symlink. Last week Nemanov posted v2 after Trond Myklebust flagged a dentry-refcount underflow in v1. This week the Linux NFS client maintainer reviewed that type check, then immediately tightened his own suggestion, and Nemanov agreed to spin a v3.</p>
+<p>No Ack, Nack, or merge landed in this window. The thread is waiting on that v3.</p>
+<h2>Brief bridge from last week</h2>
+<p>v2 already applied Trond's one-line v1 correction: after a successful CREATE UNCHECKED, if the instantiated inode is not a regular file, return <code>finish_no_open(file, NULL)</code> so the VFS follows the symlink instead of calling <code>no_open()</code> (<code>-ENXIO</code>). Passing <code>NULL</code> avoids a second <code>dput()</code> on a dentry the caller still owns. The type test in v2 was <code>!S_ISREG(d_inode(dentry)-&gt;i_mode)</code>, chosen over <code>S_ISLNK()</code> so any non-regular CREATE result would take the same path. That is where this week's review starts.</p>
+<h2>Trond: do not dereference a missing inode</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/c887ed23d456542f97168ffeda4abb5d55ba0fa6.camel@kernel.org/">Trond's first reply</a> accepts the <code>finish_no_open(file, NULL)</code> shape but objects to assuming <code>d_inode(dentry)</code> is non-NULL:</p>
+<blockquote>
+<p>"Hmm... I'm changing the above to <code>if (!d_inode(dentry) || !S_ISREG(....))</code> so that we don't inadvertently try to open a negative dentry. That can happen with NFSv2 if we hit an existing directory that has been renamed on the server."</p>
+</blockquote>
+<p>The remark is more than a NULL-safety nit. <code>nfs_atomic_open_v23()</code> is shared with NFSv2, and a CREATE that races a server-side rename can leave a negative dentry. v2's <code>d_inode(dentry)-&gt;i_mode</code> would then dereference NULL. Guarding the inode first keeps the "do not finish this open" exit for both a non-regular positive dentry (the original symlink/<code>ENXIO</code> case) and a negative dentry (the NFSv2 rename race).</p>
+<h2>Twenty minutes later: prefer <code>d_is_reg()</code></h2>
+<p><a href="https://lore.kernel.org/linux-nfs/1c8a4b344ffa6617ba20891a9094899595346007.camel@kernel.org/">Trond followed himself</a> almost immediately:</p>
+<blockquote>
+<p>"Actually, <code>if (!d_is_reg(dentry))</code> is even better."</p>
+</blockquote>
+<p><code>d_is_reg()</code> is the VFS helper that is false for negative dentries <em>and</em> for any non-regular positive inode. It collapses the two-clause test into one call that already encodes the contract the client wants: only call <code>finish_open()</code> when the dentry is a regular file. Everything else — symlink, directory, device, or a hole left by an NFSv2 rename — falls through to <code>finish_no_open(file, NULL)</code> and the VFS open path.</p>
+<p>That is a typical client-maintainer tightening: same control flow, less open-coded inode poking, and the negative-dentry case is no longer a special comment.</p>
+<h2>Nemanov agrees, offers v3</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/e940b620-7f6d-4d4a-a0f4-644d880c7b6a@vastdata.com/">Nemanov replied on August 10</a> with a short confirmation:</p>
+<blockquote>
+<p>"Agreed. Would you like a v3 with this fix?"</p>
+</blockquote>
+<p>He did not push back on either the NFSv2 negative-dentry scenario or the switch from <code>S_ISREG()</code> to <code>d_is_reg()</code>. The type check that v2 had justified as "cover any other non-regular types a server might return" is now also the right check for a missing inode. A v3 would be a one-line substitution in the same seven-line hunk.</p>
+<h2>Why this matters for NFS client development</h2>
+<p>The review shows how thin the NFSv3 <code>atomic_open</code> path still is. The original <code>7c6c5249f061</code> work added <code>atomic_open</code> so <code>O_TRUNC</code> would ride CREATE UNCHECKED; the ENXIO-on-symlink bug is one sibling of that CREATE-result / VFS-file-type mismatch, and the NFSv2 negative dentry after a server-side directory rename is another. All three share the same exit: do not call <code>finish_open()</code> unless the dentry is a regular file.</p>
+<p>It also shows the client's preferred idiom evolving in public. v1 used the wrong <code>finish_no_open()</code> argument and under-counted the dentry. v2 fixed the refcount and used <code>!S_ISREG(d_inode()-&gt;i_mode)</code>. This week Trond first added an explicit NULL inode guard, then replaced both tests with <code>d_is_reg()</code>. Each step is a few characters; each one closes a real failure mode on the shared v2/v3 atomic-open path.</p>
+<h2>Final status (this week)</h2>
+<ul>
+<li><strong>Type:</strong> Bug fix (NFSv3/v2 client, <code>nfs_atomic_open_v23()</code> in <code>fs/nfs/dir.c</code>)</li>
+<li><strong>This week's activity:</strong> maintainer review of v2; type check revised twice in twenty minutes; author offers v3</li>
+<li><strong>Agreed change:</strong> replace <code>!S_ISREG(d_inode(dentry)-&gt;i_mode)</code> with <code>!d_is_reg(dentry)</code> so negative dentries (NFSv2 rename of a directory) do not get <code>finish_open()</code></li>
+<li><strong>Outstanding at week close:</strong> v3 not yet posted; no Ack or merge of v2</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/c887ed23d456542f97168ffeda4abb5d55ba0fa6.camel@kernel.org/">2026-08-08 Trond Myklebust — guard against a negative dentry before <code>S_ISREG</code></a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/1c8a4b344ffa6617ba20891a9094899595346007.camel@kernel.org/">2026-08-08 Trond Myklebust — prefer <code>!d_is_reg(dentry)</code></a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/e940b620-7f6d-4d4a-a0f4-644d880c7b6a@vastdata.com/">2026-08-10 Michael Nemanov — agrees, offers v3</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/c887ed23d456542f97168ffeda4abb5d55ba0fa6.camel@kernel.org/">2026-08-08 Trond Myklebust <a href="mailto:trondmy@kernel.org">trondmy@kernel.org</a> — Re: [PATCH v2] nfs: fix ENXIO on O_CREAT open of existing symlink over NFSv3</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/1c8a4b344ffa6617ba20891a9094899595346007.camel@kernel.org/">2026-08-08 Trond Myklebust <a href="mailto:trondmy@kernel.org">trondmy@kernel.org</a> — Re: [PATCH v2] nfs: fix ENXIO on O_CREAT open of existing symlink over NFSv3</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/e940b620-7f6d-4d4a-a0f4-644d880c7b6a@vastdata.com/">2026-08-10 Michael Nemanov <a href="mailto:michael.nemanov@vastdata.com">michael.nemanov@vastdata.com</a> — Re: [PATCH v2] nfs: fix ENXIO on O_CREAT open of existing symlink over NFSv3</a></li>
+</ul>
+  </main>
+</body>
+</html>

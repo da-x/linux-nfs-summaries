@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Client TLS handshake UAF and CMSG v3 await review; Trond tightens NFSv3 ENXIO-on-symlink</title>
+  <meta name="description" content="A quiet week on linux-nfs still put two NFS client TLS lifetime bugs on the table, plus the only human review of the window: Trond Myklebust tightening the NFSv3 atomic_open type check that currently returns ENXIO on an existing symlink.…">
+  <meta property="og:title" content="Client TLS handshake UAF and CMSG v3 await review; Trond tightens NFSv3 ENXIO-on-symlink">
+  <meta property="og:description" content="A quiet week on linux-nfs still put two NFS client TLS lifetime bugs on the table, plus the only human review of the window: Trond Myklebust tightening the NFSv3 atomic_open type check that currently returns ENXIO on an existing symlink.…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-13T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Client TLS handshake UAF and CMSG v3 await review; Trond tightens NFSv3 ENXIO-on-symlink">
+  <meta name="twitter:description" content="A quiet week on linux-nfs still put two NFS client TLS lifetime bugs on the table, plus the only human review of the window: Trond Myklebust tightening the NFSv3 atomic_open type check that currently returns ENXIO on an existing symlink.…">
+  <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../index.html">Summaries</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Client TLS handshake UAF and CMSG v3 await review; Trond tightens NFSv3 ENXIO-on-symlink</h1>
+<p><em>Week ending 2026-08-13</em></p>
+<p>A quiet week on linux-nfs still put two <strong>NFS client TLS lifetime bugs</strong> on the table, plus the only human review of the window: Trond Myklebust tightening the NFSv3 <code>atomic_open</code> type check that currently returns <code>ENXIO</code> on an existing symlink. Nothing merged. Client maintainers spoke on <code>fs/nfs/dir.c</code> and stayed silent on both <code>xprtsock.c</code> postings.</p>
+<h2>Critical client bugs: handshake UAF, then Alert misclassification</h2>
+<p>The most urgent client fix is <a href="thread/%253C20260809170748.1223617-1-Jeremy.Jean%2540oss.cyber.gouv.fr%253E.html">Jérémy Jean’s one-commit SUNRPC patch</a> for a use-after-free on the lower TCP-with-TLS transport. <code>xs_tls_handshake_sync()</code> already pins that <code>rpc_xprt</code> for <code>xs_tls_handshake_done()</code>, but on timeout or signal it drops the pin after <code>tls_handshake_cancel()</code> returns false. False means completion already won — the callback may still be storing <code>xprt_err</code>. An ordinary Ctrl-C during an <code>xprtsec=tls</code> mount, racing <code>tlshd</code>, is enough. Jean drains the callback on the cancel-loser path and leaves the timeout/<code>-ERESTARTSYS</code> return unchanged, matching Chuck Lever’s May server-side handshake wait. Tagged <code>Fixes: 75eb6af7acdf</code> with <code>Cc: stable</code>. No replies.</p>
+<p>The same file, a different race: <a href="thread/%253C20260808-svcsock-cmsg-fixes-v3-0-62d9a631c880%2540kernel.org%253E.html">Lever’s v3 CMSG series</a> (7 patches, down from 8) hardens how in-kernel SUNRPC consumes kTLS control records after <code>read_sock_rectype</code> died on netdev. The three <strong>client</strong> patches (<code>xprtsock.c</code>, now 5–7) are the ones that still need an <code>Acked-by</code>:</p>
+<ul>
+<li>reject a TLS Alert that is not exactly two octets (<code>-EACCES</code>, so pending RPC tasks see it);</li>
+<li>classify fatality from the Alert <em>description</em>, not the retired AlertLevel octet — a peer that aborts with <code>unexpected_message</code> but leaves the level set to warning currently leaves in-flight RPCs sitting on a dead session until timeout;</li>
+<li>fold <code>xs_sock_process_cmsg()</code> into its only caller.</li>
+</ul>
+<p>v3’s only delta from v2 is dropping the server helper fold that follow-on work would re-split. Accounting and “resume after control record” remain server-only (<code>svcsock.c</code>); the client still returns <code>-EAGAIN</code> for KeyUpdate, and nobody implements a rekey path. Lever is explicit that the octet-accounting bugs have <strong>no trigger today</strong> — no RPC-with-TLS stack sends post-handshake control records — and wants independently backportable commits rather than a <code>net/handshake</code> helper. Third posting, still zero review.</p>
+<p>The two series share a file and a transport class, not a race: Jean is handshake lifetime; Lever is post-handshake receive policy.</p>
+<h2>NFSv3 client: ENXIO-on-symlink moves toward v3</h2>
+<p>The week’s only review thread is <a href="thread/%253C20260806131358.398096-1-michael.nemanov%2540vastdata.com%253E.html">Michael Nemanov’s v2 for <code>nfs_atomic_open_v23()</code></a>. Cold-dcache <code>open(O_CREAT)</code> of an existing symlink over NFSv3 still hits <code>no_open()</code> and returns <code>ENXIO</code> instead of letting the VFS follow the link. v2 already used <code>finish_no_open(file, NULL)</code> after Trond caught a dentry-refcount underflow in v1.</p>
+<p>This week Trond accepted that shape, then revised the type check twice in twenty minutes: first <code>!d_inode(dentry) || !S_ISREG(...)</code> so an NFSv2 CREATE that races a server-side directory rename does not dereference a negative dentry, then <code>!d_is_reg(dentry)</code> which already encodes both cases. Nemanov agreed and offered a v3. That v3 did not appear in-window; no Ack, no merge.</p>
+<p>The exchange is a reminder of how thin the shared v2/v3 <code>atomic_open</code> path still is. <code>7c6c5249f061</code> put <code>O_TRUNC</code> on CREATE UNCHECKED; symlink <code>ENXIO</code> and the NFSv2 negative-dentry rename race are siblings of the same rule: do not call <code>finish_open()</code> unless the dentry is a regular file.</p>
+<h2>Server-side: two-year-old nfsd netlink hangs now reproduce</h2>
+<p>syzbot, not a human, supplied the rest of the traffic. On 7 August it posted C reproducers for two June 2024 hung-task reports, both in the nfsd Generic Netlink control plane, both the same lock:</p>
+<ul>
+<li><a href="thread/%253C00000000000063fd99061ba29d87%2540google.com%253E.html"><code>nfsd_nl_version_get_doit</code></a> blocked on <code>nfsd_mutex</code> while <code>nfsd_nl_listener_set_doit</code> holds it;</li>
+<li><a href="thread/%253C000000000000689a2b061ba29db3%2540google.com%253E.html"><code>nfsd_nl_threads_get_doit</code></a> the same, with five getter tasks piled up behind the listener-set holder.</li>
+</ul>
+<p>Despite the <code>[nfs?]</code> tag, there is no <code>fs/nfs/</code> frame on either stack. Client developers can ignore these as mount/RPC regressions; nfsd still serializes version, thread, and listener netlink <code>doit</code>s on one process-wide mutex, and <code>listener_set</code> can occupy it long enough to trip <code>khungtaskd</code>. No <code>#syz test</code>, no patch, no maintainer reply.</p>
+<h2>Trends and what is still open</h2>
+<p>RPC-with-TLS hardening is the through-line: handshake callback lifetime on the client (Jean), Alert length and severity on both sides (Lever v3), LTS-shaped <code>Fixes:</code> tags, and a deferred <code>net/handshake</code> helper so <code>net/sunrpc/</code> can drop <code>&lt;net/tls_prot.h&gt;</code>. The client half of that work is blocked on review that has not arrived across three CMSG revisions plus Jean’s new UAF.</p>
+<p>Meanwhile the client maintainer is iterating <code>dir.c</code> in public and the nfsd netlink mutex remains a fuzzing magnet. Outstanding at week close: Jean’s handshake wait, Lever’s three <code>xprtsock.c</code> patches (and the four server CMSG fixes), Nemanov’s promised <code>d_is_reg()</code> v3, and two reproducible nfsd hung-task reports with no owner.</p>
+<h2>Discussions this week</h2>
+<ul>
+<li><a href="thread/%253C20260808-svcsock-cmsg-fixes-v3-0-62d9a631c880%2540kernel.org%253E.html">[PATCH v3 0/7] SUNRPC: Fix TLS control record handling</a></li>
+<li><a href="thread/%253C20260809170748.1223617-1-Jeremy.Jean%2540oss.cyber.gouv.fr%253E.html">[PATCH] SUNRPC: wait for in-flight client TLS handshake callback</a></li>
+<li><a href="thread/%253C20260806131358.398096-1-michael.nemanov%2540vastdata.com%253E.html">Re: [PATCH v2] nfs: fix ENXIO on O_CREAT open of existing symlink over NFSv3</a></li>
+<li><a href="thread/%253C00000000000063fd99061ba29d87%2540google.com%253E.html">Re: [syzbot] [nfs?] INFO: task hung in nfsd_nl_version_get_doit</a></li>
+<li><a href="thread/%253C000000000000689a2b061ba29db3%2540google.com%253E.html">Re: [syzbot] [nfs?] INFO: task hung in nfsd_nl_threads_get_doit</a></li>
+</ul>
+  </main>
+</body>
+</html>
