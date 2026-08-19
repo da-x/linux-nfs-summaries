@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NeilBrown RFC: easy VFS fixes for negative-dentry overflow and lockups</title>
+  <meta name="description" content="NeilBrown posted a 12-patch RFC/RFT this week that tries to sand down the “easy bits” of the long-running negative-dentry problem, rather than redesign how the VFS stores or reclaims those dentries. The series is a bug-fix / VFS-hardening…">
+  <meta property="og:title" content="NeilBrown RFC: easy VFS fixes for negative-dentry overflow and lockups">
+  <meta property="og:description" content="NeilBrown posted a 12-patch RFC/RFT this week that tries to sand down the “easy bits” of the long-running negative-dentry problem, rather than redesign how the VFS stores or reclaims those dentries. The series is a bug-fix / VFS-hardening…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-06T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NeilBrown RFC: easy VFS fixes for negative-dentry overflow and lockups">
+  <meta name="twitter:description" content="NeilBrown posted a 12-patch RFC/RFT this week that tries to sand down the “easy bits” of the long-running negative-dentry problem, rather than redesign how the VFS stores or reclaims those dentries. The series is a bug-fix / VFS-hardening…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-06</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NeilBrown RFC: easy VFS fixes for negative-dentry overflow and lockups</h1>
+<h2>Summary</h2>
+<p>NeilBrown posted a 12-patch <a href="https://lore.kernel.org/linux-nfs/20260803012648.2195405-1-neilb@ownmail.net/">RFC/RFT</a> this week that tries to sand down the “easy bits” of the long-running negative-dentry problem, rather than redesign how the VFS stores or reclaims those dentries. The series is a <strong>bug-fix / VFS-hardening</strong> effort, not a protocol change and not a new NFS feature. It is aimed at v7.2-rc6 and lives on the <code>vfs-neg-dentries</code> branch of Brown’s GitHub tree (top commit <code>56768a600dd9</code>).</p>
+<p>There were no replies in the week ending 2026-08-06. The discussion this week is therefore the series itself: a carefully staged refactor that Brown wants reviewed and, more importantly, run against workloads that already trigger soft lockups.</p>
+<h2>What Brown is <em>not</em> trying to fix</h2>
+<p>Brown is explicit that he is treating symptoms, not the underlying cache-size problem. After reading the LWN write-up of the negative-dentry mess, he decided against shrinking the negative-dentry population or treating negatives differently from positives:</p>
+<blockquote>
+<p>"So I didn't try to reduce the number of negative dentries or handle them differently to positive dentries. I just tried to address specific symptoms."</p>
+</blockquote>
+<p>He also left <code>d_walk()</code> alone, calling the series “big enough for now.” Most of <code>d_walk()</code> already schedules; leftover cases can wait.</p>
+<h2>Two reported symptoms</h2>
+<p>The cover letter names the two bugs the series actually attacks.</p>
+<p><strong>1. Parent <code>d_lockref</code> overflow.</strong> A directory can accumulate an effectively unbounded number of negative children. Each child historically held a counted reference through <code>-&gt;d_parent</code>, so a parent with billions of negatives can wrap <code>-&gt;d_lockref.count</code>. <a href="https://lore.kernel.org/linux-nfs/20260803012648.2195405-2-neilb@ownmail.net/">Patch 01</a> is the entire fix for that:</p>
+<blockquote>
+<p>"The number of negative child dentries that a given dentry can have is effectively unbounded, so counting the references through -&gt;d_parent can overflow -&gt;d_lockref.count."</p>
+</blockquote>
+<p>The new accounting is “list nonempty,” not “one ref per child.” The parent is <code>dget()</code>’d when <code>-&gt;d_children</code> becomes nonempty and <code>dput()</code>’d when it becomes empty. Inactive <code>DCACHE_DENTRY_CURSOR</code> children are not on that list, but they already exist only in contexts that hold a separate parent reference. <code>__d_move()</code> is careful around <code>IS_ROOT()</code> dentries that are not on any <code>d_children</code> list: it <code>dget()</code>s a parent with an empty list before shuffling children, then <code>dput()</code>s if the list is still empty afterwards. A new <code>dput_dlock()</code> helper warns instead of decrementing to zero, which “should never happen.”</p>
+<p>Brown calls this “the easiest easy bit.”</p>
+<p><strong>2. Soft lockups walking <code>-&gt;d_children</code>.</strong> The harder half is unbounded walks of the sibling list, especially in <code>fsnotify_set_children_dentry_flags()</code>. Brown does <strong>not</strong> bound the walk:</p>
+<blockquote>
+<p>"I haven't addresses the "arbitrarily long" part, but the "soft lockups" only takes another 11 patches. With these in place I would feel more confident addressing the "arbitrarily long" part."</p>
+</blockquote>
+<p>The strategy is a common iterator that can drop the parent lock, insert a cursor, and <code>cond_resched()</code>. That idea only works if three preconditions hold: nothing else is held across the walk, dentries are not needlessly reshuffled on the sibling list, and the libfs readdir helpers are refactored to share the same iterator.</p>
+<h2>The common iterator, and the NFS client change</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260803012648.2195405-3-neilb@ownmail.net/">Patch 02</a> is the NFS-facing change. It introduces <code>d_for_each_positive_child()</code> / <code>d_for_each_positive_child_continue()</code> in <code>include/linux/dcache.h</code> and converts every out-of-dcache, out-of-libfs walker to those macros. The iterators report only positive children (cursors are never positive, so they are skipped). <code>scoped_guard()</code> makes <code>break</code>/<code>goto</code> drop the parent lock.</p>
+<p>Callers converted in this patch: autofs expire, Ceph MDS client, Coda cache, libfs, <strong>NFS <code>fs/nfs/dir.c</code></strong>, and fsnotify.</p>
+<p>The NFS client tweak is in <code>nfs_clear_verifier_directory()</code>. The parent lock is now dropped and retaken between <code>nfs_unset_verifier_delegated()</code> on the parent and the same call on every child. Brown flags this twice — once in the cover letter, once in the patch — and both times he thinks it is harmless:</p>
+<blockquote>
+<p>"NFS: patch 02 drops the parent lock between calling nfs_unset_verifier_delegated() on the parent and calling it on all the children. I don't think this is significant."</p>
+</blockquote>
+<p>and, in the patch itself:</p>
+<blockquote>
+<p>"nfs_clear_verifier_directory() is changed slightly so the parent lock is dropped and retaken between clearing the verifier on the parent and on all the children. I think this is safe."</p>
+</blockquote>
+<p>That is the only NFS-client functional change in the series. It matters for directory-delegated verifier invalidation: a concurrent lookup or readdir could theoretically observe a parent whose delegated verifier has already been cleared while some children still have theirs. Brown is asking NFS reviewers to confirm that window is acceptable. Ceph is described as “nothing interesting”; Coda merely loses a redundant <code>rcu_read_lock()</code> because the spinlock already implies RCU protection.</p>
+<h2>Making the walk sleepable</h2>
+<p>The remaining ten patches exist so that the new iterator is allowed to schedule.</p>
+<p><strong>fsnotify (patches 03–04).</strong> Brown is least confident here. <a href="https://lore.kernel.org/linux-nfs/20260803012648.2195405-4-neilb@ownmail.net/">Patch 03</a> stops <code>dnotify_recalc_inode_mask()</code> from calling <code>fsnotify_recalc_mask()</code> under a spinlock; the function now returns a “please recalc” flag and callers invoke <code>fsnotify_recalc_mask()</code> after dropping the lock. <code>dnotify_handle_event()</code> is also reduced to a single recalc per loop. After that, the only spinlocks still held across a <code>d_children</code> walk are <code>i_lock</code> and <code>d_lock</code>. <a href="https://lore.kernel.org/linux-nfs/20260803012648.2195405-5-neilb@ownmail.net/">Patch 04</a> then <code>dget()</code>s the dentry and drops <code>i_lock</code> before <code>fsnotify_set_children_dentry_flags()</code> walks children. That <code>dput()</code> can sleep, which is now legal because no lock is held across the call.</p>
+<p><strong>libfs readdir (patches 05–08, 12).</strong> <code>scan_positives()</code> is rewritten to talk in <code>struct dentry *</code> rather than raw <code>hlist_node</code> pointers (<a href="https://lore.kernel.org/linux-nfs/20260803012648.2195405-6-neilb@ownmail.net/">05</a>), then switched onto <code>d_for_each_positive_child_continue()</code> (<a href="https://lore.kernel.org/linux-nfs/20260803012648.2195405-7-neilb@ownmail.net/">06</a>), then allowed to run without a cursor (<a href="https://lore.kernel.org/linux-nfs/20260803012648.2195405-8-neilb@ownmail.net/">07</a>). <a href="https://lore.kernel.org/linux-nfs/20260803012648.2195405-9-neilb@ownmail.net/">Patch 08</a> deletes <code>find_positive_dentry()</code> and uses <code>scan_positives()</code> for offset-directory lookup. That needs a new <code>lockref_get_not_dead_nested()</code> so a child ref can be taken opportunistically while the parent lock is held, and it must step over dead/cursor dentries under <code>parent-&gt;d_lock</code> because cursors are not RCU-safe. Brown claims identical behaviour for the offset-dir code, just a cleaner RCU/scan split.</p>
+<p><strong>autofs (patch 09).</strong> <a href="https://lore.kernel.org/linux-nfs/20260803012648.2195405-10-neilb@ownmail.net/">Patch 09</a> drops <code>-&gt;lookup_lock</code> from <code>get_next_positive_subdir()</code> and <code>get_next_positive_dentry()</code>. That lock only protects <code>sbi-&gt;expiring</code> and <code>sbi-&gt;active_list</code>, neither of which these walkers touch. Holding it would block the later <code>cond_resched()</code>.</p>
+<p><strong>Don’t reshuffle same-parent siblings (patch 10).</strong> <a href="https://lore.kernel.org/linux-nfs/20260803012648.2195405-11-neilb@ownmail.net/">Patch 10</a> stops <code>__d_move()</code> from moving both dentries to the head of <code>-&gt;d_children</code> when they already share a parent. That move “achieves nothing” today, but once the iterator can drop <code>d_lock</code>, a same-directory rename could bounce a still-present child to the front of the list and cause the walk to miss it. After this change, the only misses are dentries moved <em>out</em> of the directory or inserted after the walk started — “unavoidable and should not be unexpected.”</p>
+<p><strong>The actual <code>cond_resched()</code> (patches 11–12).</strong> <a href="https://lore.kernel.org/linux-nfs/20260803012648.2195405-12-neilb@ownmail.net/">Patch 11</a> is the payload. <code>d_for_each_positive_child*()</code> now calls <code>d_next_sibling_sched()</code> and is annotated <code>might_sleep()</code>. The cursor is an on-stack dentry (~330 bytes), which Brown admits is unusual. He argues it is safe because commit <code>3df5153c5f12</code> (“make cursors NORCU”) already established that cursors can be released without waiting, and “nothing ever takes a reference on a cursor that it doesn't own.” A new <code>__d_init()</code> is split out of <code>__d_alloc()</code> so <code>d_init_cursor()</code> can initialise that stack object. <code>d_walk()</code> is still not converted; some of its callers abort on need-resched and some do not. <a href="https://lore.kernel.org/linux-nfs/20260803012648.2195405-13-neilb@ownmail.net/">Patch 12</a> then deletes the now-redundant <code>cond_resched()</code> from <code>scan_positives()</code>.</p>
+<h2>Review asks, especially for NFS testers</h2>
+<p>Brown expects he has missed call sites and lock constraints:</p>
+<blockquote>
+<p>"so I have probably missed some bits and would be very happy to be told what I have missed."</p>
+</blockquote>
+<p>He particularly wants:</p>
+<ul>
+<li>confirmation that the on-stack dcache cursor logic in patch 11 is sound (“this is not something that other code does”);</li>
+<li>a second look at the fsnotify lock surgery, “non-trivial code that I'm not familiar with”;</li>
+<li>and, for NFS, a verdict on the dropped parent lock around <code>nfs_unset_verifier_delegated()</code>.</li>
+</ul>
+<p>He has only run “basic testing including the ‘notify’ parts of ltp.” The real request is for anyone who can already trigger the soft lockups to try the series and report that the lockups are gone and that nothing else broke.</p>
+<h2>Status this week</h2>
+<p>This is a <strong>new VFS bug-fix RFC</strong> that happens to touch the NFS client’s directory-verifier path. It does not change the NFS protocol, does not add client features, and does not attempt the harder negative-dentry reclamation work. As of 2026-08-06 there is no review, no Tested-by, and no conclusion from the list — only Brown’s own claim that patch 01 stops the refcount overflow and that patches 02–12 make every common <code>d_children</code> walk able to schedule. The next step he wants is exactly that testing, plus a close reading of the NFS verifier window and the on-stack cursor.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260803012648.2195405-1-neilb@ownmail.net/">2026-08-03 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH RFC/RFT v1 00/12] Fix easy bits of the negative dentry problem</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260803012648.2195405-2-neilb@ownmail.net/">2026-08-03 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v1 01/12] VFS: don't count references through -&gt;d_parent</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260803012648.2195405-3-neilb@ownmail.net/">2026-08-03 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v1 02/12] Add and use d_for_each_positive_child family of iterators</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260803012648.2195405-4-neilb@ownmail.net/">2026-08-03 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v1 03/12] fsnotify: don't hold a spin_lock across fsnotify_recalc_mask() calls.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260803012648.2195405-5-neilb@ownmail.net/">2026-08-03 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v1 04/12] fsnotify: reduce i_lock hold time in fsnotify_set_children_dentry_flags()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260803012648.2195405-6-neilb@ownmail.net/">2026-08-03 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v1 05/12] libfs: simplify scan_positives()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260803012648.2195405-7-neilb@ownmail.net/">2026-08-03 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v1 06/12] libfs: change scan_positives() to use d_for_each_positive_child_continue()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260803012648.2195405-8-neilb@ownmail.net/">2026-08-03 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v1 07/12] libfs: allow scan_positives() to be called without a cursor.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260803012648.2195405-9-neilb@ownmail.net/">2026-08-03 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v1 08/12] libfs: replace find_positive_dentry() with scan_positives()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260803012648.2195405-10-neilb@ownmail.net/">2026-08-03 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v1 09/12] autofs: don't hold -&gt;lookup_lock in get_next_positive_*</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260803012648.2195405-11-neilb@ownmail.net/">2026-08-03 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v1 10/12] VFS: don't move dentries in d_sib list when they have the same parent</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260803012648.2195405-12-neilb@ownmail.net/">2026-08-03 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v1 11/12] Call cond_reshed() as needed in d_for_each_positive_child().</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260803012648.2195405-13-neilb@ownmail.net/">2026-08-03 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — [PATCH v1 12/12] libfs: remove cond_resched() from scan_positives()</a></li>
+</ul>
+  </main>
+</body>
+</html>

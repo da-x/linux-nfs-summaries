@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD stops revoking delegations the client never recorded</title>
+  <meta name="description" content="This week Chuck Lever posted a nine-patch NFSD series that closes the server half of a client-visible delegation livelock. The work is a bug fix (with a protocol-correctness follow-through), not a new feature: when a client answers…">
+  <meta property="og:title" content="NFSD stops revoking delegations the client never recorded">
+  <meta property="og:description" content="This week Chuck Lever posted a nine-patch NFSD series that closes the server half of a client-visible delegation livelock. The work is a bug fix (with a protocol-correctness follow-through), not a new feature: when a client answers…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-06T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSD stops revoking delegations the client never recorded">
+  <meta name="twitter:description" content="This week Chuck Lever posted a nine-patch NFSD series that closes the server half of a client-visible delegation livelock. The work is a bug fix (with a protocol-correctness follow-through), not a new feature: when a client answers…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-06</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD stops revoking delegations the client never recorded</h1>
+<h2>Summary</h2>
+<p>This week Chuck Lever posted a nine-patch NFSD series that closes the server half of a client-visible delegation livelock. The work is a <strong>bug fix</strong> (with a protocol-correctness follow-through), not a new feature: when a client answers <code>CB_RECALL</code> with <code>NFS4ERR_BAD_STATEID</code> or <code>NFS4ERR_BADHANDLE</code>, NFSD must destroy that delegation rather than park it on <code>cl_revoked</code> and keep advertising <code>SEQ4_STATUS_RECALLABLE_STATE_REVOKED</code>. There were no reviews in-window; the thread is the series itself.</p>
+<h2>Client-facing failure that motivated the series</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260802-nfsd-deleg-destroy-badhandle-v1-0-323aa7196055@kernel.org/">Lever's cover letter</a> traces the bug to a nightly backup on his home-directory server. NFSD had granted a write delegation during the day; the Linux client then lost that stateid to the hole that <a href="https://lore.kernel.org/r/20260617125257.1293452-1-cel@kernel.org">NFS: Return a delegation the client fails to record</a> already addressed on the client. When NFSD later recalled the delegation, the client had no record of the stateid:</p>
+<blockquote>
+<p>"When NFSD recalled that delegation, the client had no record of the stateid and answered CB_RECALL with NFS4ERR_BAD_STATEID. NFSD added the delegation to cl_revoked, where only a FREE_STATEID drains it. That FREE_STATEID never arrives, so every later SEQUENCE reply carries SEQ4_STATUS_RECALLABLE_STATE_REVOKED. The client's state manager loops issuing TEST_STATEID but never finds the missing state."</p>
+</blockquote>
+<p>That is the same cascade documented in June: a dropped client-side <code>DELEGRETURN</code> leaves the server believing the client still holds the stateid; the recall is rejected; the server revokes; the client's recovery loop never terminates. The client patch (queued by Anna Schumaker for the next bugfix round as of early July) stops the silent drop. This series stops NFSD from turning a rejected recall into a permanent <code>SEQ4_STATUS_RECALLABLE_STATE_REVOKED</code> flag that the client's state manager cannot clear.</p>
+<h2>RFC 8881: complete the recall, do not revoke</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260802-nfsd-deleg-destroy-badhandle-v1-8-323aa7196055@kernel.org/">Patch 8</a> is the functional core. A client that answers <code>CB_RECALL</code> with <code>NFS4ERR_BADHANDLE</code> or <code>NFS4ERR_BAD_STATEID</code> has no record of the delegation, so the <code>FREE_STATEID</code> that would drain <code>cl_revoked</code> never arrives. Lever now destroys that delegation on reap instead of revoking it:</p>
+<blockquote>
+<p>"Destroy such a delegation when it is reaped rather than revoking it onto cl_revoked. RFC 8881 Section 20.2.4 completes the recall at the reply when its status is neither NFS4_OK nor NFS4ERR_DELAY, so a rejected recall leaves nothing to revoke."</p>
+</blockquote>
+<p>Administrative revoke is left alone, because <code>NFS4ERR_ADMIN_REVOKED</code> still has to report it. A destroyed stateid now returns <code>NFS4ERR_BAD_STATEID</code> instead of <code>NFS4ERR_DELEG_REVOKED</code>. Lever is explicit about the remaining hazard for a misbehaving client:</p>
+<blockquote>
+<p>"A client that rejects the recall but still holds the delegation gets no notice that its state was revoked."</p>
+</blockquote>
+<p>The patch is tagged <code>Fixes: 3bd64a5ba171 ("nfsd4: implement SEQ4_STATUS_RECALLABLE_STATE_REVOKED")</code> and <code>Cc: stable</code> for 6.14.x — the same era in which the revoked-state flag started trapping Linux clients in the <code>TEST_STATEID</code> loop.</p>
+<h2>The race: CB_RECALL can outrun the grant</h2>
+<p>A naive "destroy on BAD_STATEID" rule is wrong when the recall races the OPEN that granted the delegation. The cover letter and patch 8 both insist on RFC 8881 Section 2.10.6.3 as the proof that the client has seen the grant:</p>
+<blockquote>
+<p>"CB_RECALL can outrun the reply that granted the delegation; a rejection proves nothing until the client has seen that grant. RFC 8881 Section 2.10.6.3 makes retirement of the slot that carried the grant that proof. NFSD retries the CB_RECALL until the slot retires and revokes in the old way when the retries lapse."</p>
+</blockquote>
+<p>Until that slot retires, a <code>BAD_STATEID</code> is ambiguous: the client may simply not have recorded the grant yet. Retrying, then falling back to the old revoke path if retries expire, keeps the server from destroying a live delegation that the client is about to start using.</p>
+<h2>Referring calls on CB_RECALL</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260802-nfsd-deleg-destroy-badhandle-v1-9-323aa7196055@kernel.org/">Patch 9</a> makes <code>CB_RECALL</code> the second consumer of referring-call lists, so the client can distinguish "I have not processed the grant yet" from "I never held this stateid." Until the granting slot retires, each recall names that request in <code>CB_SEQUENCE</code>:</p>
+<blockquote>
+<p>"Remove the ambiguity with the referring call mechanism of RFC 8881 Section 2.10.6.3: until the slot that carried the grant retires, name that request as a referring call in the CB_SEQUENCE of each recall. A client that finds it still outstanding may respond NFS4ERR_DELAY, and the recall is retried until the client has processed the grant."</p>
+</blockquote>
+<p>Without that list, retries eventually lapse and NFSD revokes a delegation the client is by then able to return — the exact client-visible failure the series is trying to kill. A recall reuses one callback context across retries and <code>-&gt;prepare</code> does not run on every send; the granting request is stable, so an inherited list is the right list. Slot retirement drops it, and <code>nfs4_free_deleg()</code> releases whatever remains.</p>
+<p>For NFS client developers this is the operationally important half of the series: a Linux client that implements referring-call <code>NFS4ERR_DELAY</code> can now stall the recall until <code>nfs_inode_set_delegation()</code> has recorded the stateid, instead of answering <code>BAD_STATEID</code> and triggering either destroy or revoke.</p>
+<h2>XDR budget repairs (patches 1–6)</h2>
+<p>Referring-call lists cannot ride in <code>CB_RECALL</code> until the send-buffer budget is honest. Lever notes that NFSD's original referring-call implementation got several XDR sizes wrong, and the first six patches correct those macros in <code>fs/nfsd/xdr4cb.h</code>.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260802-nfsd-deleg-destroy-badhandle-v1-1-323aa7196055@kernel.org/">Patch 1</a> is the one that actually changes the backchannel contract. <code>cb_sequence_enc_sz</code> counted the session ID, four scalars, and one referring-call list, but <code>encode_cb_sequence4args()</code> also emits the <code>CB_SEQUENCE</code> opcode and the <code>csa_referring_call_lists</code> array count — two XDR words short. Every <code>NFS4_enc_cb_*_sz</code> built on that macro is short by the same two words. Because <code>NFSD_CB_MAX_REQ_SZ</code> derives from <code>NFS4_enc_cb_recall_sz</code>, <code>check_backchannel_attrs()</code> was accepting a <code>ca_maxrequestsize</code> eight bytes too small:</p>
+<blockquote>
+<p>"The minimum a client must advertise rises by those eight bytes."</p>
+</blockquote>
+<p>Lever is careful that this is not a send-buffer overrun: <code>rq_callsize</code> already adds two credential slacks on top of <code>p_arglen</code>. The only client that notices is one whose <code>ca_maxrequestsize</code> falls inside those eight bytes, so he marks it as no-backport.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260802-nfsd-deleg-destroy-badhandle-v1-2-323aa7196055@kernel.org/">Patch 2</a> budgets the <code>CB_RECALL</code> truncate field (one more XDR word, four more bytes on the advertised minimum). Patches <a href="https://lore.kernel.org/linux-nfs/20260802-nfsd-deleg-destroy-badhandle-v1-3-323aa7196055@kernel.org/">3</a> (<code>CB_LAYOUTRECALL</code> discriminator and recall stateid, five words), <a href="https://lore.kernel.org/linux-nfs/20260802-nfsd-deleg-destroy-badhandle-v1-4-323aa7196055@kernel.org/">4</a> (<code>CB_OFFLOAD</code> opcode), <a href="https://lore.kernel.org/linux-nfs/20260802-nfsd-deleg-destroy-badhandle-v1-5-323aa7196055@kernel.org/">5</a> (<code>CB_NOTIFY_LOCK</code> opcode), and <a href="https://lore.kernel.org/linux-nfs/20260802-nfsd-deleg-destroy-badhandle-v1-6-323aa7196055@kernel.org/">6</a> (<code>CB_RECALL_ANY</code> opcode) fix the same class of off-by-N-word macros. Those four size <code>p_arglen</code> only; credential slack has always covered the shortfall, so none of them need a backport. Taken together, they are plumbing so that a referring-call list can actually fit in the <code>CB_RECALL</code> send buffer.</p>
+<h2>Locking comment cleanup</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260802-nfsd-deleg-destroy-badhandle-v1-7-323aa7196055@kernel.org/">Patch 7</a> is documentation only. The comment above the <code>SC_STATUS_</code> flags claimed <code>nn-&gt;deleg_lock</code> protects <code>sc_status</code> for delegation stateids, but only hashed-delegation transitions take that lock. <code>c88c150a467f</code> ("nfsd: fix possible badness in FREE_STATEID") started setting <code>SC_STATUS_CLOSED</code> under <code>-&gt;cl_lock</code>; <code>8dd91e8d31fe</code> ("nfsd: fix race between laundromat and free_stateid") added two more sites. The comment is updated so the destroy/revoke path in patch 8 is not coded against a lock that is no longer exclusive.</p>
+<h2>Status</h2>
+<ul>
+<li><strong>Classification:</strong> NFSD bug fix with protocol-correct recall completion; XDR-budget prerequisite plus referring-call support on <code>CB_RECALL</code>. Directly complementary to the June NFS client <code>DELEGRETURN</code> fix.</li>
+<li><strong>Client impact:</strong> Stops <code>SEQ4_STATUS_RECALLABLE_STATE_REVOKED</code> from sticking after a client rejects a recall for a stateid it never recorded; Linux clients that honor referring calls can <code>NFS4ERR_DELAY</code> until the grant is recorded. Backchannel <code>ca_maxrequestsize</code> minimum rises by twelve bytes (eight from <code>CB_SEQUENCE</code>, four from truncate).</li>
+<li><strong>Review:</strong> None in this week's window. Patch 8 is the stable candidate (<code>Cc: stable</code> 6.14.x); patches 1–6 are explicitly not.</li>
+<li><strong>Files:</strong> <code>fs/nfsd/nfs4callback.c</code>, <code>fs/nfsd/nfs4state.c</code>, <code>fs/nfsd/state.h</code>, <code>fs/nfsd/xdr4cb.h</code> (231 insertions, 48 deletions).</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260802-nfsd-deleg-destroy-badhandle-v1-0-323aa7196055@kernel.org/">2026-08-02 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 0/9] NFSD: Do not revoke a delegation the client never recorded</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260802-nfsd-deleg-destroy-badhandle-v1-1-323aa7196055@kernel.org/">2026-08-02 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 1/9] NFSD: Budget the CB_SEQUENCE opcode and referring call array count</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260802-nfsd-deleg-destroy-badhandle-v1-3-323aa7196055@kernel.org/">2026-08-02 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 3/9] NFSD: Budget the CB_LAYOUTRECALL recall stateid</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260802-nfsd-deleg-destroy-badhandle-v1-2-323aa7196055@kernel.org/">2026-08-02 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 2/9] NFSD: Budget the CB_RECALL truncate field</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260802-nfsd-deleg-destroy-badhandle-v1-4-323aa7196055@kernel.org/">2026-08-02 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 4/9] NFSD: Budget the CB_OFFLOAD opcode</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260802-nfsd-deleg-destroy-badhandle-v1-5-323aa7196055@kernel.org/">2026-08-02 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 5/9] NFSD: Budget the CB_NOTIFY_LOCK opcode</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260802-nfsd-deleg-destroy-badhandle-v1-6-323aa7196055@kernel.org/">2026-08-02 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 6/9] NFSD: Budget the CB_RECALL_ANY opcode</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260802-nfsd-deleg-destroy-badhandle-v1-7-323aa7196055@kernel.org/">2026-08-02 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 7/9] NFSD: Correct locking documentation for delegation sc_status</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260802-nfsd-deleg-destroy-badhandle-v1-8-323aa7196055@kernel.org/">2026-08-02 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 8/9] NFSD: Destroy a recalled delegation the client does not hold</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260802-nfsd-deleg-destroy-badhandle-v1-9-323aa7196055@kernel.org/">2026-08-02 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 9/9] NFSD: Send referring calls with CB_RECALL</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd sparse-warning fixes spark XDR host-endian storage debate</title>
+  <meta name="description" content="This week&#39;s thread is a bug-fix series, not a protocol change. Jeff Layton posted a two-patch nfsd cleanup to silence sparse warnings that landed with the directory-delegation / CB_NOTIFY work now sitting in nfsd-next. Patch 2 — a one-line…">
+  <meta property="og:title" content="nfsd sparse-warning fixes spark XDR host-endian storage debate">
+  <meta property="og:description" content="This week&#39;s thread is a bug-fix series, not a protocol change. Jeff Layton posted a two-patch nfsd cleanup to silence sparse warnings that landed with the directory-delegation / CB_NOTIFY work now sitting in nfsd-next. Patch 2 — a one-line…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-06T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd sparse-warning fixes spark XDR host-endian storage debate">
+  <meta name="twitter:description" content="This week&#39;s thread is a bug-fix series, not a protocol change. Jeff Layton posted a two-patch nfsd cleanup to silence sparse warnings that landed with the directory-delegation / CB_NOTIFY work now sitting in nfsd-next. Patch 2 — a one-line…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-06</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd sparse-warning fixes spark XDR host-endian storage debate</h1>
+<h2>Summary</h2>
+<h2>Overview</h2>
+<p>This week's thread is a <strong>bug-fix</strong> series, not a protocol change. Jeff Layton posted a <a href="https://lore.kernel.org/linux-nfs/20260803-dir-deleg-v1-0-51be76861821@kernel.org/">two-patch nfsd cleanup</a> to silence sparse warnings that landed with the directory-delegation / CB_NOTIFY work now sitting in <code>nfsd-next</code>. Patch 2 — a one-line <code>__be32</code> vs. <code>int</code> type correction in <code>nfsd_lookup_dentry()</code> — was folded immediately. Patch 1, which tried to paper over a host-endian store into an XDR stream with a comment, instead opened a pointed design argument with Chuck Lever about using the XDR buffer as scratch storage. The directory-delegation series stays in <code>nfsd-next</code>; the XDR anti-pattern is deferred to a follow-on series, likely v7.4.</p>
+<p>The work is server-side, but it sits on the CB_NOTIFY encoding path that a Linux NFSv4.1 client will consume once directory delegations are enabled. The sparse warning is treated as a canary for a structural encoding problem, not as the real bug.</p>
+<h2>The patches</h2>
+<p>Layton's <a href="https://lore.kernel.org/linux-nfs/20260803-dir-deleg-v1-0-51be76861821@kernel.org/">cover letter</a> was brief:</p>
+<blockquote>
+<p>"The first patch should fix the sparse warning that the KTR noticed last week. I also took the opportunity to add a comment over the weird xdr stream (ab)use we're doing there. The second patch just fixes up a sparse warning that I noticed."</p>
+</blockquote>
+<p><strong>Patch 1</strong> (<a href="https://lore.kernel.org/linux-nfs/20260803-dir-deleg-v1-1-51be76861821@kernel.org/">nfsd: fix type mismatch and explain host-endian xdr buffer usage</a>) touches <code>fs/nfsd/nfs4xdr.c</code>. Sparse had flagged a type mismatch in the directory-event notification encoder. The <code>Fixes:</code> tag points at <code>4b64b811f368 ("nfsd: add notification handlers for dir events")</code>, reported by the kernel test robot. Layton also added a comment describing the non-standard XDR usage: the encoder "steals" a few 32-bit words from the stream buffer to hold host-endian bitmap fields that are later encoded for real.</p>
+<p><strong>Patch 2</strong> (<a href="https://lore.kernel.org/linux-nfs/20260803-dir-deleg-v1-2-51be76861821@kernel.org/">nfsd: fix nfserr type in nfsd_lookup_dentry()</a>) is a one-line change in <code>fs/nfsd/vfs.c</code>. Both <code>nfsd_lookup_dentry()</code> and <code>nfsd_cross_mnt()</code> return <code>__be32</code>; the local <code>nfserr</code> variable had the wrong type after <code>cf78c5a7d742 ("nfsd: move check_nfsd_access() call into nfsd_cross_mnt()")</code>.</p>
+<p>Chuck Lever <a href="https://lore.kernel.org/linux-nfs/a728649f-0503-48de-be6c-0947e70137f9@app.fastmail.com/">folded patch 2</a> into the original <code>nfsd_cross_mnt()</code> commit the same afternoon. That half of the series is done.</p>
+<h2>The XDR-buffer fight</h2>
+<p>Patch 1 did not land as written. Lever's <a href="https://lore.kernel.org/linux-nfs/54f8ab19-fb1b-4cd6-9600-e3d3d6971173@app.fastmail.com/">first review</a> rejected the "steal a few words" comment as an explanation of a design he still did not accept:</p>
+<blockquote>
+<p>"I still don't understand what's going on. "Steal a few words to hold it" sounds like you're trying to avoid a kmalloc call. Is this code reserving space in the XDR stream, or isn't it? If it is, then accessing those bytes has to be done with a big-endian pointer, the same way it is done at every other xdr_reserve_space() call site. Storing host-order bytes that are not part of an opaque into an XDR stream is just... wrong."</p>
+</blockquote>
+<p>If this was the usual reserve-and-backfill dance, he wanted it spelled the way every other encoder does it, "so us poor human readers can recognize that's what's going on."</p>
+<p>Layton <a href="https://lore.kernel.org/linux-nfs/b8a7379cf6e8e73a0e994937a6b738757a8be744.camel@kernel.org/">pushed back</a>: the three 32-bit words are a private scratch area for host-endian bitmap fields that get encoded later. Nothing else touches that slice, and the buffer has room. Separate allocations would mean one bitmap per <code>notify_entry4</code>, with no obvious place to track and free them.</p>
+<p>Lever then laid out three objections in a <a href="https://lore.kernel.org/linux-nfs/c018418c-4f4e-4984-8312-c082509090cd@app.fastmail.com/">longer reply</a>:</p>
+<ol>
+<li><strong>Technical debt.</strong> "It just isn't obvious what's going on, it needs a four-line comment to explain it, and it opens the door to people copy-pasting it to other encoders."</li>
+<li><strong>Ephemeral stream.</strong> Callers have to keep an <code>xdr_stream</code> pointer valid for the stream's lifetime; parking host data there is not a contract the XDR API offers.</li>
+<li><strong>SUNRPC API assumptions.</strong> "Yes, we have a sordid history of grabbing a piece of the xdr_buf's tail iov for temporary storage. That doesn't make it wise to do," and it will hurt if the tail becomes a page instead of kmalloc'd memory, or if the encoder is converted to xdrgen.</li>
+</ol>
+<p>His verdict:</p>
+<blockquote>
+<p>"So what you've done is fine for operational prototype code, but not something we can carry forward as production code. The sparse warning is a canary, it's not the actual structural problem."</p>
+</blockquote>
+<p>He suggested the server's existing chain of temporary allocations, freed when the COMPOUND is released, as a model the callback client could copy.</p>
+<h2>Will directory delegations be dropped?</h2>
+<p>Layton <a href="https://lore.kernel.org/linux-nfs/43a111b0927e4291eb0dfae08def19be1e32e02d.camel@kernel.org/">took that as a possible revert</a>:</p>
+<blockquote>
+<p>"I had no idea this practice was suddenly forbidden. That has certainly not been communicated to me in any of the previous review rounds over the last couple of years."</p>
+</blockquote>
+<p>And, more pointedly:</p>
+<blockquote>
+<p>"Does this mean you intend to drop dir delegation series again? Allocating from the xdr stream in order to hold host-endian fields is done in several places in this code. Reworking that will be a substantial effort."</p>
+</blockquote>
+<p>Lever <a href="https://lore.kernel.org/linux-nfs/848f6735-7b63-43d9-aadb-eeb1f0290d57@app.fastmail.com/">said no</a>. He has been removing this anti-pattern for some time and had not seen new instances until now; it simply had not come up in earlier review rounds. On the series itself:</p>
+<blockquote>
+<p>"No. It's deep in nfsd-next now, and this is a long-term issue, not an immediate on-the-wire behavioral problem or a vulnerability."</p>
+</blockquote>
+<p>That is the operational conclusion of the week: CB_NOTIFY directory-delegation support stays queued. The host-endian XDR scratch is accepted as debt, not as a merge blocker.</p>
+<h2>Follow-on plan</h2>
+<p>Layton first <a href="https://lore.kernel.org/linux-nfs/af9a4ca236e00df7e509e0112d88ef2cc41fa663.camel@kernel.org/">offered an LLM-drafted rewrite</a>, calling it "a bit invasive" and needing more testing, to be sent as a follow-on to the CB_NOTIFY patches. The next day he <a href="https://lore.kernel.org/linux-nfs/5db44a7b57b5b0d4f957636f4f3e6e34a4491355.camel@kernel.org/">committed to a separate series</a>:</p>
+<blockquote>
+<p>"Ok, I'll send a separate series on top of this that should address your concerns. We may be able to get away with stack allocations for some of these, and for the others we can just add a separate kmalloc'ed set of buffers or something. That'll probably be v7.4 material at the soonest though."</p>
+</blockquote>
+<h2>Significance for NFS client development</h2>
+<p>Directory delegations are a client-visible NFSv4.1 feature (RFC 8881bis <code>GET_DIR_DELEGATION</code> / <code>CB_NOTIFY</code>). The Linux client cannot usefully take a directory delegation until the server's CB_NOTIFY encoder is trustworthy. This week's argument is about that encoder's internals:</p>
+<ul>
+<li><strong>On-the-wire behavior is unchanged.</strong> Lever was explicit that this is not a protocol bug or a vulnerability. Clients talking to <code>nfsd-next</code> should see the same CB_NOTIFY payloads they saw last week.</li>
+<li><strong>The sparse warning is the wrong layer.</strong> Casting around a host-endian store into an XDR buffer silences the checker without fixing the lifetime and endianness contract. A client-side decoder that assumes well-formed, big-endian XDR is only as safe as the server's encoder remaining disciplined.</li>
+<li><strong>xdrgen and buffer-layout changes.</strong> Lever's third objection is the one that matters for the client stack long-term: if nfsd later switches the callback encoder to xdrgen, or if SUNRPC stops guaranteeing a kmalloc'd tail iov, any host-endian scratch parked in that buffer becomes a landmine. Cleaning it up before v7.4 keeps the callback path from ossifying around an anti-pattern the client (and pynfs) already exercise.</li>
+<li><strong>Allocation model for notify bitmaps.</strong> Each <code>notify_entry4</code> carries its own bitmap. Layton's concern about tracking multiple allocations is real; Lever pointed at nfsd's COMPOUND-scoped temp chain as the existing pattern. Whatever lands in the follow-on series will determine how CB_NOTIFY encoding scales when a client holds many directory delegations and the server has to encode bursts of ADD/REMOVE/RENAME notifications.</li>
+</ul>
+<h2>Status</h2>
+<ul>
+<li><strong>Patch 2:</strong> folded into <code>nfsd: move check_nfsd_access() call into nfsd_cross_mnt()</code>.</li>
+<li><strong>Patch 1:</strong> not accepted as a comment-only sparse fix. The underlying host-endian XDR scratch stays in <code>nfsd-next</code> as known technical debt.</li>
+<li><strong>Directory-delegation / CB_NOTIFY series:</strong> remains in <code>nfsd-next</code>; not being dropped.</li>
+<li><strong>Next step:</strong> Layton to post a follow-on series replacing XDR-buffer scratch with stack or kmalloc'd bitmaps, targeted at v7.4 at the earliest.</li>
+</ul>
+<p>No client-side patches were posted in this thread. The client impact is indirect: the server CB_NOTIFY path that directory-delegation clients will depend on is staying, with a promised encoder cleanup after the current merge window.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260803-dir-deleg-v1-0-51be76861821@kernel.org/">2026-08-03 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 0/2] nfsd: fix up some sparse warnings</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260803-dir-deleg-v1-1-51be76861821@kernel.org/">2026-08-03 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 1/2] nfsd: fix type mismatch and explain host-endian xdr buffer usage</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260803-dir-deleg-v1-2-51be76861821@kernel.org/">2026-08-03 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH 2/2] nfsd: fix nfserr type in nfsd_lookup_dentry()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/a728649f-0503-48de-be6c-0947e70137f9@app.fastmail.com/">2026-08-03 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 2/2] nfsd: fix nfserr type in nfsd_lookup_dentry()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/54f8ab19-fb1b-4cd6-9600-e3d3d6971173@app.fastmail.com/">2026-08-03 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 1/2] nfsd: fix type mismatch and explain host-endian xdr buffer usage</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/b8a7379cf6e8e73a0e994937a6b738757a8be744.camel@kernel.org/">2026-08-03 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 1/2] nfsd: fix type mismatch and explain host-endian xdr buffer usage</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/c018418c-4f4e-4984-8312-c082509090cd@app.fastmail.com/">2026-08-03 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 1/2] nfsd: fix type mismatch and explain host-endian xdr buffer usage</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/43a111b0927e4291eb0dfae08def19be1e32e02d.camel@kernel.org/">2026-08-03 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 1/2] nfsd: fix type mismatch and explain host-endian xdr buffer usage</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/848f6735-7b63-43d9-aadb-eeb1f0290d57@app.fastmail.com/">2026-08-03 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 1/2] nfsd: fix type mismatch and explain host-endian xdr buffer usage</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/af9a4ca236e00df7e509e0112d88ef2cc41fa663.camel@kernel.org/">2026-08-03 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 1/2] nfsd: fix type mismatch and explain host-endian xdr buffer usage</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/5db44a7b57b5b0d4f957636f4f3e6e34a4491355.camel@kernel.org/">2026-08-04 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 1/2] nfsd: fix type mismatch and explain host-endian xdr buffer usage</a></li>
+</ul>
+  </main>
+</body>
+</html>

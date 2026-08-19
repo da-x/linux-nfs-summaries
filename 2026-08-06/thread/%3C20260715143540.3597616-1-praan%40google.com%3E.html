@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Trond flags DIO extract helper oops and swap refcount hole</title>
+  <meta name="description" content="Three weeks after v3 of Pranjal Shrivastava&#39;s NFS Direct I/O modernization series landed, Linux NFS client maintainer Trond Myklebust finally walked patch 5/5 — the new nfs_direct_extract_pages() helper — and found two real client-side…">
+  <meta property="og:title" content="Trond flags DIO extract helper oops and swap refcount hole">
+  <meta property="og:description" content="Three weeks after v3 of Pranjal Shrivastava&#39;s NFS Direct I/O modernization series landed, Linux NFS client maintainer Trond Myklebust finally walked patch 5/5 — the new nfs_direct_extract_pages() helper — and found two real client-side…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-06T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Trond flags DIO extract helper oops and swap refcount hole">
+  <meta name="twitter:description" content="Three weeks after v3 of Pranjal Shrivastava&#39;s NFS Direct I/O modernization series landed, Linux NFS client maintainer Trond Myklebust finally walked patch 5/5 — the new nfs_direct_extract_pages() helper — and found two real client-side…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-06</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Trond flags DIO extract helper oops and swap refcount hole</h1>
+<h2>Summary</h2>
+<h1>Trond flags DIO extract helper oops and swap-over-NFS refcount hole</h1>
+<h2>Summary</h2>
+<p>Three weeks after v3 of Pranjal Shrivastava's NFS Direct I/O modernization series landed, Linux NFS client maintainer Trond Myklebust finally walked <a href="https://lore.kernel.org/linux-nfs/20260715143540.3597616-6-praan@google.com/">patch 5/5</a> — the new <code>nfs_direct_extract_pages()</code> helper — and found two real client-side bugs that Hellwig's earlier <code>Reviewed-by</code> had not caught. Shrivastava acknowledged both the same afternoon and sketched the v5 fix. This remains NFS <strong>client</strong> plumbing (a refactor with an embedded pin-lifetime <strong>bug fix</strong>), not a protocol change.</p>
+<h3>Brief bridge from prior weeks</h3>
+<p>v3 (<a href="https://lore.kernel.org/linux-nfs/20260715143540.3597616-1-praan@google.com/">cover</a>) dropped the stalled folio conversion and kept five patches: pin-aware <code>nfs_page</code>, <code>wb_nr_pinned</code> tracking, a bulk <code>nfs_release_request_list</code> helper, the <code>iov_iter_extract_pages()</code> migration that stops unpinning pages immediately after request creation, and the shared extract helper that unifies the read and write <code>schedule_iovec</code> paths. The week of 20 July brought Christoph Hellwig <code>Reviewed-by</code> on the two functional DIO patches and Shivaji Kant <code>Reviewed-by</code> on the helpers; Shrivastava promised a quick v4 for style nits. That v4 never appeared. The series then sat quiet until this week.</p>
+<h3>Maintainer review: two bugs in the extract helper</h3>
+<p>On 5 August, <a href="https://lore.kernel.org/linux-nfs/a7fe5eadb2999b8d95595e73d3b99d76df6895a4.camel@kernel.org/">Trond Myklebust</a> replied directly to patch 5/5 with two pointed comments on the error path.</p>
+<p>The first is a classic mixed-error-code hole. The helper walks extracted pages, creates <code>nfs_page</code> requests, and on failure does <code>iov_iter_revert(iter, result - bytes)</code>. If <code>nfs_page_create_from_page()</code> fails, <code>bytes</code> is assigned <code>PTR_ERR(req)</code> — a negative errno — so the revert arithmetic is not a byte count at all:</p>
+<blockquote>
+<p>"Oopsable if bytes == PTR_ERR(req)"
+— <a href="https://lore.kernel.org/linux-nfs/a7fe5eadb2999b8d95595e73d3b99d76df6895a4.camel@kernel.org/">Myklebust</a></p>
+</blockquote>
+<p>The second is a swap-over-NFS refcount bug in the leftover-page cleanup. After the extract-API migration in patch 4, pages that are not GUP-pinned (the swap-over-NFS path sets <code>pinned = false</code>) never took a <code>get_page()</code> ref. The existing <code>nfs_direct_release_pages()</code> still <code>put_page()</code>s them when <code>pinned</code> is false:</p>
+<blockquote>
+<p>"See what happens above with swap over NFS (which sets pinned = false)."
+— <a href="https://lore.kernel.org/linux-nfs/a7fe5eadb2999b8d95595e73d3b99d76df6895a4.camel@kernel.org/">Myklebust</a></p>
+</blockquote>
+<p>That is an important client-side finding: the same extract model that <strong>fixes</strong> premature unpinning of user DIO pages would, on the error path, drop a reference the swap path never held.</p>
+<h3>Author response: separate <code>err</code>, unpin-only cleanup, v5 incoming</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/anOxBdQYqAB3LV64@google.com/">Shrivastava</a> acked both issues within two hours and proposed concrete code. Errors will no longer be stuffed into the <code>bytes</code> accumulator:</p>
+<blockquote>
+<p>"Ack. I'll catch errors in a separate variable something like:"</p>
+<pre><code>req = nfs_page_create_from_page(...);
+if (IS_ERR(req)) {
+    err = PTR_ERR(req);
+    break;
+}
+...
+bytes += req_len;
+...
+return bytes ? bytes : err;
+</code></pre>
+<p>— <a href="https://lore.kernel.org/linux-nfs/anOxBdQYqAB3LV64@google.com/">Shrivastava</a></p>
+</blockquote>
+<p>On the swap path he confirmed the diagnosis — "we never got a ref (after patch 4) but we'll call <code>put_page()</code> if <code>pinned == false</code>" — and will shrink <code>nfs_direct_release_pages()</code> in patch 4 so leftover pages are only unpinned, never <code>put_page()</code>'d:</p>
+<blockquote>
+<pre><code>static void nfs_direct_release_pages(struct page **pages, unsigned int npages,
+                                     bool pinned)
+{
+        if (pinned)
+                unpin_user_pages(pages, npages);
+}
+</code></pre>
+<p>— <a href="https://lore.kernel.org/linux-nfs/anOxBdQYqAB3LV64@google.com/">Shrivastava</a></p>
+</blockquote>
+<p>He closed by asking the maintainer, "Sounds good for v5?" — skipping the v4 that was promised for Hellwig's style nits and folding these two functional fixes into the next posting.</p>
+<h3>Where the series stands</h3>
+<p>This week's exchange is the first maintainer-level review of the DIO extract helper. The series is still a client-side refactor plus bug-fix stack preparing <code>nfs_page</code> for pin-based GUP (and, later, PCI P2PDMA); folio conversion and <code>ITER_ALLOW_P2PDMA</code> remain follow-ups. Hellwig's <code>Reviewed-by</code> on patches 4/5 and 5/5 now has to be re-earned against the oopsable revert and the swap-over-NFS put-without-get. No merge ack has been given. Watch for v5, and for whether Myklebust is satisfied that the unpin-only cleanup is correct for every non-pinned extract source, not just swap.</p>
+<p><strong>Bottom line:</strong> the DIO pin-lifetime rewrite is not merge-ready. Trond found an oopsable error path and a swap-over-NFS refcount hole in the new extract helper; Shrivastava has a v5 plan, but the patches are not on the list yet.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/a7fe5eadb2999b8d95595e73d3b99d76df6895a4.camel@kernel.org/">2026-08-05 Trond Myklebust <a href="mailto:trondmy@kernel.org">trondmy@kernel.org</a> — Re: [PATCH v3 5/5] nfs: introduce nfs_direct_extract_pages helper</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/anOxBdQYqAB3LV64@google.com/">2026-08-05 Pranjal Shrivastava <a href="mailto:praan@google.com">praan@google.com</a> — Re: [PATCH v3 5/5] nfs: introduce nfs_direct_extract_pages helper</a></li>
+</ul>
+  </main>
+</body>
+</html>

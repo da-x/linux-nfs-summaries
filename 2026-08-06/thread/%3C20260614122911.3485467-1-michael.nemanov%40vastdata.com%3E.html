@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS client: Trond flags dentry refcount underflow in ENXIO-on-symlink O_CREAT fix</title>
+  <meta name="description" content="After nearly two months of silence, Linux NFS client maintainer Trond Myklebust finally reviewed Michael Nemanov&#39;s NFSv3 atomic_open bug-fix this week — and immediately found a refcount landmine in the proposed patch. This is a bug fix…">
+  <meta property="og:title" content="NFS client: Trond flags dentry refcount underflow in ENXIO-on-symlink O_CREAT fix">
+  <meta property="og:description" content="After nearly two months of silence, Linux NFS client maintainer Trond Myklebust finally reviewed Michael Nemanov&#39;s NFSv3 atomic_open bug-fix this week — and immediately found a refcount landmine in the proposed patch. This is a bug fix…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-06T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS client: Trond flags dentry refcount underflow in ENXIO-on-symlink O_CREAT fix">
+  <meta name="twitter:description" content="After nearly two months of silence, Linux NFS client maintainer Trond Myklebust finally reviewed Michael Nemanov&#39;s NFSv3 atomic_open bug-fix this week — and immediately found a refcount landmine in the proposed patch. This is a bug fix…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-06</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS client: Trond flags dentry refcount underflow in ENXIO-on-symlink O_CREAT fix</h1>
+<h2>Summary</h2>
+<h1>NFS client: Trond flags dentry refcount underflow in ENXIO-on-symlink O_CREAT fix</h1>
+<h2>Overview</h2>
+<p>After nearly two months of silence, Linux NFS client maintainer Trond Myklebust finally reviewed Michael Nemanov's NFSv3 <code>atomic_open</code> bug-fix this week — and immediately found a refcount landmine in the proposed patch. This is a <strong>bug fix</strong> (not a new feature or protocol change) targeting <code>fs/nfs/dir.c</code>: <code>open(2)</code> with <code>O_CREAT</code> on an existing symlink over NFSv3, with a cold dentry cache, currently returns <code>ENXIO</code> instead of following the link.</p>
+<p>The only in-window message is <a href="https://lore.kernel.org/linux-nfs/dc92eb66b8a78429eb81039fde982849e5ef6bee.camel@kernel.org/">Trond's August 5 review</a>, which does not nack the approach but requires a one-line correction before the patch can land.</p>
+<h2>Bridge from prior weeks</h2>
+<p>Nemanov (Vast Data) <a href="https://lore.kernel.org/linux-nfs/20260614122911.3485467-1-michael.nemanov@vastdata.com/">posted the original patch on June 14</a> and <a href="https://lore.kernel.org/linux-nfs/27ab9b8b-7b50-497a-880d-593eb07694b6@vastdata.com/">nudged it on June 30</a> with a terse "Trying again". The diagnosis, in brief: NFSv3 CREATE UNCHECKED (RFC 1813 §3.3.8) returns <code>NFS3_OK</code> plus the existing object's file handle when the name is already a non-regular file, so <code>nfs_do_create()</code> succeeds and the client unconditionally calls <code>finish_open()</code>. Symlink inodes carry <code>&amp;no_open_fops</code>, whose <code>no_open()</code> returns <code>-ENXIO</code>. A warm dcache masks the bug because <code>lookup_open()</code> then skips <code>atomic_open</code> entirely. The proposed 7-line fix in <code>nfs_atomic_open_v23()</code> checks <code>!S_ISREG()</code> after create and routes non-regular objects through <code>finish_no_open()</code> so the VFS can follow the symlink. The patch carries <code>Fixes: 7c6c5249f061</code> ("NFS: add atomic_open for NFSv3 to handle O_TRUNC correctly.").</p>
+<h2>This week's review: a refcount underflow</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/dc92eb66b8a78429eb81039fde982849e5ef6bee.camel@kernel.org/">Trond Myklebust</a> replied directly to the June 14 submission, quoting the new <code>finish_no_open()</code> call site:</p>
+<pre><code>+				return finish_no_open(file, dentry);
+</code></pre>
+<p>and delivering a two-sentence verdict:</p>
+<blockquote>
+<p>"This will cause the dentry to underflow the refcount. It needs to be finish_no_open(file, NULL)."</p>
+</blockquote>
+<p>That is the entire technical substance of this week's activity, and it is the kind of VFS-contract detail that only a client maintainer is likely to catch on first reading. In the <code>atomic_open</code> path, <code>finish_no_open(file, dentry)</code> consumes a dentry reference; here the dentry is already held by the caller after <code>nfs_do_create()</code> succeeded, so passing it in would drop one reference too many. Passing <code>NULL</code> tells the VFS "do not consume this dentry; leave symlink follow-up to the normal open path" without touching the refcount.</p>
+<p>Trond did not dispute the diagnosis, the <code>!S_ISREG()</code> defensive type check, or the <code>Fixes:</code> tag. The review is a surgical correction to the helper arguments, not a redesign. No v2 appeared in this week's window, so the patch remains unmerged pending that one-line change.</p>
+<h2>Significance for NFS client development</h2>
+<p>This is a textbook illustration of how fragile the NFSv3 <code>atomic_open</code> path remains. The original regression was introduced specifically to handle <code>O_TRUNC</code> correctly on CREATE; the ENXIO-on-symlink case is a sibling edge condition of the same CREATE-UNCHECKED / VFS-file-type mismatch. Nemanov's approach — treat any non-regular type as "do not finish_open, let the VFS continue" — is the right shape of fix. Trond's comment shows why the <em>exit helper</em> matters as much as the type check: <code>finish_open()</code> vs <code>finish_no_open()</code>, and <code>dentry</code> vs <code>NULL</code>, are the difference between a correct open and a use-after-free-class dentry underflow.</p>
+<p>The long latency (June 14 submission, June 30 ping, August 5 review) also underscores a recurring linux-nfs pattern: small, well-scoped client fixes can sit unreviewed for weeks, then get a precise, blocking comment in a handful of lines.</p>
+<h2>Final status</h2>
+<ul>
+<li><strong>Type:</strong> Bug fix (NFSv3 client, <code>nfs_atomic_open_v23()</code> in <code>fs/nfs/dir.c</code>)</li>
+<li><strong>This week's activity:</strong> Maintainer review; one required change identified</li>
+<li><strong>Required fix:</strong> <code>finish_no_open(file, dentry)</code> → <code>finish_no_open(file, NULL)</code></li>
+<li><strong>Outstanding:</strong> v2 from Nemanov; no merge, no Acked-by, no further discussion in-window</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/dc92eb66b8a78429eb81039fde982849e5ef6bee.camel@kernel.org/">2026-08-05 Trond Myklebust — Re: [PATCH] nfs: fix ENXIO on O_CREAT open of existing symlink over NFSv3</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/dc92eb66b8a78429eb81039fde982849e5ef6bee.camel@kernel.org/">2026-08-05 Trond Myklebust <a href="mailto:trondmy@kernel.org">trondmy@kernel.org</a> — Re: [PATCH] nfs: fix ENXIO on O_CREAT open of existing symlink over NFSv3</a></li>
+</ul>
+  </main>
+</body>
+</html>

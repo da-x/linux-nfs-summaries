@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD: write_unlock_fs() post-shutdown UAF already queued in nfsd-next</title>
+  <meta name="description" content="This week&#39;s activity is a two-message bug report, not a feature or protocol change. George Chapman flagged what he believed was a leftover post-shutdown use-after-free in the procfs write_unlock_fs() path; Chuck Lever closed it the same…">
+  <meta property="og:title" content="NFSD: write_unlock_fs() post-shutdown UAF already queued in nfsd-next">
+  <meta property="og:description" content="This week&#39;s activity is a two-message bug report, not a feature or protocol change. George Chapman flagged what he believed was a leftover post-shutdown use-after-free in the procfs write_unlock_fs() path; Chuck Lever closed it the same…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-06T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSD: write_unlock_fs() post-shutdown UAF already queued in nfsd-next">
+  <meta name="twitter:description" content="This week&#39;s activity is a two-message bug report, not a feature or protocol change. George Chapman flagged what he believed was a leftover post-shutdown use-after-free in the procfs write_unlock_fs() path; Chuck Lever closed it the same…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-06</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD: write_unlock_fs() post-shutdown UAF already queued in nfsd-next</h1>
+<h2>Summary</h2>
+<p>This week's activity is a two-message <strong>bug report</strong>, not a feature or protocol change. George Chapman flagged what he believed was a leftover post-shutdown use-after-free in the procfs <code>write_unlock_fs()</code> path; Chuck Lever closed it the same weekend by pointing at a fix already sitting in <code>nfsd-next</code>.</p>
+<h2>The report</h2>
+<p>On 1 August, <a href="https://lore.kernel.org/linux-nfs/CADjmrE=0LVQxWaodOXFyRpCSoJAShifsjJQ_VcqQXyAC-edJDw@mail.gmail.com/">George Chapman</a> wrote to linux-nfs with:</p>
+<blockquote>
+<p>"[BUG] NFSD: write_unlock_fs() has the same pre-shutdown-check UAF that 92ea163c773c just fixed for the netlink command"</p>
+</blockquote>
+<p>The claim is that the procfs handler for <code>/proc/fs/nfsd/unlock_filesystem</code> still walks NFSD state after the server has been torn down, in the same way the <code>NFSD_CMD_UNLOCK_FILESYSTEM</code> netlink command did before commit <code>92ea163c773c</code> ("NFSD: Prevent post-shutdown use-after-free in NFSD_CMD_UNLOCK_FILESYSTEM"). That netlink fix is already in the v7.2-rc tree.</p>
+<p>The ingest of Chapman's body is truncated (Chuck's reply quotes only the opening "Hi all," and a closing "before sending."), so the detailed reproducer and code walk are not on the record here. The subject line, however, is unambiguous: this is the <strong>procfs twin</strong> of a UAF that maintainers already treated as a local-admin (<code>CAP_SYS_ADMIN</code>) slab use-after-free in the unlock-filesystem admin paths.</p>
+<h2>Background (briefly)</h2>
+<p>This is not a new class of bug. In mid-June, Chuck Lever posted a three-patch series, "[PATCH 0/3] Fix NFSD post-shutdown use-after-free in the unlock_filesystem paths", after Musaab Khan showed that writing a path to <code>/proc/fs/nfsd/unlock_filesystem</code> after nfsd had stopped could hit freed <code>nn-&gt;conf_id_hashtbl</code> memory inside <code>nfsd4_cancel_copy_by_sb()</code>. Both the procfs handler and the then-pending netlink command called the cancel helper <em>before</em> taking <code>nfsd_mutex</code> and <em>before</em> confirming the server was still up. Jeff Layton reviewed that series. A follow-on patch then switched the same three unlock entry points (<code>write_unlock_fs</code>, <code>nfsd_nl_unlock_filesystem_doit</code>, <code>nfsd_nl_unlock_export_doit</code>) from <code>nn-&gt;nfsd_serv</code> to <code>NFSD_NET_UP</code> to close a distinct <strong>startup-window</strong> NULL deref.</p>
+<p>Chapman's report is aimed at the first of those holes — the post-shutdown UAF on the procfs side — after noticing that only the netlink half (<code>92ea163c773c</code>) had a visible mainline SHA.</p>
+<h2>Maintainer response: already fixed</h2>
+<p>Less than a day later, <a href="https://lore.kernel.org/linux-nfs/e359f4e2-b27e-4e5a-bf38-1c46331e4e5d@app.fastmail.com/">Chuck Lever</a> replied that the procfs half is already queued:</p>
+<blockquote>
+<p>"Commit 208b023eef24 ("NFSD: Prevent post-shutdown use-after-free in unlock_filesystem") is already queued in the nfsd-next branch."</p>
+</blockquote>
+<p>That commit title matches the June PATCH 1/3, the procfs <code>write_unlock_fs()</code> / <code>unlock_filesystem</code> counterpart to the netlink fix Chapman cited. Lever added a process note rather than a technical debate:</p>
+<blockquote>
+<p>"You can search the linux-nfs@ list archive on lore.kernel.org as part of your research to determine whether an issue like this has been previously reported or fixed."</p>
+</blockquote>
+<p>No patch was requested, no counter-analysis was offered, and no further replies landed in-window. The thread is closed as a <strong>duplicate of an already-queued NFSD bug fix</strong>.</p>
+<h2>Why it still matters for NFS client work</h2>
+<p>The code under discussion is server-side (<code>fs/nfsd/nfsctl.c</code> and the NFSv4 state-table walkers), not the NFS client. The operational impact on clients is nevertheless real: <code>unlock_filesystem</code> is the admin path that revokes NFSv4 open state, NLM locks, and in-flight async COPY operations for a superblock. A post-shutdown UAF here is a host crash, not a protocol error — every connected client loses the export. The June series already established the correct locking: cancel and revoke must run only while <code>nfsd_mutex</code> is held and the per-netns tables are live (<code>NFSD_NET_UP</code>), because <code>nfs4_state_destroy_net()</code> frees <code>nn-&gt;conf_id_hashtbl</code> on the way down and does not poison the pointer.</p>
+<p>The split landing — netlink UAF <code>92ea163c773c</code> already in v7.2-rc, procfs UAF <code>208b023eef24</code> still in <code>nfsd-next</code> as of this reply — is what made Chapman's report look novel. Lever's SHA is the status that matters: <strong>no new client or server patch is needed from this thread</strong>; the remaining work is for <code>208b023eef24</code> to leave <code>nfsd-next</code> and reach mainline/stable.</p>
+<h2>Conclusion</h2>
+<p>This week's thread is a duplicate bug report against NFSD's procfs <code>write_unlock_fs()</code> path. Chapman correctly identified that the netlink unlock command and the procfs handler shared a pre-shutdown-check UAF; Lever confirmed the procfs fix is already commit <code>208b023eef24</code> on <code>nfsd-next</code> and pointed the reporter at lore. No new patch, no protocol change, and no client-side code change came out of the exchange.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/CADjmrE=0LVQxWaodOXFyRpCSoJAShifsjJQ_VcqQXyAC-edJDw@mail.gmail.com/">2026-08-01 George Chapman <a href="mailto:gchapmancontact@gmail.com">gchapmancontact@gmail.com</a> — [BUG] NFSD: write_unlock_fs() has the same pre-shutdown-check UAF that 92ea163c773c just fixed for the netlink command</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/e359f4e2-b27e-4e5a-bf38-1c46331e4e5d@app.fastmail.com/">2026-08-02 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [BUG] NFSD: write_unlock_fs() has the same pre-shutdown-check UAF that 92ea163c773c just fixed for the netlink command</a></li>
+</ul>
+  </main>
+</body>
+</html>

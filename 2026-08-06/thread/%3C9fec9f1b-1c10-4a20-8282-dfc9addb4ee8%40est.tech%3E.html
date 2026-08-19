@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfs-utils 2.9.2 exportfs link failure with --disable-nfsdctl</title>
+  <meta name="description" content="This week’s linux-nfs traffic includes a cleanly diagnosed userspace build regression in nfs-utils 2.9.2: exportfs fails to link when the tree is configured with --disable-nfsdctl. The report is from Jaipaul Cheernam and, as of the week…">
+  <meta property="og:title" content="nfs-utils 2.9.2 exportfs link failure with --disable-nfsdctl">
+  <meta property="og:description" content="This week’s linux-nfs traffic includes a cleanly diagnosed userspace build regression in nfs-utils 2.9.2: exportfs fails to link when the tree is configured with --disable-nfsdctl. The report is from Jaipaul Cheernam and, as of the week…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-06T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfs-utils 2.9.2 exportfs link failure with --disable-nfsdctl">
+  <meta name="twitter:description" content="This week’s linux-nfs traffic includes a cleanly diagnosed userspace build regression in nfs-utils 2.9.2: exportfs fails to link when the tree is configured with --disable-nfsdctl. The report is from Jaipaul Cheernam and, as of the week…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-06</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfs-utils 2.9.2 exportfs link failure with --disable-nfsdctl</h1>
+<h2>Summary</h2>
+<p>This week’s linux-nfs traffic includes a cleanly diagnosed <strong>userspace build regression</strong> in nfs-utils 2.9.2: <code>exportfs</code> fails to link when the tree is configured with <code>--disable-nfsdctl</code>. The report is from <a href="https://lore.kernel.org/linux-nfs/9fec9f1b-1c10-4a20-8282-dfc9addb4ee8@est.tech/">Jaipaul Cheernam</a> and, as of the week ending 2026-08-06, has no replies. It is a <strong>bug-fix</strong> discussion (a configure/Makefile feature-gating mismatch), not a protocol change and not an NFS client kernel patch.</p>
+<p>The thread sits on the server-side userspace tools rather than the in-kernel NFS client. The practical impact is still operational: anyone building a slim nfs-utils (no <code>nfsdctl</code>, often also no GSS) cannot produce <code>exportfs</code>, which is the tool that publishes and withdraws exports the client later mounts.</p>
+<h2>The regression</h2>
+<p>Cheernam reports that 2.9.2 no longer builds under a configuration that 2.9.1 accepted:</p>
+<blockquote>
+<p>"Building nfs-utils 2.9.2 with --disable-nfsdctl fails to link exportfs. This is a regression from 2.9.1."</p>
+</blockquote>
+<p>His reproducer is:</p>
+<pre><code>./configure --disable-nfsdctl --disable-gss --disable-svcgss
+make
+</code></pre>
+<p><code>--disable-gss</code> is only there to drop the krb5 dependency. The failure is triggered by <code>--disable-nfsdctl</code> alone. The linker error is:</p>
+<blockquote>
+<p><code>/usr/bin/ld: exportfs-exportfs.o: in function 'unexportfs_parsed':</code>
+<code>exportfs.c:491: undefined reference to 'nfsd_nl_cmd_str'</code></p>
+</blockquote>
+<p>Default builds hide the bug because <code>enable_nfsdctl</code> defaults to <code>"yes"</code>.</p>
+<h2>Root cause: two switches that no longer agree</h2>
+<p>The 2.9.2 tree added <code>nfsdnl.c</code>, which implements <code>nfsd_nl_cmd_str()</code>. That object is compiled into <code>libnfs</code> only under <code>if CONFIG_NFSDCTL</code> in <code>support/nfs/Makefile.am</code>. Meanwhile <code>exportfs.c</code> calls the same symbol under <code>#ifdef HAVE_NFSD_NETLINK</code>, and <code>configure.ac</code> defines that macro <strong>unconditionally</strong>:</p>
+<pre><code>AC_DEFINE([HAVE_NFSD_NETLINK], 1,
+          [Define to 1 if nfsd generic netlink support is available])
+</code></pre>
+<p>The result, in Cheernam’s words:</p>
+<blockquote>
+<p>"So exportfs always compiles the netlink code path, but the implementation isn't linked in when --disable-nfsdctl is used."</p>
+</blockquote>
+<p>That is a classic feature-gate split: the compiler thinks generic-netlink unlock-export support is always present; the library only ships it when the <code>nfsdctl</code> utility is enabled.</p>
+<h2>Two proposed fixes</h2>
+<p>Cheernam verified both approaches build cleanly and asked maintainers which design they want before sending a formal patch.</p>
+<p><strong>Option A</strong> — always compile <code>nfsdnl.c</code> into <code>libnfs</code> (drop the <code>CONFIG_NFSDCTL</code> guard in <code>support/nfs/Makefile.am</code>). <code>exportfs</code> would always be able to release export state over netlink. He notes this adds no new dependency:</p>
+<blockquote>
+<p>"libnl is already unconditionally required so this adds no new dependency"</p>
+</blockquote>
+<p>The sketched Makefile change still pulls in <code>LIBNL3</code>/<code>LIBNLGENL3</code> cflags and libs, but drops the <code>-I$(top_srcdir)/utils/nfsdctl</code> include that only made sense when <code>nfsdctl</code> itself was being built.</p>
+<p><strong>Option B</strong> — stop defining <code>HAVE_NFSD_NETLINK</code> unless <code>--enable-nfsdctl</code> is on, so <code>exportfs</code> skips the netlink path when <code>nfsdctl</code> is disabled. <code>nfsdnl.h</code> already has a static inline stub that returns <code>-ENOSYS</code> for that case. The configure.ac change moves the <code>AC_DEFINE</code> inside the existing <code>if test "$enable_nfsdctl" = yes</code> block, next to the readline check.</p>
+<p>Cheernam prefers B:</p>
+<blockquote>
+<p>"I lean towards Option B as it preserves the design intent that --disable-nfsdctl disables all netlink interaction with nfsd, and keeps the feature gating consistent between configure.ac and Makefile.am."</p>
+</blockquote>
+<p>He still flags the counter-argument for A:</p>
+<blockquote>
+<p>"Option A has merit if exportfs should always release state via netlink regardless of whether the nfsdctl utility is built."</p>
+</blockquote>
+<p>That is the real design question the report leaves open: is <code>--disable-nfsdctl</code> “do not build the <code>nfsdctl</code> binary,” or “do not talk to nfsd over generic netlink at all”? Option A treats netlink unlock-export as a property of <code>exportfs</code>/<code>libnfs</code>. Option B treats it as part of the <code>nfsdctl</code> feature set.</p>
+<h2>Status this week</h2>
+<p>No maintainer has chosen A or B, and no formal patch has been posted. The report is self-contained — reproducer, exact linker error, root-cause analysis, and two tested diffs — so a follow-up should be a one-line policy decision plus a cleaned-up patch.</p>
+<p>For NFS client readers: this does not change on-the-wire behavior or the kernel client. It does affect how distributions and embedded builds that pass <code>--disable-nfsdctl</code> obtain a working <code>exportfs</code>. Until a fix lands, those builds stop at link time on <code>nfsd_nl_cmd_str</code>. Default (<code>--enable-nfsdctl</code>) configurations are unaffected.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/9fec9f1b-1c10-4a20-8282-dfc9addb4ee8@est.tech/">2026-08-05 Jaipaul Cheernam <a href="mailto:jaipaul.cheernam@est.tech">jaipaul.cheernam@est.tech</a> — [BUG] nfs-utils 2.9.2: exportfs link failure with --disable-nfsdctl</a></li>
+</ul>
+  </main>
+</body>
+</html>

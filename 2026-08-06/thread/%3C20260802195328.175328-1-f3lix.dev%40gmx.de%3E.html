@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSv4.2 client: request mode after CLONE to drop stale setid bits</title>
+  <meta name="description" content="This week&#39;s linux-nfs traffic includes a one-message bug-fix from Felix Hoffmann that targets a stale-mode hole in the NFSv4.2 client&#39;s CLONE path. There is no protocol change and no new feature: the patch asks the existing post-CLONE…">
+  <meta property="og:title" content="NFSv4.2 client: request mode after CLONE to drop stale setid bits">
+  <meta property="og:description" content="This week&#39;s linux-nfs traffic includes a one-message bug-fix from Felix Hoffmann that targets a stale-mode hole in the NFSv4.2 client&#39;s CLONE path. There is no protocol change and no new feature: the patch asks the existing post-CLONE…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-06T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSv4.2 client: request mode after CLONE to drop stale setid bits">
+  <meta name="twitter:description" content="This week&#39;s linux-nfs traffic includes a one-message bug-fix from Felix Hoffmann that targets a stale-mode hole in the NFSv4.2 client&#39;s CLONE path. There is no protocol change and no new feature: the patch asks the existing post-CLONE…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-06</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSv4.2 client: request mode after CLONE to drop stale setid bits</h1>
+<h2>Summary</h2>
+<p>This week's linux-nfs traffic includes a one-message <strong>bug-fix</strong> from Felix Hoffmann that targets a stale-mode hole in the NFSv4.2 client's <code>CLONE</code> path. There is no protocol change and no new feature: the patch asks the existing post-<code>CLONE</code> <code>GETATTR</code> to fetch <code>mode</code> so the client's inode cache cannot keep setuid/setgid bits the server has already cleared. No maintainer reply, Acked-by, or NACK landed in the week ending 2026-08-06.</p>
+<h1>Stale setid bits after CLONE</h1>
+<p><a href="https://lore.kernel.org/linux-nfs/20260802195328.175328-1-f3lix.dev@gmx.de/">Hoffmann</a> reports that an NFS server may strip setuid and setgid bits when <code>CLONE</code> writes into the destination file, but the Linux client currently omits <code>mode</code> from the compound's post-operation attributes. The cached mode can therefore still look privileged after the server has dropped those bits, and a local process can execute the file under that stale view:</p>
+<blockquote>
+<p>"The NFS server can clear setuid and setgid bits when CLONE modifies the destination. The client currently omits mode from the post-operation attributes, so the cached mode can retain setid bits after the server has removed them. A local process can then execute the file using those stale privilege bits."</p>
+</blockquote>
+<p>The proposed fix is a three-line change in <code>fs/nfs/nfs42proc.c</code>: request <code>mode</code> in the <code>CLONE</code> compound's <code>GETATTR</code> so the ordered post-operation inode update installs the server's mode before <code>CLONE</code> returns to the caller.</p>
+<blockquote>
+<p>"Request mode in the CLONE compound's GETATTR. This lets the ordered post-operation update install the server's mode before CLONE returns."</p>
+</blockquote>
+<p>Hoffmann tags the original NFSv4.2 <code>CLONE</code> plumbing, <a href="https://lore.kernel.org/linux-nfs/20260802195328.175328-1-f3lix.dev@gmx.de/">Fixes: e5341f3a5762 ("nfs42: add CLONE proc functions")</a>, and CCs <code>stable@vger.kernel.org</code>. The commit message also carries <code>Assisted-by: Codex:gpt-5</code>.</p>
+<h1>Reproducer and test evidence</h1>
+<p>The patch is a client-side correctness/security fix rather than a server or XDR change. Hoffmann tested on x86-64 with an NFSv4.2 loopback mount against Linux NFSD exporting Btrfs:</p>
+<ul>
+<li>Before the change, the client retained mode <code>04775</code> while the server stored <code>0775</code>, and the privilege transition reproduced in 10/10 non-debug runs.</li>
+<li>With the change, both client and server reported mode <code>0775</code>, and no privilege transition occurred in 10/10 non-debug runs or 3/3 KASAN runs.</li>
+</ul>
+<p>He notes that the reproducer needs write authorization on the destination: NFSD rejected the same operation against a non-writable <code>04755</code> file with <code>EACCES</code>. A working reproducer is offered privately on request.</p>
+<h1>Client-development context</h1>
+<p>This is the same family of post-op attribute bugs the client has hit on other NFSv4.2 data-modifying ops: after <code>ALLOCATE</code>/<code>DEALLOCATE</code> the client historically failed to refresh mode bits, and earlier this year Olga Kornievskaia fixed <code>CLONE</code>/<code>COPY</code> timestamp and block-attribute updates when delegated attributes were present. Hoffmann's patch is narrower and more security-flavored: it does not touch delegation handling, it only adds <code>mode</code> to the <code>CLONE</code> <code>GETATTR</code> bitmap so <code>nfs_post_op_update_inode()</code> cannot leave setid bits in cache.</p>
+<h1>Status this week</h1>
+<p>The thread has a single in-window message and no follow-up. Until reviewers weigh in, the client still ships the original <code>CLONE</code> attribute bitmap; anyone reproducing server-side setid clearing on <code>CLONE</code> (Linux NFSD on Btrfs in Hoffmann's setup) can still see a privileged cached mode on the destination until this, or an equivalent, lands.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260802195328.175328-1-f3lix.dev@gmx.de/">2026-08-02 Felix Hoffmann <a href="mailto:f3lix.dev@gmx.de">f3lix.dev@gmx.de</a> — [PATCH] NFSv4.2: request mode after CLONE</a></li>
+</ul>
+  </main>
+</body>
+</html>

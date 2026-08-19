@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>syzbot hung-task report in nfsd write_threads</title>
+  <meta name="description" content="This week’s traffic is a single, unreplied bug report: a syzbot hung-task splat tagged [nfs?] against the in-kernel NFS server control plane, not the NFS client. syzbot reported INFO: task hung in write_threads on upstream HEAD…">
+  <meta property="og:title" content="syzbot hung-task report in nfsd write_threads">
+  <meta property="og:description" content="This week’s traffic is a single, unreplied bug report: a syzbot hung-task splat tagged [nfs?] against the in-kernel NFS server control plane, not the NFS client. syzbot reported INFO: task hung in write_threads on upstream HEAD…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-06T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="syzbot hung-task report in nfsd write_threads">
+  <meta name="twitter:description" content="This week’s traffic is a single, unreplied bug report: a syzbot hung-task splat tagged [nfs?] against the in-kernel NFS server control plane, not the NFS client. syzbot reported INFO: task hung in write_threads on upstream HEAD…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-06</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>syzbot hung-task report in nfsd write_threads</h1>
+<h2>Summary</h2>
+<h2>Summary</h2>
+<p>This week’s traffic is a single, unreplied <strong>bug report</strong>: a syzbot hung-task splat tagged <code>[nfs?]</code> against the in-kernel NFS <em>server</em> control plane, not the NFS client. <a href="https://lore.kernel.org/linux-nfs/6a6d3f57.6ce73036.24301b.0010.GAE@google.com/">syzbot</a> reported <code>INFO: task hung in write_threads</code> on upstream HEAD <code>3708dd948844</code> (<code>Merge tag 'pm-7.2-rc6'</code>), with no reproducer and no human follow-up before week close.</p>
+<p>The hung task is a syzkaller worker blocked more than 143 seconds in uninterruptible sleep while taking <code>nfsd_mutex</code> from the <code>/proc/fs/nfsd/threads</code> write path:</p>
+<blockquote>
+<p>"INFO: task syz.8.803:9466 blocked for more than 143 seconds."</p>
+</blockquote>
+<p>The stack is:</p>
+<pre><code>__mutex_lock
+write_threads+0x39d/0x5a0 fs/nfsd/nfsctl.c:432
+nfsctl_transaction_write+0x10f/0x160 fs/nfsd/nfsctl.c:112
+vfs_write / ksys_write
+</code></pre>
+<p>This is a <strong>server-side hang</strong>, not a client I/O stall and not a protocol change. <code>write_threads()</code> is the nfsd control-file handler that starts or stops nfsd threads; it serializes on the global <code>nfsd_mutex</code>. The <code>[nfs?]</code> tag is syzbot’s uncertain subsystem guess. Nothing in the trace touches <code>fs/nfs/</code>, <code>xprtsock.c</code>, or any NFS client code path.</p>
+<h2>What the lock dump actually shows</h2>
+<p>The interesting part of the report is the lock inventory, not the hung stack itself. Two threads of the same syzkaller process are piled up on <code>nfsd_mutex</code>:</p>
+<ul>
+<li><code>syz.8.803/9460</code> holds <code>nfsd_mutex</code> in <a href="https://lore.kernel.org/linux-nfs/6a6d3f57.6ce73036.24301b.0010.GAE@google.com/"><code>write_ports+0xb5/0xd10 fs/nfsd/nfsctl.c:860</code></a> — the <code>/proc/fs/nfsd/portlist</code> writer that adds or removes nfsd listeners.</li>
+<li><code>syz.8.803/9466</code> is the hung task, waiting on the same mutex in <code>write_threads</code>.</li>
+</ul>
+<p>Both also hold <code>sb_writers</code> on the nfsd control filesystem and a <code>f_pos_lock</code>. That is the classic nfsdctl pattern: every write through <code>nfsctl_transaction_write()</code> takes <code>nfsd_mutex</code>, so a slow or stuck <code>write_ports</code> (socket bind, listener start, or teardown) makes every other nfsd control write — threads, versions, exports — sit in D state until the hung-task watchdog fires.</p>
+<p>The rest of the lock dump is noisier. A kworker holds <code>rtnl_mutex</code> in <code>addrconf_dad_work</code>, and <code>syz.5.1691</code> is in <code>rtnl_dellink</code> waiting on <code>rtnl_mutex</code> and then <code>synchronize_rcu_expedited</code>. The kernel is also tainted <code>G S L</code> (<code>CPU_OUT_OF_SPEC</code> and <code>SOFTLOCKUP</code>). The NMI backtraces that follow are unhelpful: <code>khungtaskd</code> dumping stacks, and <code>swapper/0</code> sitting in <code>pv_native_safe_halt</code>. There is no smoking-gun stack of a CPU spinning inside nfsd.</p>
+<p>Whether <code>write_ports</code> is itself blocked behind RTNL (listener bind/unbind while holding <code>nfsd_mutex</code>) is not proven by this dump. The report does not capture the holder’s full wait chain, only that it still owns <code>nfsd_mutex</code> after 143 seconds.</p>
+<h2>Reproducer status and related reports</h2>
+<p>syzbot is explicit:</p>
+<blockquote>
+<p>"Unfortunately, I don't have any reproducer for this issue yet."</p>
+</blockquote>
+<p>Assets (disk image, <code>vmlinux</code>, <code>bzImage</code>) and a dashboard entry (<code>extid=78013a8f4497a445a448</code>) are attached. The prescribed <code>Reported-by</code> tag is <code>syzbot+78013a8f4497a445a448@syzkaller.appspotmail.com</code>.</p>
+<p>The same morning, syzbot filed a sibling splat, <code>[syzbot] [nfs?] INFO: task hung in write_ports</code>, against 7.2-rc5. That report <em>does</em> have a C reproducer, and its lock dump is more diagnostic: <code>nfsd_mutex</code> is held by <code>nfsd_shutdown_threads</code> on the <code>deactivate_super</code> path while a crowd of writers wait in <code>write_ports</code>. Together the two reports point at the same bottleneck — global <code>nfsd_mutex</code> serializing thread start, portlist updates, and nfsd teardown — rather than a client-side bug. They remain separate syzbot bugs; nobody has <code>#syz dup</code>’d them on-list this week.</p>
+<p>Older hung-task reports against the netlink siblings (<code>nfsd_nl_threads_get_doit</code>, <code>nfsd_nl_threads_set_doit</code>) exist from prior cycles. They share the same mutex, not the same reproducer.</p>
+<h2>NFS client angle</h2>
+<p>There is none in this thread. No client maintainer replied, and the stack never leaves <code>fs/nfsd/nfsctl.c</code>. The client-relevant work this week (Chuck Lever’s kTLS CMSG fixes in <code>xprtsock.c</code>, TCP <code>read_sock</code> follow-ups) lives in other threads. A hang in <code>write_threads</code> can of course starve a test harness that is also mounting NFS, but that is a test-lab coupling, not a client defect.</p>
+<h2>Status at week close</h2>
+<p>Unanswered. No <code>#syz fix</code>, no <code>#syz dup</code>, no maintainer analysis, no patch. The report is a <strong>bug report</strong> of a hung nfsd control-file write, likely <code>nfsd_mutex</code> held too long by a concurrent <code>write_ports</code> (and possibly by nfsd shutdown, if the sibling <code>write_ports</code> splat is the same bug). Until someone captures the holder’s wait chain or runs the <code>write_ports</code> C reproducer against this tree, it stays an open, unreproduced server-side hung-task report.</p>
+<p>syzbot’s usual closing boilerplate still applies: reply with <code>#syz fix: exact-commit-title</code> if a fix lands, or <code>#syz dup:</code> if this is folded into the <code>write_ports</code> bug.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/6a6d3f57.6ce73036.24301b.0010.GAE@google.com/">2026-08-01 syzbot — [syzbot] [nfs?] INFO: task hung in write_threads</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/6a6d3f57.6ce73036.24301b.0010.GAE@google.com/">2026-08-01 syzbot <a href="mailto:syzbot+78013a8f4497a445a448@syzkaller.appspotmail.com">syzbot+78013a8f4497a445a448@syzkaller.appspotmail.com</a> — [syzbot] [nfs?] INFO: task hung in write_threads</a></li>
+</ul>
+  </main>
+</body>
+</html>

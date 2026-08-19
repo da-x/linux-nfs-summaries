@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfs-utils 2.9.2: --disable-nfsdctl breaks exportfs link</title>
+  <meta name="description" content="This is a bug fix / build-regression report, not a new feature or protocol change. On 1 August, Gentoo developer Lars Wendler reported that nfs-utils 2.9.2 fails to link exportfs when configured with --disable-nfsdctl. The only in-window…">
+  <meta property="og:title" content="nfs-utils 2.9.2: --disable-nfsdctl breaks exportfs link">
+  <meta property="og:description" content="This is a bug fix / build-regression report, not a new feature or protocol change. On 1 August, Gentoo developer Lars Wendler reported that nfs-utils 2.9.2 fails to link exportfs when configured with --disable-nfsdctl. The only in-window…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-06T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfs-utils 2.9.2: --disable-nfsdctl breaks exportfs link">
+  <meta name="twitter:description" content="This is a bug fix / build-regression report, not a new feature or protocol change. On 1 August, Gentoo developer Lars Wendler reported that nfs-utils 2.9.2 fails to link exportfs when configured with --disable-nfsdctl. The only in-window…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-06</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfs-utils 2.9.2: --disable-nfsdctl breaks exportfs link</h1>
+<h2>Summary</h2>
+<h1>nfs-utils 2.9.2: <code>--disable-nfsdctl</code> breaks <code>exportfs</code> link</h1>
+<h2>Overview</h2>
+<p>This is a <strong>bug fix / build-regression report</strong>, not a new feature or protocol change. On 1 August, Gentoo developer <a href="https://lore.kernel.org/linux-nfs/20260801175346.4d948b87@chagall.paradoxon.rec/">Lars Wendler</a> reported that <strong>nfs-utils 2.9.2 fails to link <code>exportfs</code></strong> when configured with <code>--disable-nfsdctl</code>. The only in-window message in this thread is that report. There is no maintainer reply, Ack, or patch on this thread before the 6 August week close.</p>
+<p>The failure is in userspace nfs-utils, not the kernel NFS client. It still matters for client-facing deployments: <code>exportfs</code> is the tool that publishes and withdraws NFS exports, and the 2.9.2 netlink path is how it is supposed to talk to <code>nfsd</code> without the older upcall machinery. Distros that ship a slim nfs-utils (no <code>nfsdctl</code> binary, no GSS, no LDAP) cannot even <em>build</em> 2.9.2 as released.</p>
+<h2>The report</h2>
+<p>Wendler was packaging 2.9.2 for Gentoo with a long, typical distro configure line: <code>--disable-static</code>, TIRPC, systemd units, <code>--enable-caps</code>, IPv6, NFSv4 server, <code>blkmapd</code> / <code>nfsdcld</code> / <code>nfsdcltrack</code>, and <strong><code>--disable-nfsdctl</code></strong>. GSS, svcgss, LDAP, junction, krb5, and tcp-wrappers were all off.</p>
+<p>The link of <code>utils/exportfs</code> dies here:</p>
+<blockquote>
+<p>"exportfs.c:(.text+0xfbe): undefined reference to <code>nfsd_nl_cmd_str</code>"</p>
+</blockquote>
+<p>The undefined symbol is referenced from <code>unexportfs_parsed</code> in <code>exportfs-exportfs.o</code>. The rest of the link line is otherwise ordinary: <code>libexport.a</code>, <code>libnfs.a</code>, <code>libmisc.a</code>, <code>libreexport.a</code>, libuuid, pthread, and <strong>libnl-3 / libnl-genl-3</strong>. So netlink libraries are already on the link line; the missing piece is a helper that should have come from libnfs.</p>
+<p>Wendler's workaround is blunt:</p>
+<blockquote>
+<p>"Switching <code>--disable-nfsdctl</code> to <code>--enable-nfsdctl</code> in the above set of configure flags makes the build succeed."</p>
+</blockquote>
+<p>That is the entire thread. No patch, no "please file a bug", no "this is expected". The 2.9.2 tarball, as released, does not build with a configure switch that nfs-utils itself documents.</p>
+<h2>What the linker is telling us</h2>
+<p><code>nfsd_nl_cmd_str</code> is the string helper for nfsd generic-netlink commands. It lives in <code>nfsdnl.c</code>, which 2.9.2 added so <code>exportfs</code> / <code>exportd</code> / <code>mountd</code> can drive nfsd over netlink (unlock-export / unexport) instead of the older channels. <code>unexportfs_parsed</code> is the path that tears an export down; that path now wants the netlink command name even when the operator asked <em>not</em> to build <code>nfsdctl</code>.</p>
+<p>Two configure knobs have been allowed to drift apart:</p>
+<ul>
+<li><strong><code>--enable/--disable-nfsdctl</code></strong> (default <strong>yes</strong>) gates <code>CONFIG_NFSDCTL</code> in <code>support/nfs/Makefile.am</code>, and that conditional is what actually compiles <code>nfsdnl.c</code> into <code>libnfs</code>.</li>
+<li><strong><code>HAVE_NFSD_NETLINK</code></strong> is the preprocessor gate in <code>exportfs.c</code>. <code>configure.ac</code> defines it <strong>unconditionally</strong> once the nfsd netlink headers are present, independent of <code>--disable-nfsdctl</code>.</li>
+</ul>
+<p>Result: <code>exportfs.c</code> always compiles the netlink unexport path, but <code>libnfs</code> only provides <code>nfsd_nl_cmd_str</code> when <code>nfsdctl</code> is enabled. Default <code>./configure &amp;&amp; make</code> hides the bug. Any distro that turns <code>nfsdctl</code> off — Gentoo in Wendler's case — hits the undefined reference.</p>
+<p>The link line already pulls in libnl, so this is not "you forgot a dependency". It is a <strong>feature-gate mismatch</strong> between the utility (<code>nfsdctl</code>) and the library helper that <code>exportfs</code> now unconditionally calls.</p>
+<h2>Same-week independent confirmation</h2>
+<p>Four days later, outside this thread, <a href="https://lore.kernel.org/linux-nfs/9fec9f1b-1c10-4a20-8282-dfc9addb4ee8@est.tech/">Jaipaul Cheernam</a> filed the same 2.9.2 link failure with a minimal reproducer (<code>./configure --disable-nfsdctl --disable-gss &amp;&amp; make</code>) and called it a <strong>regression from 2.9.1</strong>. That diagnosis matches Wendler's symptom exactly: <code>exportfs.c:491: undefined reference to nfsd_nl_cmd_str</code>. Cheernam's analysis is the technical root cause above; he also sketched two fixes (always compile <code>nfsdnl.c</code> into libnfs, or move <code>HAVE_NFSD_NETLINK</code> under <code>--enable-nfsdctl</code>) and asked which the maintainers prefer. <strong>No answer landed on either thread this week.</strong></p>
+<h2>Why it matters for NFS userspace</h2>
+<p>2.9.2 is the first nfs-utils release in which <code>exportfs</code> is wired to nfsd generic netlink. That is the userspace half of the exportfs/exportd/mountd netlink up/downcall work from earlier in the year. The utility flag <code>--disable-nfsdctl</code> was left meaning "do not build the <code>nfsdctl</code> binary", but the new netlink helper was hung off that same conditional while <code>exportfs</code> was compiled as if netlink were always there.</p>
+<p>For NFS <em>client</em> machines that still build nfs-utils (to get <code>mount.nfs</code>, <code>nfsidmap</code>, etc.) and for servers that do not want <code>nfsdctl</code>, 2.9.2 is a hard stop. Wendler's Gentoo flags are not exotic: <code>--enable-nfsv4server</code> plus <code>--disable-nfsdctl</code> is a perfectly reasonable "NFSv4 server, no extra ctl tool" build. The fact that flipping one switch makes the link succeed is the giveaway that the C sources are fine and the automake/configure split is not.</p>
+<h2>Final status (this week)</h2>
+<ul>
+<li><strong>Type:</strong> Build-regression bug in nfs-utils 2.9.2 (<code>exportfs</code> / <code>nfsdnl.c</code> / <code>--disable-nfsdctl</code>)</li>
+<li><strong>This week's activity on this thread:</strong> one report from Lars Wendler; no replies</li>
+<li><strong>Symptom:</strong> <code>undefined reference to nfsd_nl_cmd_str</code> from <code>unexportfs_parsed</code> when linking <code>exportfs</code></li>
+<li><strong>Workaround stated by the reporter:</strong> configure with <code>--enable-nfsdctl</code></li>
+<li><strong>Outstanding at week close:</strong> no maintainer Ack, no agreed fix, no 2.9.3 / stable patch on this thread. A parallel report later in the week independently confirmed the regression and proposed two gating fixes; that discussion is also unanswered in-window.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260801175346.4d948b87@chagall.paradoxon.rec/">2026-08-01 Lars Wendler — 2.9.2 release: --disable-nfsdctl breaks build</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260801175346.4d948b87@chagall.paradoxon.rec/">2026-08-01 Lars Wendler <a href="mailto:polynomial-c@gmx.de">polynomial-c@gmx.de</a> — 2.9.2 release: --disable-nfsdctl breaks build</a></li>
+</ul>
+  </main>
+</body>
+</html>

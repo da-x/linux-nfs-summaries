@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS sysfs kobject UAF on delayed release</title>
+  <meta name="description" content="This week’s linux-nfs traffic included a tightly scoped bug fix for the NFS client sysfs layer: a use-after-free that only surfaces when kobject teardown is deliberately delayed. The discussion is not a protocol change and does not add a…">
+  <meta property="og:title" content="NFS sysfs kobject UAF on delayed release">
+  <meta property="og:description" content="This week’s linux-nfs traffic included a tightly scoped bug fix for the NFS client sysfs layer: a use-after-free that only surfaces when kobject teardown is deliberately delayed. The discussion is not a protocol change and does not add a…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-06T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS sysfs kobject UAF on delayed release">
+  <meta name="twitter:description" content="This week’s linux-nfs traffic included a tightly scoped bug fix for the NFS client sysfs layer: a use-after-free that only surfaces when kobject teardown is deliberately delayed. The discussion is not a protocol change and does not add a…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-06</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS sysfs kobject UAF on delayed release</h1>
+<h2>Summary</h2>
+<p>This week’s linux-nfs traffic included a tightly scoped <strong>bug fix</strong> for the NFS <em>client</em> sysfs layer: a use-after-free that only surfaces when kobject teardown is deliberately delayed. The discussion is not a protocol change and does not add a feature; it restores lifetime ordering between two kobjects that share a single <code>nfs_netns_client</code> allocation.</p>
+<h2>The report</h2>
+<p>On 3 August, <a href="https://lore.kernel.org/linux-nfs/20260803-nfs-v1-1-034176dab4a3@gmail.com/">Vasileios Almpanis</a> posted <code>[PATCH] NFS: sysfs: fix use-after-free on delayed kobject release</code>. The object in question is <code>struct nfs_netns_client</code>, which embeds <strong>two</strong> kobjects. The allocation is freed from <code>nfs_netns_object_release()</code>, the release callback of <code>nfs_net_kobj</code>. The sibling kobject (<code>p-&gt;kobject</code>) lives in that same slab object, but nothing holds the allocation alive until <code>p-&gt;kobject</code> itself has finished releasing.</p>
+<p>Almpanis put the lifetime hole in plain terms:</p>
+<blockquote>
+<p>"struct nfs_netns_client embeds two kobjects and is freed by nfs_netns_object_release(), the release function of nfs_net_kobj. Despite that the first one, p-&gt;kobject lives in the same allocation. Nothing keeps the allocation from being freed before p-&gt;kobject has been released."</p>
+</blockquote>
+<p>Under normal production configs the two releases tend to run back-to-back, so the race is easy to miss. With <code>CONFIG_DEBUG_KOBJECT_RELEASE=y</code>, each kobject release is deferred onto a <code>delayed_work</code> embedded in the kobject, with an <strong>independent random delay</strong>. In that mode <code>nfs_net_kobj</code> can free the slab first. <code>p-&gt;kobject</code>’s timer is then left armed inside freed memory, and KASAN fires from the timer wheel:</p>
+<pre><code>kobject: 'nfs_client' (...): kobject_release, parent 0000000000000000 (delayed 300)
+kobject: 'net' (...): kobject_release, parent 0000000000000000 (delayed 100)
+
+BUG: KASAN: slab-use-after-free in __run_timers+0x932/0x980
+Write of size 8 at addr ffff888027fdb868 by task swapper/0/0
+</code></pre>
+<p>The splat is a <strong>write</strong> of size 8 in <code>__run_timers</code>, which matches a timer callback still sitting in the freed kobject. Almpanis reproduced it on a KASAN kernel with <code>CONFIG_NFS_FS=y</code> and <code>CONFIG_DEBUG_KOBJECT_RELEASE=y</code> by cycling network namespaces:</p>
+<pre><code>for i in $(seq 16); do unshare -n true; done; sleep 20
+</code></pre>
+<p>That is a client-side path: creating and destroying netns instances exercises <code>/sys/fs/nfs</code> per-namespace objects, not the NFS server.</p>
+<p>The regression is attributed to <a href="https://git.kernel.org/linus/e96f9268eea6">e96f9268eea6</a> (<code>NFS: Make all of /sys/fs/nfs network-namespace unique</code>), the commit that made the NFS sysfs tree netns-unique and introduced this dual-kobject layout.</p>
+<h2>The fix</h2>
+<p>The patch is eight lines in <code>fs/nfs/sysfs.c</code>. Rather than changing how the structure is allocated, Almpanis pins the parent kobject for the lifetime of the child:</p>
+<blockquote>
+<p>"Give p-&gt;kobject a reference on nfs_net_kobj for its whole lifetime and drop it from nfs_netns_client_release(), so the allocation is always freed after p-&gt;kobject has been released."</p>
+</blockquote>
+<p>In other words, <code>p-&gt;kobject</code> takes a reference on <code>nfs_net_kobj</code> when it is set up, and only drops that reference from <code>nfs_netns_client_release()</code>. Because the slab is freed from <code>nfs_net_kobj</code>’s release function, that extra reference guarantees the allocation outlives the delayed work / timer belonging to <code>p-&gt;kobject</code>. The debug-kobject random delay can no longer invert the two releases.</p>
+<p>This is the classic kobject pattern for nested objects that share storage: the object that actually <code>kfree()</code>s must be the last one whose release callback runs. The debug option exists precisely to catch cases where that invariant is only accidentally true.</p>
+<h2>Review and status</h2>
+<p>The next day, <a href="https://lore.kernel.org/linux-nfs/4FA2A276-5C44-4D7E-8C33-1322A7BB8AB4@hammerspace.com/">Benjamin Coddington</a> of Hammerspace replied with a one-line review and no requested changes:</p>
+<blockquote>
+<p>"Reviewed-by: Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a>"</p>
+</blockquote>
+<p>There was no debate over the diagnosis, no alternative approach (for example splitting the two kobjects into separate allocations), and no follow-up from other NFS client maintainers in this window. The thread therefore ends this week with a Reviewed-by on v1, and no v2 in sight.</p>
+<h2>Why it matters for the NFS client</h2>
+<p>The bug is in the client’s sysfs / netns glue, not in RPC, pNFS, or the wire protocol. It is still an important client fix:</p>
+<ul>
+<li><code>/sys/fs/nfs</code> is the control plane for per-netns NFS client state. Namespace create/destroy is a hot path for containers and test harnesses (<code>unshare -n</code> is exactly that).</li>
+<li>The UAF is real memory corruption (timer write after free), not a debug-only warning. <code>CONFIG_DEBUG_KOBJECT_RELEASE</code> only makes the race deterministic; the missing reference is a structural lifetime bug.</li>
+<li>The <code>Fixes:</code> tag points at the netns-unique sysfs conversion, so this is a candidate for stable backports to every tree that carries that change.</li>
+</ul>
+<p>No remaining open questions were raised on-list this week. The practical next step is maintainer pickup of Almpanis’s v1 with Coddington’s Reviewed-by.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260803-nfs-v1-1-034176dab4a3@gmail.com/">2026-08-03 Vasileios Almpanis <a href="mailto:vasilisalmpanis@gmail.com">vasilisalmpanis@gmail.com</a> — [PATCH] NFS: sysfs: fix use-after-free on delayed kobject release</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/4FA2A276-5C44-4D7E-8C33-1322A7BB8AB4@hammerspace.com/">2026-08-04 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — Re: [PATCH] NFS: sysfs: fix use-after-free on delayed kobject release</a></li>
+</ul>
+  </main>
+</body>
+</html>

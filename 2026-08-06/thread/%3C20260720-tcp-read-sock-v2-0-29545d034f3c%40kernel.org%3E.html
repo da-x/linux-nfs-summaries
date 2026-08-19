@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>kTLS read_sock needs a documented errno contract</title>
+  <meta name="description" content="Two days after netdev NACKed read_sock_rectype, the thread this week is no longer arguing for that proto_ops method. Chuck Lever and kTLS maintainer Sabrina Dubroca instead spend 31 July picking apart the existing -&gt;read_sock contract —…">
+  <meta property="og:title" content="kTLS read_sock needs a documented errno contract">
+  <meta property="og:description" content="Two days after netdev NACKed read_sock_rectype, the thread this week is no longer arguing for that proto_ops method. Chuck Lever and kTLS maintainer Sabrina Dubroca instead spend 31 July picking apart the existing -&gt;read_sock contract —…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-06T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="kTLS read_sock needs a documented errno contract">
+  <meta name="twitter:description" content="Two days after netdev NACKed read_sock_rectype, the thread this week is no longer arguing for that proto_ops method. Chuck Lever and kTLS maintainer Sabrina Dubroca instead spend 31 July picking apart the existing -&gt;read_sock contract —…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-06</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>kTLS read_sock needs a documented errno contract</h1>
+<h2>Summary</h2>
+<h1>kTLS read_sock needs a documented errno contract</h1>
+<h2>Summary</h2>
+<p>Two days after netdev NACKed <code>read_sock_rectype</code>, the thread this week is no longer arguing for that proto_ops method. <a href="https://lore.kernel.org/linux-nfs/6deaada6-b916-4232-9df9-fff27472e98c@app.fastmail.com/">Chuck Lever</a> and kTLS maintainer <a href="https://lore.kernel.org/linux-nfs/amxenihnJifrwuYv@krikkit/">Sabrina Dubroca</a> instead spend 31 July picking apart the <em>existing</em> <code>-&gt;read_sock</code> contract — the one NFSD svcsock and a later NFS client <code>xprtsock</code> conversion would have to live with if control records stay a fallback path.</p>
+<p>This remains a <strong>new kernel networking API</strong> discussion plus a related <strong>kTLS bug-fix / API-hygiene</strong> thread, not a protocol change. The on-the-wire TLS/RPC framing is untouched. What is at stake for NFS is still how in-kernel TCP consumers see KeyUpdate and fatal Alerts once kTLS is active, without leaking control bytes into page-cache receive pages.</p>
+<h2>Brief recap of prior weeks</h2>
+<p>v2 of Lever's six-patch net-next series added <code>read_sock_rectype</code> to <code>struct proto_ops</code>, implemented it on the kTLS software path, converted NFSD svcsock, and bounded consecutive no-data records in <code>tls_sw_read_sock()</code>. The no-data cap was split out to a <code>net</code> prerequisite as a standalone DoS fix for empty TLS 1.3 data records. Last week Jakub Kicinski rejected the new proto_ops hook as a TLS-only one-off; Dubroca called a TLS-specific argument in a generic API "quite ugly"; Lever conceded. Kicinski's setsockopt sketch then collapsed into behavior kTLS already has: <code>recvmsg</code> without CMSG and <code>read_sock</code> already error out if the next record is control. That is the claim this week's two messages answer.</p>
+<h2>Lever: <code>-EINVAL</code> is not a contract</h2>
+<p>Replying to <a href="https://lore.kernel.org/linux-nfs/20260730143556.4a8463fd@kernel.org/">Kicinski's "we already constrain control records"</a>, <a href="https://lore.kernel.org/linux-nfs/6deaada6-b916-4232-9df9-fff27472e98c@app.fastmail.com/">Lever first restated the SUNRPC preference</a> that motivated the series:</p>
+<blockquote>
+<p>"But the “recover the control type with a separate operation” is strictly better than “pass a CMSG buffer to every I/O operation just in case” ;-)"</p>
+</blockquote>
+<p>Then he corrected the "already constrained" claim. There is <strong>no API contract</strong> for <code>-&gt;read_sock</code>. The TLS implementation happens to return <code>-EINVAL</code> for two unrelated reasons:</p>
+<ul>
+<li><code>net/tls/tls_sw.c:2068-2072</code> — entry gate: <code>sk_psock_get(sk)</code> is non-NULL, so the socket is under sockmap/BPF. Drop the ref and refuse before acquiring the reader.</li>
+<li><code>net/tls/tls_sw.c:2111-2115</code> — per-record: <code>tlm-&gt;control != TLS_RECORD_TYPE_DATA</code>. The record is requeued rather than consumed.</li>
+</ul>
+<blockquote>
+<p>"As far as I can tell, no other socket provider that implements read_sock will return -EINVAL. But this isn’t a documented guarantee that a socket consumer can depend on, currently."</p>
+</blockquote>
+<p>That is the NFS-relevant bug in this week's mail. A kTLS-enabled NFS client (or NFSD) that treats <code>-EINVAL</code> as "control record pending, fall back to <code>recvmsg</code>+CMSG" cannot tell that condition from "this socket is under sockmap." Mixing those two failures is exactly the kind of exception processing Lever has been trying to keep off the normal I/O path. His concrete ask:</p>
+<blockquote>
+<p>"What would make this just a little friendlier is having distinct errnos for these two conditions, and a kdoc API contract that documents them."</p>
+</blockquote>
+<h2>Dubroca: document <code>read_sock</code>, kill the leftover, maybe a new errno</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/amxenihnJifrwuYv@krikkit/">Dubroca agreed on the documentation</a>, and went further: the first <code>-EINVAL</code> is not even a real condition anymore.</p>
+<blockquote>
+<p>"You can ignore this one, it's just a leftover that 79511603a65b ("tls: remove dead sockmap (psock) handling from the SW path") missed. I'll get back to cleaning all this up once I'm not drowning in reviews (I'm sure being on holidays next week will help with that)."</p>
+</blockquote>
+<p>That is a <strong>latent kTLS bug fix</strong>: dead sockmap/psock handling still sitting in <code>tls_sw_read_sock()</code> after the SW-path cleanup, returning a confusing <code>-EINVAL</code> that no consumer should have to interpret. Dubroca owns that cleanup; it is not in this series.</p>
+<p>On the remaining control-record <code>-EINVAL</code>, she +1'd a kdoc contract and admitted the current <code>read_sock</code> semantics are opaque even to the kTLS maintainer:</p>
+<blockquote>
+<p>"+1 on the API contract doc. I have no idea what read_actor does to desc, how that relates to the returned value, and if it modifies the skb it gets in any way. That makes it hard to figure out the correct behavior for tls_sw_read_sock()."</p>
+</blockquote>
+<p>She floated two design options that would actually give SUNRPC something to code against:</p>
+<blockquote>
+<p>"Maybe we should even come up with some new internal errno (like one of the &gt;=512 in include/linux/errno.h). And maybe this -errno return should be desc-&gt;error instead. I really don't know how read_sock is supposed to behave."</p>
+</blockquote>
+<p>She did not concede Lever's "separate operation is strictly better" line. On that she only wrote:</p>
+<blockquote>
+<p>"That's up to every user to decide :)"</p>
+</blockquote>
+<p>So the CMSG-on-every-I/O vs. recover-control-type-separately argument is still open. What is no longer open is whether consumers can treat today's <code>-EINVAL</code> as a stable signal: they cannot, until someone writes the contract.</p>
+<h2>What this means for NFS client development</h2>
+<p>Nothing this week touches <code>xprtsock</code> directly. The client conversion remains a follow-up that was going to copy the NFSD svcsock template. The week's result still lands on the client path:</p>
+<ul>
+<li>Last week's NACK of <code>read_sock_rectype</code> stands. There is still no first-class control-record delivery for kernel <code>read_sock</code> consumers.</li>
+<li>Lever is now arguing for a <strong>documented <code>read_sock</code> error contract</strong> as the minimum viable alternative: distinct errnos so "next record is not DATA" is not the same code as "socket is under sockmap," plus kdoc so NFSD and the NFS client can depend on it.</li>
+<li>Dubroca agrees the contract is missing and has queued a cleanup of the leftover sockmap <code>-EINVAL</code>. She is also willing to invent a new internal errno (<code>&gt;= 512</code>) or route the failure through <code>desc-&gt;error</code> instead of the <code>read_sock</code> return value. Either of those would be the hook a future <code>xprtsock</code> <code>read_sock</code> loop would use to stop draining DATA and issue one <code>recvmsg</code>+CMSG into a side buffer — the dance that avoids leaking Alert/KeyUpdate bytes into page-cache receive pages.</li>
+<li>Until that contract exists, a kTLS-enabled NFS client still cannot distinguish "control record queued" from a generic <code>-EINVAL</code>, and still cannot handle KeyUpdate or fatal Alerts on <code>read_sock</code> without the CMSG fallback that mixes control payload into RPC message memory.</li>
+</ul>
+<h2>Status at week close</h2>
+<p>The series is <strong>still under redesign, not merged</strong>. Consensus in-window:</p>
+<ul>
+<li><code>read_sock_rectype</code> as posted remains rejected. No v3, no replacement API, no measurements of the three-way comparison Dubroca asked for last week.</li>
+<li>Existing kTLS <code>read_sock</code> <em>does</em> requeue non-DATA records and return <code>-EINVAL</code>, but that is an implementation accident, not a documented guarantee. Lever wants distinct errnos and kdoc; Dubroca wants the same plus possibly a new internal errno or <code>desc-&gt;error</code>.</li>
+<li>The sockmap/psock <code>-EINVAL</code> at <code>tls_sw.c:2068</code> is dead code leftover from <code>79511603a65b</code>. Dubroca will clean it up; she is on holiday the following week.</li>
+<li>The empty-record DoS bound remains the only piece moving independently, on <code>net</code>.</li>
+<li>NFSD svcsock conversion and the planned NFS client <code>xprtsock</code> conversion still cannot land.</li>
+</ul>
+<p>The practical takeaway for NFS client development this week: the lock-pinning fix is still the only forward-moving piece. The control-record path has shifted from "new proto_ops method" to "please document <code>read_sock</code> so we can even write the fallback correctly," and that documentation does not exist yet.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/6deaada6-b916-4232-9df9-fff27472e98c@app.fastmail.com/">2026-07-31 Chuck Lever — Re: [PATCH net-next v2 2/6] net: Introduce read_sock_rectype proto_ops for control record delivery</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/amxenihnJifrwuYv@krikkit/">2026-07-31 Sabrina Dubroca — Re: [PATCH net-next v2 2/6] net: Introduce read_sock_rectype proto_ops for control record delivery</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/6deaada6-b916-4232-9df9-fff27472e98c@app.fastmail.com/">2026-07-31 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH net-next v2 2/6] net: Introduce read_sock_rectype proto_ops for control record delivery</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/amxenihnJifrwuYv@krikkit/">2026-07-31 Sabrina Dubroca <a href="mailto:sd@queasysnail.net">sd@queasysnail.net</a> — Re: [PATCH net-next v2 2/6] net: Introduce read_sock_rectype proto_ops for control record delivery</a></li>
+</ul>
+  </main>
+</body>
+</html>

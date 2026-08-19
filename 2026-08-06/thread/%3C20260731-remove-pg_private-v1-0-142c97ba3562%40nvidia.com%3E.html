@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RFC: drop PG_private, with mechanical NFS folio-private cleanup</title>
+  <meta name="description" content="Zi Yan (NVIDIA) posted an RFC 14-patch series that is not an NFS protocol change and not an NFS bug fix. It is a core-MM flag-space reclaim: delete PG_private so a forthcoming PG_folio (currently reserved as PG_folio) can mark every page…">
+  <meta property="og:title" content="RFC: drop PG_private, with mechanical NFS folio-private cleanup">
+  <meta property="og:description" content="Zi Yan (NVIDIA) posted an RFC 14-patch series that is not an NFS protocol change and not an NFS bug fix. It is a core-MM flag-space reclaim: delete PG_private so a forthcoming PG_folio (currently reserved as PG_folio) can mark every page…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-06T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="RFC: drop PG_private, with mechanical NFS folio-private cleanup">
+  <meta name="twitter:description" content="Zi Yan (NVIDIA) posted an RFC 14-patch series that is not an NFS protocol change and not an NFS bug fix. It is a core-MM flag-space reclaim: delete PG_private so a forthcoming PG_folio (currently reserved as PG_folio) can mark every page…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-06</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>RFC: drop PG_private, with mechanical NFS folio-private cleanup</h1>
+<h2>Summary</h2>
+<h2>RFC to retire <code>PG_private</code> lands on linux-nfs with mechanical client cleanup</h2>
+<p>Zi Yan (NVIDIA) posted an <a href="https://lore.kernel.org/linux-nfs/20260731-remove-pg_private-v1-0-142c97ba3562@nvidia.com/">RFC 14-patch series</a> that is not an NFS protocol change and not an NFS bug fix. It is a core-MM flag-space reclaim: delete <code>PG_private</code> so a forthcoming <code>PG_folio</code> (currently reserved as <code>__PG_folio</code>) can mark every page that belongs to a folio. Callers would stop testing the flag and instead treat <code>page/folio-&gt;private != NULL</code> as the presence check.</p>
+<p>Yan framed the motivation in the cover letter:</p>
+<blockquote>
+<p>"This patchset removes PG_private to make space for upcoming PG_folio (reserved as __PG_folio) for identifying pages from a folio"</p>
+</blockquote>
+<p>The intended end state is broader than NFS: <code>page_rmappable_folio()</code> would set <code>PG_folio</code> on every page of a folio so <code>vm_insert_*()</code> can reject folios and rmap can accept only folios, with <code>page_folio()</code> eventually returning NULL for non-folio pages.</p>
+<h3>Why linux-nfs was on the To/Cc list</h3>
+<p>Most filesystems already go through <code>folio_attach/detach/change_private()</code>, which bump and drop the folio refcount as <code>-&gt;private</code> is set and cleared. Yan listed NFS as one of the <strong>exceptional</strong> users that does <em>not</em> fit that helper pattern, but also as one that needs no semantic rewrite:</p>
+<blockquote>
+<p>"6. fs/nfs/write.c: folio refcount maintenance is in a bigger scope than folio-&gt;private. So folio_attach/detach/get_private() is not used. Nothing to change."</p>
+</blockquote>
+<p>That is the client-side takeaway. NFS already keeps writeback request state on <code>folio-&gt;private</code> (the <code>nfs_page</code> / page-group path) while holding folio references over a wider lifetime than a simple attach/detach pair. The series therefore does not try to convert NFS onto the generic helpers; it only strips now-redundant flag ops and comments.</p>
+<p>Two of the 14 patches actually touch the NFS client:</p>
+<ul>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260731-remove-pg_private-v1-11-142c97ba3562@nvidia.com/">PATCH RFC 11/14</a></strong> — <code>treewide: remove folio_set/clear_private()</code>. After the flag helpers become no-ops, the two remaining calls in <code>fs/nfs/write.c</code> are deleted (2 lines). The same patch also drops the now-empty helpers from <code>include/linux/pagemap.h</code> and a leftover in <code>mm/migrate.c</code>. Yan: "They are no-ops now. Remove them."</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260731-remove-pg_private-v1-13-142c97ba3562@nvidia.com/">PATCH RFC 13/14</a></strong> — <code>treewide: adjust comments on PagePrivate and PG_private</code>. <code>fs/nfs/file.c</code> comments that still talk about <code>PagePrivate</code> / <code>PG_private</code> are rewritten to talk about <code>page/folio-&gt;private</code> instead (4 lines). Ceph and UBIFS get the same comment pass.</li>
+</ul>
+<p>Trond Myklebust and Anna Schumaker are on the To: line of both NFS-touching patches, and <code>linux-nfs@vger.kernel.org</code> is Cced. Neither NFS maintainer had replied in-window.</p>
+<p>The cover letter also notes a related helper, <code>folio_test_fs_private()</code>, added so core MM can ask “does this folio have filesystem-only private data?” while excluding swapcache (which overlays <code>swp_entry_t</code> on <code>-&gt;private</code>) and hugetlb (which stores its own flags there). Filesystem code, including NFS, is not expected to see those two cases.</p>
+<h3>Exceptional users around NFS, and the Xen question</h3>
+<p>The rest of the series is the inventory of code that used <code>PG_private</code> as a <em>marker</em> rather than as a shadow of <code>-&gt;private</code>: zsmalloc first-component zpdesc pages, perf ring-buffer high-order AUX pages, Xen grant-table foreign-page encoding (pointer on 32-bit, packed <code>{domid,gref}</code> on 64-bit, including the valid-zero case), fscrypt bounce pages, erofs reverse-readahead lists plus in-flight I/O counters, f2fs <code>PAGE_PRIVATE_NOT_POINTER</code> bit packing, and hugetlb’s <code>folio_change_private(folio, NULL)</code> without a matching refcount.</p>
+<p>That inventory is what produced the only in-window review. On 3 August, <a href="https://lore.kernel.org/linux-nfs/5ca4d0e4-1747-45a7-a916-a7516bb1692b@suse.com/">Jürgen Groß</a> (SUSE, Xen) asked — the OpenPGP-signed body arrived truncated on the list, but Yan’s reply preserves the tail of the question as <code>not set)?</code> — whether <code>-&gt;private</code> can be live <strong>without</strong> <code>PG_private</code>.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/DKFIGJBRSDB1.O204NIB7HZMR@nvidia.com/">Yan confirmed</a>:</p>
+<blockquote>
+<p>"Yes, it is possible. See: #5 in the exceptional users: erofs uses -&gt;private for reverse linked list and in-flight counters without setting PG_private. I get rid of the first one and converted the second one to use folio_attach/detach/get_private() to follow the general -&gt;private use pattern."</p>
+</blockquote>
+<p>He then restated the non-filesystem overlays and the new helper:</p>
+<blockquote>
+<p>"For non file system folios, anon swapcache puts swap_entry_t in -&gt;private and hugetlb puts its flags in -&gt;private. I added folio_test_fs_private() to exclude them, but this helper is planned to be used by core MM, since filesystem code should not encounter these two."</p>
+</blockquote>
+<p>That answer is the week’s only technical conclusion: the flag and the pointer were already allowed to diverge, which is exactly why NFS can keep using <code>-&gt;private</code> as request state without a <code>PG_private</code> bit, and why the flag can be deleted.</p>
+<h3>Semantic nits that could still matter to NFS tooling</h3>
+<p>Yan flagged a minor ABI/docs shift, not an NFS functional change:</p>
+<blockquote>
+<p>"KPF_PRIVATE has a minor semantic change. Since PG_private will be removed, KPF_PRIVATE represents pagecache folios whose -&gt;mapping is not NULL and with -&gt;private set. Currently KPF_PRIVATE can be set for orphaned pagecache folios with -&gt;mapping == NULL."</p>
+</blockquote>
+<p>He also left <code>Documentation/mm/hugetlbfs_reserv.rst</code> alone because it is already stale. Testing reported this week is MM/selftest plus zsmalloc, erofs, fscrypt, and f2fs; <strong>no NFS or xfstests run is claimed</strong>. The series is explicitly LLM-assisted (Claude for planning and review, Codex for a final pass).</p>
+<h3>Status at week’s end</h3>
+<p>This remains an RFC. The NFS client impact in-tree is two deleted no-op flag calls in <code>fs/nfs/write.c</code> and comment wording in <code>fs/nfs/file.c</code>; writeback still owns <code>folio-&gt;private</code> over a wider refcount window than the generic attach/detach helpers. No Acked-by or Reviewed-by from NFS maintainers, no follow-up patches, and no merge discussion. The only reviewer engagement is Groß’s Xen-oriented question, answered by Yan with the erofs/<code>folio_test_fs_private()</code> explanation. Watch for whether Trond/Anna object to dropping the explicit <code>folio_set/clear_private()</code> markers on the NFS writeback path, or whether a later revision tries to force NFS onto <code>folio_attach/detach_private()</code> after all.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260731-remove-pg_private-v1-0-142c97ba3562@nvidia.com/">2026-08-01 Zi Yan <a href="mailto:ziy@nvidia.com">ziy@nvidia.com</a> — [PATCH RFC 00/14] Remove PG_private by using page/folio-&gt;private checks instead</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260731-remove-pg_private-v1-11-142c97ba3562@nvidia.com/">2026-08-01 Zi Yan <a href="mailto:ziy@nvidia.com">ziy@nvidia.com</a> — [PATCH RFC 11/14] treewide: remove folio_set/clear_private()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260731-remove-pg_private-v1-13-142c97ba3562@nvidia.com/">2026-08-01 Zi Yan <a href="mailto:ziy@nvidia.com">ziy@nvidia.com</a> — [PATCH RFC 13/14] treewide: adjust comments on PagePrivate and PG_private</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/5ca4d0e4-1747-45a7-a916-a7516bb1692b@suse.com/">2026-08-03 Jürgen Groß <a href="mailto:jgross@suse.com">jgross@suse.com</a> — Re: [PATCH RFC 00/14] Remove PG_private by using page/folio-&gt;private checks instead</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/DKFIGJBRSDB1.O204NIB7HZMR@nvidia.com/">2026-08-03 "Zi Yan" <a href="mailto:ziy@nvidia.com">ziy@nvidia.com</a> — Re: [PATCH RFC 00/14] Remove PG_private by using page/folio-&gt;private checks instead</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSv4.2 futimens() still skips SETATTR; leases workaround</title>
+  <meta name="description" content="This remains a client-side NFS bug report, not a protocol change or new feature. Earlier weeks established that GNU touch -d on NFSv4.2 can return success from fd-based futimens() / utimensat(fd, NULL, ...) while never sending SETATTR, so…">
+  <meta property="og:title" content="NFSv4.2 futimens() still skips SETATTR; leases workaround">
+  <meta property="og:description" content="This remains a client-side NFS bug report, not a protocol change or new feature. Earlier weeks established that GNU touch -d on NFSv4.2 can return success from fd-based futimens() / utimensat(fd, NULL, ...) while never sending SETATTR, so…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-06T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSv4.2 futimens() still skips SETATTR; leases workaround">
+  <meta name="twitter:description" content="This remains a client-side NFS bug report, not a protocol change or new feature. Earlier weeks established that GNU touch -d on NFSv4.2 can return success from fd-based futimens() / utimensat(fd, NULL, ...) while never sending SETATTR, so…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-06</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSv4.2 futimens() still skips SETATTR; leases workaround</h1>
+<h2>Summary</h2>
+<p>This remains a <strong>client-side NFS bug report</strong>, not a protocol change or new feature. Earlier weeks established that GNU <code>touch -d</code> on NFSv4.2 can return success from fd-based <code>futimens()</code> / <code>utimensat(fd, NULL, ...)</code> while never sending <code>SETATTR</code>, so the server inode stays stale and the client's cached timestamps later snap back. <a href="https://lore.kernel.org/linux-nfs/nMlXgkbm-9ZP_fFN16OpzFd4kwNlyXq169-6CoOE4nuHyTsmGaFeJgzuhj3grRboJKg9RapKov2_FJ1E3BCL0oZ7UNzF0pgwwhVC6VOVJYQ=@proton.me//">Michael Yang</a> originally isolated the fd-versus-pathname split; <a href="https://lore.kernel.org/linux-nfs/fcffc38c-80fd-ca2f-1b1a-f9d041c6a2c7@applied-asynchrony.com//">Holger Hoffstätte</a> confirmed it on 7.1.x and flagged <code>b8b3002fbfef</code> (<code>nfs: split nfs_update_timestamps</code>) plus <code>761475268fa8</code> (<code>fs: refactor -&gt;update_time handling</code>) as 7.0-era suspects. Last week Yang further bounded the regression to <strong>6.17+ and NFSv4.2 only</strong> (absent on 6.12.88 LTS; <code>vers=4.1</code> updates the server).</p>
+<p>This week's four in-window messages add a third independent reproduction, a practical workaround tied to NFSv4 delegations, a regressions-list nudge for a real bisection, and a negative result on 7.2-rc5. There is still no maintainer diagnosis or patch.</p>
+<h2>Third reproduction, and a leases workaround</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/7ddc02d8-fa98-4d89-b2c7-0048fe9cfa10@cipixia.com//">Matt Kinni</a> reported the same silent-success behaviour on Fedora 44 with kernel 7.0.8 and nfs-utils 2.8.7. Local extraction preserved timestamps; copying onto an NFSv4.2 mount with <code>rsync -a</code> only updated the <em>client</em> view. The server-side backing inode did not change, and the client later reverted. <code>touch -d</code> failed the same way.</p>
+<p>The new operational clue is that the failure tracks NFS <strong>delegations / leases</strong>, not just the protocol minor version:</p>
+<blockquote>
+<p>"I have not tried forcing vers=4.1 yet, but disabling NFS delegations on the server with fs.leases-enable=0 made the problem go away for me."</p>
+</blockquote>
+<p>That is the first in-thread observation that the missing <code>SETATTR</code> is associated with a write/open delegation rather than a generic v4.2 setattr path. Combined with last week's <code>vers=4.1</code> success, the client picture now looks like: fd-based <code>-&gt;update_time</code> on a delegated NFSv4.2 open file dirties the local inode and returns 0 without flushing attributes to the wire.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/10af95c9-fe18-35b9-d696-5dbd53066b3d@applied-asynchrony.com//">Holger Hoffstätte</a> immediately tried both workarounds and ranked them:</p>
+<blockquote>
+<p>"Disabling leases seems like the best workaround for now if one can live with the performance hit. Forcing 4.1 makes files work, but in turn seems to break directory modification timestamps. :-/"</p>
+</blockquote>
+<p>So <code>vers=4.1</code> is not a free escape hatch: file mtimes land, but directory mtime updates appear to regress. <code>fs.leases-enable=0</code> on the server restores persistence at the cost of delegation performance.</p>
+<h2>Still no bisection; 7.2-rc5 does not help</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/38643fbd-3031-49ea-92bf-0870bfe5353e@leemhuis.info//">Thorsten Leemhuis</a>, writing from the kernel regressions list, pressed for the missing developer-facing evidence:</p>
+<blockquote>
+<p>"Did anyone bisect this (or try reverting the two commits that Holger mentioned earlier)? Seems this is needed to get the attention of the developers -- especially if it's really a VFS issue, as they won't see the report on a nfs list."</p>
+</blockquote>
+<p>Nobody in this week's traffic answered that call. Hoffstätte's two 7.0 commits remain un-reverted in public, and last week's Proxmox data already showed the bug on 6.17.x, so those commits cannot be the original introduction even if they sit on the failing path. The practical bisection window is still <strong>6.12.88 (good) through 6.17 (bad)</strong>.</p>
+<p>Later the same day <a href="https://lore.kernel.org/linux-nfs/83b13893-067e-74f0-be47-52661212d0f0@applied-asynchrony.com//">Hoffstätte</a> tested 7.2-rc5 with leases left enabled, hoping recent related timestamp/setattr commits in that tree would close the hole:</p>
+<blockquote>
+<p>"Since 7.2-rc contains a few commits that fix related problems, I decided to give -rc5 a try (with fs.leases-enable=1). Unfortunately the lack of attribute persistence seems to persist."</p>
+</blockquote>
+<p>The regression is therefore still live on current -rc, not just 7.0/7.1 stable.</p>
+<h2>Where things stand</h2>
+<p>The report is now independently reproduced on three setups (Yang, Hoffstätte, Kinni), protocol-bounded to NFSv4.2, version-bounded against 6.12 LTS, and <strong>workaround-bounded to NFS leases/delegations</strong>. The user-visible impact is unchanged and still nasty: tools that rely on <code>futimens()</code> (<code>touch -d</code>, <code>rsync -a</code>) look successful, then timestamps evaporate on revalidation.</p>
+<p>What NFS client developers still lack is a commit-level bisection (or a revert of the 7.0 timestamp-split / VFS <code>-&gt;update_time</code> refactor) and a look at how the v4.2 delegated open-file setattr path interacts with <code>nfs_update_timestamps</code>. No protocol change is proposed. No maintainer reply landed this week.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/7ddc02d8-fa98-4d89-b2c7-0048fe9cfa10@cipixia.com/">2026-07-31 Matt Kinni — Re: [BUG] NFSv4.2: futimens() returns success without sending SETATTR</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/38643fbd-3031-49ea-92bf-0870bfe5353e@leemhuis.info/">2026-07-31 Thorsten Leemhuis — Re: [BUG] NFSv4.2: futimens() returns success without sending SETATTR</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/10af95c9-fe18-35b9-d696-5dbd53066b3d@applied-asynchrony.com/">2026-07-31 Holger Hoffstätte — leases workaround vs. vers=4.1</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/83b13893-067e-74f0-be47-52661212d0f0@applied-asynchrony.com/">2026-07-31 Holger Hoffstätte — 7.2-rc5 still broken</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/7ddc02d8-fa98-4d89-b2c7-0048fe9cfa10@cipixia.com/">2026-07-31 Matt Kinni <a href="mailto:matt@cipixia.com">matt@cipixia.com</a> — Re: [BUG] NFSv4.2: futimens() returns success without sending SETATTR</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/38643fbd-3031-49ea-92bf-0870bfe5353e@leemhuis.info/">2026-07-31 Thorsten Leemhuis <a href="mailto:regressions@leemhuis.info">regressions@leemhuis.info</a> — Re: [BUG] NFSv4.2: futimens() returns success without sending SETATTR</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/10af95c9-fe18-35b9-d696-5dbd53066b3d@applied-asynchrony.com/">2026-07-31 Holger Hoffstätte <a href="mailto:holger@applied-asynchrony.com">holger@applied-asynchrony.com</a> — Re: [BUG] NFSv4.2: futimens() returns success without sending SETATTR</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/83b13893-067e-74f0-be47-52661212d0f0@applied-asynchrony.com/">2026-07-31 Holger Hoffstätte <a href="mailto:holger@applied-asynchrony.com">holger@applied-asynchrony.com</a> — Re: [BUG] NFSv4.2: futimens() returns success without sending SETATTR</a></li>
+</ul>
+  </main>
+</body>
+</html>
