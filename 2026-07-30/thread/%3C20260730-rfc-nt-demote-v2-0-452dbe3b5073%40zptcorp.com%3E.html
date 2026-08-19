@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RFC v2 NT demotion: reviewers want reason, not a new async mode</title>
+  <meta name="description" content="This is a new feature RFC for the memory-management demotion path — not an NFS protocol change and not a client bug fix. Two months after the May RFC, Yiannis Nikolakopoulos (with Alirad Malek, ZPT Corp) posted v2 of &quot;[PATCH RFC v2 0/3]…">
+  <meta property="og:title" content="RFC v2 NT demotion: reviewers want reason, not a new async mode">
+  <meta property="og:description" content="This is a new feature RFC for the memory-management demotion path — not an NFS protocol change and not a client bug fix. Two months after the May RFC, Yiannis Nikolakopoulos (with Alirad Malek, ZPT Corp) posted v2 of &quot;[PATCH RFC v2 0/3]…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-30T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="RFC v2 NT demotion: reviewers want reason, not a new async mode">
+  <meta name="twitter:description" content="This is a new feature RFC for the memory-management demotion path — not an NFS protocol change and not a client bug fix. Two months after the May RFC, Yiannis Nikolakopoulos (with Alirad Malek, ZPT Corp) posted v2 of &quot;[PATCH RFC v2 0/3]…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-30</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>RFC v2 NT demotion: reviewers want reason, not a new async mode</h1>
+<h2>Summary</h2>
+<h2>Summary</h2>
+<p>This is a <strong>new feature</strong> RFC for the memory-management demotion path — not an NFS protocol change and not a client bug fix. Two months after the May RFC, <a href="https://lore.kernel.org/linux-nfs/20260730-rfc-nt-demote-v2-0-452dbe3b5073@zptcorp.com/">Yiannis Nikolakopoulos</a> (with Alirad Malek, ZPT Corp) posted v2 of "[PATCH RFC v2 0/3] Demote to lower tier using non-temporal stores." The pitch is unchanged: demoted pages are already cold, so a plain <code>memcpy</code> pollutes the local last-level cache and can hurt CXL expanders that do in-line compression.</p>
+<blockquote>
+<p>"Using non-temporal stores instead of a standard memcpy path can reduce the cache pollution in the local node and the bandwidth overhead to the target node."</p>
+</blockquote>
+<p>A CXL microbenchmark that allocates 64 GB locally and then triggers <code>memory.reclaim</code> still claims the headline result: write traffic stays at N GB, while device read traffic drops from N to almost zero.</p>
+<h3>Brief recap of v1</h3>
+<p>v1 gated the new <code>MIGRATE_ASYNC_NON_TEMPORAL_STORES</code> path behind a Kconfig option. Gregory Price asked whether that opt-in was necessary. Earlier this week, on the v1 thread, Nikolakopoulos conceded the flag was just caution and promised to drop it. That is the only design change that actually landed in v2.</p>
+<h3>What v2 actually ships</h3>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260730-rfc-nt-demote-v2-1-452dbe3b5073@zptcorp.com/">Patch 1/3</a> adds <code>_nt</code> helpers from <code>folio_mc_copy</code> down to <code>copy_mc_to_kernel</code>, using x86 <code>memcpy_flushcache</code> (non-temporal stores).</li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260730-rfc-nt-demote-v2-2-452dbe3b5073@zptcorp.com/">Patch 2/3</a> introduces <code>MIGRATE_ASYNC_NON_TEMPORAL_STORES</code> and a helper that treats both async modes as async, replacing raw <code>MIGRATE_ASYNC</code> checks — including the one-line swap in <code>fs/nfs/write.c</code>.</li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260730-rfc-nt-demote-v2-3-452dbe3b5073@zptcorp.com/">Patch 3/3</a> uses the new mode on the demotion path only. The Kconfig is gone; NT stores are always used for demotion on x86_64.</li>
+</ul>
+<p>The cover letter still lists two opens: duplication of machine-check handling in <code>copy_mc_to_kernel_nt</code> (Huan Nguyen is said to have ideas for v3), and no aarch64 story because ARM <code>memcpy_flushcache</code> does not use NT stores.</p>
+<h3>Reviewers reject the extra migrate mode</h3>
+<p>Hours after the series landed, <a href="https://lore.kernel.org/linux-nfs/amuJbBrTW9W6_sx8@gourry-fedora-PF4VCD3F/">Gregory Price</a> asked the question that now dominates the thread: why is NT an explicit option at all?</p>
+<blockquote>
+<p>"I'm still a bit confused why using NT Stores needs to be an explicit option - rather than the default behavior if NT Store is available."</p>
+<p>"Lets assume we did this for all ASYNC requests, is there a negative effect? A positive effect? Why the new ASYNC type? Is there a correctness issue?"</p>
+</blockquote>
+<p><a href="https://lore.kernel.org/linux-nfs/CAPTztWatWbsF4KQwD-_nib-vrZ6uvrhMYcOc1mkWu-7DzN95AQ@mail.gmail.com/">Frank van der Linden</a> said the separate mode was probably just "don't break anything else," then argued for always using NT on ASYNC. He noted that arm64 already uses NT-hinted stores by default, and that NT can be a slight hit only when the destination is used immediately. He suggested folding mode and reason so the copy path can decide:</p>
+<blockquote>
+<p>"Maybe the mode and reason should be folded in to one variable, so that, further down the stack, a decision can be made as to what type of copy to use?"</p>
+</blockquote>
+<p>He also floated skipping NT when <code>folio_test_waiters(folio)</code> is true, then immediately called that "overthinking it."</p>
+<p><a href="https://lore.kernel.org/linux-nfs/amuTOC7qxWHVyZcO@cmpxchg.org/">Johannes Weiner</a> supplied the concrete counter-example against "NT for all ASYNC":</p>
+<blockquote>
+<p>"do_numa_page() -&gt; migrate_misplaced_folio() is such a case. It happens literally in the access path to that data. MIGRATE_ASYNC just means don't block, fail fast, because waiting for an IO-bound lock to avoid a remote NUMA access would be a bad idea."</p>
+</blockquote>
+<p>Compaction, by contrast, uses <code>MIGRATE_SYNC*</code> and walks PFNs out of execution order — a better NT candidate. Weiner's conclusion:</p>
+<blockquote>
+<p>"Agree. <code>reason</code> seems like a much stronger signal."</p>
+</blockquote>
+<p><a href="https://lore.kernel.org/linux-nfs/amu4cfko8YY9awfF@gourry-fedora-PF4VCD3F/">Price closed the loop</a>:</p>
+<blockquote>
+<p>"I think this ends up cleaner as well, it would be a nice improvement."</p>
+</blockquote>
+<p>No one in-window reviewed the <code>_nt</code> helpers or the machine-check duplication. The authors have not yet replied to the mode-versus-reason critique.</p>
+<h3>NFS client angle</h3>
+<p>NFS is still only an incidental consumer. Patch 2/3 rewrites the <code>MIGRATE_ASYNC</code> test in <code>fs/nfs/write.c</code> to the new "either async mode" helper so NFS writeback keeps treating NT-async migrations as non-blocking. There is no NFS-specific bug fix, no writeback behavior change, and no protocol work. If v3 follows the reviewers and keys NT off <code>MR_DEMOTION</code> (or similar) instead of a new migrate mode, that one-line NFS helper change may shrink or disappear.</p>
+<h3>Bottom line</h3>
+<p>v2 delivered the promised Kconfig removal and still funnels NT stores through a new async migrate mode used only for demotion. Reviewers from Price, van der Linden, and Weiner have already moved the design target: pick the copy strategy from migrate <em>reason</em> (and whether the folio is about to be used), not from a second ASYNC flag. Machine-check vs. NT priority and aarch64 remain open. Until a v3 lands, the only NFS client footprint is that mechanical helper swap in <code>fs/nfs/write.c</code>.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260730-rfc-nt-demote-v2-0-452dbe3b5073@zptcorp.com/">2026-07-30 Yiannis Nikolakopoulos <a href="mailto:yiannis.nikolakop@gmail.com">yiannis.nikolakop@gmail.com</a> — [PATCH RFC v2 0/3] Demote to lower tier using non-temporal stores</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260730-rfc-nt-demote-v2-1-452dbe3b5073@zptcorp.com/">2026-07-30 Yiannis Nikolakopoulos <a href="mailto:yiannis.nikolakop@gmail.com">yiannis.nikolakop@gmail.com</a> — [PATCH RFC v2 1/3] mm, x86: support copying a folio using non-temporal stores</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260730-rfc-nt-demote-v2-2-452dbe3b5073@zptcorp.com/">2026-07-30 Yiannis Nikolakopoulos <a href="mailto:yiannis.nikolakop@gmail.com">yiannis.nikolakop@gmail.com</a> — [PATCH RFC v2 2/3] mm: new migrate_mode flag for async using non-temporal stores</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260730-rfc-nt-demote-v2-3-452dbe3b5073@zptcorp.com/">2026-07-30 Yiannis Nikolakopoulos <a href="mailto:yiannis.nikolakop@gmail.com">yiannis.nikolakop@gmail.com</a> — [PATCH RFC v2 3/3] mm: use non-temporal stores for demotion</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/amuJbBrTW9W6_sx8@gourry-fedora-PF4VCD3F/">2026-07-30 Gregory Price <a href="mailto:gourry@gourry.net">gourry@gourry.net</a> — Re: [PATCH RFC v2 0/3] Demote to lower tier using non-temporal stores</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAPTztWatWbsF4KQwD-_nib-vrZ6uvrhMYcOc1mkWu-7DzN95AQ@mail.gmail.com/">2026-07-30 Frank van der Linden <a href="mailto:fvdl@google.com">fvdl@google.com</a> — Re: [PATCH RFC v2 0/3] Demote to lower tier using non-temporal stores</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/amuTOC7qxWHVyZcO@cmpxchg.org/">2026-07-30 Johannes Weiner <a href="mailto:hannes@cmpxchg.org">hannes@cmpxchg.org</a> — Re: [PATCH RFC v2 0/3] Demote to lower tier using non-temporal stores</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/amu4cfko8YY9awfF@gourry-fedora-PF4VCD3F/">2026-07-30 Gregory Price <a href="mailto:gourry@gourry.net">gourry@gourry.net</a> — Re: [PATCH RFC v2 0/3] Demote to lower tier using non-temporal stores</a></li>
+</ul>
+  </main>
+</body>
+</html>

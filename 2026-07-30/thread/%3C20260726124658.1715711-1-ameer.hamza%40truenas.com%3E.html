@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd race between client_info_show() and free_client()</title>
+  <meta name="description" content="This week&#39;s linux-nfs traffic included a concise nfsd bug-fix from TrueNAS: a general protection fault in /proc/fs/nfsd/clients/&lt;id&gt;/info caused by a lock mismatch between the seq_file reader and client teardown. The patch was posted,…">
+  <meta property="og:title" content="nfsd race between client_info_show() and free_client()">
+  <meta property="og:description" content="This week&#39;s linux-nfs traffic included a concise nfsd bug-fix from TrueNAS: a general protection fault in /proc/fs/nfsd/clients/&lt;id&gt;/info caused by a lock mismatch between the seq_file reader and client teardown. The patch was posted,…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-30T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd race between client_info_show() and free_client()">
+  <meta name="twitter:description" content="This week&#39;s linux-nfs traffic included a concise nfsd bug-fix from TrueNAS: a general protection fault in /proc/fs/nfsd/clients/&lt;id&gt;/info caused by a lock mismatch between the seq_file reader and client teardown. The patch was posted,…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-30</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd race between client_info_show() and free_client()</h1>
+<h2>Summary</h2>
+<p>This week's linux-nfs traffic included a concise <strong>nfsd bug-fix</strong> from TrueNAS: a general protection fault in <code>/proc/fs/nfsd/clients/&lt;id&gt;/info</code> caused by a lock mismatch between the seq_file reader and client teardown. The patch was posted, reviewed by maintainers in the usual b4 flow, and applied to <code>nfsd-testing</code> two days later. There is no protocol change and no NFS client work in this thread; the impact is server-side observability and crash avoidance under concurrent client expiry.</p>
+<h2>The race</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260726124658.1715711-1-ameer.hamza@truenas.com/">Ameer Hamza</a> reported that <code>client_info_show()</code> walks <code>clp-&gt;cl_sessions</code> under <code>clp-&gt;cl_lock</code> to print each session's slot counts, while <code>free_client()</code> is "the only unlocked mutator of <code>cl_sessions</code>" and tears the same list down without taking that lock. <code>get_nfsdfs_clp()</code> pins the <code>nfs4_client</code> for the procfs reader, but <strong>not</strong> its sessions. Because <code>free_client()</code> frees every session <em>before</em> <code>nfsd_client_rmdir()</code>, an in-flight <code>cat</code> of the info file can follow a <code>list_del()</code>'d node whose <code>-&gt;next</code> has already been poisoned:</p>
+<blockquote>
+<p>"a reader can observe a client mid-teardown because get_nfsdfs_clp() pins the nfs4_client but not its sessions: free_client() frees every session before calling nfsd_client_rmdir(), so an in-flight seq_file reader can follow a list_del()'d node whose -&gt;next now holds LIST_POISON1 and take a general protection fault"</p>
+</blockquote>
+<p>The oops is a GPF on a non-canonical address (<code>0xdead00000000014c</code> / <code>LIST_POISON1</code>), with RIP in <code>client_info_show()</code> on a <code>cat</code> of the procfs file, then a kernel panic when <code>panic_on_oops</code> is set. Hamza tagged the regression to <a href="https://git.kernel.org/linus/601c8cb349c2">601c8cb349c2</a> ("nfsd: add session slot count to <code>/proc/fs/nfsd/clients/*/info</code>"), the commit that first made <code>client_info_show()</code> walk the session list.</p>
+<p>The reproducer is deliberately small: an NFSv4.1 loopback mount, a flock of readers spinning on <code>cat /proc/fs/nfsd/clients/*/info</code>, and a writer that <code>ls</code>es the export and writes <code>expire</code> into each client's <code>ctl</code> file. Hamza was explicit that <strong>reader-only</strong> load is not enough:</p>
+<blockquote>
+<p>"The "expire" write is what drives free_client(); a reader-only loop does not reproduce this. panic_on_oops is needed because the fault happens while the reader holds cl_lock."</p>
+</blockquote>
+<p>Nicholas Wolff of TrueNAS is credited as the reporter.</p>
+<h2>The fix</h2>
+<p>The change is a 12-line adjustment in <code>fs/nfsd/nfs4state.c</code>. Instead of freeing sessions in place, <code>free_client()</code> now <strong>detaches</strong> <code>cl_sessions</code> onto a local reap list while holding <code>cl_lock</code>, drops the lock, and only then frees the sessions. Hamza framed this as matching existing nfsd teardown idioms rather than inventing a new one:</p>
+<blockquote>
+<p>"Removing entries from cl_sessions under cl_lock matches unhash_session(), and the detach-then-reap shape matches how __destroy_client() reaps cl_delegations. The sessions cannot be freed while cl_lock is held, since free_session() calls nfsd4_del_conns(), which re-acquires it."</p>
+</blockquote>
+<p>That last constraint is the reason the patch does not simply hold <code>cl_lock</code> across <code>free_session()</code>: doing so would deadlock on the nested lock grab in <code>nfsd4_del_conns()</code>. The result is a classic list-reap pattern: serialize unhashing with the procfs walker, then drop the lock before the work that itself needs <code>cl_lock</code>.</p>
+<h2>Outcome</h2>
+<p>Two days later, <a href="https://lore.kernel.org/linux-nfs/178526880789.196485.7039893911303764929.b4-ty@b4/">Chuck Lever</a> applied the patch with no requested revisions:</p>
+<blockquote>
+<p>"Applied to nfsd-testing, thanks!"</p>
+</blockquote>
+<p>The applied commit on <code>nfsd-testing</code> is <code>fe521a9894e7ffed2a2eda9383622d4533ad655f</code>. There was no further technical debate in-window: the diagnosis, lock-ordering rationale, and reproducer were accepted as-is. For operators, the practical takeaway is that concurrent <code>expire</code> of NFSv4.1 clients while reading <code>/proc/fs/nfsd/clients/*/info</code> could panic the server after the session-slot-count procfs addition; the reap-under-lock change closes that window without altering the NFSv4.1 wire protocol or client behavior.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260726124658.1715711-1-ameer.hamza@truenas.com/">2026-07-26 Ameer Hamza <a href="mailto:ameer.hamza@truenas.com">ameer.hamza@truenas.com</a> — [PATCH] nfsd: fix race between client_info_show() and free_client()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178526880789.196485.7039893911303764929.b4-ty@b4/">2026-07-28 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH] nfsd: fix race between client_info_show() and free_client()</a></li>
+</ul>
+  </main>
+</body>
+</html>

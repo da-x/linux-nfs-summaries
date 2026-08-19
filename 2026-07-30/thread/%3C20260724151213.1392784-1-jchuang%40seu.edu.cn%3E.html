@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS client rejects oversized NFSv4 callback bitmaps</title>
+  <meta name="description" content="This week’s only traffic on the thread is a two-line NFS client bug fix from Jiancheng Huang, posted as [PATCH v2] NFS: reject oversized callback bitmap lengths. There is no prior in-archive history for this series in the current window,…">
+  <meta property="og:title" content="NFS client rejects oversized NFSv4 callback bitmaps">
+  <meta property="og:description" content="This week’s only traffic on the thread is a two-line NFS client bug fix from Jiancheng Huang, posted as [PATCH v2] NFS: reject oversized callback bitmap lengths. There is no prior in-archive history for this series in the current window,…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-30T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS client rejects oversized NFSv4 callback bitmaps">
+  <meta name="twitter:description" content="This week’s only traffic on the thread is a two-line NFS client bug fix from Jiancheng Huang, posted as [PATCH v2] NFS: reject oversized callback bitmap lengths. There is no prior in-archive history for this series in the current window,…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-30</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS client rejects oversized NFSv4 callback bitmaps</h1>
+<h2>Summary</h2>
+<p>This week’s only traffic on the thread is a two-line NFS client bug fix from <a href="https://lore.kernel.org/linux-nfs/20260724151213.1392784-1-jchuang@seu.edu.cn/">Jiancheng Huang</a>, posted as <strong>[PATCH v2] NFS: reject oversized callback bitmap lengths</strong>. There is no prior in-archive history for this series in the current window, and as of the week ending 2026-07-30 nobody has reviewed, acked, or nacked the change. The discussion is a <strong>client-side bug fix / XDR hardening patch</strong>, not a protocol change or a new feature.</p>
+<h2>The bug: <code>decode_bitmap()</code> trusts a wrap-prone length</h2>
+<p>Huang targets <code>decode_bitmap()</code> in <code>fs/nfs/callback_xdr.c</code>, the NFSv4 callback decoder that walks attribute bitmaps on the client’s callback path. The function only keeps three bitmap words locally, but it currently shifts the <strong>server-supplied word count into a byte length before it checks that count</strong>. A huge <code>attrlen</code> can therefore wrap the value handed to <code>xdr_inline_decode()</code>, after which the decoder still performs its fixed-word reads against memory that is no longer inside the XDR carrier.</p>
+<p>Huang’s cover letter states the failure mode directly:</p>
+<blockquote>
+<p>"decode_bitmap() stores at most three bitmap words, but shifts the server-supplied word count before validating it. A large attrlen can wrap the byte count passed to xdr_inline_decode() and leave the fixed-word reads outside the XDR carrier."</p>
+</blockquote>
+<p>That is a classic integer-wrap-then-decode pattern: the client treats an attacker-controlled (or merely malformed) callback bitmap length as a trusted size, converts it with a left shift, and only then tries to pull words out of the XDR stream. Once the shifted length wraps, the “inline” decode no longer bounds the subsequent 32-bit reads, which KASAN reports as a stack out-of-bounds access.</p>
+<p>The <code>Fixes:</code> tag is <code>1da177e4c3f4 ("Linux-2.6.12-rc2")</code>, i.e. the original Linux git epoch rather than a recent regression. In practical terms this is a long-standing callback XDR hygiene hole on the <strong>NFS client</strong>, not a newly introduced 6.x/7.x regression.</p>
+<h2>The proposed fix</h2>
+<p>The patch is deliberately small: <strong>two insertions in <code>fs/nfs/callback_xdr.c</code></strong>. Huang’s stated policy is to fail closed on anything larger than the local three-word bitmap:</p>
+<blockquote>
+<p>"Reject lengths larger than the local three-word representation before the shift and return NFS4ERR_INVAL for malformed callbacks."</p>
+</blockquote>
+<p>That ordering is the whole point of the change. The length check must happen <strong>before</strong> the shift so a huge <code>attrlen</code> cannot wrap into a seemingly plausible byte count. Returning <code>NFS4ERR_INVAL</code> is the NFSv4 way of saying the callback is malformed rather than attempting to skip, truncate, or partially decode an oversized bitmap. Because the client only ever materializes three words, any larger advertised length is already useless even if it were well-formed on the wire.</p>
+<p>v2 does not change the source. Huang notes:</p>
+<blockquote>
+<p>"Changes in v2: Add the relevant public mailing lists to Cc; no source changes."</p>
+</blockquote>
+<p>The v2 resend is therefore a distribution fix so linux-nfs and related lists actually see the patch, not a technical revision of the decoder logic.</p>
+<p>The patch carries <code>Assisted-by: Codex:gpt-5.6-luna</code>, so reviewers will be looking at an AI-assisted two-liner against a very old decode path. That does not change the substance of the overflow, but it does mean the usual extra scrutiny around whether the check is in the right place, whether three words is still the right cap, and whether <code>NFS4ERR_INVAL</code> is the status the rest of the callback state machine expects.</p>
+<h2>Evidence: KUnit plus KASAN on v7.2-rc4</h2>
+<p>Huang attached a KUnit/KASAN oracle log from a bounded QEMU run on <strong>v7.2-rc4</strong>, sourced as <code>confirmed/nfs_callback_bitmap_overflow_raw_excerpt.log</code>. The subtest is <code>nfs-callback-bitmap-overflow</code> in the <code>nfsv4</code> module. The first case, <code>nfs_callback_bitmap_overflow_test</code>, is marked <code>ok</code>; immediately afterward KASAN fires:</p>
+<blockquote>
+<p>"BUG: KASAN: stack-out-of-bounds in decode_bitmap+0x1e6/0x240"</p>
+</blockquote>
+<blockquote>
+<p>"Read of size 4 at addr ffff888002f47ab0 by task kunit_try_catch/69"</p>
+</blockquote>
+<p>The call trace is the kunit catcher → <code>kasan_report</code> → <code>decode_bitmap</code>. That is consistent with the wrap story: after <code>xdr_inline_decode()</code> is given a wrapped length, the decoder still does a 4-byte (one bitmap word) read that lands off the end of the stack buffer KASAN is watching. The log is presented as reproduction of the <strong>unpatched</strong> decoder, not as a post-fix regression test in the excerpt itself.</p>
+<p>For NFS client development this is the interesting part. Callback XDR is on the hot path for delegations, layouts, and other server-initiated NFSv4 operations; a stack OOB in <code>decode_bitmap()</code> is a client crash (or worse) triggered by a malformed callback, which can come from a buggy or malicious NFS server. Bounding the bitmap word count before any shift is the same class of defensive decode the list has been pushing on other XDR parsers: never let a wire length be used in arithmetic until it is known to fit the local representation.</p>
+<h2>Status this week</h2>
+<p>No maintainer or reviewer mail landed in-window. The thread therefore ends where it began: a v2 client patch that:</p>
+<ul>
+<li>identifies a wrap in NFSv4 callback bitmap decoding;</li>
+<li>rejects oversized lengths before the shift;</li>
+<li>returns <code>NFS4ERR_INVAL</code>;</li>
+<li>is backed by a KASAN stack-OOB report in <code>decode_bitmap()</code>;</li>
+<li>still awaits review, testing on real callback traffic, and a decision on whether the three-word cap and <code>Fixes:</code> tag are the right long-term story.</li>
+</ul>
+<p>Until someone on linux-nfs comments, the technical conclusion is Huang’s: the client must not shift a server-supplied bitmap length that already exceeds the three words <code>decode_bitmap()</code> can store.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260724151213.1392784-1-jchuang@seu.edu.cn/">2026-07-24 Jiancheng Huang <a href="mailto:jchuang@seu.edu.cn">jchuang@seu.edu.cn</a> — [PATCH v2] NFS: reject oversized callback bitmap lengths</a></li>
+</ul>
+  </main>
+</body>
+</html>

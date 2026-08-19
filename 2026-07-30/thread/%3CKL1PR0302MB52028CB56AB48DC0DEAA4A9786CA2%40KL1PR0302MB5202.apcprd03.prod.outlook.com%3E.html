@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>pNFS client size stale across layoutcommit</title>
+  <meta name="description" content="Lenovo&#39;s Quan Wang posted a one-hunk NFS client bug fix this week aimed at a pNFS attribute-consistency hole: after a parallel write has already recorded a new last-write-byte, a racing dentry revalidation can still hand userspace the…">
+  <meta property="og:title" content="pNFS client size stale across layoutcommit">
+  <meta property="og:description" content="Lenovo&#39;s Quan Wang posted a one-hunk NFS client bug fix this week aimed at a pNFS attribute-consistency hole: after a parallel write has already recorded a new last-write-byte, a racing dentry revalidation can still hand userspace the…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-30T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="pNFS client size stale across layoutcommit">
+  <meta name="twitter:description" content="Lenovo&#39;s Quan Wang posted a one-hunk NFS client bug fix this week aimed at a pNFS attribute-consistency hole: after a parallel write has already recorded a new last-write-byte, a racing dentry revalidation can still hand userspace the…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-30</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>pNFS client size stale across layoutcommit</h1>
+<h2>Summary</h2>
+<h1>NFSv4.2/pNFS: applications can still see a stale file size across layoutcommit</h1>
+<p>Lenovo's Quan Wang posted a one-hunk NFS <strong>client</strong> bug fix this week aimed at a pNFS attribute-consistency hole: after a parallel write has already recorded a new last-write-byte, a racing dentry revalidation can still hand userspace the metadata server's old <code>i_size</code>. The posting is a bug fix, not a protocol change and not a new feature. It arrived without review, without a <code>Fixes:</code> tag, and with a commit log short enough that maintainers will almost certainly ask for a rewrite before it can land.</p>
+<h2>What landed on the list this week</h2>
+<p>On 29 July, <a href="https://lore.kernel.org/linux-nfs/KL1PR0302MB52028CB56AB48DC0DEAA4A9786CA2@KL1PR0302MB5202.apcprd03.prod.outlook.com/">Wang posted</a> <code>[PATCH] NFSv4.2/pNFS: fix applacation get old size of file</code> (the subject line keeps the "applacation" typo). The change is three lines in <code>fs/nfs/inode.c</code> (two insertions, one deletion). The entire technical argument is a single sentence:</p>
+<blockquote>
+<p>"it happened when call nfs_lookup_revalidate_dentry between pnfs_set_layoutcommit and nfs4_layoutcommit_release"</p>
+</blockquote>
+<p>A same-subject message from Wang appeared a day earlier, on 28 July, as a separate thread root, but that earlier note carried no usable patch body. This week's in-window discussion is therefore the 29 July resend plus silence: no Acked-by, no review comments, no maintainer follow-up.</p>
+<h2>The client race, in NFS terms</h2>
+<p>The window Wang names is the classic pNFS "MDS does not know the new size yet" interval.</p>
+<ul>
+<li><code>pnfs_set_layoutcommit()</code> is the client-side bookkeeping that runs after a pNFS data-server write. It records the new last-write-byte on the layout header and sets <code>NFS_INO_LAYOUTCOMMIT</code> so a later <code>LAYOUTCOMMIT</code> can push that size (and the modified layout) to the metadata server.</li>
+<li><code>nfs4_layoutcommit_release()</code> is the completion path for that <code>LAYOUTCOMMIT</code> RPC. Only then does the client normally fold the MDS's post-commit attributes back into the inode.</li>
+<li>Between those two points the MDS GETATTR size is still the pre-write value. If <code>nfs_lookup_revalidate_dentry()</code> runs in that gap — a path the VFS takes on pretty much any lookup/<code>stat</code> of a dentry whose cache validity has expired — the revalidation can refresh inode attributes from the MDS and install that stale size.</li>
+</ul>
+<p>From an application point of view the file has already been written (and the client already <em>knows</em> the new size via the layoutcommit state), but <code>stat()</code>, <code>fstat()</code>, or a subsequent open/lookup reports the old length. That is exactly the class of pNFS client bug that shows up as truncated reads, short <code>copy_file_range</code>/<code>clone</code> decisions, or build tools that decide a just-written artifact is empty.</p>
+<p>The fact that the hunk lives in <code>fs/nfs/inode.c</code> rather than <code>fs/nfs/pnfs.c</code> or <code>nfs4proc.c</code> is the important client-design signal. Wang is not changing when <code>LAYOUTCOMMIT</code> is sent, nor the NFSv4.2 wire format. He is teaching the generic NFS inode attribute-update / revalidation path to respect a pending layoutcommit so that a lookup-time GETATTR cannot clobber a size the layout code has already claimed.</p>
+<p>That is the same family of defense the client already uses for outstanding writebacks and delegations: do not let a server attribute refresh shrink or replace <code>i_size</code> while the client still holds a more recent locally generated size. Extending that rule across <code>NFS_INO_LAYOUTCOMMIT</code> is the obvious three-line shape of this patch, even though the list posting omitted a readable diff in the ingested copy.</p>
+<h2>Why this matters for NFSv4.2 / pNFS client work</h2>
+<p>On a non-pNFS NFSv4 mount, writes go through the MDS, so a GETATTR after a successful WRITE already sees the new size (or the client has unstable-write / close-to-open state that keeps <code>i_size</code> coherent). pNFS breaks that assumption: the data path and the metadata path are different servers. File size becomes a client-reconstructed value until <code>LAYOUTCOMMIT</code>. Any hole in that reconstruction is user-visible.</p>
+<p><code>nfs_lookup_revalidate_dentry()</code> is a particularly nasty trigger because it is not under the writer's lock. A second process doing <code>stat</code> on the same path, a directory listing that revalidates children, or even the writer's own path-based follow-up can land in the window. The bug is therefore not "writer sees the wrong size in its own fd" so much as "the dcache/inode cache forgets the pNFS-extended size the moment someone looks the name up again."</p>
+<p>That is also why a fix in <code>inode.c</code> is more interesting than a layout-driver workaround. A block/SCSI-layout-only change would miss files, objects, and Flexfiles. Putting the guard on the common inode update path is the right layer — <em>if</em> the condition is tight enough not to paper over genuine MDS size changes (truncate from another client, setattr, etc.).</p>
+<h2>What the posting does not yet give reviewers</h2>
+<p>The patch is not review-ready by linux-nfs norms, and that is the other story this week.</p>
+<ul>
+<li>The commit message does not name the function being changed, the flag or helper being tested, or the precise attribute field that is being preserved.</li>
+<li>There is no reproducer (even a "write via pNFS, immediately <code>stat</code> from another task" sketch), no <code>Fixes:</code>, no <code>Cc: stable</code>, and no indication of which layout driver or NFSv4.2 feature (copy, seek, fallocate, ordinary writes) first exposed it.</li>
+<li>The subject and log are riddled with typos ("applacation", "when call"), the list subject is missing a stable <code>[PATCH]</code> prefix, and the <code>Signed-off-by</code> line is slightly malformed. A day-earlier attempt at the same subject suggests the 29 July mail is already a resend.</li>
+</ul>
+<p>None of that makes the race description implausible. It does mean the thread currently ends where it started: a plausible client bug with a three-line inode.c proposed fix, and no one yet on the record agreeing that the chosen condition is sufficient — or that it does not reintroduce the opposite bug of ignoring a real MDS-side shrink.</p>
+<h2>Status</h2>
+<p><strong>Bug fix, NFS client, pNFS/NFSv4.2 attribute cache.</strong> Discussion has not evolved past the initial post. Until a reviewer walks through <code>nfs_lookup_revalidate_dentry()</code> versus <code>pnfs_set_layoutcommit()</code> / <code>nfs4_layoutcommit_release()</code> and confirms the inode.c guard, this should be treated as an unreviewed report of a real-looking size-coherence race rather than a merged fix.</p>
+<p>The next useful step from Wang — or from anyone picking the report up — is a v2 that quotes the exact inode helper being changed, explains how a pending layoutcommit size wins over a GETATTR without masking truncate, and adds a <code>Fixes:</code> line so -stable can follow.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/KL1PR0302MB52028CB56AB48DC0DEAA4A9786CA2@KL1PR0302MB5202.apcprd03.prod.outlook.com/">2026-07-29 Quan Quan6 Wang <a href="mailto:wangquan6@lenovo.com">wangquan6@lenovo.com</a> — NFSv4.2/pNFS: fix applacation get old size of file</a></li>
+</ul>
+  </main>
+</body>
+</html>

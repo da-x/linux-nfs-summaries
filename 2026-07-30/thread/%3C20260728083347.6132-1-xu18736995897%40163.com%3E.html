@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>statd leak on SM_MON re-monitor</title>
+  <meta name="description" content="This week’s linux-nfs traffic included a small but pointed bug-fix patch for the userspace rpc.statd daemon, not a protocol change and not a kernel NFS client patch. xuchenchen of KylinSoft posted a two-line change to utils/statd/monitor.c…">
+  <meta property="og:title" content="statd leak on SM_MON re-monitor">
+  <meta property="og:description" content="This week’s linux-nfs traffic included a small but pointed bug-fix patch for the userspace rpc.statd daemon, not a protocol change and not a kernel NFS client patch. xuchenchen of KylinSoft posted a two-line change to utils/statd/monitor.c…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-30T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="statd leak on SM_MON re-monitor">
+  <meta name="twitter:description" content="This week’s linux-nfs traffic included a small but pointed bug-fix patch for the userspace rpc.statd daemon, not a protocol change and not a kernel NFS client patch. xuchenchen of KylinSoft posted a two-line change to utils/statd/monitor.c…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-30</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>statd leak on SM_MON re-monitor</h1>
+<h2>Summary</h2>
+<p>This week’s linux-nfs traffic included a small but pointed <strong>bug-fix</strong> patch for the userspace <code>rpc.statd</code> daemon, not a protocol change and not a kernel NFS client patch. <a href="https://lore.kernel.org/linux-nfs/20260728083347.6132-1-xu18736995897@163.com/">xuchenchen</a> of KylinSoft posted a two-line change to <code>utils/statd/monitor.c</code> titled “[PATCH] statd: fix memory leak in sm_mon_1_svc() when existing host re-monitors.” There were no replies in the window, so the discussion has not yet evolved into review, Acked-by, or merge commentary.</p>
+<h2>What broke</h2>
+<p>The leak lives in the SM_MON RPC handler that lockd/statd uses to register hosts for NSM (Network Status Monitor) notifications. When an NFS client (or another NSM peer) already has a <code>notify_list</code> entry and then sends a <strong>new SM_MON with a different priv cookie</strong>, <code>sm_mon_1_svc()</code> sets <code>existing=1</code> and <strong>reuses</strong> that entry instead of allocating a fresh host record. The newly allocated DNS name string is then written over <code>clnt-&gt;dns_name</code> without releasing the previous pointer.</p>
+<p>xuchenchen’s commit message states the failure mode plainly:</p>
+<blockquote>
+<p>"When an already-monitored host sends a new SM_MON request with a different priv cookie, the code sets existing=1 and reuses the existing notify_list entry. However, clnt-&gt;dns_name is overwritten with the newly allocated dnsname without freeing the old value, causing a memory leak."</p>
+</blockquote>
+<p>Because <code>rpc.statd</code> is a long-lived helper sitting under NFS lock recovery, that is not a one-shot leak:</p>
+<blockquote>
+<p>"Since statd is a long-running daemon, repeated SM_MON requests with changing cookies will accumulate leaked strings."</p>
+</blockquote>
+<p>That path is client-adjacent even though the code is in nfs-utils: Linux NFS clients rely on <code>lockd</code> + <code>statd</code> to monitor the server (and vice versa) so that NLM locks can be reclaimed after a reboot. A host that remounts, restarts lockd, or re-registers with a new cookie will keep pumping SM_MON at an already-tracked peer; each of those re-monitors would drop another <code>dns_name</code> allocation on the floor.</p>
+<h2>The fix</h2>
+<p>The patch does the obvious, local thing: <strong>free the old <code>dns_name</code> before overwriting it</strong> when the existing-host reuse path is taken. It is a two-insertion change (<code>+2</code> lines in <code>utils/statd/monitor.c</code>), signed off by xuchenchen <code>&lt;xuchenchen@kylinos.cn&gt;</code>. No new NSM wire behavior is proposed; the SM_MON request is still accepted, the existing notify-list node is still reused, and only the string ownership is corrected.</p>
+<h2>Status this week</h2>
+<p>As of the 2026-07-30 window the thread is a <strong>single unreviewed patch</strong>. There is no maintainer ACK, no request for a reproducer or kmemleak/valgrind trace, and no debate over whether <code>dnsname</code> should be assigned at all on the existing-host path versus only when the name actually changes. Until that review lands, the practical takeaway for NFS client operators is that a long-running <code>statd</code> that sees repeated re-monitor SM_MON traffic with rotating priv cookies can leak hostname strings; the proposed fix is a one-site <code>free()</code> before the overwrite.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260728083347.6132-1-xu18736995897@163.com/">2026-07-28 xuchenchen <a href="mailto:xu18736995897@163.com">xu18736995897@163.com</a> — [PATCH] statd: fix memory leak in sm_mon_1_svc() when existing host re-monitors</a></li>
+</ul>
+  </main>
+</body>
+</html>

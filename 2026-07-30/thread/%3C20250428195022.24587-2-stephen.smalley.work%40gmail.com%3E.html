@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSv4.2 listxattr size-query oops and lockup after LSM interface change</title>
+  <meta name="description" content="This week the long-quiet security_inode_listsecurity() interface cleanup returned as a critical NFS client bug fix. Chuck Lever reported that Stephen Smalley&#39;s LSM hook update, merged into lsm/dev in early May, wedges an NFSv4.2 client…">
+  <meta property="og:title" content="NFSv4.2 listxattr size-query oops and lockup after LSM interface change">
+  <meta property="og:description" content="This week the long-quiet security_inode_listsecurity() interface cleanup returned as a critical NFS client bug fix. Chuck Lever reported that Stephen Smalley&#39;s LSM hook update, merged into lsm/dev in early May, wedges an NFSv4.2 client…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-30T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSv4.2 listxattr size-query oops and lockup after LSM interface change">
+  <meta name="twitter:description" content="This week the long-quiet security_inode_listsecurity() interface cleanup returned as a critical NFS client bug fix. Chuck Lever reported that Stephen Smalley&#39;s LSM hook update, merged into lsm/dev in early May, wedges an NFSv4.2 client…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-30</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSv4.2 listxattr size-query oops and lockup after LSM interface change</h1>
+<h2>Summary</h2>
+<h1>NFSv4.2 Client listxattr Regression: NULL Deref, Orphaned Spinlock, Soft Lockup</h1>
+<p>This week the long-quiet <code>security_inode_listsecurity()</code> interface cleanup returned as a <strong>critical NFS client bug fix</strong>. <a href="https://lore.kernel.org/linux-nfs/20260725200958.4471-1-cel@kernel.org/">Chuck Lever</a> reported that Stephen Smalley's LSM hook update, merged into <code>lsm/dev</code> in early May, wedges an NFSv4.2 client during fstests: a size-query <code>listxattr(2)</code> underflows an unsigned remaining-size accumulator, copies into a NULL buffer while the xattr listcache spinlock is held, and leaves the machine spinning in the shrinker until the watchdog fires.</p>
+<h2>Classification</h2>
+<p>This is a <strong>bug fix</strong> for a regression in the NFSv4.2 client's <code>listxattr</code> path, not a new feature or protocol change. The underlying interface cleanup (<code>security_inode_listsecurity()</code> / <code>xattr_list_one()</code>) shipped earlier; this week's traffic is about the severity of the fallout on a filesystem that caches xattrs behind a lock.</p>
+<h2>Prior context (brief)</h2>
+<p>In late April / early May, Paul Moore forward-ported <a href="https://lore.kernel.org/linux-nfs/20250428195022.24587-2-stephen.smalley.work@gmail.com/">Stephen Smalley's v2 patch</a> so LSM hooks could use <code>xattr_list_one()</code>, adapting <code>fs/nfs/nfs4proc.c</code> along with the security and VFS sides. Moore merged it into <code>lsm/dev</code> after SELinux testsuite runs (local and NFS) came back clean. That work was treated as a routine interface cleanup. The client-side accounting that consumed the new hook was not hardened for the size-query case (<code>listxattr(2)</code> with a NULL buffer and length zero).</p>
+<h2>The report: fstests hang, then the machine is gone</h2>
+<p>On 25 July, <a href="https://lore.kernel.org/linux-nfs/20260725200958.4471-1-cel@kernel.org/">Chuck Lever</a> wrote that the commit "wedges an NFSv4.2 client running fstests." A kdevops run against <code>nfsd-next</code> hangs at <code>generic/086</code>; the client never recovers:</p>
+<blockquote>
+<p>"watchdog: BUG: soft lockup - CPU#3 stuck for 250s! [086:60396]"</p>
+</blockquote>
+<p>The lockup stack is in the NFSv4 xattr listcache shrinker:</p>
+<blockquote>
+<p><code>__pv_queued_spin_lock_slowpath</code> → <code>_raw_spin_lock</code> → <code>nfs4_xattr_set_listcache</code> → <code>nfs4_xattr_discard_cache</code> → <code>nfs4_xattr_cache_scan</code> → <code>do_shrink_slab</code> → <code>drop_caches_sysctl_handler</code></p>
+</blockquote>
+<p>The <code>D</code> taint, Lever noted, means something already died. By the time the watchdog fires the client has taken "two dozen NULL pointer dereferences, all of them in the same place":</p>
+<blockquote>
+<p><code>RIP: _copy_from_pages+0x44/0xd0 [sunrpc]</code>
+<code>nfs4_xattr_cache_list [nfsv4]</code> → <code>nfs4_listxattr [nfsv4]</code> → <code>vfs_listxattr</code> → <code>__x64_sys_listxattr</code></p>
+</blockquote>
+<h2>Technical argument: unsigned wrap plus a lock held across the fault</h2>
+<p>Lever connected the two stages. <code>nfs4_listxattr()</code> keeps its remaining-size accumulator as an unsigned <code>size_t</code>. On a size query, <code>xattr_list_one()</code> still decrements that accumulator for the SELinux label even though the buffer is NULL, so the value wraps to a huge length. <code>nfs4_xattr_cache_list()</code> then sees a NULL buffer paired with a length that passes its own bounds check and copies into it.</p>
+<p>The fault happens <strong>while the xattr listcache spinlock is held</strong>. Task exit does not drop spinlocks, so the lock is orphaned; the next shrinker pass (triggered here by <code>drop_caches</code> from <code>generic/086</code>) spins until the watchdog fires.</p>
+<p>The reproducer does not need fstests machinery:</p>
+<blockquote>
+<p>"The reproducer is a plain getfattr on a file on an NFSv4.2 mount with SELinux enforcing, which is what fstests generic/086 arrives at by way of a drop_caches write."</p>
+</blockquote>
+<p>Lever reverted the LSM interface commit on <code>nfsd-next</code> and reran the full <code>nfs_v42</code> fstests section on the same guests: 745 tests, no soft lockup, no oops, <code>generic/086</code> passes. The two remaining failures (<code>generic/033</code>, <code>generic/258</code>) are unrelated to xattrs.</p>
+<p>He was explicit that a revert is <strong>not</strong> the proposed fix. Achilles Gaikwad had already posted a targeted accounting patch (<a href="https://lore.kernel.org/linux-nfs/20260707152305.15324-1-achillesgaikwad@gmail.com/">v2, 7 July</a>) that declares <code>left</code> as <code>ssize_t</code>, measures security-hook consumption with a scratch copy, and only decrements remaining size when a buffer is present. Lever left the design choice to LSM and NFS maintainers:</p>
+<blockquote>
+<p>"Whether the right answer is that patch, a change to <code>xattr_list_one()</code> so it leaves the remaining size alone when the buffer is NULL, or hardening <code>nfs4_xattr_cache_list()</code> against a NULL buffer, is for the three of you to settle."</p>
+</blockquote>
+<p>The severity argument was the point of the mail:</p>
+<blockquote>
+<p>"I am reporting the severity, because the accounting bug is not confined to a short size query: on a filesystem that caches xattrs behind a lock, it takes the whole machine down."</p>
+</blockquote>
+<p>He offered to retest whatever they settle on against the same kdevops setup.</p>
+<h2>LSM response: take Gaikwad's NFS-only fix, but get an NFS ACK</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/CAHC9VhSGn6UQ1__HtqjKWD1KgyMOhHYYKny5HnVuPAuvqZR9aw@mail.gmail.com/">Paul Moore</a> replied the next day that he had already reviewed Gaikwad's patch in early July and it "looked okay" (he had tagged it <code>Reviewed-by</code> on 7 July). Because the fix only touches NFS code, he had assumed the NFS tree would pick it up:</p>
+<blockquote>
+<p>"I had figured that the NFS folks would have wanted to pull that via the NFS tree since it only touches NFS code. If they would prefer I send it up to Linus via the LSM tree I can do that, but I would appreciate an ACK and Tested-by from someone on the NFS side."</p>
+</blockquote>
+<p>He started a test kernel with Gaikwad's patch through the usual selinux-testsuite.</p>
+<p>Later the same day, <a href="https://lore.kernel.org/linux-nfs/CAHC9VhSh=fXCcDG88m0Qbt61aKajx=cHGQXX7DbyiQtkJRtKYQ@mail.gmail.com/">Moore reported</a> that the suite was unsurprisingly uninteresting as a reproducer, but still clean:</p>
+<blockquote>
+<p>"Not that I was expecting this to be a good test, but FWIW, the selinux-testsuite (and audit-testsuite for that matter) ran clean with Achilles's patch."</p>
+</blockquote>
+<h2>Conclusions this week</h2>
+<ul>
+<li>The May LSM interface cleanup is a confirmed <strong>NFSv4.2 client regression</strong>: size-query <code>listxattr</code> underflows, <code>_copy_from_pages</code> faults on a NULL buffer, and an orphaned listcache spinlock turns that into a machine-wide soft lockup under shrinker pressure.</li>
+<li>Revert of the LSM commit restores fstests (<code>generic/086</code> included) but is not the intended fix.</li>
+<li>Consensus on the LSM side is to land <a href="https://lore.kernel.org/linux-nfs/20260707152305.15324-1-achillesgaikwad@gmail.com/">Gaikwad's nfs4_listxattr accounting patch</a> rather than change <code>xattr_list_one()</code> or only harden <code>nfs4_xattr_cache_list()</code>.</li>
+<li>Merge path is still open: NFS tree vs LSM tree. Moore is willing to send it via LSM if the NFS maintainers ACK and Tested-by it. Lever offered the kdevops fstests setup as the real validation; that Tested-by had not landed by the end of this week.</li>
+</ul>
+<p>No client-side ACK, no merge, and no alternative (<code>xattr_list_one()</code> NULL-buffer change vs listcache hardening) was settled in-window. The outstanding ask from LSM is an NFS-side ACK plus a Tested-by on the same NFSv4.2 + SELinux + fstests configuration that exposed the lockup.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260725200958.4471-1-cel@kernel.org/">2026-07-25 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v2] security,fs,nfs,net: update security_inode_listsecurity() interface</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAHC9VhSGn6UQ1__HtqjKWD1KgyMOhHYYKny5HnVuPAuvqZR9aw@mail.gmail.com/">2026-07-26 Paul Moore <a href="mailto:paul@paul-moore.com">paul@paul-moore.com</a> — Re: [PATCH v2] security,fs,nfs,net: update security_inode_listsecurity() interface</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAHC9VhSh=fXCcDG88m0Qbt61aKajx=cHGQXX7DbyiQtkJRtKYQ@mail.gmail.com/">2026-07-26 Paul Moore <a href="mailto:paul@paul-moore.com">paul@paul-moore.com</a> — Re: [PATCH v2] security,fs,nfs,net: update security_inode_listsecurity() interface</a></li>
+</ul>
+  </main>
+</body>
+</html>

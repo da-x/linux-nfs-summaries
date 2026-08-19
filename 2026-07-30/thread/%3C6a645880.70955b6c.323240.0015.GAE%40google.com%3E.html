@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>syzbot: hung task in nfsd_nl_svc_export_set_reqs_doit — export-cache downcall waits on listener_set</title>
+  <meta name="description" content="This is a bug report — a hung-task / control-plane DoS, not a protocol change and not a new feature. Google&#39;s syzbot filed a single unreproduced report against the NFS server generic-netlink family. The hung function,…">
+  <meta property="og:title" content="syzbot: hung task in nfsd_nl_svc_export_set_reqs_doit — export-cache downcall waits on listener_set">
+  <meta property="og:description" content="This is a bug report — a hung-task / control-plane DoS, not a protocol change and not a new feature. Google&#39;s syzbot filed a single unreproduced report against the NFS server generic-netlink family. The hung function,…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-30T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="syzbot: hung task in nfsd_nl_svc_export_set_reqs_doit — export-cache downcall waits on listener_set">
+  <meta name="twitter:description" content="This is a bug report — a hung-task / control-plane DoS, not a protocol change and not a new feature. Google&#39;s syzbot filed a single unreproduced report against the NFS server generic-netlink family. The hung function,…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-30</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>syzbot: hung task in nfsd_nl_svc_export_set_reqs_doit — export-cache downcall waits on listener_set</h1>
+<h2>Summary</h2>
+<h1>syzbot: hung task in <code>nfsd_nl_svc_export_set_reqs_doit</code> — the export-cache downcall waits on <code>listener_set</code></h1>
+<h2>Classification</h2>
+<p>This is a <strong>bug report</strong> — a hung-task / control-plane DoS, not a protocol change and not a new feature. Google's syzbot filed a single unreproduced report against the <strong>NFS server</strong> generic-netlink family. The hung function, <code>nfsd_nl_svc_export_set_reqs_doit</code> in <code>fs/nfsd/export.c</code>, is the downcall that userspace (exportd/mountd) uses to populate the <code>nfsd.export</code> cache. That is the table NFSv2/v3 (and some v4) <strong>clients</strong> depend on for a path to become a published export.</p>
+<p>No human has replied in this thread. The lock dump is nonetheless decisive, and it is the same class of failure Jeff Layton and Neil Brown diagnosed last week on the sibling <code>nfsd_nl_cache_flush_doit</code> hang — now landing on the original <code>svc_export</code> netlink path that the newer <code>expkey</code> (<code>nfsd.fh</code>) upcall was modeled after.</p>
+<h2>Brief bridge from last week</h2>
+<p>Last week syzbot hung <a href="https://lore.kernel.org/linux-nfs/6a590ea0.ccd3b023.4fae3.0000.GAE@google.com/">cache flush</a>, then <a href="https://lore.kernel.org/linux-nfs/6a611d64.42649fcc.22d900.0016.GAE@google.com/">expkey-set-reqs</a> and <a href="https://lore.kernel.org/linux-nfs/6a611ffa.16bfb6d0.3c48cb.0004.GAE@google.com/">expkey-get-reqs</a>, all on the global <code>nfsd_mutex</code>. Layton's diagnosis was that <strong>synchronous rpcbind registration (including a ~60s <code>rpc_ping</code>) runs under that mutex</strong>, and netlink <code>listener_set</code> can batch many sockets in one call. Neil Brown asked why a local service is given a full minute, and sketched dropping the mutex across the listener batch. No patches were posted. This week's report is that same prediction coming true on the export-table downcall itself.</p>
+<h2>What landed this week</h2>
+<p>On Saturday, 25 July, <a href="https://lore.kernel.org/linux-nfs/6a645880.70955b6c.323240.0015.GAE@google.com/">syzbot reported</a> a hung task on upstream HEAD <code>248951ddc14d</code> (<code>Merge tag 'hwmon-for-v7.2-rc5'</code>):</p>
+<blockquote>
+<p>"INFO: task syz.1.1268:11597 blocked for more than 143 seconds."</p>
+</blockquote>
+<blockquote>
+<p>"Unfortunately, I don't have any reproducer for this issue yet."</p>
+</blockquote>
+<p>The kernel is a <code>PREEMPT(full)</code> syzkaller build, tainted <code>L</code> (SOFTLOCKUP). The hung task is blocked in <code>__mutex_lock</code> → <code>nfsd_nl_svc_export_set_reqs_doit+0x8a/0x2f0</code> at <code>fs/nfsd/export.c:1057</code>, having entered via <code>genl_family_rcv_msg_doit</code> / <code>sendmsg</code>. It already holds the generic-netlink <code>cb_lock</code> and is waiting for the global <code>nfsd_mutex</code>.</p>
+<p>syzbot asked that any fix carry:</p>
+<blockquote>
+<p>"Reported-by: syzbot+4fb3e2ffc13bcbb4e273@syzkaller.appspotmail.com"</p>
+</blockquote>
+<h2>The lock dump: <code>listener_set</code> holds the mutex the export downcall is waiting on</h2>
+<p>The interesting evidence is not the hung stack itself — it is the "Showing all locks held in the system" listing, which names the holder:</p>
+<table><thead><tr><th>Task</th><th>Handler</th><th>Role</th></tr></thead><tbody>
+<tr><td><code>syz.4.1009</code></td><td><code>nfsd_nl_listener_set_doit</code> (<code>nfsctl.c:1964</code>)</td><td><strong>holds</strong> <code>nfsd_mutex</code> (plus <code>cb_lock</code>)</td></tr>
+<tr><td><code>syz.1.1268</code> (the hung task)</td><td><code>nfsd_nl_svc_export_set_reqs_doit</code> (<code>export.c:1057</code>)</td><td><strong>waiting</strong> on <code>nfsd_mutex</code> (already holds <code>cb_lock</code>)</td></tr>
+</tbody></table>
+<p>This is not a classic AB-BA deadlock. <code>cb_lock</code> is an rwsem, so both tasks can hold it as readers. The hung task is in D-state on the same coarse <code>nfsd_mutex</code> that <code>listener_set</code> is not releasing for more than 143 seconds. Every other nfsd netlink command — export-table updates, fh-cache upcalls, thread-count changes, cache flushes — queues behind that hold.</p>
+<p>That pairing is the cleanest confirmation yet that last week's diagnosis applies to the <strong>original</strong> export netlink path, not only to the new <code>expkey</code> handlers. Last Wednesday's <a href="https://lore.kernel.org/linux-nfs/6a611d64.42649fcc.22d900.0016.GAE@google.com/">expkey-set-reqs dump</a> already showed <code>nfsd_nl_svc_export_set_reqs_doit</code> as a <em>holder</em> of <code>nfsd_mutex</code>. This week's dump flips the roles: the export downcall is now the <em>waiter</em>, and <code>listener_set</code> is the long-hold site — the same holder Layton named on the cache-flush hang and that the <a href="https://lore.kernel.org/linux-nfs/6a611ffa.16bfb6d0.3c48cb.0004.GAE@google.com/">expkey-get-reqs dump</a> already confirmed.</p>
+<p>The NMI backtrace is a red herring for the NFS path. CPU 0 was in <code>pv_native_safe_halt</code> (<code>swapper/0</code>); the <code>SOFTLOCKUP</code> taint and the USB hub workqueues in the lock list are incidental syzkaller noise. The nfsd story is entirely the <code>listener_set</code> / <code>svc_export_set_reqs</code> pile-up on <code>nfsd_mutex</code>.</p>
+<p>A sibling report, filed two hours later the same morning, hangs in <a href="https://lore.kernel.org/linux-nfs/6a647246.a2ea2cc8.fbad6.0014.GAE@google.com/"><code>nfsd_nl_unlock_export_doit</code></a> with the same holder (<code>listener_set</code> at <code>nfsctl.c:1964</code>). Together they say: both the export-table <em>install</em> path and the export <em>unlock/revoke</em> path are now documented victims of one slow <code>listener_set</code>.</p>
+<h2>Same root cause already diagnosed last week</h2>
+<p>Layton's diagnosis from the cache-flush thread applies here almost verbatim:</p>
+<blockquote>
+<p>"The hard problem here is that rpcbind registration is done synchronously under the nfsd_mutex. To talk to rpcbind, the kernel has to create a RPC client, which does a RPC ping first. If rpcbind is down then it can take up to a minute for the RPC ping to time out."</p>
+</blockquote>
+<p>And:</p>
+<blockquote>
+<p>"If we couple those delays with a long list of listeners, then it's easy to see how to reproduce the hang."</p>
+</blockquote>
+<p>This dump names <code>nfsd_nl_listener_set_doit</code> as the holder, so the mechanism does not need to be inferred. The new netlink <code>listener_set</code> handler can install many sockets in one call; each one may try to register with rpcbind while still holding <code>nfsd_mutex</code>. A down or unresponsive local rpcbind turns each registration into a ~60-second stall. Two such stalls is 143 seconds of hung-task watchdog — exactly what syzbot observed.</p>
+<p>Brown's question from that thread is the design fork still open when this report arrived:</p>
+<blockquote>
+<p>"Why are we waiting a whole minute for a local service to respond? If it hasn't responded in 1 second, is it ever really likely to?"</p>
+</blockquote>
+<p>Layton's answer — a shorter timeout is necessary but not sufficient, because "even at 1s, you could easily cause a lockup warning with just a few hundred listeners" — is the reason this new report will not be fixed by touching <code>nfsd_nl_svc_export_set_reqs_doit</code> itself. The export handler is an innocent waiter. The bug is that <strong>any</strong> nfsd netlink op, including the long-standing export-table downcall, takes the same global mutex that listener setup holds across synchronous rpcbind I/O.</p>
+<p>The open design options remain last week's three:</p>
+<ol>
+<li>shorten <code>rpc_ping</code> (Brown's first preference; Layton says necessary but insufficient);</li>
+<li>drop/reacquire <code>nfsd_mutex</code> around registration / the listener batch (Brown's sketch);</li>
+<li>async registration off a serialized queue or callback chain (Layton's preference), with care not to scramble rpcbind's table.</li>
+</ol>
+<p>None of those patches have been posted to the list as of this window.</p>
+<h2>NFS client impact</h2>
+<p>This is a server-side hang, but it sits on a path NFS <strong>clients</strong> actually use:</p>
+<ul>
+<li><strong>Export-table downcalls.</strong> When an administrator publishes or revokes an export, userspace replies via <code>svc_export-set-reqs</code>. If that handler is stuck behind <code>nfsd_mutex</code> for minutes, newly published exports never become visible and revoked exports stay live. A client <code>mount</code> of a just-exported path simply does not complete; a client still holding a revoked export continues to see it.</li>
+<li><strong>File-handle cache is already a known victim.</strong> Last week's expkey-set-reqs / expkey-get-reqs reports hung both directions of the <code>nfsd.fh</code> upcall. A working mount needs the export table <em>and</em> the fh cache; either one being serialized behind <code>listener_set</code> is enough to stall. That is the same failure mode Paul Moore already hit as <code>mount.nfs: Connection refused</code> on a localhost mount after the expkey netlink conversion.</li>
+<li><strong>Listener / thread control.</strong> <code>nfsd_nl_listener_set_doit</code> is the holder. If bringing nfsd up or adding sockets stalls on rpcbind while holding the mutex, <em>every</em> other control-plane op — including the ones clients indirectly depend on for mount — stalls with it. New clients cannot connect until the lock is released.</li>
+<li><strong>NFSv2/v3 discovery.</strong> The underlying rpcbind-under-mutex problem is specifically a v2/v3 client-visibility issue: nfsd will serve without a successful registration, but clients that find the server via portmap see a missing or stale table. The 143-second export-downcall hang is the control-plane counterpart of that same rpcbind stall.</li>
+</ul>
+<p>For NFSv4.2 clients the damage is more about control-plane latency than wire protocol: inter-server copy, state reclaim, and admin-driven export changes all assume the netlink family stays responsive. An export downcall that sits in D-state for more than two minutes is not responsive.</p>
+<p>There is no NFS <em>client</em> code change in this thread and no client-side bug to fix. The client-visible symptom is a server that stops answering export-cache downcalls and, in the worst case, stops appearing in portmap while <code>listener_set</code> holds the lock.</p>
+<h2>Status</h2>
+<ul>
+<li><strong>Type:</strong> hung-task / DoS bug in the nfsd netlink control plane, exposing the original <code>svc_export</code> downcall as another victim of <code>nfsd_mutex</code>.</li>
+<li><strong>Reproducer:</strong> none. syzbot is fuzzing concurrent netlink commands; the lock dump — <code>listener_set</code> holding, <code>svc_export_set_reqs</code> waiting — is the reproducer.</li>
+<li><strong>Human reply:</strong> none in this thread as of 30 July. The related cache-flush thread already has a design discussion but no patches posted and nothing applied.</li>
+<li><strong>Fix tag requested:</strong> <code>Reported-by: syzbot+4fb3e2ffc13bcbb4e273@syzkaller.appspotmail.com</code>.</li>
+</ul>
+<p>Until the mutex is no longer held across rpcbind I/O — or until rpcbind I/O fails in well under a second — every nfsd netlink command, old or new, is another hung-task report waiting to happen. This week's <code>svc_export_set_reqs</code> report is that prediction coming true on the export table itself, three days after the diagnosis that already named <code>listener_set</code> as the long-hold site.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/6a645880.70955b6c.323240.0015.GAE@google.com/">2026-07-25 syzbot <a href="mailto:syzbot+4fb3e2ffc13bcbb4e273@syzkaller.appspotmail.com">syzbot+4fb3e2ffc13bcbb4e273@syzkaller.appspotmail.com</a> — [syzbot] [nfs?] INFO: task hung in nfsd_nl_svc_export_set_reqs_doit</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/6a645880.70955b6c.323240.0015.GAE@google.com/">2026-07-25 syzbot <a href="mailto:syzbot+4fb3e2ffc13bcbb4e273@syzkaller.appspotmail.com">syzbot+4fb3e2ffc13bcbb4e273@syzkaller.appspotmail.com</a> — [syzbot] [nfs?] INFO: task hung in nfsd_nl_svc_export_set_reqs_doit</a></li>
+</ul>
+  </main>
+</body>
+</html>

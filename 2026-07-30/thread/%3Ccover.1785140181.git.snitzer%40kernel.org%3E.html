@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSv4.2 client uncacheable-file and uncacheable-dirent support (v4)</title>
+  <meta name="description" content="This week Mike Snitzer posted PATCH v4 of a six-patch NFSv4.2 client series that implements two companion OPTIONAL attributes from IETF drafts: UNCACHEABLE_FILE_DATA (FATTR4 87) and UNCACHEABLE_DIRENT_METADATA (FATTR4 88). The posting is a…">
+  <meta property="og:title" content="NFSv4.2 client uncacheable-file and uncacheable-dirent support (v4)">
+  <meta property="og:description" content="This week Mike Snitzer posted PATCH v4 of a six-patch NFSv4.2 client series that implements two companion OPTIONAL attributes from IETF drafts: UNCACHEABLE_FILE_DATA (FATTR4 87) and UNCACHEABLE_DIRENT_METADATA (FATTR4 88). The posting is a…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-30T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSv4.2 client uncacheable-file and uncacheable-dirent support (v4)">
+  <meta name="twitter:description" content="This week Mike Snitzer posted PATCH v4 of a six-patch NFSv4.2 client series that implements two companion OPTIONAL attributes from IETF drafts: UNCACHEABLE_FILE_DATA (FATTR4 87) and UNCACHEABLE_DIRENT_METADATA (FATTR4 88). The posting is a…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-30</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSv4.2 client uncacheable-file and uncacheable-dirent support (v4)</h1>
+<h2>Summary</h2>
+<p>This week Mike Snitzer posted <a href="https://lore.kernel.org/linux-nfs/cover.1785140181.git.snitzer@kernel.org/">PATCH v4 of a six-patch NFSv4.2 client series</a> that implements two companion OPTIONAL attributes from IETF drafts: <code>UNCACHEABLE_FILE_DATA</code> (FATTR4 87) and <code>UNCACHEABLE_DIRENT_METADATA</code> (FATTR4 88). The posting is a feature series with two important client bug fixes versus v3; no reviews arrived in-window.</p>
+<p>The attributes let a server tell the client to stop caching state that changes faster than a typical NFS cache lifetime. Snitzer's cover letter frames the target deployments as mixed-protocol namespaces:</p>
+<blockquote>
+<p>"The motivating deployments expose a single namespace concurrently through NFSv4.2, NFSv3, and SMB, plus server-side policy engines, so file data and directory contents can change faster than a typical client cache lifetime -- producing stale reads and read-modify-write "write holes" for file data, and stale size/timestamp listings for directories."</p>
+</blockquote>
+<p>Both attributes are independent, type-disjoint, read-write booleans. The Linux client only <em>honors</em> a server-set value; it does not SETATTR either bit. A server MUST reject a query of attr 87 on a non-regular object, or attr 88 on a non-directory, with <code>NFS4ERR_INVAL</code>. That type-gating rule is the source of both v4 regressions.</p>
+<h2>Prior versions (brief)</h2>
+<p>v1 (late June) covered only attr 87 and tried to introduce it via xdrgen (<code>Documentation/sunrpc/xdr/nfs4_2.x</code>). <a href="https://lore.kernel.org/linux-nfs/16ff281b-f776-4e6c-9f2a-83c03f0d6eae@app.fastmail.com/">Anna Schumaker</a> objected that xdrgen is a server-side tool, and <a href="https://lore.kernel.org/linux-nfs/95f1c397-0630-44dc-a1d4-6e093c27fd6e@app.fastmail.com/">Chuck Lever</a> confirmed the client does not consume those generated headers. Schumaker also asked for a <code>bool</code> inode flag and cleanup of stray whitespace. v2 dropped xdrgen, open-coded the FATTR4 constants in <code>&lt;linux/nfs4.h&gt;</code>, stored the flags as <code>bool : 1</code> bitfields, and added the three attr-88 patches. v3 (1 July) was a one-line build fix: <code>FATTR4_WORD2_UNCACHEABLE_FILE_DATA</code> became the first, unconditional <code>nfs4_fattr_bitmap</code> word2 entry so the initializer no longer started with a stray <code>|</code> when <code>CONFIG_NFS_V4_SECURITY_LABEL</code> was off.</p>
+<h2>v4: two NFS4ERR_INVAL holes</h2>
+<p>v4's headline is two client-side request-bitmap bugs that would fail opens and directory-delegation returns against any server advertising the new attributes.</p>
+<p><strong>Hole 1 — regular-file OPEN vs. attr 88.</strong> v3 put <code>UNCACHEABLE_DIRENT_METADATA</code> into the shared request bitmaps (<code>nfs4_fattr_bitmap</code>, <code>nfs4_pnfs_open_bitmap</code>). Those arrays are used verbatim as OPEN's <code>open_bitmap</code>: a GETATTR that is masked only by the server's supported set and is <em>not</em> type-gated. Every regular-file OPEN therefore queried a directory-only attribute. Snitzer:</p>
+<blockquote>
+<p>"v3 placed attr 88 in the shared request bitmaps ... so every regular-file OPEN queried a directory-only attribute and the server answered NFS4ERR_INVAL, failing opens broadly."</p>
+</blockquote>
+<p>Patch 4 no longer adds attr 88 to those bitmaps. <a href="https://lore.kernel.org/linux-nfs/0949ae8eb880fe0fbe702fc1c3e5fbd70ec356da.1785140181.git.snitzer@kernel.org/">Patch 5</a> instead has <code>nfs4_bitmap_copy_adjust()</code> add it only for directory targets, gated on <code>server-&gt;attr_bitmask</code>. Attr 87 continues to ride the shared bitmaps because it is legal — and wanted — on a regular-file OPEN (it drives the O_DIRECT decision).</p>
+<p><strong>Hole 2 — directory DELEGRETURN vs. attr 87.</strong> The opposite direction: <code>nfs4_update_changeattr_locked()</code> only ever runs on directory inodes, but v3 had it set the file-only <code>NFS_INO_INVALID_UNCACHEABLE_FILE_DATA</code> bit. <code>nfs4_bitmask_set()</code> then translated that bit into a request for attr 87 with no object-type check. With directory delegation support, DELEGRETURN of a directory delegation would query attr 87 on a directory and fail <code>NFS4ERR_INVAL</code>. <a href="https://lore.kernel.org/linux-nfs/b0f1a4c6ee59d7e4ea2d64fe3cc905ca3b3f8864.1785140181.git.snitzer@kernel.org/">Patch 2</a> drops the bit from the directory-only aggregation and type-gates <code>nfs4_bitmask_set()</code> so attr 87 is requested only for <code>S_ISREG</code> inodes.</p>
+<p>Net of the two gates: a regular file requests file_data and never dirent_metadata; a directory requests dirent_metadata and never file_data; an unknown/other object (LOOKUP/LOOKUPP/CREATE with a NULL inode) requests neither.</p>
+<h2>How the client honors the attributes</h2>
+<p><strong>UNCACHEABLE_FILE_DATA (patches 1–3).</strong> <a href="https://lore.kernel.org/linux-nfs/fd21d2ae964f720a4dfd8795454f35486133b0c9.1785140181.git.snitzer@kernel.org/">Patch 1</a> (Tom Haynes, adapted by Snitzer) decodes attr 87, tracks per-exported-filesystem support, and records <code>NFS_I(inode)-&gt;uncacheable_file_data</code>. <a href="https://lore.kernel.org/linux-nfs/8f107c866d97997d9dde76090aacdbbe9752d2e2.1785140181.git.snitzer@kernel.org/">Patch 3</a> then opens a marked regular file with <code>O_DIRECT</code> via a new <code>NFS_CONTEXT_O_DIRECT</code> open-context flag, set in <code>nfs4_atomic_open()</code> (unless the open is <code>O_APPEND</code>) and applied by <code>nfs_atomic_open()</code> / <code>nfs4_file_open()</code>. The I/O mode is chosen at open and is not flipped on an already-open file; a later attribute change takes effect on the next open, which the draft permits.</p>
+<p>The implementation deliberately does <strong>not</strong> take the draft's optional Section 4.3 relaxation that would keep read caching under a delegation:</p>
+<blockquote>
+<p>"This implementation deliberately does not take it: an uncacheable file is opened O_DIRECT regardless of any delegation held, which is compliant (read caching is simply suppressed more aggressively than the Section 4.3 minimum) and avoids decoupling read vs write caching behind a single open flag. Relaxing reads under a delegation is left as a possible future optimization."</p>
+</blockquote>
+<p>Misaligned O_DIRECT over SunRPC is already legal for the remote NFS path; the only DIO-alignment fallback is NFS LOCALIO, which is unaffected.</p>
+<p><strong>UNCACHEABLE_DIRENT_METADATA (patches 4–6).</strong> <a href="https://lore.kernel.org/linux-nfs/67fa3924952bb75d2c68af3844ee3a7e9b11a73c.1785140181.git.snitzer@kernel.org/">Patch 4</a> decodes attr 88 and records <code>NFS_I(inode)-&gt;uncacheable_dirent_metadata</code>. Unlike attr 87, this directory attribute is <em>not</em> tied to <code>cache_validity</code> / file-delegation machinery and has no <code>NFS_INO_INVALID_*</code> bit of its own. It is requested unconditionally for directories via the type gate, so it is refetched on every directory GETATTR and cannot go stale. A comment at the inode-recording site documents the asymmetry: a directory cannot hold an NFSv4 read/write delegation, and the draft requires a server to recall or withhold a directory delegation while the attribute is set, so there is never an authoritative cached state to optimize against. An invalidation bit would only be useful alongside a lazy re-request path such as <code>nfs4_bitmask_set()</code>, which is not type-gated and would request a directory-only attribute on regular files.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/77b72759ad7beee334abfda36098cc310f6e96a5.1785140181.git.snitzer@kernel.org/">Patch 6</a> is the readdir-path change. When a directory is marked uncacheable, <code>nfs_readdir()</code> bypasses the readdir page cache by forcing the <code>-EBADCOOKIE</code> path into <code>uncached_readdir()</code> (including <code>dir_cookie == 0</code>, so the first listing of an uncacheable directory also hits the server). A new tracepoint records the bypass. Because the attribute governs per-entry size and timestamps — carried only by READDIRPLUS — the patch also forces READDIRPLUS for an uncacheable directory when the server is capable. Without that, <code>nfs_use_readdirplus()</code> would enable plus-mode only at directory start or after a cache-usage threshold that the cache-bypassing path never accrues, leaving continuation READDIRs of a large directory refreshing names but serving stale per-entry attributes from inode caches. Forcing READDIRPLUS makes each READDIR refresh those caches via <code>nfs_prime_dcache()</code> → <code>nfs_refresh_inode()</code>, so a subsequent <code>stat()</code> sees current values. Directory change-attribute semantics are unchanged; only serving READDIR responses from the local cache is suppressed.</p>
+<h2>Status</h2>
+<p>The series touches <code>fs/nfs/{dir,inode,nfs4file,nfs4proc,nfs4xdr}.c</code> plus the usual headers and tracepoints (~235 insertions). Authorship is Tom Haynes for patch 1 and Snitzer for the rest; several commits carry an <code>Assisted-by: Claude:claude-opus-4-8</code> tag. No Acked-by/Reviewed-by tags and no on-list replies this week. The two v4 bitmap fixes are the concrete client correctness work: without them, advertising either new attribute on a server would break ordinary OPEN of regular files or DELEGRETURN of directory delegations with <code>NFS4ERR_INVAL</code>.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/cover.1785140181.git.snitzer@kernel.org/">2026-07-27 Mike Snitzer <a href="mailto:snitzer@kernel.org">snitzer@kernel.org</a> — [PATCH v4 0/6] nfs: NFSv4.2 client support for UNCACHEABLE_FILE_DATA and UNCACHEABLE_DIRENT_METADATA</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/fd21d2ae964f720a4dfd8795454f35486133b0c9.1785140181.git.snitzer@kernel.org/">2026-07-27 Mike Snitzer <a href="mailto:snitzer@kernel.org">snitzer@kernel.org</a> — [PATCH v4 1/6] nfs4.2: add UNCACHEABLE_FILE_DATA attribute support</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/b0f1a4c6ee59d7e4ea2d64fe3cc905ca3b3f8864.1785140181.git.snitzer@kernel.org/">2026-07-27 Mike Snitzer <a href="mailto:snitzer@kernel.org">snitzer@kernel.org</a> — [PATCH v4 2/6] nfs4.2: request UNCACHEABLE_FILE_DATA only for regular files</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/8f107c866d97997d9dde76090aacdbbe9752d2e2.1785140181.git.snitzer@kernel.org/">2026-07-27 Mike Snitzer <a href="mailto:snitzer@kernel.org">snitzer@kernel.org</a> — [PATCH v4 3/6] nfs4.2: open UNCACHEABLE_FILE_DATA files with O_DIRECT</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/67fa3924952bb75d2c68af3844ee3a7e9b11a73c.1785140181.git.snitzer@kernel.org/">2026-07-27 Mike Snitzer <a href="mailto:snitzer@kernel.org">snitzer@kernel.org</a> — [PATCH v4 4/6] nfs4.2: add UNCACHEABLE_DIRENT_METADATA attribute support</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/0949ae8eb880fe0fbe702fc1c3e5fbd70ec356da.1785140181.git.snitzer@kernel.org/">2026-07-27 Mike Snitzer <a href="mailto:snitzer@kernel.org">snitzer@kernel.org</a> — [PATCH v4 5/6] nfs4.2: request UNCACHEABLE_DIRENT_METADATA only for directories</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/77b72759ad7beee334abfda36098cc310f6e96a5.1785140181.git.snitzer@kernel.org/">2026-07-27 Mike Snitzer <a href="mailto:snitzer@kernel.org">snitzer@kernel.org</a> — [PATCH v4 6/6] nfs4.2: honor UNCACHEABLE_DIRENT_METADATA by refetching readdir</a></li>
+</ul>
+  </main>
+</body>
+</html>
