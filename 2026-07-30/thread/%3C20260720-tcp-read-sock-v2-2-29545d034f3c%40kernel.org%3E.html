@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>kTLS maintainer doubts TCP-style API can hide TLS records</title>
+  <meta name="description" content="Late on 30 July, kTLS maintainer Sabrina Dubroca closed the week&#39;s debate on Chuck Lever&#39;s read_sock_rectype proto_ops hook with a verdict that is worse for NFS than a simple NACK. She agreed with networking maintainer Jakub Kicinski&#39;s…">
+  <meta property="og:title" content="kTLS maintainer doubts TCP-style API can hide TLS records">
+  <meta property="og:description" content="Late on 30 July, kTLS maintainer Sabrina Dubroca closed the week&#39;s debate on Chuck Lever&#39;s read_sock_rectype proto_ops hook with a verdict that is worse for NFS than a simple NACK. She agreed with networking maintainer Jakub Kicinski&#39;s…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-30T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="kTLS maintainer doubts TCP-style API can hide TLS records">
+  <meta name="twitter:description" content="Late on 30 July, kTLS maintainer Sabrina Dubroca closed the week&#39;s debate on Chuck Lever&#39;s read_sock_rectype proto_ops hook with a verdict that is worse for NFS than a simple NACK. She agreed with networking maintainer Jakub Kicinski&#39;s…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-30</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>kTLS maintainer doubts TCP-style API can hide TLS records</h1>
+<h2>Summary</h2>
+<h1>kTLS maintainer doubts TCP-style API can hide TLS records</h1>
+<h2>Summary</h2>
+<p>Late on 30 July, kTLS maintainer <a href="https://lore.kernel.org/linux-nfs/amvg-dZzDB6GzzSH@krikkit/">Sabrina Dubroca</a> closed the week's debate on <a href="https://lore.kernel.org/linux-nfs/20260720-tcp-read-sock-v2-2-29545d034f3c@kernel.org//">Chuck Lever's <code>read_sock_rectype</code> proto_ops hook</a> with a verdict that is worse for NFS than a simple NACK. She agreed with networking maintainer Jakub Kicinski's stream-socket philosophy — and then said the mismatch that NFSD and a future NFS client <code>xprtsock</code> conversion are trying to paper over may be unfixable:</p>
+<blockquote>
+<p>"I agree. But TCP is a magical world where users don't have to worry about message types, and TLS isn't. It seems the users of the existing (TCP-oriented) API are unhappy with the mismatch, but I'm not convinced we can (and maybe "should") make that work."</p>
+</blockquote>
+<p>This is a <strong>new kernel networking API</strong>, not a protocol change and not, in this patch, a bug fix. The on-the-wire TLS/RPC framing is untouched. What is at stake for NFS is how in-kernel TCP consumers (NFSD first, the NFS client next) see KeyUpdate and fatal Alerts once kTLS is active, without falling back to <code>sock_recvmsg()</code> and CMSG, and without leaking control bytes into page-cache receive pages.</p>
+<h2>Brief recap: how the week arrived here</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260720-tcp-read-sock-v2-2-29545d034f3c@kernel.org//">Patch 2</a> is the API core of Lever's six-patch net-next series. It adds <code>read_sock_rectype</code> to <code>struct proto_ops</code> and a <code>sk_read_rectype_actor_t</code> callback that carries a protocol-layer record type (for example <code>TLS_RECORD_TYPE_ALERT</code>). Existing <code>read_sock</code> consumers keep their old behavior. Lever named four affected subsystems: NFSD (<code>svcsock</code>), the NFS client (<code>xprtsock</code>), NVMe target, and NVMe host. Each either falls back to <code>sock_recvmsg()</code> or lacks TLS alert handling entirely.</p>
+<p>Earlier this week, already summarized on the <a href="https://lore.kernel.org/linux-nfs/20260720-tcp-read-sock-v2-0-29545d034f3c@kernel.org//">cover-letter thread</a>, Kicinski rejected the hook as a TLS-only one-off that does not belong in <code>proto_ops</code>. Lever conceded Dubroca's "ugly in <code>struct proto_ops</code>" point. A setsockopt sketch that would pre-seed the expected content type collapsed into behavior kTLS already has: <code>recvmsg</code> without CMSG and <code>read_sock</code> already error out when the next record is control. Dubroca then translated Lever's page-cache complaint: a <code>recvmsg</code> with CMSG <em>and</em> pages dumps Alert or KeyUpdate bytes into those pages. To avoid that, a consumer must drain DATA with <code>read_sock</code> or <code>recvmsg</code> without CMSG, then — once nothing else is reading the socket — do one <code>recvmsg</code>+CMSG into a separate buffer. <code>read_sock_rectype</code> was meant to skip that dance.</p>
+<p>That is the NFS-relevant bug the series is trying to fix. For in-kernel consumers the I/O buffers <em>are</em> page-cache pages. Mixing control payload into <code>rq_pages</code> (NFSD) or the equivalent client receive pages (<code>xprtsock</code>) is why svcsock still runs a MSG_CTRUNC recovery path, and why a kTLS-enabled NFS client still has no first-class control-record path at all.</p>
+<h2>This week's only new note: stream vs. typed records</h2>
+<p>Minutes before Dubroca's reply, <a href="https://lore.kernel.org/linux-nfs/20260730163457.1105fa69@kernel.org//">Kicinski had restated the design philosophy</a> that had already killed the setsockopt sketch:</p>
+<blockquote>
+<p>"I guess the difference in perspective stems from a fact that I'd look at a socket as a stream one reads and dispatches work based on the input. Not an abstraction layer that by itself dispatches different handlers for different message types."</p>
+</blockquote>
+<p><a href="https://lore.kernel.org/linux-nfs/amvg-dZzDB6GzzSH@krikkit//">Dubroca agreed</a> — and then drew the line that matters for anyone planning the NFS client conversion. TCP users never have to think about message types. TLS users do. The existing <code>read_sock</code> API is TCP-oriented. SUNRPC is unhappy with that mismatch. Making the kernel socket layer dispatch TLS record types on behalf of the consumer — which is exactly what <code>read_sock_rectype</code> does — may not be something netdev can, or should, provide.</p>
+<p>That is a sharper conclusion than "try a generic extra argument on <code>read_sock</code>." Earlier in the week Dubroca had left that door open: growing <code>read_sock</code> by an argument would be acceptable if the extra argument were not TLS-specific, because there are only two existing <code>proto_ops.read_sock</code> consumers (strp/sockmap and NVMe) plus a handful of direct <code>tcp_read_sock()</code> callers that could pass NULL. A cmsg-like generic side channel, she had already warned, would erase most of the benefit and put callers back on "try <code>read_sock</code>, then fall back to <code>recvmsg</code>." Friday night's note goes further: even a well-shaped generic hook may be the wrong fight, because the TCP-shaped API cannot honestly hide TLS record types.</p>
+<p>No alternative was proposed in this message. No v3 was posted. Lever did not reply in-window.</p>
+<h2>What this means for NFS client development</h2>
+<p>Nothing in this week's single in-thread mail touches <code>xprtsock</code> directly. The client conversion was always a follow-up, with NFSD svcsock as the template. Dubroca's closing line still lands on the client path:</p>
+<ul>
+<li>The infrastructure that would let a kTLS-enabled NFS client see KeyUpdate and fatal Alerts on <code>read_sock</code> <strong>without</strong> a CMSG fallback, and <strong>without</strong> leaking control bytes into page-cache receive pages, is not merely waiting on a redesign. The kTLS maintainer is now questioning whether the kernel should try to make that TCP-shaped path work at all.</li>
+<li>If netdev holds that line, the NFS client will keep the two-step receive: drain DATA with <code>read_sock</code> / <code>recvmsg</code> without CMSG, then a carefully serialized <code>recvmsg</code>+CMSG into a non-page-cache buffer when the next record is control. That is exactly the dance <code>read_sock_rectype</code> was invented to avoid, and it is the dance that already leaks into <code>rq_pages</code> when done carelessly on the server.</li>
+<li>The homework Dubroca set earlier this week still stands if Lever tries again: measure current svcsock (<code>sock_recvmsg</code> only), <code>read_sock</code> plus a <code>recvmsg</code>+CMSG fallback, and whatever replaces <code>read_sock_rectype</code>. A rare Alert is not, by itself, enough to justify a new proto_ops method. After this note, even a measured win may not be enough if the API still tries to hide TLS record types from a TCP-oriented caller.</li>
+<li>The one piece still moving is independent of this patch: the no-data bound for empty TLS 1.3 data records, already split to a <code>net</code> prerequisite, which protects NFSD service threads from a lock-pinning DoS. A future client <code>read_sock</code> loop will want the same escape hatch, whether or not control-record delivery is ever first-class.</li>
+</ul>
+<h2>Status at week close</h2>
+<p>The patch is <strong>rejected in spirit, not just in shape</strong>. Consensus after <a href="https://lore.kernel.org/linux-nfs/amvg-dZzDB6GzzSH@krikkit//">Dubroca's 23:40 UTC note</a>:</p>
+<ul>
+<li><code>read_sock_rectype</code> as a TLS-specific proto_ops method will not land.</li>
+<li>Kicinski wants sockets treated as streams that the caller demultiplexes. Dubroca agrees, and doubts the kernel should paper over TLS record types to keep TCP-oriented consumers happy.</li>
+<li>No agreed replacement. The page-cache leak that motivates a first-class control-record path for SUNRPC is understood by the kTLS maintainer; she is no longer convinced it is a problem the socket API should solve.</li>
+<li>NFSD svcsock conversion (patches 5–6) and the planned NFS client <code>xprtsock</code> conversion cannot land until — and unless — an API both sides will accept is invented.</li>
+<li>Any resend should be tagged <strong>RFC</strong>, with human-written cover text, measurements, and a design that does not assume TLS can be made to look like TCP.</li>
+</ul>
+<p>The practical takeaway for NFS client development this week: the lock-pinning fix is in flight, but the client still cannot handle TLS control records on <code>read_sock</code>, and the kTLS maintainer has now said the TCP-shaped API that was going to change that may be the wrong model.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/amvg-dZzDB6GzzSH@krikkit/">2026-07-30 Sabrina Dubroca <a href="mailto:sd@queasysnail.net">sd@queasysnail.net</a> — Re: [PATCH net-next v2 2/6] net: Introduce read_sock_rectype proto_ops for control record delivery</a></li>
+</ul>
+  </main>
+</body>
+</html>

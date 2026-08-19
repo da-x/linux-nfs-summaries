@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSv4.2 client lockup, silent futimens, and pNFS stale size dominate a week of hardening</title>
+  <meta name="description" content="The Linux NFS list spent the week of 24–30 July on client correctness, not on new wire protocol. The loudest item is a confirmed NFSv4.2 listxattr oops that takes the machine down. Around it sit an unfixed futimens() SETATTR skip, an…">
+  <meta property="og:title" content="NFSv4.2 client lockup, silent futimens, and pNFS stale size dominate a week of hardening">
+  <meta property="og:description" content="The Linux NFS list spent the week of 24–30 July on client correctness, not on new wire protocol. The loudest item is a confirmed NFSv4.2 listxattr oops that takes the machine down. Around it sit an unfixed futimens() SETATTR skip, an…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-30T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSv4.2 client lockup, silent futimens, and pNFS stale size dominate a week of hardening">
+  <meta name="twitter:description" content="The Linux NFS list spent the week of 24–30 July on client correctness, not on new wire protocol. The loudest item is a confirmed NFSv4.2 listxattr oops that takes the machine down. Around it sit an unfixed futimens() SETATTR skip, an…">
+  <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../index.html">Summaries</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSv4.2 client lockup, silent futimens, and pNFS stale size dominate a week of hardening</h1>
+<p><em>Week ending 2026-07-30</em></p>
+<p>The Linux NFS list spent the week of 24–30 July on <strong>client correctness</strong>, not on new wire protocol. The loudest item is a confirmed <strong>NFSv4.2 <code>listxattr</code> oops that takes the machine down</strong>. Around it sit an unfixed <strong><code>futimens()</code> SETATTR skip</strong>, an unreviewed <strong>pNFS size-coherence race</strong>, a <strong>callback XDR overflow</strong>, and v4 of Mike Snitzer’s uncacheable-attribute series — which is itself two client bitmap bug fixes wrapped in a feature. Netdev, meanwhile, rejected the kTLS <code>read_sock</code> API the NFS client was going to grow onto.</p>
+<p>Server-side traffic was real (an nfsd procfs GPF landed in <code>nfsd-testing</code>; syzbot hung two more netlink commands behind <code>listener_set</code>) but secondary to the client picture.</p>
+<h2>Critical: NFSv4.2 listxattr size-query oops and lockup</h2>
+<p>Chuck Lever reported that Stephen Smalley’s merged <code>security_inode_listsecurity()</code> cleanup <a href="thread/%253C20250428195022.24587-2-stephen.smalley.work%2540gmail.com%253E.html">wedges an NFSv4.2 client in fstests</a>. A size-query <code>listxattr(2)</code> (NULL buffer, length zero) underflows an unsigned remaining-size accumulator in <code>nfs4_listxattr()</code>. <code>nfs4_xattr_cache_list()</code> then copies into that NULL buffer <strong>while the xattr listcache spinlock is held</strong>. Task exit does not drop spinlocks, so the next shrinker pass — <code>generic/086</code> writing <code>drop_caches</code> is enough — spins until the watchdog fires.</p>
+<p>The stack is unambiguous: two dozen <code>_copy_from_pages</code> NULL derefs, then <code>nfs4_xattr_cache_scan</code> stuck on the orphaned lock. The reproducer is a plain <code>getfattr</code> on an NFSv4.2 mount with SELinux enforcing. Lever reverted the LSM commit on <code>nfsd-next</code> and reran <code>nfs_v42</code>: 745 tests, no lockup, <code>generic/086</code> passes.</p>
+<p>A revert is <strong>not</strong> the proposed fix. Achilles Gaikwad already posted a targeted accounting patch (<code>left</code> as <code>ssize_t</code>, only decrement when a buffer is present). Paul Moore has Reviewed-by on that patch and will send it via the LSM tree if NFS maintainers ACK and Tested-by it. That ACK had not landed by week close. Until it does, any NFSv4.2 + SELinux client built against <code>lsm/dev</code> can panic on a size-query listxattr.</p>
+<h2>Client bugs still open</h2>
+<p><strong><code>futimens()</code> still lies on NFSv4.2.</strong> <a href="thread/%253CnMlXgkbm-9ZP_fFN16OpzFd4kwNlyXq169-6CoOE4nuHyTsmGaFeJgzuhj3grRboJKg9RapKov2_FJ1E3BCL0oZ7UNzF0pgwwhVC6VOVJYQ%253D%2540proton.me%253E.html">Michael Yang tightened last week’s report</a>: GNU <code>touch -d</code> on an open fd returns success, dirties the local inode, and never sends <code>SETATTR</code>. The server inode is unchanged; the next revalidation snaps the timestamps back. New this week: the failure is already in 6.17.x (Proxmox bug 7621), <strong>absent on 6.12.88 LTS</strong>, and <strong>absent on <code>vers=4.1</code></strong>. Pathname-based <code>utimensat</code> on v4.2 still works. The 7.0 timestamp-split commits are no longer the first-pass suspects; the bisection window is 6.13–6.17 on the v4.2 open-file setattr path. No maintainer reply, no patch.</p>
+<p><strong>pNFS applications can still see a stale size.</strong> Lenovo’s Quan Wang first posted an <a href="thread/%253CKL1PR0302MB520263A7814093607F9B8BE086CB2%2540KL1PR0302MB5202.apcprd03.prod.outlook.com%253E.html">empty same-subject note</a>, then a <a href="thread/%253CKL1PR0302MB52028CB56AB48DC0DEAA4A9786CA2%2540KL1PR0302MB5202.apcprd03.prod.outlook.com%253E.html">three-line <code>fs/nfs/inode.c</code> patch</a>. The race is classic pNFS: after <code>pnfs_set_layoutcommit()</code> the client already knows the new last-write-byte, but <code>nfs_lookup_revalidate_dentry()</code> can still refresh <code>i_size</code> from the MDS <strong>before</strong> <code>nfs4_layoutcommit_release()</code>. A concurrent <code>stat()</code> therefore reports the pre-write length. The hunk belongs in the generic inode path, not a layout driver — the right layer, if the guard does not paper over a real MDS truncate. The posting has no <code>Fixes:</code>, no reproducer, and no review.</p>
+<p><strong>Callback bitmap wrap.</strong> <a href="thread/%253C20260724151213.1392784-1-jchuang%2540seu.edu.cn%253E.html">Jiancheng Huang’s v2</a> is two lines in <code>decode_bitmap()</code> (<code>fs/nfs/callback_xdr.c</code>): reject a server-supplied word count larger than the local three-word bitmap <strong>before</strong> shifting it into a byte length, and return <code>NFS4ERR_INVAL</code>. A huge <code>attrlen</code> currently wraps the value handed to <code>xdr_inline_decode()</code>, after which the fixed-word reads walk off the XDR carrier. KASAN on v7.2-rc4 reports a stack OOB in <code>decode_bitmap</code>. <code>Fixes:</code> is the git epoch; this is long-standing callback hygiene, not a 7.x regression. No review in-window.</p>
+<h2>Client features: uncacheable attributes, still no reviews</h2>
+<p><a href="thread/%253Ccover.1785140181.git.snitzer%2540kernel.org%253E.html">Mike Snitzer posted v4</a> of NFSv4.2 client support for <code>UNCACHEABLE_FILE_DATA</code> (FATTR4 87) and <code>UNCACHEABLE_DIRENT_METADATA</code> (FATTR4 88). The motivating deployments mix NFSv4.2, NFSv3, and SMB on one namespace, so data and dirents change faster than a typical cache lifetime.</p>
+<p>v4’s real news is two <strong>request-bitmap holes</strong> that would have broken ordinary traffic against any server advertising the new attributes:</p>
+<ul>
+<li>v3 put directory-only attr 88 on the shared OPEN bitmaps, so every regular-file OPEN got <code>NFS4ERR_INVAL</code>.</li>
+<li>v3 had directory <code>DELEGRETURN</code> request file-only attr 87 the same way.</li>
+</ul>
+<p>v4 type-gates both: regular files request 87 only, directories request 88 only. Honoring the bits is then straightforward — marked files open <code>O_DIRECT</code> (no Section 4.3 read-cache relaxation under a delegation), marked directories bypass the readdir page cache and force READDIRPLUS so per-entry size/mtime stay fresh. No Acked-by landed.</p>
+<p>On the shared LOCALIO boundary, Chuck Lever’s <a href="thread/%253C20260727130410.14887-1-cel%2540kernel.org%253E.html">v1</a> then <a href="thread/%253C20260728165911.462534-1-cel%2540kernel.org%253E.html">v2</a> peel NFS <strong>client</strong> headers out of server-side LOCALIO ahead of xdrgen. <code>nfslocalio.h</code> no longer smuggles <code>uapi/linux/nfs.h</code> or the client-only <code>decode_opaque_fixed()</code> wrapper into client builds, and LOCALIO opens stop impersonating NFSv4 just because the copy buffer was <code>NFS4_FHSIZE</code>. Neil Brown and Mike Snitzer Reviewed-by the whole v2 series. Behavior is intended identical, with one favorable efficiency win: LOCALIO no longer forces filesystems to compute birth-time and change-cookie attributes nobody reads.</p>
+<h2>Debate: kTLS control records will not look like TCP</h2>
+<p>The series that was going to give NFSD — and later the NFS <strong>client</strong> <code>xprtsock</code> path — first-class kTLS Alert/KeyUpdate delivery on <code>read_sock</code> is <strong>not a merge candidate</strong>. Jakub Kicinski rejected <a href="thread/%253C20260720-tcp-read-sock-v2-0-29545d034f3c%2540kernel.org%253E.html">Chuck Lever’s <code>read_sock_rectype</code> proto_ops hook</a> as a TLS-only one-off that does not belong in <code>struct proto_ops</code>. An AI-written cover paragraph soured the review; Sabrina Dubroca’s procedural note is the useful one: this should have been <strong>RFC v2</strong>, with numbers comparing current <code>sock_recvmsg</code>, <code>read_sock</code> plus CMSG fallback, and whatever replaces the new hook.</p>
+<p>The NFS-relevant bug the series is trying to fix is still real. A <code>recvmsg</code> with CMSG <em>and</em> pages dumps Alert/KeyUpdate bytes into those pages — and for in-kernel consumers the I/O buffers <strong>are</strong> page-cache pages. Mixing control payload into <code>rq_pages</code> (NFSD) or client receive pages (<code>xprtsock</code>) is why svcsock still runs a MSG_CTRUNC recovery dance, and why a kTLS-enabled NFS client still has no first-class control-record path.</p>
+<p>By Friday night Dubroca had gone further than a shape NACK. On the <a href="thread/%253C20260720-tcp-read-sock-v2-2-29545d034f3c%2540kernel.org%253E.html">patch-2 thread</a> she agreed with Kicinski’s stream-socket philosophy and doubted the kernel <em>should</em> paper over TLS record types to keep TCP-oriented consumers happy. No replacement API was agreed. The one piece still moving is independent: the no-data bound for empty TLS 1.3 records, already split to a <code>net</code> prerequisite, which stops a client from pinning <code>tls_sw_read_sock()</code> with a stream of empty records.</p>
+<p>Until that redesign exists, the planned client <code>xprtsock</code> conversion cannot land.</p>
+<h2>Userspace and the rest of the list</h2>
+<p>Steve Dickson <a href="thread/%253Cdc0f6f41-84be-4a70-92db-89890bded3ab%2540redhat.com%253E.html">announced nfs-utils 2.9.2</a> — memory-leak fixes, netlink and exportfs work, a new <code>nfs-iostat</code> option — and restored the missing git tag after Mike Owen noticed. xuchenchen posted an <a href="thread/%253C20260728083347.6132-1-xu18736995897%2540163.com%253E.html">unreviewed <code>rpc.statd</code> leak</a>: on SM_MON re-monitor with a new priv cookie, <code>sm_mon_1_svc()</code> overwrites <code>clnt-&gt;dns_name</code> without freeing the old string. Ian Bridges <a href="thread/%253Caj9bie25tpHnz7_G%2540dev%253E.html">pinged</a> his still-unreviewed <code>strlcat()</code> → <code>snprintf()</code> cleanup in <code>rpc_sockaddr2uaddr()</code>.</p>
+<p>On the server, Ameer Hamza’s <a href="thread/%253C20260726124658.1715711-1-ameer.hamza%2540truenas.com%253E.html">procfs GPF</a> — <code>client_info_show()</code> walking <code>cl_sessions</code> under <code>cl_lock</code> while <code>free_client()</code> tears the list down unlocked — was applied to <code>nfsd-testing</code> two days later. syzbot then hung both <a href="thread/%253C6a645880.70955b6c.323240.0015.GAE%2540google.com%253E.html"><code>nfsd_nl_svc_export_set_reqs_doit</code></a> and <a href="thread/%253C6a647246.a2ea2cc8.fbad6.0014.GAE%2540google.com%253E.html"><code>nfsd_nl_unlock_export_doit</code></a> behind <code>nfsd_nl_listener_set_doit</code> holding <code>nfsd_mutex</code> across synchronous rpcbind registration. That is last week’s diagnosis coming true on the export-install and export-revoke paths clients actually depend on; still no patch.</p>
+<p>David Howells posted <a href="thread/%253C20260728141344.1811120-1-dhowells%2540redhat.com%253E.html">VFS foreign-UID hooks v3</a> so kAFS can fix sticky-dir <code>open(O_CREAT)</code> now that bash-5.3 dropped its 1992 workaround. NFS is not converted: the default helpers still compare <code>i_uid</code>, which is the model the NFS client already uses. A regression in those defaults would still be an NFS regression. Marc Dionne acked the AFS half; VFS maintainers have not.</p>
+<p>Incidental mm/include traffic touched NFS only mechanically: Brendan Jackman <a href="thread/%253C20260716-folio-alloc-cleanups-v1-0-5363b8e92d33%2540google.com%253E.html">dropped the controversial mempolicy-internal header</a> (sunrpc keeps the public <code>folio_alloc_node()</code> rename); an <a href="thread/%253C20260730-rfc-nt-demote-v2-0-452dbe3b5073%2540zptcorp.com%253E.html">NT-store demotion RFC v2</a> still carries a one-line <code>fs/nfs/write.c</code> helper swap that reviewers may delete if NT is keyed off migrate <em>reason</em> instead of a new ASYNC mode; Thomas Gleixner <a href="thread/%253C20260721131207.803760-1-petr.pavlu%2540suse.com%253E.html">acked</a> the jiffies sysctl include in Petr Pavlu’s <code>kmod.h</code> cleanup (the NFS hunk is last week’s <code>cache_lib.c</code> <code>umh.h</code> swap).</p>
+<h2>What to watch</h2>
+<ol>
+<li><strong>Land Gaikwad’s <code>nfs4_listxattr</code> accounting patch</strong> — or an equivalent — with an NFS Tested-by on the same SELinux + fstests setup Lever used. This is the week’s only confirmed machine-down client regression.</li>
+<li><strong>Bisect <code>futimens()</code></strong> on NFSv4.2 between 6.12.88 and 6.17. The failure mode is now sharp enough to find.</li>
+<li><strong>Rewrite the pNFS size patch</strong> with a named helper, a truncate-safe condition, and a <code>Fixes:</code> line.</li>
+<li><strong>Review Huang’s callback-bitmap check</strong> before a malformed CB_GETATTR/CB_RECALL walks off the stack.</li>
+<li><strong>Snitzer v4 type-gating</strong> needs eyes; advertising attrs 87/88 without it breaks OPEN and directory DELEGRETURN.</li>
+<li><strong>kTLS control records</strong> need an RFC, measurements, and a design netdev will accept. The client <code>xprtsock</code> conversion is blocked until then.</li>
+</ol>
+<p>The client tree this week is a pile of real bugs and one well-reviewed LOCALIO cleanup. The feature work is waiting on review; the crashers should not.</p>
+<h2>Discussions this week</h2>
+<ul>
+<li><a href="thread/%253C20260720-tcp-read-sock-v2-0-29545d034f3c%2540kernel.org%253E.html">Re: [PATCH net-next v2 0/6] Deliver TLS control records to kernel read_sock consumers</a></li>
+<li><a href="thread/%253C20260720-tcp-read-sock-v2-2-29545d034f3c%2540kernel.org%253E.html">Re: [PATCH net-next v2 2/6] net: Introduce read_sock_rectype proto_ops for control record delivery</a></li>
+<li><a href="thread/%253C20260727130410.14887-1-cel%2540kernel.org%253E.html">[PATCH 0/3] Remove NFS client header dependencies from LOCALIO</a></li>
+<li><a href="thread/%253C20260728165911.462534-1-cel%2540kernel.org%253E.html">[PATCH v2 0/5] Remove NFS client header dependencies from LOCALIO</a></li>
+<li><a href="thread/%253Ccover.1785140181.git.snitzer%2540kernel.org%253E.html">[PATCH v4 0/6] nfs: NFSv4.2 client support for UNCACHEABLE_FILE_DATA and UNCACHEABLE_DIRENT_METADATA</a></li>
+<li><a href="thread/%253C20260728141344.1811120-1-dhowells%2540redhat.com%253E.html">[PATCH v3 0/2] vfs, afs, bash: Fix miscomparison of foreign user IDs in the VFS</a></li>
+<li><a href="thread/%253C20250428195022.24587-2-stephen.smalley.work%2540gmail.com%253E.html">Re: [PATCH v2] security,fs,nfs,net: update security_inode_listsecurity() interface</a></li>
+<li><a href="thread/%253C20260716-folio-alloc-cleanups-v1-0-5363b8e92d33%2540google.com%253E.html">Re: [PATCH 1/3] mm: move internal mempolicy APIs to new internal header</a></li>
+<li><a href="thread/%253C20260526-rfc-nt-demote-v1-0-eb9c9422daef%2540zptcorp.com%253E.html">Re: [PATCH RFC 3/3] mm: use non-temporal stores for demotion</a></li>
+<li><a href="thread/%253C20260730-rfc-nt-demote-v2-0-452dbe3b5073%2540zptcorp.com%253E.html">[PATCH RFC v2 0/3] Demote to lower tier using non-temporal stores</a></li>
+<li><a href="thread/%253C20260721131207.803760-1-petr.pavlu%2540suse.com%253E.html">Re: [PATCH v2 2/3] time/jiffies: Include linux/sysctl.h for proc_int_u2k_conv_uop(), ...</a></li>
+<li><a href="thread/%253CKL1PR0302MB520263A7814093607F9B8BE086CB2%2540KL1PR0302MB5202.apcprd03.prod.outlook.com%253E.html">NFSv4.2/pNFS: fix applacation get old size of file</a></li>
+<li><a href="thread/%253CKL1PR0302MB52028CB56AB48DC0DEAA4A9786CA2%2540KL1PR0302MB5202.apcprd03.prod.outlook.com%253E.html">NFSv4.2/pNFS: fix applacation get old size of file</a></li>
+<li><a href="thread/%253Cdc0f6f41-84be-4a70-92db-89890bded3ab%2540redhat.com%253E.html">ANNOUNCE: nfs-utils-2.9.2 released.</a></li>
+<li><a href="thread/%253Caj9bie25tpHnz7_G%2540dev%253E.html">Re: [PATCH] SUNRPC: Replace strlcat() with snprintf() in rpc_sockaddr2uaddr()</a></li>
+<li><a href="thread/%253C20260726124658.1715711-1-ameer.hamza%2540truenas.com%253E.html">[PATCH] nfsd: fix race between client_info_show() and free_client()</a></li>
+<li><a href="thread/%253C20260728083347.6132-1-xu18736995897%2540163.com%253E.html">[PATCH] statd: fix memory leak in sm_mon_1_svc() when existing host re-monitors</a></li>
+<li><a href="thread/%253C6a645880.70955b6c.323240.0015.GAE%2540google.com%253E.html">[syzbot] [nfs?] INFO: task hung in nfsd_nl_svc_export_set_reqs_doit</a></li>
+<li><a href="thread/%253C6a647246.a2ea2cc8.fbad6.0014.GAE%2540google.com%253E.html">[syzbot] [nfs?] INFO: task hung in nfsd_nl_unlock_export_doit</a></li>
+<li><a href="thread/%253CnMlXgkbm-9ZP_fFN16OpzFd4kwNlyXq169-6CoOE4nuHyTsmGaFeJgzuhj3grRboJKg9RapKov2_FJ1E3BCL0oZ7UNzF0pgwwhVC6VOVJYQ%253D%2540proton.me%253E.html">Re: [BUG] NFSv4.2: futimens() returns success without sending SETATTR</a></li>
+<li><a href="thread/%253C20260724151213.1392784-1-jchuang%2540seu.edu.cn%253E.html">[PATCH v2] NFS: reject oversized callback bitmap lengths</a></li>
+</ul>
+  </main>
+</body>
+</html>
