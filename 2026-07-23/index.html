@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Client DIO pin rewrite lands review; futimens() silently drops SETATTR; NLMv3 grant callback merged</title>
+  <meta name="description" content="The NFS client’s O_DIRECT path is the week’s biggest development story: Google’s pin-aware rewrite is through full review and ready to land as P2PDMA groundwork. Against that, a 7.0-era futimens() regression still has no patch, two…">
+  <meta property="og:title" content="Client DIO pin rewrite lands review; futimens() silently drops SETATTR; NLMv3 grant callback merged">
+  <meta property="og:description" content="The NFS client’s O_DIRECT path is the week’s biggest development story: Google’s pin-aware rewrite is through full review and ready to land as P2PDMA groundwork. Against that, a 7.0-era futimens() regression still has no patch, two…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-23T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Client DIO pin rewrite lands review; futimens() silently drops SETATTR; NLMv3 grant callback merged">
+  <meta name="twitter:description" content="The NFS client’s O_DIRECT path is the week’s biggest development story: Google’s pin-aware rewrite is through full review and ready to land as P2PDMA groundwork. Against that, a 7.0-era futimens() regression still has no patch, two…">
+  <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../index.html">Summaries</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Client DIO pin rewrite lands review; futimens() silently drops SETATTR; NLMv3 grant callback merged</h1>
+<p><em>Week ending 2026-07-23</em></p>
+<p>The NFS client’s O_DIRECT path is the week’s biggest development story: Google’s pin-aware rewrite is through full review and ready to land as P2PDMA groundwork. Against that, a 7.0-era <code>futimens()</code> regression still has no patch, two lockd/lease crash fixes sit unreviewed, and Trond Myklebust shut down extra <code>rdirplus=</code> knobs in favor of traces. On the server, NeilBrown’s create-path refactor and Jeff Layton’s netlink stats both hit <code>nfsd-testing</code> in a day, while syzbot hangs exposed rpcbind I/O under <code>nfsd_mutex</code> as a multi-vector DoS.</p>
+<h2>Client DIO: pin-aware rewrite wins full review</h2>
+<p>Pranjal Shrivastava’s five-patch <a href="thread/%253C20260720150601.2702700-1-praan%2540google.com%253E.html">v4 DIO modernization</a> is the week’s headline client series. It replaces <code>iov_iter_get_pages_alloc2()</code> with <code>iov_iter_extract_pages()</code>, adds <code>PG_PINNED</code> / <code>wb_nr_pinned</code> so <code>nfs_page</code> owns GUP pins, and centralizes extraction in <code>nfs_direct_extract_pages()</code>. The API swap also <strong>fixes premature unpinning</strong>: the old loop dropped pins immediately after request creation; pins are now held until I/O completion.</p>
+<p>Christoph Hellwig walked <a href="thread/%253C20260715143540.3597616-1-praan%2540google.com%253E.html">v3</a> on 20 July (style nits plus <code>Reviewed-by</code> on the two functional DIO patches); Shrivastava respun the same day. Two days later Hellwig tagged the remaining three v4 patches “Looks good.” Shivaji Kant’s reviews from v3 carried over. xfstests <code>-g quick</code> on TCP and RDMA for NFSv3 and v4.0–v4.2 showed no regressions. Folio aggregation and <code>ITER_ALLOW_P2PDMA</code> remain follow-ups.</p>
+<p>Mike Snitzer’s <a href="thread/%253C20260708213610.19001-1-snitzer%2540kernel.org%253E.html">localio DIO misaligned-tracepoint fix</a> is still pending: Anna Schumaker asked only for a <code>Fixes:</code> tag.</p>
+<h2>Critical client bugs: silent timestamps, lease crash, lockd oops</h2>
+<p>The most user-visible client defect this week has no patch. <a href="thread/%253CnMlXgkbm-9ZP_fFN16OpzFd4kwNlyXq169-6CoOE4nuHyTsmGaFeJgzuhj3grRboJKg9RapKov2_FJ1E3BCL0oZ7UNzF0pgwwhVC6VOVJYQ%253D%2540proton.me%253E.html">Michael Yang reported</a> that GNU <code>touch -d</code> on NFSv4.2 returns success from fd-based <code>futimens()</code> / <code>utimensat(fd, NULL, …)</code> <strong>without sending SETATTR</strong>. Client <code>stat</code> briefly shows the new times, the server inode never changes, and revalidation snaps the cache back. Pathname-based <code>utimensat()</code> works. Holger Hoffstätte confirmed on 7.1.x and bisected the onset to the 7.0 window, pointing at <code>nfs: split nfs_update_timestamps</code> and the VFS <code>-&gt;update_time</code> refactor. No maintainer reply landed.</p>
+<p>Two crash fixes arrived unreviewed:</p>
+<ul>
+<li><a href="thread/%253CSI2PR01MB454532D657E40A783BEAD771C7C12%2540SI2PR01MB4545.apcprd01.prod.exchangelabs.com%253E.html">Zhansong Gao</a> — <code>nfs4_add_lease()</code> races with delegation return and passes a possibly-NULL <code>priv</code> into <code>nfs4_delete_lease()</code>, oopsing in <code>generic_setlease()</code>. Four-line fix against the application-leases-on-delegations work.</li>
+<li><a href="thread/%253C20260717172809.1591290-1-shuangpeng.kernel%2540gmail.com%253E.html">Shuangpeng Bai</a> — lockd installs NLM <code>fl_ops</code> even when lockowner allocation fails, so VFS teardown NULL-derefs in <code>nlmclnt_locks_release_private()</code>. Ancient (<code>Fixes: 1da177e4c3f4</code>), stable-Cc’d.</li>
+</ul>
+<p>The one client-facing lockd bug that <em>did</em> land is Olga Kornievskaia’s NLMv3 <code>GRANTED_MSG</code> repair. Chuck Lever’s <a href="thread/%253C20260721181544.3048006-1-cel%2540kernel.org%253E.html">nfsd-7.2-2 pull</a> restored <code>nlmsvc_lookup_host()</code> on the grant-callback path so a host without <code>nfsd</code> can accept the callback; Linus merged it 22 July. The xdrgen conversion had wired a <strong>client</strong> callback through the nfsd-gated server helper, hanging blocked NLM locks on ordinary clients.</p>
+<p>Userspace: Steve Dickson committed Huawei’s <a href="thread/%253Ca0df2e1c-27fe-44cd-9a97-f04134f029f5%2540huawei.com%253E.html">gssd <code>upcall_*</code> leak</a> and <a href="thread/%253C356736aa-25d8-4b79-a50f-33b4e7035856%2540huawei.com%253E.html">nfsd <code>haddr</code> overflow</a> to <code>nfs-utils-2-9-2-rc6</code>.</p>
+<h2>Policy debate: no more <code>rdirplus=</code> knobs</h2>
+<p>Jorge Mora (NetApp) <a href="thread/%253CSA1PR06MB1135309B2E478CE0323EF04BCE1FF2%2540SA1PR06MB11353.namprd06.prod.outlook.com%253E.html">re-pinged</a> for <code>rdirplus=legacy</code> / <code>eager</code> after a Rocky 8.7 → 6.12 GETATTR/LOOKUP storm on a read-only tree walk. Trond Myklebust was blunt: the client already has heuristic / <code>none</code> / <code>force</code>, and he is “violently opposed to adding yet another” slightly different heuristic. Capture the existing readdirplus tracepoints and argue for a default-heuristic fix; for static trees, use <code>statx(..., AT_STATX_DONT_SYNC)</code>. The request is rejected pending data.</p>
+<h2>Swap, netfs, and kTLS: client plumbing in motion</h2>
+<p>Christoph Hellwig’s <a href="thread/%253C20260723054622.3460249-1-hch%2540lst.de%253E.html">swap_ops v2</a> (acked by Chris Li) lets the NFS client supply <code>struct swap_ops</code> directly from <code>fs/nfs/file.c</code>, dropping the MM → <code>swap_rw</code> → NFS DIO double hop. No wire-protocol change; swap-over-NFS I/O loses one indirect call. A companion <a href="thread/%253C20260722130615.3163560-1-hch%2540lst.de%253E.html">zram single-folio write restore</a> is MM-only.</p>
+<p>David Howells posted <a href="thread/%253C20260722130218.78958-1-dhowells%2540redhat.com%253E.html">netfs v7 (29 patches)</a>: <code>folio_queue</code> / <code>ITER_FOLIOQ</code> give way to <code>bvecq</code> chains so a filesystem can emit one RPC with one <code>kernel_sendmsg()</code>. NFS must match a new <code>-&gt;issue_*()</code> contract (<code>nfs_netfs_issue_read()</code> now returns <code>int</code>); over-reads become fatal <code>-EIO</code>. Three Yichong Chen leak fixes lead the series. No linux-nfs review in-window.</p>
+<p>Chuck Lever’s <a href="thread/%253C20260720-tcp-read-sock-v2-0-29545d034f3c%2540kernel.org%253E.html">kTLS <code>read_sock_rectype</code> v2</a> converts NFSD svcsock first; <strong>xprtsock is the named next consumer</strong>, so a kTLS NFS client can see KeyUpdate and fatal Alerts without a CMSG fallback. Sabrina Dubroca split patch 1 (empty TLS 1.3 data-record lock-pin) out to <code>net</code>; the new API stays on net-next.</p>
+<p>Ameer Hamza’s <a href="thread/%253C20260722182012.2063936-1-ameer.hamza%2540truenas.com%253E.html">SUNRPC <code>NUMA_NO_NODE</code> restore</a> undoes a 2× READ-throughput collapse on four-node boxes (v6.17→v6.18): a folio-scratch conversion plus kthread auto-affinity pinned every globally pooled nfsd thread — and <strong>NFS client callback</strong> threads — to the creator’s node. Reviewed by Jeff Layton, applied to <code>nfsd-testing</code> ahead of the pool-mode rewrite, aimed at stable v6.18+.</p>
+<p>Chuck also posted a four-patch <a href="thread/%253C20260721162306.894558-1-cel%2540kernel.org%253E.html">SSC confinement</a> that deletes the dead client <code>nfs_ssc_client_ops</code> table left by earlier UAFs, pins <code>nfsv4</code> across sleeping <code>ssc_open</code> with RCU + <code>try_module_get()</code>, and splits the shared header so NFSD stops compiling client types. Preventive architecture after a trail of source-mount lifetime bugs; no replies yet.</p>
+<h2>Server: create-path and netlink stats land; rpcbind-under-mutex is a DoS</h2>
+<p>NeilBrown’s 18-patch <a href="thread/%253C20260717093001.1972119-1-neilb%2540ownmail.net%253E.html"><code>nfs4_create_file()</code> v5</a> — exclusive-create attribute drop, mounted-on-file CREATE across v2/v3/v4, groundwork for <code>vfs_lookup_open()</code> — was Reviewed-by Layton and applied to <code>nfsd-testing</code> the same day as the <a href="thread/%253C20260717043242.1865905-1-neilb%2540ownmail.net%253E.html">v4</a> posting.</p>
+<p>Jeff Layton’s <a href="thread/%253C20260717-exportd-netlink-v7-0-b7ce17b83b60%2540kernel.org%253E.html">nfsstat→netlink v7</a> also applied same-day. Dai Ngo settled the leftover debate: <a href="thread/%253C20260619-exportd-netlink-v6-0-ddef3499793c%2540kernel.org%253E.html">drop <code>wdeleg_getattr</code></a>; CB_GETATTR counts are good enough. Per-netns procedure counts and the first backchannel op stats are in.</p>
+<p>Chuck’s <a href="thread/%253C20260717001232.438792-1-cel%2540kernel.org%253E.html">global DRC clean-ups</a> (off-by-one prune limit; <code>percpu_counter_add_local()</code> to kill a global spinlock that fired on every ~144-byte DRC update) got Reviewed-by from NeilBrown and Layton. His <a href="thread/%253C20260720163724.810227-1-cel%2540kernel.org%253E.html">flexfile UID mapping fix</a> stops LAYOUTGET from leaking host UIDs into client AUTH_SYS creds in a non-initial user namespace — and uses <code>from_kuid_munged()</code> so an unmapped owner cannot wrap to uid 0. Layton reviewed.</p>
+<p>Thorsten Leemhuis asked why the <a href="thread/%253C20260709-cel-v4-0-1d519d9be0cb%2540kernel.org%253E.html">lock-owner UAF</a> was not already on its way to Linus. Chuck’s policy: same CI/review as everything else; it rides the first nfsd-7.3 pull with a stable tag for 7.2.y. Original reporter Wolfgang Walter is fine carrying the patch.</p>
+<p>The open server fight is control-plane locking. syzbot hung <a href="thread/%253C6a590ea0.ccd3b023.4fae3.0000.GAE%2540google.com%253E.html">cache flush</a>, then <a href="thread/%253C6a611d64.42649fcc.22d900.0016.GAE%2540google.com%253E.html">expkey-set-reqs</a> and <a href="thread/%253C6a611ffa.16bfb6d0.3c48cb.0004.GAE%2540google.com%253E.html">expkey-get-reqs</a>, all on <code>nfsd_mutex</code>. Layton: synchronous rpcbind registration (including a ~60s <code>rpc_ping</code>) runs under that mutex; netlink <code>listener_set</code> can batch many sockets. NeilBrown wants a 1s timeout and questions holding the mutex across the whole batch; Layton says even 1s lockups with a few hundred listeners and prefers ordered async registration. No patches posted. Client impact: stalled fh-cache upcalls look like <code>mount.nfs: Connection refused</code>.</p>
+<p>Header hygiene continued in parallel: <a href="thread/%253C20260717184112.507548-1-cel%2540kernel.org%253E.html">NFSv4 tidying</a> (Layton R-b), <a href="thread/%253C20260720141442.783935-1-cel%2540kernel.org%253E.html"><code>linux/nfs_fh.h</code></a>, <a href="thread/%253C20260723182043.990391-1-cel%2540kernel.org%253E.html">write-path vs v3 <code>stable_how</code></a>. Adjacent VFS: Howells’ <a href="thread/%253C20260723140047.702495-1-dhowells%2540redhat.com%253E.html">foreign-UID inode ops</a> (NFS keeps the default <code>i_uid</code> path); Brauner closed a <a href="thread/%253C20260708130648.767811-1-lgs201920130244%2540gmail.com%253E.html">duplicate fhandle NULL-deref</a> as already fixed.</p>
+<h2>Watch next week</h2>
+<ul>
+<li>Maintainer pull of the DIO pin series, and a <code>Fixes:</code> tag on the localio tracepoint.</li>
+<li>A root cause — and patch — for fd-based <code>futimens()</code> on NFSv4.2.</li>
+<li>Review of the <code>nfs4_add_lease()</code> NULL-<code>priv</code> crash and the lockd lockowner oops.</li>
+<li>Mora’s readdirplus traces, or silence.</li>
+<li>rpcbind-off-mutex patches for the syzbot hangs.</li>
+<li>xprtsock conversion once <code>read_sock_rectype</code> is split between <code>net</code> and net-next.</li>
+</ul>
+<h2>Discussions this week</h2>
+<ul>
+<li><a href="thread/%253C20260619-exportd-netlink-v6-0-ddef3499793c%2540kernel.org%253E.html">Re: [PATCH v6 3/6] nfsd: implement server-stats-get netlink handler</a></li>
+<li><a href="thread/%253C20260717-exportd-netlink-v7-0-b7ce17b83b60%2540kernel.org%253E.html">[PATCH v7 0/6] nfsd/sunrpc: convert nfsstat server-side interfaces to use netlink</a></li>
+<li><a href="thread/%253C20260717043242.1865905-1-neilb%2540ownmail.net%253E.html">[PATCH v4 00/18] nfsd: refactor nfs4_create_file()</a></li>
+<li><a href="thread/%253C20260717093001.1972119-1-neilb%2540ownmail.net%253E.html">[PATCH v5 00/18] nfsd: refactor nfs4_create_file()</a></li>
+<li><a href="thread/%253C20260717001232.438792-1-cel%2540kernel.org%253E.html">[PATCH 0/5] Minor NFSD global DRC clean-ups</a></li>
+<li><a href="thread/%253C20260709-cel-v4-0-1d519d9be0cb%2540kernel.org%253E.html">Re: [PATCH v4 1/9] NFSD: Prevent lock owner use-after-free during client teardown</a></li>
+<li><a href="thread/%253C20260715143540.3597616-1-praan%2540google.com%253E.html">Re: [PATCH v3 1/5] nfs: make nfs_page pin-aware</a></li>
+<li><a href="thread/%253C20260720150601.2702700-1-praan%2540google.com%253E.html">[PATCH v4 0/5] nfs: modernize direct I/O path</a></li>
+<li><a href="thread/%253C20260716-folio-alloc-cleanups-v1-0-5363b8e92d33%2540google.com%253E.html">Re: [PATCH 1/3] mm: move internal mempolicy APIs to new internal header</a></li>
+<li><a href="thread/%253C20260722130218.78958-1-dhowells%2540redhat.com%253E.html">[PATCH v7 01/29] netfs: clear PG_private_2 on copy-to-cache append failure</a></li>
+<li><a href="thread/%253C20260722130615.3163560-1-hch%2540lst.de%253E.html">swap_ops updates</a></li>
+<li><a href="thread/%253C20260722130615.3163560-2-hch%2540lst.de%253E.html">Re: [PATCH 1/3] mm/swap: revert to single-folio writes for synchronous swap devices</a></li>
+<li><a href="thread/%253C20260722130615.3163560-3-hch%2540lst.de%253E.html">Re: [PATCH 2/3] mm/swap: add a new swap_ops.h header to allow for pluggable swap ops</a></li>
+<li><a href="thread/%253C20260723054622.3460249-1-hch%2540lst.de%253E.html">swap_ops updates v2</a></li>
+<li><a href="thread/%253C20260720-tcp-read-sock-v2-0-29545d034f3c%2540kernel.org%253E.html">[PATCH net-next v2 0/6] Deliver TLS control records to kernel read_sock consumers</a></li>
+<li><a href="thread/%253C20260720141442.783935-1-cel%2540kernel.org%253E.html">[PATCH 0/3] Move NFS filehandle defs into separate include</a></li>
+<li><a href="thread/%253C20260721162306.894558-1-cel%2540kernel.org%253E.html">[PATCH 0/4] Confine the inter-server copy interface to fs/nfs_common</a></li>
+<li><a href="thread/%253C20260717184112.507548-1-cel%2540kernel.org%253E.html">[PATCH 0/6] NFSv4-related tidying</a></li>
+<li><a href="thread/%253C20260723182043.990391-1-cel%2540kernel.org%253E.html">[PATCH 0/2] NFSD: Decouple the write path from NFSv3 XDR constants</a></li>
+<li><a href="thread/%253C20260721181544.3048006-1-cel%2540kernel.org%253E.html">[GIT PULL] Another NFSD fix for v7.2</a></li>
+<li><a href="thread/%253C6a590ea0.ccd3b023.4fae3.0000.GAE%2540google.com%253E.html">Re: [syzbot] [nfs?] INFO: task hung in nfsd_nl_cache_flush_doit</a></li>
+<li><a href="thread/%253C6a611d64.42649fcc.22d900.0016.GAE%2540google.com%253E.html">[syzbot] [nfs?] INFO: task hung in nfsd_nl_expkey_set_reqs_doit</a></li>
+<li><a href="thread/%253C6a611ffa.16bfb6d0.3c48cb.0004.GAE%2540google.com%253E.html">[syzbot] [nfs?] INFO: task hung in nfsd_nl_expkey_get_reqs_dumpit</a></li>
+<li><a href="thread/%253C20260723140047.702495-1-dhowells%2540redhat.com%253E.html">[PATCH v2 0/2] vfs, afs, bash: Fix miscomparison of foreign user IDs in the VFS</a></li>
+<li><a href="thread/%253C20260721131207.803760-1-petr.pavlu%2540suse.com%253E.html">[PATCH v2 0/3] Bring includes in linux/kmod.h up to date</a></li>
+<li><a href="thread/%253C20260720163724.810227-1-cel%2540kernel.org%253E.html">[PATCH] NFSD: Map flex file layout IDs through the request's user namespace</a></li>
+<li><a href="thread/%253C20260722182012.2063936-1-ameer.hamza%2540truenas.com%253E.html">[PATCH] SUNRPC: Restore NUMA_NO_NODE for svc thread allocations in global mode</a></li>
+<li><a href="thread/%253C20260717172809.1591290-1-shuangpeng.kernel%2540gmail.com%253E.html">[PATCH] lockd: fix NULL dereference on lockowner allocation failure</a></li>
+<li><a href="thread/%253C20260708213610.19001-1-snitzer%2540kernel.org%253E.html">Re: [PATCH] NFS/localio: fix nfs_local_dio_misaligned tracepoint</a></li>
+<li><a href="thread/%253C20260708130648.767811-1-lgs201920130244%2540gmail.com%253E.html">Re: [PATCH] fhandle: handle detached mounts in capable_wrt_mount()</a></li>
+<li><a href="thread/%253CSI2PR01MB454532D657E40A783BEAD771C7C12%2540SI2PR01MB4545.apcprd01.prod.exchangelabs.com%253E.html">[PATCH] NFSv4: Fix incorrect argument passed to nfs4_delete_lease() in nfs4_add_lease()</a></li>
+<li><a href="thread/%253CnMlXgkbm-9ZP_fFN16OpzFd4kwNlyXq169-6CoOE4nuHyTsmGaFeJgzuhj3grRboJKg9RapKov2_FJ1E3BCL0oZ7UNzF0pgwwhVC6VOVJYQ%253D%2540proton.me%253E.html">[BUG] NFSv4.2: futimens() returns success without sending SETATTR</a></li>
+<li><a href="thread/%253C356736aa-25d8-4b79-a50f-33b4e7035856%2540huawei.com%253E.html">Re: nfsd: fix memory overflow for haddr</a></li>
+<li><a href="thread/%253Ca0df2e1c-27fe-44cd-9a97-f04134f029f5%2540huawei.com%253E.html">Re: gssd: fix memory leak in gssd_free_client</a></li>
+<li><a href="thread/%253Cab25204c-5a53-42e1-ab3a-c4f704ebc929%2540web.de%253E.html">Re: [PATCH] nfsd: Use seq_putc() in seq_quote_mem()</a></li>
+<li><a href="thread/%253CSA1PR06MB1135309B2E478CE0323EF04BCE1FF2%2540SA1PR06MB11353.namprd06.prod.outlook.com%253E.html">Re: NFS mount option rdirplus</a></li>
+</ul>
+  </main>
+</body>
+</html>
