@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Flexfiles decode hardening for LAYOUTGET and GETDEVICEINFO</title>
+  <meta name="description" content="This week Junrui Luo posted a five-patch v1 series that hardens the NFSv4 flexfiles layout driver against malformed metadata-server replies. The work is a bug-fix series, not a protocol change or a new feature: every patch closes a…">
+  <meta property="og:title" content="Flexfiles decode hardening for LAYOUTGET and GETDEVICEINFO">
+  <meta property="og:description" content="This week Junrui Luo posted a five-patch v1 series that hardens the NFSv4 flexfiles layout driver against malformed metadata-server replies. The work is a bug-fix series, not a protocol change or a new feature: every patch closes a…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-06T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Flexfiles decode hardening for LAYOUTGET and GETDEVICEINFO">
+  <meta name="twitter:description" content="This week Junrui Luo posted a five-patch v1 series that hardens the NFSv4 flexfiles layout driver against malformed metadata-server replies. The work is a bug-fix series, not a protocol change or a new feature: every patch closes a…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-06</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Flexfiles decode hardening for LAYOUTGET and GETDEVICEINFO</h1>
+<h2>Summary</h2>
+<p>This week Junrui Luo posted a five-patch v1 series that hardens the NFSv4 flexfiles layout driver against malformed metadata-server replies. The work is a <strong>bug-fix</strong> series, not a protocol change or a new feature: every patch closes a decode-path hole in <code>LAYOUTGET</code> or <code>GETDEVICEINFO</code> that a hostile or buggy MDS can trigger on the client. There were no replies in-window; the series landed on 4 August and still awaits review.</p>
+<p>Luo framed the set as independent, stable-bound client fixes:</p>
+<blockquote>
+<p>"All five patches fix bugs the flexfiles layout driver hits while decoding a reply body from the metadata server."</p>
+<p>"The five are independent of each other and can be applied in any order."</p>
+</blockquote>
+<p><a href="https://lore.kernel.org/linux-nfs/20260804-nfs-fixes-v1-0-1544df970e7c@outlook.com/">The cover letter</a> splits the series along the two XDR decode paths: patches 1–3 sit on GETDEVICEINFO (<code>nfs4_ff_alloc_deviceid_node()</code> / <code>nfs4_decode_mp_ds_addr()</code>), patches 4–5 on LAYOUTGET (<code>ff_layout_alloc_lseg()</code>). Yuhao Jiang is credited as reporter on every patch; four of the five carry <code>Cc: stable@vger.kernel.org</code>.</p>
+<h2>GETDEVICEINFO: unbounded loops, a netid leak, and a stack-port leak</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260804-nfs-fixes-v1-1-1544df970e7c@outlook.com/">Patch 1</a> bounds the multipath address count taken off the wire in <code>nfs4_ff_alloc_deviceid_node()</code>. <code>mp_count</code> is used as the loop bound for <code>nfs4_decode_mp_ds_addr()</code> with no upper cap, even though <code>nfs4_get_device_info()</code> only bounds <code>pdev-&gt;pglen</code>. Once the XDR stream is exhausted, <code>nfs4_decode_mp_ds_addr()</code> returns NULL without consuming a byte, so every remaining iteration re-fails at the same offset. Luo’s diagnosis is blunt:</p>
+<blockquote>
+<p>"A server advertising 0xffffffff addresses in a body that holds none of them spins the loop for roughly 2^32 iterations with no rescheduling point, potentially tripping the soft lockup watchdog and the RCU stall detector on non-preemptible kernels. The list_empty(&amp;dsaddrs) check below the loop only runs once the loop has finished."</p>
+</blockquote>
+<p>The fix rejects implausible counts up front, matching the existing <code>mirror_array_cnt</code> / <code>dss_count</code> checks in <code>ff_layout_alloc_lseg()</code>. The bound is introduced as a new constant in <code>flexfilelayout.h</code>. Fixes tag: <code>d67ae825a59d</code> ("pnfs/flexfiles: Add the FlexFile Layout Driver").</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260804-nfs-fixes-v1-2-1544df970e7c@outlook.com/">Patch 2</a> is a resource leak, not a DoS. <code>nfs4_decode_mp_ds_addr()</code> allocates <code>r_netid</code> and hands it to the returned <code>nfs4_pnfs_ds_addr</code>, but both drain loops in <code>nfs4_ff_alloc_deviceid_node()</code> free only <code>da_remotestr</code> and the <code>da</code> itself. Luo notes two call sites:</p>
+<blockquote>
+<p>"The success-path loop runs when nfs4_pnfs_ds_add() finds an equivalent data server already cached and leaves the caller's list intact; the out_err_drain_dsaddrs loop runs on every late failure in the function."</p>
+<p>"da_remotestr and da_netid are the only heap pointers in the structure, so free both, as nfs4_pnfs_ds_addr_free() does."</p>
+</blockquote>
+<p>This is the only patch in the series without a stable Cc. Fixes tag: <code>4be78d26810b</code> ("NFSv4/pNFS: Store the transport type in struct nfs4_pnfs_ds_addr").</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260804-nfs-fixes-v1-3-1544df970e7c@outlook.com/">Patch 3</a> is the most security-flavoured of the GETDEVICEINFO trio, and it lives in shared pNFS code (<code>fs/nfs/pnfs_nfs.c</code>) rather than the flexfiles driver. <code>nfs4_decode_mp_ds_addr()</code> splits <code>r_addr</code> with two <code>strrchr()</code> passes; <code>rpc_pton()</code> validates the address half with an explicit length and never looks at the port octets. The port is converted with <code>sscanf(portstr, "%d-%d", &amp;tmp[0], &amp;tmp[1])</code> and the return value is discarded. <code>tmp[]</code> is uninitialised, so an <code>r_addr</code> such as <code>"192.168.1.1.x.y"</code> leaves both elements unwritten:</p>
+<blockquote>
+<p>"The stale stack contents then become the destination port of the data server connection and are rendered into da_remotestr, potentially leaking client stack memory to the metadata server."</p>
+</blockquote>
+<p>The fix requires both conversions to succeed and otherwise takes the existing <code>out_free_da</code> path, matching <code>rpc_uaddr2sockaddr()</code>. Fixes tag: <code>16b374ca439f</code> ("NFSv4.1: pnfs: filelayout: add driver's LAYOUTGET and GETDEVICEINFO infrastructure") — so this is older than flexfiles itself and applies to any layout driver that uses the shared multipath decoder.</p>
+<h2>LAYOUTGET: allocator WARN and a client panic on stripe_unit</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260804-nfs-fixes-v1-4-1544df970e7c@outlook.com/">Patch 4</a> closes the remaining unbounded count in <code>ff_layout_alloc_lseg()</code>. <code>fh_count</code> is decoded from the flexfiles LAYOUTGET body and passed straight to <code>kzalloc_objs()</code> to size <code>dss_info-&gt;fh_versions</code>. Commit <code>2c6bb3c40bc2</code> already rejected a zero count, but unlike neighbouring <code>mirror_array_cnt</code> and <code>dss_count</code> the value had no upper bound:</p>
+<blockquote>
+<p>"sizeof(struct nfs_fh) is 130, so an fh_count of 32264 or more pushes get_order() past MAX_PAGE_ORDER and trips the page allocator's WARN_ON_ONCE_GFP()."</p>
+</blockquote>
+<p>Luo rejects implausible counts up front, matching both the local mirror/dss checks and <code>filelayout_decode_layout()</code>’s handling of the equivalent <code>num_fh</code> field. A new header constant carries the cap. Fixes tag again: <code>d67ae825a59d</code>.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260804-nfs-fixes-v1-5-1544df970e7c@outlook.com/">Patch 5</a> is the most severe of the five: a client panic on first I/O. <code>ff_layout_alloc_lseg()</code> decodes <code>stripe_unit</code> as a u64 and only rejects it when <code>dss_count &gt; 1 &amp;&amp; stripe_unit == 0</code>. Every consumer then divides by only the low 32 bits. <code>ff_layout_pg_test()</code> narrows explicitly to <code>u32</code>; <code>nfs4_ff_layout_calc_dss_id()</code> passes the u64 to <code>do_div()</code>, which narrows the divisor itself. Luo’s conclusion:</p>
+<blockquote>
+<p>"A server-supplied non-zero multiple of 2^32 such as 0x100000000 therefore passes the check and reaches both dividers as a zero divisor, so the first read or write through the layout takes a divide error and panics the client. The same narrowing silently turns any other value above U32_MAX into an unrelated stripe size."</p>
+<p>"Values that do not fit in 32 bits are not representable by the arithmetic this driver performs on stripe_unit, so reject them at decode time rather than truncating them."</p>
+</blockquote>
+<p>Fixes tag: <code>20b1d75fb840</code> ("NFSv4/flexfiles: Add support for striped layouts").</p>
+<h2>Status this week</h2>
+<p>The series is a clean, small (22 insertions / 3 deletions across four files) client-side hardening drop against base commit <code>075b74841bd0065a3bda3440873c747938e69b68</code>. No Acked-by, Reviewed-by, or maintainer comment landed before the week closed. The practical takeaway for NFS client development is that flexfiles still trusts several on-the-wire counts and a 64-bit stripe unit that the rest of the driver cannot actually use: an MDS can stall the client in GETDEVICEINFO, leak <code>da_netid</code>, leak stack into <code>da_remotestr</code> and the DS port, trip the page allocator on LAYOUTGET, or panic the client on the first striped I/O. Four of the five patches are marked for stable; patch 2 (the netid leak) is not.</p>
+<p>Until review arrives, the series stands as posted: five independent decode-path bug fixes for the flexfiles client, with the shared pNFS multipath decoder (patch 3) and the stripe-unit divide-by-zero (patch 5) the two that reach beyond flexfiles-only code or beyond a mere WARN.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260804-nfs-fixes-v1-4-1544df970e7c@outlook.com/">2026-08-04 Junrui Luo via B4 Relay <a href="mailto:devnull+moonafterrain.outlook.com@kernel.org">devnull+moonafterrain.outlook.com@kernel.org</a> — [PATCH 4/5] NFSv4/flexfiles: bound the filehandle version count</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260804-nfs-fixes-v1-3-1544df970e7c@outlook.com/">2026-08-04 Junrui Luo via B4 Relay <a href="mailto:devnull+moonafterrain.outlook.com@kernel.org">devnull+moonafterrain.outlook.com@kernel.org</a> — [PATCH 3/5] NFSv4/pNFS: check the sscanf return in nfs4_decode_mp_ds_addr</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260804-nfs-fixes-v1-1-1544df970e7c@outlook.com/">2026-08-04 Junrui Luo via B4 Relay <a href="mailto:devnull+moonafterrain.outlook.com@kernel.org">devnull+moonafterrain.outlook.com@kernel.org</a> — [PATCH 1/5] NFSv4/flexfiles: bound the multipath address count</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260804-nfs-fixes-v1-0-1544df970e7c@outlook.com/">2026-08-04 Junrui Luo via B4 Relay <a href="mailto:devnull+moonafterrain.outlook.com@kernel.org">devnull+moonafterrain.outlook.com@kernel.org</a> — [PATCH 0/5] NFSv4/flexfiles: harden LAYOUTGET and GETDEVICEINFO decode</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260804-nfs-fixes-v1-5-1544df970e7c@outlook.com/">2026-08-04 Junrui Luo via B4 Relay <a href="mailto:devnull+moonafterrain.outlook.com@kernel.org">devnull+moonafterrain.outlook.com@kernel.org</a> — [PATCH 5/5] NFSv4/flexfiles: bound stripe_unit to 32 bits</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260804-nfs-fixes-v1-2-1544df970e7c@outlook.com/">2026-08-04 Junrui Luo via B4 Relay <a href="mailto:devnull+moonafterrain.outlook.com@kernel.org">devnull+moonafterrain.outlook.com@kernel.org</a> — [PATCH 2/5] NFSv4/flexfiles: fix da_netid leak in nfs4_ff_alloc_deviceid_node()</a></li>
+</ul>
+  </main>
+</body>
+</html>
