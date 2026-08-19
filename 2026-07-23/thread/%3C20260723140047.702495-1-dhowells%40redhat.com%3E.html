@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VFS foreign-UID hooks unmask AFS sticky-dir O_CREAT</title>
+  <meta name="description" content="David Howells posted [PATCH v2 0/2] this week, a bug-fix series with a new VFS inode-op API, aimed at Al Viro and Christian Brauner. The VFS currently assumes it can compare inode-&gt;i_uid to another inode’s i_uid or to current_fsuid().…">
+  <meta property="og:title" content="VFS foreign-UID hooks unmask AFS sticky-dir O_CREAT">
+  <meta property="og:description" content="David Howells posted [PATCH v2 0/2] this week, a bug-fix series with a new VFS inode-op API, aimed at Al Viro and Christian Brauner. The VFS currently assumes it can compare inode-&gt;i_uid to another inode’s i_uid or to current_fsuid().…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-23T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="VFS foreign-UID hooks unmask AFS sticky-dir O_CREAT">
+  <meta name="twitter:description" content="David Howells posted [PATCH v2 0/2] this week, a bug-fix series with a new VFS inode-op API, aimed at Al Viro and Christian Brauner. The VFS currently assumes it can compare inode-&gt;i_uid to another inode’s i_uid or to current_fsuid().…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-23</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>VFS foreign-UID hooks unmask AFS sticky-dir O_CREAT</h1>
+<h2>Summary</h2>
+<h2>Summary</h2>
+<p>David Howells posted [PATCH v2 0/2] this week, a <strong>bug-fix series with a new VFS inode-op API</strong>, aimed at Al Viro and Christian Brauner. The VFS currently assumes it can compare <code>inode-&gt;i_uid</code> to another inode’s <code>i_uid</code> or to <code>current_fsuid()</code>. Network filesystems violate that in four ways at once: the IDs may live in a different number space, <code>current_fsuid()</code> may not be the subject of the RPC, the IDs may not be 32-bit, and some filesystems (CIFS without POSIX extensions) do not even have a UNIX integer UID. The immediate casualty is the write-to-sticky check, which makes <code>open(O_CREAT)</code> of an existing AFS file fail when it should succeed — a failure currently papered over by a 1992-vintage bash workaround that is about to disappear.</p>
+<p>This is not an NFS protocol change. NFS is in the blast radius only as a VFS consumer: the sticky-dir, lease, chown and inode-owner helpers that every network filesystem walks through are being rerouted through filesystem-overridable comparisons. kAFS is the first (and so far only) implementer; CIFS is named as the next obvious candidate. There is no Ack or Review-by from VFS maintainers in-window. Chet Ramey, CCed because of the bash side, sent a signed MIME reply with no readable body.</p>
+<h2>The VFS problem, as Howells frames it</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260723140047.702495-1-dhowells@redhat.com/">In the cover letter</a> Howells defines “foreign” IDs as ones that “do not belong in the same number space as the system's user IDs.” AFS is the running example: a public cell can be mounted by a client whose local UIDs collide with, or cannot even represent, the server’s 64-bit AuriStor YFS IDs. Worse, kAFS authenticates with a token in a key, so ownership of a file is a property of that token, not of <code>current_fsuid()</code>:</p>
+<blockquote>
+<p>"Further, kAFS uses a key containing an authentication token to specify the subject doing an RPC operation to the server - and, as such, this needs to be used instead of current_fsuid() in determining whether the current user has ownership rights over a file."</p>
+</blockquote>
+<p>CIFS is called out for a different failure mode — identifiers that are not integers at all. USB drives and cdroms get a mention as local filesystems that can also ship foreign IDs.</p>
+<p>The user-visible bug is <code>may_create_in_sticky()</code>. Commit <code>30aba6656f61</code> (“namei: allow restricted O_CREAT of FIFOs and regular files”) refuses <code>O_CREAT</code> on an existing FIFO or regular file in a world-writable sticky directory unless the caller owns the file or the file’s owner matches the directory’s. Those comparisons are <code>i_uid</code> vs <code>current_fsuid()</code> / <code>i_uid</code> vs <code>i_uid</code>. On AFS they are meaningless, so a perfectly legal <code>echo foo &gt;&gt;file</code> in a sticky AFS directory fails with <code>EACCES</code>.</p>
+<p>Bash has been hiding that since version 1.11 (January 1992). <code>redir_open()</code> retries <code>open()</code> without <code>O_CREAT</code> if the first attempt returned <code>EACCES</code> and bash was built with AFS workarounds. That fallback was written against an IBM AFS 3.1 cache-manager/server bug that preferred <code>EACCES</code> to <code>EEXIST</code>; every IBM-derived AFS server still does. As an unintended side effect it also punches a hole in the Linux sticky-dir protection. Howells notes the workaround “is going to be removed,” citing Chet Ramey’s bash-5.3-rc1 <code>redir.c</code>, so the kernel has to stop lying about ownership before userspace stops covering for it.</p>
+<h2>Patch 1: inode ops so the filesystem owns the comparison</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260723140047.702495-2-dhowells@redhat.com/">vfs: Allow filesystems with foreign owner IDs to override UID checks</a> adds three helpers and two optional inode operations, gated by a new <code>IOP_OWNERSHIP_OVERRIDE</code> flag on <code>i_opflags</code> (the v2-only change; v1 walked the ops table without a fast flag). Defaults preserve today’s <code>i_uid</code> comparisons, so local filesystems and NFS (which maps into the system ID space) keep current behaviour unless they opt in.</p>
+<p>The three helpers:</p>
+<ol>
+<li>
+<p><code>vfs_inode_is_owned_by_me()</code> — default <code>i_uid</code> vs <code>current_fsuid()</code> with idmapping. Override:</p>
+<p><code>int (*is_owned_by_me)(struct mnt_idmap *idmap, struct inode *inode);</code></p>
+<p>Return 0 if owned, 1 if not, or an error on lookup failure. The filesystem may identify the subject by something other than fsuid (an AFS token, a CIFS SID, …).</p>
+</li>
+<li>
+<p><code>vfs_inodes_have_same_owner()</code> — default <code>i_uid</code> vs <code>i_uid</code>. Override:</p>
+<p><code>int (*have_same_owner)(struct mnt_idmap *idmap, struct inode *inode1, struct inode *inode2);</code></p>
+</li>
+<li>
+<p><code>vfs_inode_and_dir_have_same_owner()</code> — same as (2), but the second inode is the parent directory taken from a <code>nameidata</code>.</p>
+</li>
+</ol>
+<p>Call sites converted this round:</p>
+<ul>
+<li><code>chown_ok()</code> / <code>chgrp_ok()</code> — Howells flags that these may still need to defer <em>all</em> interpretation of the new UID/GID to the netfs, because <code>chown(2)</code> cannot even express a 64-bit YFS ID or a CIFS GUID. <code>-&gt;setattr()</code> still gets a chance to reject.</li>
+<li><code>coredump_file()</code> — “the check that's there might be sufficient.”</li>
+<li><code>inode_owner_or_capable()</code> — namespace mapping “probably could be used.”</li>
+<li><code>vfs_setlease()</code> — “Actually, it should query if leasing is permitted.” AFS has a lock-permission ACL bit, but the server already checks it on the RPC, so Howells leaves a filesystem permission hook for later.</li>
+<li><code>may_follow_link()</code>, <code>may_create_in_sticky()</code>, <code>__check_sticky()</code>, <code>may_dedupe_file()</code>.</li>
+</ul>
+<p>Left alone, with rationale:</p>
+<ul>
+<li><code>acl_permission_check()</code> / <code>posix_acl_permission()</code> — only used by <code>generic_permission()</code>, which a filesystem with <code>-&gt;permission()</code> already overrides. AFS evaluates its own ACLs in <code>-&gt;permission()</code> and on the server.</li>
+<li>IMA policy ops — “I'm not sure what the best way to deal with this is.”</li>
+</ul>
+<p><code>__check_sticky()</code> is the AFS-shaped special case. Calling <code>vfs_inode_is_owned_by_me()</code> on a directory does not work for kAFS (the ADMINISTER bit is not a directory-ownership signal), so the helper falls back to <code>vfs_inodes_have_same_owner()</code> against the parent, matching <code>may_create_in_sticky()</code>. Howells also asks, unanswered this week, whether <code>may_create_in_sticky()</code> should return OK immediately if the open that is in flight created the file being checked.</p>
+<p>He is candid that wrapping the comparisons is not free: idmapping may run an extra time, “though this is only done in three places, all to do with world-writable sticky dir checks.” Documentation is updated in <code>Documentation/filesystems/vfs.rst</code>.</p>
+<h2>Patch 2: kAFS implements the hooks, unblocking bash</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260723140047.702495-3-dhowells@redhat.com/">afs, bash: Fix open(O_CREAT) on an extant AFS file in a sticky dir</a> is the actual <strong>bug fix</strong>, tagged <code>Fixes: 30aba6656f61</code>. kAFS grows both inode ops in <code>fs/afs/security.c</code> (46 lines) and wires them from dir/file/inode:</p>
+<ul>
+<li><code>-&gt;is_owned_by_me()</code> does <strong>not</strong> compare <code>i_uid</code> to <code>current_fsuid()</code>. It looks at the access rights from <code>FS.FetchStatus</code> (and friends) and treats the file as owned if the server set the <code>ADMINISTER</code> bit for the current key. That check “doesn't work for directories, but none of the ops should require that.” Anonymous accesses never see <code>ADMINISTER</code>, so they are never treated as owning an anonymously-owned file.</li>
+<li><code>-&gt;have_same_owner()</code> compares the 64-bit AFS owner IDs from <code>FS.FetchStatus</code> — IDs that will not fit in a <code>kuid_t</code> on AuriStor YFS. Anonymously-owned files match anonymously-owned parents, but an anonymously-owned directory cannot have the sticky bit set, so the sticky-dir path cannot be spoofed that way.</li>
+</ul>
+<p>The test Howells wants: create a sticky AFS directory (token required), create a file in it, <code>strace bash</code> doing <code>echo foo &gt;&gt;file</code>. Success is a single <code>open(O_CREAT)</code> that returns 0; failure (today, without the bash fallback) is <code>EACCES</code> followed by a retry without <code>O_CREAT</code>.</p>
+<p>Reported-by is Etienne Champetier; CCs include Marc Dionne and Jeffrey Altman (AuriStor), Cheyenne Wills, Steve French, and the AFS/CIFS/fsdevel lists. The branch is <code>afs-sticky-2</code> in Howells’ linux-fs.git.</p>
+<h2>What this means for the NFS client</h2>
+<p>NFS is not converted. The default helpers still do <code>i_uid</code> vs <code>current_fsuid()</code> with mount idmapping, which is the model NFSv3/v4 already use: the client maps server IDs into the local (or idmapped) namespace before they land in <code>inode-&gt;i_uid</code>. So the sticky-dir, lease and chown paths keep their current NFS behaviour unless someone later implements the ops.</p>
+<p>That is also the limit of the claim. Howells’ four violated assumptions are AFS/CIFS-shaped. NFS <em>does</em> treat <code>current_fsuid()</code> as the subject (RPC credentials are derived from it, plus krb5/machine creds), and NFS IDs <em>are</em> 32-bit once mapped. The series still matters to NFS client developers for three reasons:</p>
+<ol>
+<li>Every <code>open(O_CREAT)</code> in a sticky directory, every <code>inode_owner_or_capable()</code>, every <code>vfs_setlease()</code> now goes through the new helpers. A regression in the default path is an NFS regression.</li>
+<li>CIFS is the named follow-on, and CIFS and NFS share VFS sticky/lease code. If CIFS later implements <code>is_owned_by_me</code> with a SID/GUID, the helper contract (0 = owned, 1 = not, negative = lookup error) becomes ABI for two network filesystems.</li>
+<li><code>chown</code> remains unfixed for any netfs whose IDs do not fit <code>uid_t</code>. Howells is explicit:</li>
+</ol>
+<blockquote>
+<p>"Note that chown may also need modifying in some way - but that can't necessarily supply the information required (for instance, an AuriStor YFS ID is 64 bits, but chown can only handle a 32-bit integer; CIFS might use a GUID)."</p>
+</blockquote>
+<p>NFS idmapping already collapses that to 32 bits, so NFS is not blocked; AFS and CIFS still are.</p>
+<h2>Evolution this week, and what did not happen</h2>
+<p>v1 of this pair dates to 2025-07 / 2025-10 (same subject, same two patches). v2’s changelog is two bullets: rebase on v7.2-rc4, and the <code>IOP_OWNERSHIP_OVERRIDE</code> fast-path flag. No design change. There is no v3 in this window (a v3 appears the following week, outside scope).</p>
+<p><a href="https://lore.kernel.org/linux-nfs/e7575f17-9546-452c-ad08-d908adeb72e5@case.edu/">Chet Ramey’s reply</a> is an OpenPGP/MIME signed message with no extractable text in the archive — a signature wrapper, not a review. Al Viro, Christian Brauner and Steve French are silent. The series is posted, not merged, and Howells is still asking the VFS maintainers to take the inode-op API so the AFS sticky-dir fix can land before bash drops <code>redir_open()</code>’s <code>~O_CREAT</code> fallback.</p>
+<p><strong>Status this week:</strong> bug-fix series posted to linux-nfs / linux-fsdevel / linux-cifs / linux-afs; no Ack; kAFS is the only filesystem implementing the new ops; NFS behaviour is intended to be unchanged via the default <code>i_uid</code> path.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260723140047.702495-1-dhowells@redhat.com/">2026-07-23 David Howells — [PATCH v2 0/2] vfs, afs, bash: Fix miscomparison of foreign user IDs in the VFS</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260723140047.702495-2-dhowells@redhat.com/">2026-07-23 David Howells — [PATCH v2 1/2] vfs: Allow filesystems with foreign owner IDs to override UID checks</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260723140047.702495-3-dhowells@redhat.com/">2026-07-23 David Howells — [PATCH v2 2/2] afs, bash: Fix open(O_CREAT) on an extant AFS file in a sticky dir</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/e7575f17-9546-452c-ad08-d908adeb72e5@case.edu/">2026-07-23 Chet Ramey — Re: [PATCH v2 2/2] afs, bash: Fix open(O_CREAT) on an extant AFS file in a sticky dir</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260723140047.702495-1-dhowells@redhat.com/">2026-07-23 David Howells <a href="mailto:dhowells@redhat.com">dhowells@redhat.com</a> — [PATCH v2 0/2] vfs, afs, bash: Fix miscomparison of foreign user IDs in the VFS</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260723140047.702495-2-dhowells@redhat.com/">2026-07-23 David Howells <a href="mailto:dhowells@redhat.com">dhowells@redhat.com</a> — [PATCH v2 1/2] vfs: Allow filesystems with foreign owner IDs to override UID checks</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260723140047.702495-3-dhowells@redhat.com/">2026-07-23 David Howells <a href="mailto:dhowells@redhat.com">dhowells@redhat.com</a> — [PATCH v2 2/2] afs, bash: Fix open(O_CREAT) on an extant AFS file in a sticky dir</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/e7575f17-9546-452c-ad08-d908adeb72e5@case.edu/">2026-07-23 Chet Ramey <a href="mailto:chet.ramey@case.edu">chet.ramey@case.edu</a> — Re: [PATCH v2 2/2] afs, bash: Fix open(O_CREAT) on an extant AFS file in a sticky dir</a></li>
+</ul>
+  </main>
+</body>
+</html>

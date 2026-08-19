@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Confine inter-server copy to nfs_common after a trail of UAFs</title>
+  <meta name="description" content="Week of 2026-07-17 to 2026-07-23 | Thread: [PATCH 0/4] Confine the inter-server copy interface to fs/nfs_common">
+  <meta property="og:title" content="Confine inter-server copy to nfs_common after a trail of UAFs">
+  <meta property="og:description" content="Week of 2026-07-17 to 2026-07-23 | Thread: [PATCH 0/4] Confine the inter-server copy interface to fs/nfs_common">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-23T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Confine inter-server copy to nfs_common after a trail of UAFs">
+  <meta name="twitter:description" content="Week of 2026-07-17 to 2026-07-23 | Thread: [PATCH 0/4] Confine the inter-server copy interface to fs/nfs_common">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-23</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Confine inter-server copy to nfs_common after a trail of UAFs</h1>
+<h2>Summary</h2>
+<h1>Confine Inter-Server Copy to nfs_common After a Trail of Client UAFs</h1>
+<p><strong>Week of 2026-07-17 to 2026-07-23</strong> | Thread: [PATCH 0/4] Confine the inter-server copy interface to fs/nfs_common</p>
+<h2>Overview</h2>
+<p>This thread is a <strong>structural cleanup and hardening series</strong>, not a live-bug fix and not a protocol change. On 21 July, <a href="https://lore.kernel.org/linux-nfs/20260721162306.894558-1-cel@kernel.org/">Chuck Lever</a> posted four patches that pull the NFSv4.2 inter-server copy (SSC) broker fully into <code>fs/nfs_common</code>, delete client-side registration that has been dead since an earlier use-after-free fix, and replace an implicit “the caller’s mount pins nfsv4” contract with RCU plus <code>try_module_get()</code> owned by the broker itself.</p>
+<p>The series is aimed squarely at the NFS <strong>client</strong> object that has been the common factor in a cluster of use-after-free and reference-leak repairs: the source mount that the client creates and opens while NFSD decides when it may be torn down. Lever is explicit that runtime copy behavior is meant to stay the same:</p>
+<blockquote>
+<p>"None of this fixes a live bug, and the source mount's lifetime still spans both modules. What changes is that the broker no longer relies on rules its callers enforce. Inter-server copy behavior is meant to be unchanged throughout."</p>
+</blockquote>
+<p>There were no replies in-window. Olga Kornievskaia and Dai Ngo are Cced on every patch as the historical SSC stakeholders.</p>
+<h2>Why the client keeps getting hurt</h2>
+<p>The cover letter <a href="https://lore.kernel.org/linux-nfs/20260721162306.894558-1-cel@kernel.org/">frames the series</a> as the architectural follow-through to three already-merged client/server lifetime bugs — <code>75333d48f922</code>, <code>34e8f9ec4c9a</code>, and <code>d2c343c51caf</code> — plus three further repairs of the bookkeeping added by <code>f4e44b393389</code>:</p>
+<blockquote>
+<p>"Inter-server copy has drawn a steady trail of use-after-free and reference-leak fixes: 75333d48f922, 34e8f9ec4c9a, and d2c343c51caf among them. They cluster on one object, the source mount that the NFS client creates and opens while NFSD decides when it may be torn down. The bookkeeping that tracks it, added by f4e44b393389, has needed three follow-on repairs of its own. Splitting an object's lifetime across two modules that are forbidden to call each other directly is what keeps producing these bugs."</p>
+</blockquote>
+<p>The most recent of those, <code>75333d48f922</code> ("NFSD: fix use-after-free in <code>__nfs42_ssc_open()</code>"), already narrowed the split: NFSD stopped reaching back through the broker to deactivate the source superblock, and post-copy cleanup became the laundromat’s job alone. What it did <strong>not</strong> do was retract the client registration path it had just stopped using. That leftover machinery is the starting point of this series.</p>
+<p>A second, still-live contract is what patch 3 attacks. Today the client ops table can be read unsynchronized only because:</p>
+<blockquote>
+<p>"an inter-server copy holds an active vers=4.2 mount of the source, that mount pins the nfsv4 module, and unregister runs only at module exit."</p>
+</blockquote>
+<p>Lever wants that argument out of the NFS client and into the broker, so safety no longer “depends on how a caller in another subsystem manages mounts.”</p>
+<h2>Patch 1/4: delete the unused client ops table</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260721162306.894558-2-cel@kernel.org/">Patch 1</a> is the client-visible cleanup. Once <code>nfsd4_interssc_disconnect()</code> went away, nothing called <code>nfs_do_sb_deactive()</code> or the <code>nfs_ssc_client_ops</code> table. The patch removes:</p>
+<ul>
+<li><code>nfs_do_sb_deactive()</code> and the SSC registration hooks from <code>fs/nfs/super.c</code></li>
+<li><code>struct nfs_ssc_client_ops</code>, <code>nfs_ssc_register()</code>, and <code>nfs_ssc_unregister()</code> from <code>fs/nfs_common/nfs_ssc.c</code> and <code>include/linux/nfs_ssc.h</code></li>
+<li>the leftover include in <code>fs/nfsd/nfs4proc.c</code></li>
+</ul>
+<p>Net: 89 lines deleted, no functional change. This is the first time the client stops advertising an ops vector whose only remaining consumer was a UAF that had already been closed by moving teardown to the laundromat.</p>
+<h2>Patch 2/4: hide the client’s <code>ssc_open</code> behind the broker</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260721162306.894558-3-cel@kernel.org/">Patch 2</a> hoists the call into the client’s <code>ssc_open</code> method out of <code>fs/nfsd/nfs4proc.c</code> and into <code>fs/nfs_common/nfs_ssc.c</code>. The new entry points are named <code>nfsd42_ssc_open()</code> / <code>nfsd42_ssc_close()</code> because they are meant to be invoked only by NFSD. Lever’s stated goal is client-header hygiene as much as server cleanup:</p>
+<blockquote>
+<p>"The infrastructure and details for calling the client's ssc_open method can be hidden in nfs_ssc.c. This reduces the SSC footprint in fs/nfsd/nfs4proc.c, a step toward removing that file's dependency on &lt;linux/nfs_fs.h&gt;, which indirectly includes &lt;uapi/linux/nfs.h&gt;."</p>
+</blockquote>
+<p>That last point is the client-side leak in the other direction: <code>nfs4proc.c</code> has been parsing NFS client types (and therefore <code>&lt;uapi/linux/nfs.h&gt;</code>) just to invoke one method on a table the client registered. After this patch the server no longer needs to know how the client implements open.</p>
+<h2>Patch 3/4: RCU + module pin instead of “the mount keeps nfsv4 loaded”</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260721162306.894558-4-cel@kernel.org/">Patch 3</a> is the real hardening change, and the one that most directly touches NFS client module lifetime. <code>nfsd42_ssc_open()</code> and <code>nfsd42_ssc_close()</code> currently load <code>ssc_nfs4_ops</code> with no synchronization while <code>nfs42_ssc_register()</code> / <code>nfs42_ssc_unregister()</code> store it. Those unsynchronized loads are only safe because an in-flight copy holds a vers=4.2 source mount, that mount pins <code>nfsv4</code> via <code>nfs_client-&gt;cl_nfs_mod</code>, and unregister runs only at nfsv4 module exit.</p>
+<p>The new rule is local to the broker:</p>
+<ul>
+<li>Readers observe the pointer under RCU, so they see either a valid table or <code>NULL</code>.</li>
+<li><code>nfs42_ssc_unregister()</code> stores <code>NULL</code> and then <code>synchronize_rcu()</code>, so it cannot return while a reader still holds the pointer.</li>
+<li><code>sco_close()</code> does not sleep, so <code>nfsd42_ssc_close()</code> runs it entirely inside the RCU read-side section.</li>
+<li><code>__nfs42_ssc_open()</code> <strong>does</strong> sleep — it issues a GETATTR RPC to the source server and allocates with <code>GFP_KERNEL</code> — so it cannot run under <code>rcu_read_lock()</code>. The broker takes <code>try_module_get()</code> on the provider while still in the RCU section, drops the lock, invokes open, then <code>module_put()</code>. If the table is already gone, the copy fails with <code>-EIO</code>.</li>
+</ul>
+<p>Lever’s punchline for the client:</p>
+<blockquote>
+<p>"The reference keeps the provider mapped across the sleep without relying on the caller's mount."</p>
+</blockquote>
+<p><code>fs/nfs/nfs4file.c</code> gains a one-line include so the client’s remaining registration site still sees the (now RCU-aware) ops-table API. After this patch, unloading <code>nfsv4</code> no longer depends on “there cannot be an SSC open in flight because a mount is holding us.”</p>
+<h2>Patch 4/4: split the shared header so the client stops compiling the server</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260721162306.894558-5-cel@kernel.org/">Patch 4</a> is the textual remainder Lever promised in the cover letter. <code>include/linux/nfs_ssc.h</code> currently declares both sides’ interfaces, so each implementation parses the other’s types and inherits its includes — which is how <code>&lt;uapi/linux/nfs.h&gt;</code> reaches <code>nfs4proc.c</code>. The split:</p>
+<ul>
+<li>New <code>include/linux/nfsd_ssc.h</code> holds the server-side APIs and does <strong>not</strong> pull <code>uapi/linux/nfs.h</code> either directly or via the NFS client headers.</li>
+<li><code>struct nfsd4_ssc_umount_item</code> is private to nfsd and moves into <code>fs/nfsd/xdr4.h</code> next to its only consumers, rather than into the exported header.</li>
+<li><code>fs/nfsd/nfs4proc.c</code> now includes <code>&lt;linux/pagemap.h&gt;</code> directly for <code>filemap_check_wb_err()</code>, because that symbol used to arrive as a transitive gift from the client headers.</li>
+<li>Missing header guards and <code>struct file</code> / <code>struct vfsmount</code> forward declarations are added.</li>
+</ul>
+<p>The client-facing <code>nfs_ssc.h</code> shrinks to the ops-table types the nfsv4 module actually registers.</p>
+<h2>Conclusions and outlook</h2>
+<p>This is preventive architecture, not a regression fix. Lever is careful not to oversell it: the source mount’s lifetime still spans <code>nfs</code> and <code>nfsd</code>, and no in-tree copy path is supposed to change. What the series does change, from a client-development point of view, is:</p>
+<ol>
+<li><strong>Dead client API removal.</strong> The <code>nfs_ssc_client_ops</code> / <code>nfs_ssc_register()</code> / <code>nfs_do_sb_deactive()</code> path, left behind by the <code>__nfs42_ssc_open()</code> UAF fix, is gone from <code>fs/nfs/super.c</code>.</li>
+<li><strong>Module-lifetime ownership.</strong> The nfsv4 module is now pinned by the broker across a sleeping <code>ssc_open</code> (GETATTR + <code>GFP_KERNEL</code>), instead of by the implicit “the source mount’s <code>cl_nfs_mod</code> keeps us loaded” rule.</li>
+<li><strong>Header isolation.</strong> The client no longer has to export types into a header that NFSD compiles, and NFSD no longer compiles <code>&lt;uapi/linux/nfs.h&gt;</code> as a side effect of talking to the client.</li>
+</ol>
+<p>The series is a same-day posting with no review tags yet. Until Olga Kornievskaia, Dai Ngo, or a client maintainer weigh in, the open question is whether reviewers accept Lever’s claim that the remaining cross-module lifetime of the source mount is now a documentation problem rather than a locking one.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260721162306.894558-1-cel@kernel.org/">2026-07-21 Chuck Lever — [PATCH 0/4] Confine the inter-server copy interface to fs/nfs_common</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260721162306.894558-2-cel@kernel.org/">2026-07-21 Chuck Lever — [PATCH 1/4] nfs_common: Remove unused nfs_ssc_client_ops infrastructure</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260721162306.894558-3-cel@kernel.org/">2026-07-21 Chuck Lever — [PATCH 2/4] NFSD: Hoist nfs42_ssc_open() into fs/nfs_common/nfs_ssc.c</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260721162306.894558-4-cel@kernel.org/">2026-07-21 Chuck Lever — [PATCH 3/4] nfs_common: Synchronize access to the SSC client ops table</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260721162306.894558-5-cel@kernel.org/">2026-07-21 Chuck Lever — [PATCH 4/4] NFSD: Split linux/nfs_ssc.h</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260721162306.894558-1-cel@kernel.org/">2026-07-21 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 0/4] Confine the inter-server copy interface to fs/nfs_common</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260721162306.894558-3-cel@kernel.org/">2026-07-21 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 2/4] NFSD: Hoist nfs42_ssc_open() into fs/nfs_common/nfs_ssc.c</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260721162306.894558-2-cel@kernel.org/">2026-07-21 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 1/4] nfs_common: Remove unused nfs_ssc_client_ops infrastructure</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260721162306.894558-4-cel@kernel.org/">2026-07-21 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 3/4] nfs_common: Synchronize access to the SSC client ops table</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260721162306.894558-5-cel@kernel.org/">2026-07-21 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 4/4] NFSD: Split linux/nfs_ssc.h</a></li>
+</ul>
+  </main>
+</body>
+</html>

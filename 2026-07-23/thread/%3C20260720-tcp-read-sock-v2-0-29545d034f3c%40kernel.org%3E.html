@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>kTLS read_sock_rectype series lands for NFSD, NFS client next</title>
+  <meta name="description" content="Chuck Lever posted v2 of a six-patch net-next series that gives kernel read_sock consumers a first-class path for TLS control records. The work is a new kernel networking API plus a related kTLS bug fix, not a protocol change: it leaves…">
+  <meta property="og:title" content="kTLS read_sock_rectype series lands for NFSD, NFS client next">
+  <meta property="og:description" content="Chuck Lever posted v2 of a six-patch net-next series that gives kernel read_sock consumers a first-class path for TLS control records. The work is a new kernel networking API plus a related kTLS bug fix, not a protocol change: it leaves…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-23T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="kTLS read_sock_rectype series lands for NFSD, NFS client next">
+  <meta name="twitter:description" content="Chuck Lever posted v2 of a six-patch net-next series that gives kernel read_sock consumers a first-class path for TLS control records. The work is a new kernel networking API plus a related kTLS bug fix, not a protocol change: it leaves…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-23</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>kTLS read_sock_rectype series lands for NFSD, NFS client next</h1>
+<h2>Summary</h2>
+<p>Chuck Lever posted <a href="https://lore.kernel.org/linux-nfs/20260720-tcp-read-sock-v2-0-29545d034f3c@kernel.org/">v2 of a six-patch net-next series</a> that gives kernel <code>read_sock</code> consumers a first-class path for TLS control records. The work is a <strong>new kernel networking API</strong> plus a <strong>related kTLS bug fix</strong>, not a protocol change: it leaves the on-the-wire TLS/RPC framing alone and only changes how in-kernel TCP consumers (NFSD first, NFS client later) see Alerts and Handshake records once kTLS is active.</p>
+<h2>Why it matters for NFS</h2>
+<p>Today <code>tls_sw_read_sock()</code> rejects Alerts and Handshake records with <code>-EINVAL</code>. A consumer that actually needs those records falls back to <code>sock_recvmsg()</code> with ancillary buffers, which is why NFSD's svcsock still runs a MSG_CTRUNC recovery dance on every receive. Lever's cover letter is blunt about the security motivation:</p>
+<blockquote>
+<p>"The improvement is more than cosmetic. All of these consumers need to handle TLS Alert messages efficiently and securely (in particular, for KeyUpdate)."</p>
+</blockquote>
+<p>The first consumer converted in this series is NFSD's svcsock. The <strong>NFS client (<code>xprtsock</code>) is explicitly the next target</strong>, along with NVMe target and NVMe host. <a href="https://lore.kernel.org/linux-nfs/20260720-tcp-read-sock-v2-2-29545d034f3c@kernel.org/">Patch 2</a> lists all four subsystems as currently either falling back to <code>sock_recvmsg()</code> or lacking TLS alert handling entirely. That is the client-side bug the series is scaffolding: once kTLS is on, an NFS client using <code>read_sock</code> cannot see KeyUpdate or fatal Alerts without the new callback.</p>
+<p>v2 is a substantial redesign from the February v1 (<code>read_sock_cmsg</code>):</p>
+<ul>
+<li>The proto_ops method was renamed from <code>read_sock_cmsg</code> to <code>read_sock_rectype</code>.</li>
+<li>Non-data records now use a record-type actor, not RFC cmsg-style delivery.</li>
+<li>Consecutive no-data records are bounded so they cannot pin the socket lock (new patch 1).</li>
+<li>Selftests cover data/control interleaving (new patch 4).</li>
+</ul>
+<h2>The new API</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260720-tcp-read-sock-v2-2-29545d034f3c@kernel.org/">Patch 2</a> adds <code>read_sock_rectype</code> to <code>struct proto_ops</code>. The existing <code>read_sock</code> data path is left unchanged, so current consumers keep their old behavior. A new <code>sk_read_rectype_actor_t</code> callback extends the data actor with a <code>rectype</code> argument (for example <code>TLS_RECORD_TYPE_ALERT</code>). Lever is careful about the contract:</p>
+<blockquote>
+<p>"The new sk_read_rectype_actor_t callback does not share the data actor's byte-counting contract. It returns 0 to consume a record or a negative value to requeue it and stop delivery. The return is never a byte count."</p>
+</blockquote>
+<p><a href="https://lore.kernel.org/linux-nfs/20260720-tcp-read-sock-v2-3-29545d034f3c@kernel.org/">Patch 3</a> implements that method on the kTLS software receive path, so NFSD, the NFS client, and NVMe no longer have to detour through CMSG just to see a control record.</p>
+<p>Because <code>read_sock_rectype</code> has no userspace entry point, <a href="https://lore.kernel.org/linux-nfs/20260720-tcp-read-sock-v2-4-29545d034f3c@kernel.org/">patch 4</a> exercises the shared decryption and <code>rx_list</code> pipeline through recvmsg and splice instead. Seven new tests cover data-control-data, multiple distinct control types, peek-after-data, control-before-data, mixed types, and a trailing control record followed by EOF.</p>
+<h2>The no-data cap: bug fix hiding in a feature series</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260720-tcp-read-sock-v2-1-29545d034f3c@kernel.org/">Patch 1</a> is the important <strong>bug fix</strong>. An empty TLS 1.3 data record (and, once the rest of the series lands, a control record with no payload) leaves <code>tls_sw_read_sock()</code> looping without advancing the caller's read descriptor. A peer that streams such records can pin the socket lock and the kernel receive context indefinitely. The patch caps consecutive no-data records at <code>TLS_RX_NODATA_LIMIT</code>; the count resets on any record that delivers bytes. Returning 0 is treated as "no progress, re-poll," not EOF.</p>
+<p>Lever scoped the cap to <code>tls_sw_read_sock()</code> alone. Splice and recvmsg already return to the caller's context, reschedule, and drop the lock; a flood there only burns the caller's own scheduler time. <code>read_sock</code> consumers, by contrast, drive the loop from a work item or service thread that holds the socket lock across the whole call.</p>
+<p>That patch drew the week's real technical debate.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/b9d60674-1ba7-4f23-beee-4ddfffd4dda9@suse.de/">Hannes Reinecke</a> Reviewed-by'd it but flagged the presentation:</p>
+<blockquote>
+<p>"This is technically a fix, so it might be worthwhile sending it on its own."</p>
+</blockquote>
+<p><a href="https://lore.kernel.org/linux-nfs/909e0132-5c0c-4c0c-b8c5-b90b88ad0231@app.fastmail.com/">Lever initially pushed back</a>, arguing the issue "is not reachable until the subsequent patches in this series have been applied," so he had positioned it as a prerequisite rather than part of an earlier fixes series.</p>
+<p>kTLS maintainer <a href="https://lore.kernel.org/linux-nfs/amIj_DG7SuWx8MeY@krikkit/">Sabrina Dubroca disagreed</a>. She treated patch 1 as a follow-up to <code>3be28e2c9cd0</code> ("net/tls: Consume empty data records in tls_sw_read_sock()"):</p>
+<blockquote>
+<p>"Control records only become a problem after the rest of the series, but TLS 1.3 empty data records would get there with the current code, no?"</p>
+</blockquote>
+<p>She also asked whether a <strong>time-based limit</strong> (as <code>net_rx_action()</code> does) would be better than a packet count, and whether <code>tls_sw_read_sock()</code> already reschedules via <code>tls_rx_rec_wait()</code>, undercutting part of Lever's "only this path needs the cap" rationale.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/7a0f5521-3a44-4e8e-9a30-542b0ece448d@app.fastmail.com/">Lever then offered to change presentation strategy</a>: post the earlier kTLS fixes Dubroca had already suggested, together with 1/6 of this series, destined for <strong>net</strong>, and keep 2–6 for net-next. <a href="https://lore.kernel.org/linux-nfs/amKQGyH41zom7LGe@krikkit/">Dubroca agreed</a>:</p>
+<blockquote>
+<p>"That makes sense. 2..6/6 from this series can still be around for review (maybe with a [RFC] prefix if you resend the net-next patches before net gets merged into net-next, to help the maintainers by avoiding conflicts)."</p>
+</blockquote>
+<p>That is where the week ended: the no-data bound is now understood as a <strong>standalone kTLS fix for empty TLS 1.3 data records</strong>, to be split out to <code>net</code>, while the new API stays on net-next.</p>
+<h2>svcsock conversion (and what it previews for xprtsock)</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260720-tcp-read-sock-v2-5-29545d034f3c@kernel.org/">Patch 5</a> is the first real consumer. When the socket provides <code>read_sock_rectype</code> (now set by kTLS), <code>svc_tcp_recvfrom()</code> dispatches to <code>svc_tcp_recvfrom_readsock()</code>:</p>
+<ul>
+<li><code>svc_tcp_recv_actor()</code> parses the RPC record byte stream directly from skbs. Fragment header bytes fill <code>sk_marker</code>; body bytes go into <code>rq_pages</code> at <code>sk_datalen</code>. Completing the last fragment of an RPC message zeros <code>desc-&gt;count</code> and stops the loop.</li>
+<li><code>svc_tcp_rectype_actor()</code> handles non-data TLS records. Fatal alerts mark the transport for deferred close and stop the loop via <code>desc-&gt;count</code>. Every non-data record is consumed (return 0) so later data records remain deliverable.</li>
+</ul>
+<p>Plain TCP / non-kTLS sockets keep the old <code>sock_recvmsg()</code> path in patch 5 so the two implementations can be reviewed side by side. <a href="https://lore.kernel.org/linux-nfs/20260720-tcp-read-sock-v2-6-29545d034f3c@kernel.org/">Patch 6</a> then deletes that legacy path (~300 lines), on the grounds that plain TCP already provides <code>tcp_read_sock</code> in <code>proto_ops</code>. One <code>read_sock</code>-based receive path then covers all NFSD cases: <code>read_sock_rectype</code> under kTLS, <code>read_sock</code> otherwise.</p>
+<p>That svcsock conversion is the template the NFS client is expected to follow. xprtsock is not touched this week, but the cover letter and patch 2 both name it as a later series on the same mechanism. Until that lands, a kTLS-enabled NFS client still cannot see control records on the <code>read_sock</code> path.</p>
+<h2>Reviews and NVMe caveat</h2>
+<p>Reinecke <a href="https://lore.kernel.org/linux-nfs/4038dcf8-bab8-48d1-864d-8dc7c978dcc6@suse.de/">Reviewed-by'd patches 1–3</a>. On the new method name he only remarked, <a href="https://lore.kernel.org/linux-nfs/77756ade-5d55-4719-b9e6-7874bddd77c7@suse.de/">"Naming is a bit odd, but hey."</a> On the cover letter he was supportive but declined to rubber-stamp the SUNRPC half, and he cooled the NVMe "we need it" pitch:</p>
+<blockquote>
+<p>"I was tempted to say 'We need it', but meanwhile we found during spec review that the REPLACETLSPSK mechanism as defined in the spec is at odds with the TLS KeyUpdate. So while we (from the NVMe side) might be wanting to use it eventually, we first have to figure out how to interact sanely between the NVMe and TLS layer."</p>
+</blockquote>
+<p>He also said he did not feel qualified to review the NFS/SunRPC details. No Reviewed-by appeared this week on patches 4–6 (selftests and the svcsock conversion).</p>
+<h2>Status at week close</h2>
+<p>The series is <strong>under active review, not merged</strong>. Consensus at the end of the window:</p>
+<ul>
+<li>Treat <a href="https://lore.kernel.org/linux-nfs/20260720-tcp-read-sock-v2-1-29545d034f3c@kernel.org/">patch 1</a> as a <strong>kTLS bug fix</strong> for empty TLS 1.3 data records and send it (with earlier related fixes) to <code>net</code>.</li>
+<li>Keep patches 2–6 on net-next as the new <code>read_sock_rectype</code> feature, possibly marked RFC if they are resent before <code>net</code> merges into net-next.</li>
+<li>Open design questions remain on packet-count vs. time-based bounding and on whether <code>tls_rx_rec_wait()</code> already provides a reschedule point.</li>
+<li>NFSD svcsock is the first consumer; <strong>NFS client xprtsock conversion is planned but not in this series</strong>.</li>
+</ul>
+<p>That split is the practical takeaway for NFS client development this week: the infrastructure that will let xprtsock handle KeyUpdate and fatal Alerts without a CMSG fallback is on the table, but the lock-pinning fix needs to land first, and the client-side conversion itself is still a follow-up.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260720-tcp-read-sock-v2-0-29545d034f3c@kernel.org/">2026-07-20 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH net-next v2 0/6] Deliver TLS control records to kernel read_sock consumers</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260720-tcp-read-sock-v2-1-29545d034f3c@kernel.org/">2026-07-20 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH net-next v2 1/6] net/tls: Bound consecutive no-data records in tls_sw_read_sock()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260720-tcp-read-sock-v2-2-29545d034f3c@kernel.org/">2026-07-20 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH net-next v2 2/6] net: Introduce read_sock_rectype proto_ops for control record delivery</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260720-tcp-read-sock-v2-3-29545d034f3c@kernel.org/">2026-07-20 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH net-next v2 3/6] tls: Implement read_sock_rectype for kTLS software path</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260720-tcp-read-sock-v2-4-29545d034f3c@kernel.org/">2026-07-20 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH net-next v2 4/6] selftests/tls: Add tests for data/control record interleaving</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260720-tcp-read-sock-v2-5-29545d034f3c@kernel.org/">2026-07-20 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH net-next v2 5/6] SUNRPC: Use read_sock_rectype for svcsock TCP receives</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260720-tcp-read-sock-v2-6-29545d034f3c@kernel.org/">2026-07-20 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH net-next v2 6/6] SUNRPC: Remove sock_recvmsg path from svcsock TCP receives</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/b9d60674-1ba7-4f23-beee-4ddfffd4dda9@suse.de/">2026-07-23 Hannes Reinecke <a href="mailto:hare@suse.de">hare@suse.de</a> — Re: [PATCH net-next v2 1/6] net/tls: Bound consecutive no-data records in tls_sw_read_sock()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/77756ade-5d55-4719-b9e6-7874bddd77c7@suse.de/">2026-07-23 Hannes Reinecke <a href="mailto:hare@suse.de">hare@suse.de</a> — Re: [PATCH net-next v2 2/6] net: Introduce read_sock_rectype proto_ops for control record delivery</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/4038dcf8-bab8-48d1-864d-8dc7c978dcc6@suse.de/">2026-07-23 Hannes Reinecke <a href="mailto:hare@suse.de">hare@suse.de</a> — Re: [PATCH net-next v2 3/6] tls: Implement read_sock_rectype for kTLS software path</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/9c88fc7e-5853-436f-881f-20074a3c9279@suse.de/">2026-07-23 Hannes Reinecke <a href="mailto:hare@suse.de">hare@suse.de</a> — Re: [PATCH net-next v2 0/6] Deliver TLS control records to kernel read_sock consumers</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/909e0132-5c0c-4c0c-b8c5-b90b88ad0231@app.fastmail.com/">2026-07-23 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH net-next v2 1/6] net/tls: Bound consecutive no-data records in tls_sw_read_sock()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/amIj_DG7SuWx8MeY@krikkit/">2026-07-23 Sabrina Dubroca <a href="mailto:sd@queasysnail.net">sd@queasysnail.net</a> — Re: [PATCH net-next v2 1/6] net/tls: Bound consecutive no-data records in tls_sw_read_sock()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/7a0f5521-3a44-4e8e-9a30-542b0ece448d@app.fastmail.com/">2026-07-23 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH net-next v2 1/6] net/tls: Bound consecutive no-data records in tls_sw_read_sock()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/amKQGyH41zom7LGe@krikkit/">2026-07-23 Sabrina Dubroca <a href="mailto:sd@queasysnail.net">sd@queasysnail.net</a> — Re: [PATCH net-next v2 1/6] net/tls: Bound consecutive no-data records in tls_sw_read_sock()</a></li>
+</ul>
+  </main>
+</body>
+</html>

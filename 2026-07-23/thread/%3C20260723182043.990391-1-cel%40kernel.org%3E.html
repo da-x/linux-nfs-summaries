@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD write path decoupled from NFSv3 XDR stable_how constants</title>
+  <meta name="description" content="Week of 2026-07-17 to 2026-07-23 | Thread: [PATCH 0/2] NFSD: Decouple the write path from NFSv3 XDR constants">
+  <meta property="og:title" content="NFSD write path decoupled from NFSv3 XDR stable_how constants">
+  <meta property="og:description" content="Week of 2026-07-17 to 2026-07-23 | Thread: [PATCH 0/2] NFSD: Decouple the write path from NFSv3 XDR constants">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-23T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSD write path decoupled from NFSv3 XDR stable_how constants">
+  <meta name="twitter:description" content="Week of 2026-07-17 to 2026-07-23 | Thread: [PATCH 0/2] NFSD: Decouple the write path from NFSv3 XDR constants">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-23</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD write path decoupled from NFSv3 XDR stable_how constants</h1>
+<h2>Summary</h2>
+<h1>NFSD write path decoupled from NFSv3 XDR <code>stable_how</code> constants</h1>
+<p><strong>Week of 2026-07-17 to 2026-07-23</strong> | Thread: [PATCH 0/2] NFSD: Decouple the write path from NFSv3 XDR constants</p>
+<h2>Overview</h2>
+<p>This thread is a <strong>cleanup / API-hygiene series</strong>, not a protocol change and not a client-facing feature. On Thursday, 23 July, Chuck Lever posted a two-patch set that severs NFSD's version-neutral write helpers from NFSv3 on-the-wire constants. The work is almost entirely server-side, but patch 1 relocates a shared UAPI-adjacent enum (<code>enum nfs3_stable_how</code>) out of <code>include/linux/nfs.h</code> into <code>include/linux/nfs3.h</code>, which is the header both the NFS client and NFSD already use for v3 wire values. There were no replies in-window: the series landed at the end of the week and is awaiting review.</p>
+<p>The motivating debt is a long-standing numeric coincidence. NFSD's internal write helpers are supposed to be NFS-version-agnostic, yet <code>nfsd_write()</code> has historically taken an NFSv3 <code>stable_how</code> value lifted straight off the wire. The NFSv4 WRITE and COPY paths then borrowed those same NFSv3 constants for their own stable values, which only works because <code>stable_how</code> and <code>stable_how4</code> happen to share numeric encodings. As <a href="https://lore.kernel.org/linux-nfs/20260723182043.990391-1-cel@kernel.org/">Chuck put it in the cover letter</a>:</p>
+<blockquote>
+<p>"That coincidence is the debt: it binds version-neutral VFS helpers to one protocol version's XDR and leaves NFSv4 depending on nfs3.h."</p>
+</blockquote>
+<p>The proposed fix is to stop passing a protocol enum through the generic VFS helpers and pass IOCB flags instead. That removes a <code>nfs3.h</code> dependency from code that is not related to NFSv3.</p>
+<h2>Patch 1/2: Move <code>enum nfs3_stable_how</code> into <code>linux/nfs3.h</code></h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260723182043.990391-2-cel@kernel.org/">The first patch</a> is a small header cleanup that matters to both client and server trees. <code>enum nfs3_stable_how</code> (<code>UNSTABLE</code>, <code>DATA_SYNC</code>, <code>FILE_SYNC</code>) was introduced with NFSv3, but it has lived in the version-neutral <code>include/linux/nfs.h</code>. NFSv2 has no <code>stable_how</code> on the wire at all; its write path only passes <code>NFS_FILE_SYNC</code> as a placeholder the protocol ignores. Chuck's rationale is straightforward:</p>
+<blockquote>
+<p>"The stable_how constants describe an NFSv3 wire value, so they belong in linux/nfs3.h."</p>
+</blockquote>
+<p>The move is three files: the enum is deleted from <code>include/linux/nfs.h</code>, re-homed in <code>include/linux/nfs3.h</code>, and <code>include/trace/misc/nfs.h</code> picks up an extra include so existing tracepoints still compile. There is no behavioral change. For NFS client development the practical effect is header hygiene: client code that already includes <code>nfs3.h</code> for v3 XDR continues to see the same enumerators, while version-neutral client headers no longer advertise a v3-only wire type.</p>
+<h2>Patch 2/2: <code>nfsd_write()</code> takes IOCB flags, not a v3 XDR value</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260723182043.990391-3-cel@kernel.org/">The second patch</a> is the real API change. Chuck states the problem without hedging:</p>
+<blockquote>
+<p>"The current nfsd_write() API is not NFS version-agnostic, as it relies on callers to pass an NFSv3 stable_how value to determine the persistence of the requested WRITE. NFSv2 does not use a stable-how value on the wire, and NFSv4 has its own stable_how4 (though stable_how and stable_how4 happen to share the same numeric values)."</p>
+</blockquote>
+<p>The replacement is mechanical but careful. <code>nfsd_write()</code>'s <code>stable</code> argument becomes a set of IOCB flags. Version-specific procedure code now translates its own protocol's stability request into those flags before calling the generic helper:</p>
+<ul>
+<li>NFSv2 continues to request a fully synchronous write (the protocol has no unstable-write concept).</li>
+<li>NFSv3 maps <code>UNSTABLE</code> / <code>DATA_SYNC</code> / <code>FILE_SYNC</code> onto the corresponding IOCB bits in <code>nfs3proc.c</code>.</li>
+<li>NFSv4 WRITE and COPY stop borrowing the v3 enumerators and switch to the new <code>stable_how4</code> constants added in <code>include/linux/nfs4.h</code>. Chuck is explicit that this is a no-behavior change:</li>
+</ul>
+<blockquote>
+<p>"Convert those sites to the stable_how4 enumerators so the v4 code expresses its own protocol's values directly, with no change in behavior."</p>
+</blockquote>
+<p>Two small correctness nits ride along. The NFSv3 WRITE decoder now bound-checks the decoded <code>stable</code> value the way the NFSv4 WRITE decoder already does, and <code>nfsd3_writeargs.stable</code> becomes unsigned to match. Those are defensive decoder fixes, not write-path semantics changes.</p>
+<p>The net of the vfs.c churn is a simplification: the generic helper no longer switches on an XDR enum. It just applies the IOCB flags it is given. Chuck's closing claim is the architectural payoff:</p>
+<blockquote>
+<p>"The larger benefit is one less NFSv4 dependency on nfs3.h."</p>
+</blockquote>
+<p>Touched files are concentrated in NFSD (<code>nfs3proc.c</code>, <code>nfs3xdr.c</code>, <code>nfs4proc.c</code>, <code>nfs4xdr.c</code>, <code>nfsproc.c</code>, <code>vfs.c</code>, <code>vfs.h</code>, <code>xdr3.h</code>) plus the new <code>stable_how4</code> enumerators in <code>include/linux/nfs4.h</code>. Twelve files, +66 / −37 overall.</p>
+<h2>Client-development angle</h2>
+<p>This is not a client bug-fix series, and it does not change on-the-wire WRITE semantics for any NFS version. The client-relevant pieces are:</p>
+<ol>
+<li><strong>Shared header relocation.</strong> Moving <code>enum nfs3_stable_how</code> into <code>linux/nfs3.h</code> is the kind of header split client developers have wanted for years: version-neutral <code>nfs.h</code> stops carrying a v3 XDR type. Any out-of-tree or trace-side code that included only <code>linux/nfs.h</code> and expected <code>NFS_UNSTABLE</code> / <code>NFS_DATA_SYNC</code> / <code>NFS_FILE_SYNC</code> will need <code>linux/nfs3.h</code> (the in-tree trace header is already updated).</li>
+<li><strong>NFSv4 no longer leans on nfs3.h for WRITE/COPY stability.</strong> Adding first-class <code>stable_how4</code> enumerators in <code>linux/nfs4.h</code> is the same direction the client already took for other v4 wire types. It removes a cross-version include hazard if client or common code later wants to reason about v4 stable-how without pulling v3 headers.</li>
+<li><strong>No client write-path change.</strong> Client <code>nfs_writeback</code> / <code>nfs_pageio</code> / pNFS layout-commit stability handling is untouched. The coincidence that v3 <code>stable_how</code> and v4 <code>stable_how4</code> share numeric values remains true on the wire; this series just stops the <em>server</em> from depending on that coincidence internally.</li>
+</ol>
+<h2>Status</h2>
+<p>Posted late on 2026-07-23. No Reviewed-by, Acked-by, or comments yet. The series is self-contained cleanup sitting alongside Chuck's other NFSD hygiene this week (global DRC counter fixes, lock-owner UAF merge-timeline discussion) and is the sort of prerequisite that usually lands in <code>nfsd-next</code> once a maintainer glance confirms the IOCB-flag mapping is complete for v2/v3/v4 WRITE and v4 COPY.</p>
+<h2>Conclusions</h2>
+<ul>
+<li><strong>Type:</strong> cleanup / internal API change, with a small defensive bound-check on the NFSv3 WRITE decoder.</li>
+<li><strong>Not a protocol change.</strong> Wire encodings of <code>stable_how</code> / <code>stable_how4</code> are unchanged; NFSv4 WRITE and COPY keep the same numeric values, now spelled with their own enumerators.</li>
+<li><strong>The design argument is decoupling.</strong> Version-neutral VFS helpers should speak VFS (IOCB flags), not a single protocol version's XDR. The numeric overlap between v3 and v4 was convenient and is now treated as technical debt.</li>
+<li><strong>Client impact is header-only.</strong> <code>enum nfs3_stable_how</code> moves to <code>linux/nfs3.h</code>; <code>linux/nfs4.h</code> gains <code>stable_how4</code>. No client I/O path is modified.</li>
+<li><strong>Awaiting review.</strong> Three messages, all from the author, no discussion yet.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260723182043.990391-1-cel@kernel.org/">2026-07-23 Chuck Lever — [PATCH 0/2] NFSD: Decouple the write path from NFSv3 XDR constants</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260723182043.990391-2-cel@kernel.org/">2026-07-23 Chuck Lever — [PATCH 1/2] NFS: Move definition of enum nfs3_stable_how</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260723182043.990391-3-cel@kernel.org/">2026-07-23 Chuck Lever — [PATCH 2/2] NFSD: Replace nfsd_write()'s "stable" argument with "iocb_flags"</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260723182043.990391-1-cel@kernel.org/">2026-07-23 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 0/2] NFSD: Decouple the write path from NFSv3 XDR constants</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260723182043.990391-2-cel@kernel.org/">2026-07-23 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 1/2] NFS: Move definition of enum nfs3_stable_how</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260723182043.990391-3-cel@kernel.org/">2026-07-23 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 2/2] NFSD: Replace nfsd_write()'s "stable" argument with "iocb_flags"</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SUNRPC restores NUMA_NO_NODE after nfsd affinity collapse</title>
+  <meta name="description" content="This week’s discussion is a bug fix, not a protocol change or new feature: a six-line SUNRPC correction that undoes a NUMA-affinity collapse introduced while converting the RPC scratch buffer to folios. Ameer Hamza of TrueNAS posted the…">
+  <meta property="og:title" content="SUNRPC restores NUMA_NO_NODE after nfsd affinity collapse">
+  <meta property="og:description" content="This week’s discussion is a bug fix, not a protocol change or new feature: a six-line SUNRPC correction that undoes a NUMA-affinity collapse introduced while converting the RPC scratch buffer to folios. Ameer Hamza of TrueNAS posted the…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-23T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="SUNRPC restores NUMA_NO_NODE after nfsd affinity collapse">
+  <meta name="twitter:description" content="This week’s discussion is a bug fix, not a protocol change or new feature: a six-line SUNRPC correction that undoes a NUMA-affinity collapse introduced while converting the RPC scratch buffer to folios. Ameer Hamza of TrueNAS posted the…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-23</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>SUNRPC restores NUMA_NO_NODE after nfsd affinity collapse</h1>
+<h2>Summary</h2>
+<p>This week’s discussion is a <strong>bug fix</strong>, not a protocol change or new feature: a six-line SUNRPC correction that undoes a NUMA-affinity collapse introduced while converting the RPC scratch buffer to folios. <a href="https://lore.kernel.org/linux-nfs/20260722182012.2063936-1-ameer.hamza@truenas.com/">Ameer Hamza</a> of TrueNAS posted the patch on 22 July after a bisect of a <strong>2× NFS READ throughput regression between v6.17 and v6.18</strong> on a four-node server, and the thread closed the same day with a Reviewed-by from Jeff Layton and an apply to <code>nfsd-testing</code> from Chuck Lever.</p>
+<h2>How a folio conversion pinned every nfsd thread to one node</h2>
+<p>The regression is a side-effect of <a href="https://lore.kernel.org/linux-nfs/20260722182012.2063936-1-ameer.hamza@truenas.com/">commit d57e43b72bf2</a> (<code>SUNRPC: Update svcxdr_init_decode() to call xdr_set_scratch_folio()</code>). That change made <code>svc_pool_map_get_node()</code> return <code>numa_mem_id()</code> instead of <code>NUMA_NO_NODE</code> because <code>__folio_alloc_node()</code> cannot accept the latter. Hamza’s central technical point is that the two values are <strong>not equivalent</strong>:</p>
+<blockquote>
+<p>"That return value is not equivalent: it is evaluated in the context of the task creating the nfsd threads, once per thread created, and it is passed to <code>kthread_create_on_node()</code> and to the per-thread allocations in <code>svc_prepare_thread()</code>."</p>
+</blockquote>
+<p>A later kthread change, <code>d1a89197589c</code> (<code>kthread: Default affine kthread to its preferred NUMA node</code>), then turned that node id into a real CPU affinity. Under the default <code>pool_mode=global</code>, a single writer of <code>/proc/fs/nfsd/threads</code> creates every nfsd kthread, so each thread inherits the creator’s local-memory node — typically the <strong>same</strong> node for the entire pool. Hamza described the fallout:</p>
+<blockquote>
+<p>"The CPUs of the other nodes are then unable to run nfsd at all, and the threads' allocations — svc_rqst structures, page pointer arrays, newly allocated task stacks, and the per-RPC pages allocated at run time — all prefer that one node."</p>
+</blockquote>
+<p>On the four-node box that motivated the patch, every nfsd thread came up restricted to one node’s CPUs. Restoring <code>NUMA_NO_NODE</code> made the threads runnable on all CPUs again and recovered the lost READ throughput.</p>
+<h2>The fix: restore global-mode semantics, isolate the folio constraint</h2>
+<p>The patch does not revert the folio conversion. It restores the <code>NUMA_NO_NODE</code> behaviour that global mode has had since <code>11fd165c68b7</code> (<code>sunrpc: use better NUMA affinities</code>) and resolves <code>NUMA_NO_NODE</code> to <code>numa_mem_id()</code> <strong>only</strong> at the one call site that cannot accept it — the same fallback <code>alloc_pages_node()</code> used for the scratch page before the conversion. The mapped percpu and pernode branches are left alone.</p>
+<p>Hamza explicitly called out the <strong>NFS client</strong> impact. Unpooled services share this fallback when no percpu or pernode map is active:</p>
+<blockquote>
+<p>"Unpooled services such as lockd and the NFS client callback service also take this fallback when no percpu or pernode map is active, restoring their thread placement in that case."</p>
+</blockquote>
+<p>That is the client-development angle: the same <code>svc_pool_map_get_node()</code> path feeds the NFS client’s callback service (<code>fs/nfs/callback*</code>). After d57e43b72bf2, a client that starts its callback threads from one CPU could pin those kthreads — and their <code>svc_rqst</code> / RPC-page allocations — to a single NUMA node, starving callback processing on the rest of the machine. The restore puts callback-thread placement back where it was before the folio conversion.</p>
+<p>Hamza aimed the patch at <code>nfsd-fixes</code> and stable (v6.18+), not at the in-flight pool-mode rework:</p>
+<blockquote>
+<p>"The pool-mode rework in nfsd-testing already removes global mode, so this fix is based on nfsd-fixes and aimed there and at stable (v6.18+), where the regression ships."</p>
+</blockquote>
+<h2>Review: the patch is accepted, with a caveat about global mode</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/4b35251a112d6593ce41741fbcb9517b35e5f287.camel@kernel.org/">Jeff Layton</a> reviewed the change the same afternoon. He did not dispute the diagnosis or the six-line repair, but he questioned how much energy global mode still deserves on real NUMA hardware:</p>
+<blockquote>
+<p>"The patch seems sane. I wonder how much we should care about people using global mode on real NUMA hw though? The better fix for those folks would be to move to pernode, most likely."</p>
+</blockquote>
+<p>That remark sits against the earlier pool-mode series that hard-codes <code>pool_mode</code> to pernode and deletes the other modes — the same rework Hamza said already lives in <code>nfsd-testing</code>. Layton still added <code>Reviewed-by: Jeff Layton &lt;jlayton@kernel.org&gt;</code>, treating the restore as the correct stable-tree answer even if pernode is the longer-term design.</p>
+<h2>Landed, and ordered ahead of the pool-mode rewrite</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/178475581093.3096927.18170922544327617159.b4-ty@b4/">Chuck Lever</a> applied the patch to <code>nfsd-testing</code> a few hours later and recorded the commit as <code>ea94cbfb34c7151d79da28a8c7e4bec0290b3e27</code>. He also reordered the branch so the NUMA restore sits <strong>before</strong> Layton’s svc-pool restructuring:</p>
+<blockquote>
+<p>"Applied to nfsd-testing, thanks! nfsd-testing has been re-ordered so this patch is positioned before Jeff's restructuring of svc pools."</p>
+</blockquote>
+<p>That ordering matters: the restore has to land first so that trees which still have global mode (v6.18+, <code>nfsd-fixes</code>, and the early part of <code>nfsd-testing</code>) get the affinity fix, while the later pool-mode rewrite can then delete global mode on top of a correct baseline.</p>
+<h2>Conclusions</h2>
+<ul>
+<li><strong>Classification:</strong> important <strong>bug fix</strong> in SUNRPC thread placement; no protocol change.</li>
+<li><strong>Root cause:</strong> <code>svc_pool_map_get_node()</code> started returning <code>numa_mem_id()</code> to satisfy <code>__folio_alloc_node()</code>, and kthread NUMA auto-affinity then pinned every globally pooled nfsd thread — plus unpooled lockd and <strong>NFS client callback</strong> threads — to the creator’s node.</li>
+<li><strong>User-visible effect:</strong> 2× NFS READ throughput drop on multi-node hardware between v6.17 and v6.18; all nfsd threads runnable on only one node’s CPUs.</li>
+<li><strong>Fix:</strong> restore <code>NUMA_NO_NODE</code> for global / unmapped services; resolve the node only at the folio allocation site.</li>
+<li><strong>Status:</strong> Reviewed-by Layton; applied to <code>nfsd-testing</code> as <code>ea94cbfb34c7</code>, ordered ahead of the pool-mode rewrite; intended for <code>nfsd-fixes</code> and stable v6.18+.</li>
+<li><strong>Client note:</strong> the same fallback repairs NFS client callback-service thread placement, so clients on NUMA boxes regain the ability to run callback kthreads across nodes rather than on a single node’s CPUs.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260722182012.2063936-1-ameer.hamza@truenas.com/">2026-07-22 Ameer Hamza <a href="mailto:ameer.hamza@truenas.com">ameer.hamza@truenas.com</a> — [PATCH] SUNRPC: Restore NUMA_NO_NODE for svc thread allocations in global mode</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/4b35251a112d6593ce41741fbcb9517b35e5f287.camel@kernel.org/">2026-07-22 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH] SUNRPC: Restore NUMA_NO_NODE for svc thread allocations in global mode</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178475581093.3096927.18170922544327617159.b4-ty@b4/">2026-07-22 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH] SUNRPC: Restore NUMA_NO_NODE for svc thread allocations in global mode</a></li>
+</ul>
+  </main>
+</body>
+</html>

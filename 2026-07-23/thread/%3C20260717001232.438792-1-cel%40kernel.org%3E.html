@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD global DRC clean-ups: off-by-one fix and percpu counter contention elimination</title>
+  <meta name="description" content="Week of 2026-07-17 to 2026-07-23 | Thread: [PATCH 0/5] Minor NFSD global DRC clean-ups">
+  <meta property="og:title" content="NFSD global DRC clean-ups: off-by-one fix and percpu counter contention elimination">
+  <meta property="og:description" content="Week of 2026-07-17 to 2026-07-23 | Thread: [PATCH 0/5] Minor NFSD global DRC clean-ups">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-23T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSD global DRC clean-ups: off-by-one fix and percpu counter contention elimination">
+  <meta name="twitter:description" content="Week of 2026-07-17 to 2026-07-23 | Thread: [PATCH 0/5] Minor NFSD global DRC clean-ups">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-23</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD global DRC clean-ups: off-by-one fix and percpu counter contention elimination</h1>
+<h2>Summary</h2>
+<h1>NFSD Global DRC Clean-Ups: Off-by-One Fix and Per-CPU Counter Contention Elimination</h1>
+<p><strong>Week of 2026-07-17 to 2026-07-23</strong> | Thread: [PATCH 0/5] Minor NFSD global DRC clean-ups</p>
+<h2>Overview</h2>
+<p>This thread is a <strong>bug fix and performance improvement series</strong> for the NFS server (NFSD) side, specifically targeting the global Data Reply Cache (DRC) and its associated statistics infrastructure. Chuck Lever posted a five-patch series on July 17 that addresses an off-by-one bug in DRC bucket pruning and eliminates unnecessary spinlock contention from per-CPU counter updates across three different accounting paths. The series also adds ABI documentation for the <code>reply_cache_stats</code> procfs file.</p>
+<p>While this is server-side work (NFSD rather than the NFS client), it has direct implications for NFS client performance on busy multi-CPU servers, particularly under high rates of non-idempotent NFSv3 operations and RDMA workloads.</p>
+<h2>The Patches</h2>
+<h3>Patch 1/5: Off-by-One in DRC Bucket Pruning Limit</h3>
+<p>The first patch fixes a genuine bug in <code>nfsd_prune_bucket_locked()</code>. As Chuck Lever <a href="https://lore.kernel.org/linux-nfs/20260717001232.438792-2-cel@kernel.org/">explained</a>:</p>
+<blockquote>
+<p>"nfsd_prune_bucket_locked() evicts an entry before checking the freed count against @max. The check uses '++freed &gt; max', which does not break until freed exceeds max, resulting in max + 1 evictions."</p>
+</blockquote>
+<p>The fix is a one-character change from <code>&gt;</code> to <code>&gt;=</code>, ensuring the pruning limit stated in the function comment is actually honored. This carries a <code>Fixes:</code> tag referencing commit <code>a9507f6af145</code> ("NFSD: Replace nfsd_prune_bucket()").</p>
+<h3>Patches 2/5, 3/5, and 4/5: Eliminating Per-CPU Counter Contention</h3>
+<p>The bulk of the series addresses a subtle but significant performance problem. The DRC memory accounting counter, reply cache hit/miss/nocache statistics, and IO byte counters all used <code>percpu_counter_add()</code> or <code>percpu_counter_inc()</code>, which apply a default batch threshold of <code>max(32, 2*nr_cpus)</code>. When the update amount exceeds that threshold, the function falls back to acquiring the counter's <strong>global spinlock</strong> on every single update.</p>
+<p>The problem was particularly acute for the DRC memory counter, as Chuck <a href="https://lore.kernel.org/linux-nfs/20260717001232.438792-3-cel@kernel.org/">detailed</a>:</p>
+<blockquote>
+<p>"Each DRC entry add or removal updates the counter by sizeof(struct nfsd_cacherep) (~144 bytes), which always exceeds the batch threshold. percpu_counter_add() then acquires the counter's global spinlock on every update, serializing all nfsd threads."</p>
+</blockquote>
+<p>He quantified the impact:</p>
+<blockquote>
+<p>"On a 10-CPU NFS server handling a high rate of non-idempotent NFSv3 operations, this lock accounts for a measurable fraction of total spin lock overhead because nfsd_cache_lookup() both inserts a new entry and prunes up to three old entries per RPC, producing 4-7 global lock acquisitions per operation."</p>
+</blockquote>
+<p>For the IO byte counters, profiling data was provided:</p>
+<blockquote>
+<p>"Profiling on a 10-CPU RDMA NFS server shows 0.44% of total CPU cycles spent contending on these locks during a small random write workload."</p>
+</blockquote>
+<p>The fix in all three cases is to switch to <code>percpu_counter_add_local()</code> / <code>percpu_counter_sub_local()</code>, which batch with <code>INT_MAX</code> so updates always remain on the per-CPU fast path. Read accuracy is preserved because all readers use <code>percpu_counter_sum_positive()</code>.</p>
+<h3>Patch 5/5: ABI Documentation</h3>
+<p>The final patch adds a new file, <code>Documentation/ABI/testing/procfs-nfsd-reply_cache_stats</code>, documenting the <code>/proc/fs/nfsd/reply_cache_stats</code> interface that has existed since v3.10 but was previously undocumented. As Chuck noted, this "establishes a contract that parsers should match on field name rather than line position."</p>
+<h2>Community Response</h2>
+<p>The series received quick and enthusiastic endorsements from both NFSD maintainers.</p>
+<p><strong>NeilBrown</strong> <a href="https://lore.kernel.org/linux-nfs/178426348638.3371781.2716060745747771641@noble.neil.brown.name/">reviewed the full series</a> and gave an unqualified review:</p>
+<blockquote>
+<p>"All looks very sensible to me."
+"Reviewed-by: NeilBrown <a href="mailto:neil@brown.name">neil@brown.name</a>"</p>
+</blockquote>
+<p><strong>Jeff Layton</strong> was particularly struck by the performance implications, <a href="https://lore.kernel.org/linux-nfs/8468bd59a86850d7aee57186ef53feff2f493a61.camel@kernel.org/">reacting</a> to the DRC memory accounting patch with:</p>
+<blockquote>
+<p>"Dear god -- I had no idea that this was a thing. I wonder if we have other places we're using percpu_counter_add() where we shouldn't?"</p>
+</blockquote>
+<p>He then <a href="https://lore.kernel.org/linux-nfs/6542630e20d90e5cc32bfe3af1a3beb06575ef67.camel@kernel.org/">expanded on the series</a> more broadly:</p>
+<blockquote>
+<p>"I had no idea that percpu counters could devolve into spinlocking in certain conditions. Ick. I wonder if we need to do a pass over all of our percpu counter usage for the same sort of thing. ISTM that we pretty much always want to use the *_local versions for our use-cases."
+"Reviewed-by: Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a>"</p>
+</blockquote>
+<h2>Significance and Outlook</h2>
+<p>This series is notable on two fronts:</p>
+<ol>
+<li>
+<p><strong>The off-by-one fix</strong> is a straightforward correctness bug that has been present since the DRC bucket pruning code was refactored. While its practical impact is small (one extra eviction per prune cycle), it represents a violation of the documented contract.</p>
+</li>
+<li>
+<p><strong>The percpu counter contention fixes</strong> expose a broader kernel-wide pattern: <code>percpu_counter_add()</code> with amounts exceeding the batch threshold silently degrades into a global spinlock, which can be a significant scalability bottleneck on multi-CPU systems. Jeff Layton's suggestion to audit all NFS subsystem percpu counter usage for the same issue hints at follow-up work that may emerge in subsequent weeks.</p>
+</li>
+</ol>
+<p>The series is ready for merge with two Reviewed-by tags from the NFSD maintainers. Chuck Lever noted in the cover letter that he is "working on a series of global DRC improvements" beyond these clean-ups, suggesting further DRC architecture changes are in flight.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260717001232.438792-1-cel@kernel.org/">2026-07-17 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 0/5] Minor NFSD global DRC clean-ups</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260717001232.438792-2-cel@kernel.org/">2026-07-17 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 1/5] NFSD: Fix off-by-one in DRC bucket pruning limit</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260717001232.438792-4-cel@kernel.org/">2026-07-17 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 3/5] NFSD: Eliminate percpu counter contention in reply cache statistics</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260717001232.438792-3-cel@kernel.org/">2026-07-17 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 2/5] NFSD: Eliminate percpu counter contention in DRC memory accounting</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260717001232.438792-5-cel@kernel.org/">2026-07-17 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 4/5] NFSD: Eliminate percpu counter contention in IO byte accounting</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260717001232.438792-6-cel@kernel.org/">2026-07-17 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 5/5] NFSD: Document reply_cache_stats ABI</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178426348638.3371781.2716060745747771641@noble.neil.brown.name/">2026-07-17 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH 0/5] Minor NFSD global DRC clean-ups</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/8468bd59a86850d7aee57186ef53feff2f493a61.camel@kernel.org/">2026-07-17 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 2/5] NFSD: Eliminate percpu counter contention in DRC memory accounting</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/6542630e20d90e5cc32bfe3af1a3beb06575ef67.camel@kernel.org/">2026-07-17 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 0/5] Minor NFSD global DRC clean-ups</a></li>
+</ul>
+  </main>
+</body>
+</html>

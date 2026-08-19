@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSv4 client: NULL priv crash in nfs4_add_lease() cleanup</title>
+  <meta name="description" content="This week’s linux-nfs traffic includes a tightly scoped NFSv4 client bug fix from Zhansong Gao, posted 22 July with no replies yet in-window. The patch is not a protocol change and does not add a feature; it repairs a NULL-pointer crash in…">
+  <meta property="og:title" content="NFSv4 client: NULL priv crash in nfs4_add_lease() cleanup">
+  <meta property="og:description" content="This week’s linux-nfs traffic includes a tightly scoped NFSv4 client bug fix from Zhansong Gao, posted 22 July with no replies yet in-window. The patch is not a protocol change and does not add a feature; it repairs a NULL-pointer crash in…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-23T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSv4 client: NULL priv crash in nfs4_add_lease() cleanup">
+  <meta name="twitter:description" content="This week’s linux-nfs traffic includes a tightly scoped NFSv4 client bug fix from Zhansong Gao, posted 22 July with no replies yet in-window. The patch is not a protocol change and does not add a feature; it repairs a NULL-pointer crash in…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-23</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSv4 client: NULL priv crash in nfs4_add_lease() cleanup</h1>
+<h2>Summary</h2>
+<p>This week’s linux-nfs traffic includes a tightly scoped <strong>NFSv4 client bug fix</strong> from <a href="https://lore.kernel.org/linux-nfs/SI2PR01MB454532D657E40A783BEAD771C7C12@SI2PR01MB4545.apcprd01.prod.exchangelabs.com/">Zhansong Gao</a>, posted 22 July with no replies yet in-window. The patch is not a protocol change and does not add a feature; it repairs a NULL-pointer crash in the application-lease path that was introduced when the client learned to hang local leases off NFSv4 delegations.</p>
+<h2>The crash: a race between lease add and delegation return</h2>
+<p>Gao’s one-file change to <code>fs/nfs/nfs4proc.c</code> targets <code>nfs4_add_lease()</code>. That helper is the client’s glue between VFS application leases (<code>fcntl(F_SETLEASE)</code> / <code>generic_setlease()</code>) and an NFSv4 delegation. When a lease is being installed and a concurrent delegation return wins the race, the add path must unwind the half-installed lease by calling <code>nfs4_delete_lease()</code>.</p>
+<p>The existing unwind passed the wrong object. Gao writes:</p>
+<blockquote>
+<p>"When nfs4_add_lease() races with a delegation return, it calls nfs4_delete_lease() to clean up. Previously, it passed priv, which can legitimately be NULL. Passing a NULL priv eventually leads to a NULL pointer dereference in generic_setlease()."</p>
+</blockquote>
+<p>That is a client-side correctness bug, not a server or wire-protocol issue. <code>priv</code> is the per-lease private state that the VFS lease machinery expects to find when tearing a lease down. On the race path it is allowed to still be NULL — the lease never fully attached — so feeding it into <code>nfs4_delete_lease()</code> and then into <code>generic_setlease()</code> is a use of an optional pointer as if it were mandatory. The resulting NULL deref is the kind of crash that only shows up under concurrent recall/return, which is exactly when application leases backed by delegations are supposed to be interesting.</p>
+<p>The patch is a four-line edit (three insertions, one deletion) in <code>nfs4proc.c</code>. Gao tags it:</p>
+<blockquote>
+<p>Fixes: e93a5e9306a5 ("NFSv4: Add support for application leases underpinned by a delegation")</p>
+</blockquote>
+<p>That commit is the original client feature that made a local application lease rest on an NFSv4 file delegation instead of being a purely local VFS object. The bug is therefore a leftover in the feature’s error/race cleanup, not a regression in some later refactor.</p>
+<h2>Why this matters for NFS client development</h2>
+<p>Application leases-on-delegations are a client-only contract with the VFS: user-space can take <code>F_RDLCK</code>/<code>F_WRLCK</code> leases, and the NFS client promises those leases will break when the server recalls or the client returns the underlying delegation. The add path has to be atomic with respect to that recall/return. If the unwind uses a NULL <code>priv</code>, the client does not merely fail to install the lease — it oopses in <code>generic_setlease()</code>, taking down the process (and potentially more, depending on context) instead of returning an error to <code>fcntl()</code>.</p>
+<p>For client developers this is the classic “cleanup on the failure path used the success-path object” pattern:</p>
+<ul>
+<li>The success path has a fully populated <code>priv</code> and can delete by that handle.</li>
+<li>The race-with-return path does not, and must delete by a handle that is always valid (the file lock / flc context, not the optional private).</li>
+</ul>
+<p>Gao’s commit message does not spell out the replacement argument in prose — the diff itself is the four-line substitution — but the diagnosis is unambiguous: <strong>do not pass a possibly-NULL <code>priv</code> into <code>nfs4_delete_lease()</code></strong>.</p>
+<h2>Status this week</h2>
+<p>The thread is a single message. There is no Reviewed-by, Acked-by, or maintainer comment in the 17–23 July window, and no follow-up revision. The patch stands as an unreviewed but clearly motivated client crash fix, bisecting to the application-lease-on-delegation work, and waiting for NFS client review before it can land.</p>
+<p>No related discussion of the same NULL-<code>priv</code> path appeared elsewhere on the list this week. The only in-thread conclusion is Gao’s own: the incorrect argument is a latent NULL deref, and the one-line call-site correction is the fix.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/SI2PR01MB454532D657E40A783BEAD771C7C12@SI2PR01MB4545.apcprd01.prod.exchangelabs.com/">2026-07-22 Zhansong Gao <a href="mailto:zhsgao@hotmail.com">zhsgao@hotmail.com</a> — [PATCH] NFSv4: Fix incorrect argument passed to nfs4_delete_lease() in nfs4_add_lease()</a></li>
+</ul>
+  </main>
+</body>
+</html>

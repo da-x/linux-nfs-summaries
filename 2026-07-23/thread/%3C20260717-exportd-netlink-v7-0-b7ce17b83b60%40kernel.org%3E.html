@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd netlink stats v7 applied: server-side nfsstat moves to netlink, wdeleg_getattr retired</title>
+  <meta name="description" content="This thread carries forward Jeff Layton&#39;s series converting the NFS server-side nfsstat interface from procfs scraping to a generic-netlink dump handler. The prior v6 thread (2026-07-23 summary) ended with the last open design question —…">
+  <meta property="og:title" content="nfsd netlink stats v7 applied: server-side nfsstat moves to netlink, wdeleg_getattr retired">
+  <meta property="og:description" content="This thread carries forward Jeff Layton&#39;s series converting the NFS server-side nfsstat interface from procfs scraping to a generic-netlink dump handler. The prior v6 thread (2026-07-23 summary) ended with the last open design question —…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-23T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd netlink stats v7 applied: server-side nfsstat moves to netlink, wdeleg_getattr retired">
+  <meta name="twitter:description" content="This thread carries forward Jeff Layton&#39;s series converting the NFS server-side nfsstat interface from procfs scraping to a generic-netlink dump handler. The prior v6 thread (2026-07-23 summary) ended with the last open design question —…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-23</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd netlink stats v7 applied: server-side nfsstat moves to netlink, wdeleg_getattr retired</h1>
+<h2>Summary</h2>
+<h1>nfsd netlink stats v7 applied: server-side <code>nfsstat</code> goes netlink, and <code>wdeleg_getattr</code> is finally gone</h1>
+<h2>Context (brief bridge)</h2>
+<p>This thread carries forward Jeff Layton's series converting the NFS <em>server</em>-side <code>nfsstat</code> interface from procfs scraping to a generic-netlink dump handler. The prior v6 thread (<a href="https://lore.kernel.org/linux-nfs/">2026-07-23 summary</a>) ended with the last open design question — what to do about the legacy <code>wdeleg_getattr</code> procfs counter — handed off to its original author, Dai Ngo, who had not yet replied.</p>
+<p>This week that question is answered and the series lands: <strong>v7 was posted on Friday 2026-07-17 and applied to nfsd-testing the same day.</strong></p>
+<h2>This Week (July 17): v7 posted and merged in one day</h2>
+<h3>Layton posts v7, incorporating Dai's verdict</h3>
+<p>Layton <a href="https://lore.kernel.org/linux-nfs/20260717-exportd-netlink-v7-0-b7ce17b83b60@kernel.org/">posted v7</a> with an unapologetic cover letter:</p>
+<blockquote>
+<p>"I last sent this series about a month ago, and dropped the ball on sending out a newer version afterward. This version fixes some minor issues that Chuck and Sashiko pointed out in review."</p>
+</blockquote>
+<p>The stated motivation for the whole series is unchanged — the procfs interface has "several limitations: the counters are global (not network-namespace-aware), the format is fragile to parse, and it cannot be extended without breaking existing parsers." The v7-specific change relative to v6 is small but reflects the prior thread's conclusion:</p>
+<blockquote>
+<p>"Skip never-called operations in the server-stats netlink dump instead of emitting a zero-count entry for every opcode"</p>
+</blockquote>
+<p>And per his target: "Ideally, I'd like to see this go into v7.3."</p>
+<h3>The six patches</h3>
+<ol>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260717-exportd-netlink-v7-1-b7ce17b83b60@kernel.org/">1/6 sunrpc: add per-netns per-procedure call counts to svc_stat</a></strong> — adds a <code>vs_count</code> pointer array to <code>struct svc_stat</code> plus <code>svc_stat_alloc_counts()</code> / <code>svc_stat_free_counts()</code> helpers, and increments the per-net counter alongside the global one in <code>svc_generic_init_request()</code>.</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260717-exportd-netlink-v7-2-b7ce17b83b60@kernel.org/">2/6 sunrpc: use per-net counts in svc_seq_show()</a></strong> — a one-line change that makes <code>/proc/net/rpc/nfsd</code> itself report per-network-namespace procedure call counts. Layton notes "the only caller is nfsd, which always allocates vs_count via svc_stat_alloc_counts() in nfsd_net_init(), so the per-netns arrays are always available."</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260717-exportd-netlink-v7-3-b7ce17b83b60@kernel.org/">3/6 nfsd: implement server-stats-get netlink handler</a></strong> — the core of the series. The dump streams scalar stats (reply cache, filehandle, IO, network, RPC) followed by per-version procedure counts and NFSv4 per-operation counts. Layton's commit message documents a subtle sizing constraint: "the first dump message is allocated at NLMSG_GOODSIZE (a single page on most architectures) regardless of the client's receive buffer; packing every counter into one message would overflow it and fail the dump with -EMSGSIZE." Sections are therefore paged across messages, with <code>cb-&gt;args[0]</code>/<code>cb-&gt;args[1]</code> tracking section and entry index.</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260717-exportd-netlink-v7-4-b7ce17b83b60@kernel.org/">4/6 sunrpc: remove unused svc_version vs_count field</a></strong> — now that both <code>svc_seq_show()</code> and the netlink handler read the per-netns arrays, "the global per-version vs_count percpu counters are no longer read by anything." The field and its <code>DEFINE_PER_CPU_ALIGNED</code> initializers are removed across nfsd, lockd, and the NFS client callback service (11 files, 39 deletions).</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260717-exportd-netlink-v7-5-b7ce17b83b60@kernel.org/">5/6 nfsd: count NFSv4 callback operations per netns</a></strong> — adds a per-netns percpu counter array indexed by RFC 8881 callback opcode (<code>OP_CB_GETATTR..OP_CB_OFFLOAD</code>), bumped in <code>nfsd4_run_cb()</code>. This patch also implements the removal of <code>wdeleg_getattr</code>: "Report the procfs 'wdeleg_getattr' line from the CB_GETATTR counter and drop the now-redundant NFSD_STATS_WDELEG_GETATTR counter, its helper, and its increment site." Layton is candid about the semantic shift: "The two are not identical: the old counter incremented on every such conflict, whereas the CB_GETATTR counter only counts callbacks that are actually queued, so concurrent conflicts that coalesce onto an already in-flight CB_GETATTR are now counted once rather than once per conflict."</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260717-exportd-netlink-v7-6-b7ce17b83b60@kernel.org/">6/6 nfsd: export NFSv4 callback op stats via netlink</a></strong> — adds a <code>proc4cb-ops</code> nested attribute to the server-stats dump, reusing the existing op/count layout.</li>
+</ol>
+<h3>Lever applies it the same day</h3>
+<p>Chuck Lever <a href="https://lore.kernel.org/linux-nfs/178429502166.2709028.16160860800198876103.b4-ty@b4/">replied</a> at 13:30 UTC — roughly two and a half hours after the posting:</p>
+<blockquote>
+<p>"Applied to nfsd-testing, thanks!"</p>
+</blockquote>
+<p>He listed all six commit hashes. The series is now in <code>nfsd-testing</code> heading toward v7.3.</p>
+<h2>Key Technical Points</h2>
+<ul>
+<li><strong>Namespace-aware server stats:</strong> The central win is that both <code>/proc/net/rpc/nfsd</code> and the new netlink handler now report per-network-namespace procedure counts, fixing the "counters are global" limitation Layton called out in the cover letter.</li>
+<li><strong>Backchannel observability:</strong> Patches 5/6 add the first-ever per-operation statistics for NFSv4 <em>callback</em> (backchannel) operations — previously only the forward channel (<code>proc4ops</code>) was tracked. This closes a real observability gap for diagnosing delegation recall and backchannel pressure from the server side.</li>
+<li><strong><code>wdeleg_getattr</code> retirement:</strong> The counter that dominated the v6 thread is now gone as a first-class stat. Per Dai Ngo's verdict last week ("it would be better to remove it altogether"), patch 5/6 repurposes the procfs <code>wdeleg_getattr</code> line to report from the CB_GETATTR counter and deletes the dedicated counter, helper, and increment site.</li>
+<li><strong>Dump pagination:</strong> The <code>-EMSGSIZE</code> hazard on the first netlink dump message is handled by section-based paging — a design detail that matters for any userspace consumer merging attributes across messages.</li>
+</ul>
+<h2>Classification and Significance</h2>
+<ul>
+<li><strong>Type:</strong> This is a <strong>new feature</strong> (netlink stats interface) combined with a <strong>cleanup/refactor</strong> (removal of global per-version counters and the <code>wdeleg_getattr</code> stat). The v6-era bug fixes (use-after-free in <code>nfsd4_run_cb()</code>, CB_SEQUENCE undercount on v4.1+) are already baked into the applied code; no new bug fix was introduced this week.</li>
+<li><strong>NFS client relevance:</strong> While server-side, the series directly affects how NFS <em>client</em> behavior is observable from the admin side. The new per-netns callback op counts (CB_GETATTR, CB_SEQUENCE, etc.) give operators a netlink-based view of delegation recall and backchannel activity — historically only visible via the fragile procfs scrape. The nfs-utils patch to consume this over netlink with a procfs fallback is already merged, so userspace tooling is ready.</li>
+<li><strong>Cleanup scope:</strong> Patch 4/6 touches <code>fs/nfs/callback_xdr.c</code> (the client's callback service) and both lockd service files, removing dead percpu counter initializers — a modest but welcome reduction of duplicated global state.</li>
+</ul>
+<h2>Where Things Stand</h2>
+<p>The series is applied to <code>nfsd-testing</code> with all six commits listed by Lever. The only remaining question from the v6 era — the fate of <code>wdeleg_getattr</code> — has been resolved in favor of removal, and patch 5/6 implements it exactly as Dai prescribed. With Layton's stated target of v7.3 and the series already in the testing tree, this thread is effectively <strong>done</strong>; future activity would be limited to any late review nits before the merge window opens.</p>
+<h2>Key Messages This Week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260717-exportd-netlink-v7-0-b7ce17b83b60@kernel.org/">Jeff Layton — v7 cover letter: "I last sent this series about a month ago, and dropped the ball"</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260717-exportd-netlink-v7-5-b7ce17b83b60@kernel.org/">Jeff Layton — patch 5/6: "concurrent conflicts that coalesce onto an already in-flight CB_GETATTR are now counted once rather than once per conflict"</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178429502166.2709028.16160860800198876103.b4-ty@b4/">Chuck Lever — "Applied to nfsd-testing, thanks!"</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260717-exportd-netlink-v7-0-b7ce17b83b60@kernel.org/">2026-07-17 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v7 0/6] nfsd/sunrpc: convert nfsstat server-side interfaces to use netlink</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260717-exportd-netlink-v7-2-b7ce17b83b60@kernel.org/">2026-07-17 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v7 2/6] sunrpc: use per-net counts in svc_seq_show()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260717-exportd-netlink-v7-1-b7ce17b83b60@kernel.org/">2026-07-17 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v7 1/6] sunrpc: add per-netns per-procedure call counts to svc_stat</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260717-exportd-netlink-v7-3-b7ce17b83b60@kernel.org/">2026-07-17 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v7 3/6] nfsd: implement server-stats-get netlink handler</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260717-exportd-netlink-v7-4-b7ce17b83b60@kernel.org/">2026-07-17 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v7 4/6] sunrpc: remove unused svc_version vs_count field</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260717-exportd-netlink-v7-5-b7ce17b83b60@kernel.org/">2026-07-17 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v7 5/6] nfsd: count NFSv4 callback operations per netns</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260717-exportd-netlink-v7-6-b7ce17b83b60@kernel.org/">2026-07-17 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v7 6/6] nfsd: export NFSv4 callback op stats via netlink</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178429502166.2709028.16160860800198876103.b4-ty@b4/">2026-07-17 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v7 0/6] nfsd/sunrpc: convert nfsstat server-side interfaces to use netlink</a></li>
+</ul>
+  </main>
+</body>
+</html>

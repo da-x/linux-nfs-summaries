@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSv4.2 futimens() succeeds without SETATTR</title>
+  <meta name="description" content="This week&#39;s linux-nfs traffic opened a client-side bug report, not a protocol change or new feature: GNU touch on NFSv4.2 can return success from the fd-based futimens()/utimensat(fd, NULL, ...) path while never sending SETATTR, so the…">
+  <meta property="og:title" content="NFSv4.2 futimens() succeeds without SETATTR">
+  <meta property="og:description" content="This week&#39;s linux-nfs traffic opened a client-side bug report, not a protocol change or new feature: GNU touch on NFSv4.2 can return success from the fd-based futimens()/utimensat(fd, NULL, ...) path while never sending SETATTR, so the…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-23T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSv4.2 futimens() succeeds without SETATTR">
+  <meta name="twitter:description" content="This week&#39;s linux-nfs traffic opened a client-side bug report, not a protocol change or new feature: GNU touch on NFSv4.2 can return success from the fd-based futimens()/utimensat(fd, NULL, ...) path while never sending SETATTR, so the…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-23</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSv4.2 futimens() succeeds without SETATTR</h1>
+<h2>Summary</h2>
+<p>This week's linux-nfs traffic opened a <strong>client-side bug report</strong>, not a protocol change or new feature: GNU <code>touch</code> on NFSv4.2 can return success from the fd-based <code>futimens()</code>/<code>utimensat(fd, NULL, ...)</code> path while never sending <code>SETATTR</code>, so the server inode is unchanged and the client's cached timestamps later snap back.</p>
+<h2>The report</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/nMlXgkbm-9ZP_fFN16OpzFd4kwNlyXq169-6CoOE4nuHyTsmGaFeJgzuhj3grRboJKg9RapKov2_FJ1E3BCL0oZ7UNzF0pgwwhVC6VOVJYQ=@proton.me/">Michael Yang</a> described a reproducible NFSv4.2 timestamp failure on Fedora 44 with kernel 7.1.3 (both CachyOS and stock Fedora builds), nfs-utils 2.8.7, and coreutils 9.10. The mount is a straightforward <code>vers=4.2</code> NFSv4 share (<code>rw,relatime,...</code>); the bug also reproduces with <code>noac</code>.</p>
+<p>The failing sequence is the fd-based form used by GNU <code>touch</code>:</p>
+<pre><code>touch -d '2004-02-29 16:21:42' /mnt/tank/test
+</code></pre>
+<p><code>strace</code> shows <code>openat()</code> followed by <code>utimensat(0, NULL, [{tv_sec=1078032102, tv_nsec=0}, ...], 0) = 0</code> after coreutils has duplicated the file descriptor onto fd 0. Yang's observed behaviour is:</p>
+<ol>
+<li><code>utimensat()</code> returns success.</li>
+<li>Client <code>stat</code> temporarily shows the requested atime/mtime.</li>
+<li>The server-side backing inode is unchanged.</li>
+<li>The NFS client <code>SETATTR</code> counter does not increment.</li>
+<li>After attribute revalidation, the client timestamps revert to the server's.</li>
+<li><code>sync</code> and a clean unmount do not push the change.</li>
+</ol>
+<p>He contrasted that with pathname-based <code>utimensat(AT_FDCWD, "/mnt/tank/test", ...)</code>, which <strong>does</strong> increment the client <code>SETATTR</code> counter and immediately updates the server inode. The same inode number and birth time on both sides rule out a "different file" mix-up. His summary of the split:</p>
+<blockquote>
+<p>"fd-based timestamp update: returns success, no SETATTR observed, server inode unchanged, update later disappears"</p>
+</blockquote>
+<p>versus</p>
+<blockquote>
+<p>"pathname-based timestamp update: returns success, SETATTR observed, server inode updated"</p>
+</blockquote>
+<blockquote>
+<p>"This therefore appears specific to the fd-based futimens() / utimensat(fd, NULL, ...) path."</p>
+</blockquote>
+<p>That is a classic NFS <strong>client</strong> setattr/timestamp path bug: userspace is told the update succeeded, the local cache is dirtied, and nothing is ever flushed to the wire.</p>
+<h2>Confirmation and a 7.0-era suspect list</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/fcffc38c-80fd-ca2f-1b1a-f9d041c6a2c7@applied-asynchrony.com/">Holger Hoffstätte</a> confirmed the same failure on 7.1.x and thanked Yang for isolating the fd-versus-path distinction:</p>
+<blockquote>
+<p>"Confirmed (also with 7.1.x) and thank you for tracking down the details. This has been driving me nuts for quite a while, but I could not figure out whether it's my very historic NFS config, server- or client-side, autofs or whatever."</p>
+</blockquote>
+<p>He then bisected the <em>onset</em> rather than a single commit: 7.0.0 already reproduces, so the regression likely landed in the 7.0 merge window. Two commits stood out as plausible client/VFS interaction points:</p>
+<ul>
+<li><code>b8b3002fbfef</code> — <code>nfs: split nfs_update_timestamps</code></li>
+<li><code>761475268fa8</code> — <code>fs: refactor -&gt;update_time handling</code> (part of a larger VFS series)</li>
+</ul>
+<blockquote>
+<p>"Hope that helps someone to find the cause."</p>
+</blockquote>
+<h2>Where things stand this week</h2>
+<p>This is an <strong>NFS client timestamp/setattr bug</strong> affecting the common GNU <code>touch</code> fd-based path. The report is well instrumented (strace, SETATTR counters, client vs. server <code>stat</code>, <code>noac</code> control) and independently reproduced. No maintainer reply, patch, or confirmed root cause landed inside this week; the working hypothesis is a 7.0-era interaction between the VFS <code>-&gt;update_time</code> refactor and NFS's split <code>nfs_update_timestamps</code> path, which appears to update the local inode and return success without issuing NFSv4 <code>SETATTR</code> when the caller uses an open file descriptor rather than a pathname.</p>
+<p>No protocol change is proposed. The practical impact for NFS client users is silent timestamp loss: tools that rely on <code>futimens()</code> (notably GNU <code>touch -d</code>) look successful, then the timestamps evaporate on the next revalidation.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/nMlXgkbm-9ZP_fFN16OpzFd4kwNlyXq169-6CoOE4nuHyTsmGaFeJgzuhj3grRboJKg9RapKov2_FJ1E3BCL0oZ7UNzF0pgwwhVC6VOVJYQ=@proton.me/">2026-07-20 Michael <a href="mailto:michaely4ng@proton.me">michaely4ng@proton.me</a> — [BUG] NFSv4.2: futimens() returns success without sending SETATTR</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/fcffc38c-80fd-ca2f-1b1a-f9d041c6a2c7@applied-asynchrony.com/">2026-07-23 Holger Hoffstätte <a href="mailto:holger@applied-asynchrony.com">holger@applied-asynchrony.com</a> — Re: [BUG] NFSv4.2: futimens() returns success without sending SETATTR</a></li>
+</ul>
+  </main>
+</body>
+</html>

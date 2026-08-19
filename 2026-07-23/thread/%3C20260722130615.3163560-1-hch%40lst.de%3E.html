@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>swap_ops follow-on: zram single-folio writes and NFS/SMB ops pushdown</title>
+  <meta name="description" content="Christoph Hellwig posted a three-patch follow-on to the swap-ops work already sitting in mm-unstable, aiming at two distinct problems: a zram performance regression from batched swap I/O, and a double-indirect call path that still sits…">
+  <meta property="og:title" content="swap_ops follow-on: zram single-folio writes and NFS/SMB ops pushdown">
+  <meta property="og:description" content="Christoph Hellwig posted a three-patch follow-on to the swap-ops work already sitting in mm-unstable, aiming at two distinct problems: a zram performance regression from batched swap I/O, and a double-indirect call path that still sits…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-23T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="swap_ops follow-on: zram single-folio writes and NFS/SMB ops pushdown">
+  <meta name="twitter:description" content="Christoph Hellwig posted a three-patch follow-on to the swap-ops work already sitting in mm-unstable, aiming at two distinct problems: a zram performance regression from batched swap I/O, and a double-indirect call path that still sits…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-23</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>swap_ops follow-on: zram single-folio writes and NFS/SMB ops pushdown</h1>
+<h2>Summary</h2>
+<h1>swap_ops updates: zram single-folio writes and NFS/SMB ops pushdown</h1>
+<h2>Overview</h2>
+<p>Christoph Hellwig posted a three-patch follow-on to the swap-ops work already sitting in <code>mm-unstable</code>, aiming at two distinct problems: a zram performance regression from batched swap I/O, and a double-indirect call path that still sits between MM and filesystem-based swap, including swap-over-NFS. Memory-management maintainer Chris Li and zram reporter Kairui Song both endorsed the functional patches this week; the only open request is a clearer commit message on the header-extraction patch. Hellwig posted a v2 the next day as a separate series.</p>
+<p>This is <strong>not a protocol change</strong>. It is a <strong>swap-subsystem refactor plus a performance bug fix</strong>, with concrete NFS client code movement in <code>fs/nfs/file.c</code> and <code>fs/nfs/direct.c</code>.</p>
+<h2>Background</h2>
+<p>In May, Hellwig had already sketched a merge-order plan for related swap work: Kairui Song's swap-table series first, then <code>swap_ops</code>, then the larger <code>swap_activate</code> interface rework. That earlier <code>swap_activate</code> series moved swapfile operations onto <code>file_operations</code> and mechanically updated the NFS client. This week's series is the next step: make <code>swap_ops</code> themselves pluggable so filesystem swap no longer bounces through a generic MM helper.</p>
+<h2>The series</h2>
+<p>Hellwig introduced the set on July 22 as a direct sequel to the in-tree swap-ops work:</p>
+<blockquote>
+<p>"this series is a follow on to the swap ops series now in mm-unstable. The first patch reintroduces direct folio writes for synchronous swap files, the other two remove the double indirect for file system based swap."
+— <a href="https://lore.kernel.org/linux-nfs/20260722130615.3163560-1-hch@lst.de/">Christoph Hellwig</a></p>
+</blockquote>
+<h3>Patch 1: restore single-folio writes for synchronous swap</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260722130615.3163560-2-hch@lst.de/">Patch 1</a> is the important <strong>bug-fix / performance fix</strong>. Kairui Song had reported that zram is faster when each folio is submitted immediately rather than batched, because classic LRU scanning wants the folio writeback bit cleared inside the scan loop. Hellwig's 11-line change in <code>mm/page_io.c</code> kicks off I/O for synchronous devices on every iteration instead of waiting for a batch.</p>
+<p>Chris Li acked it the same afternoon (<a href="https://lore.kernel.org/linux-nfs/CACePvbWpxJ-5kzvkFwNRcpxqxsKNowsKkWLC6BtzuabyNZv4oA@mail.gmail.com/">Acked-by: Chris Li</a>). The next day Kairui, the original reporter, confirmed the approach:</p>
+<blockquote>
+<p>"Looks good, thanks!"
+— <a href="https://lore.kernel.org/linux-nfs/CAMgjq7ArsgdKf-uZ_drQ9Kqtq4i_MMZ+dP+tjNzPrsrR0YPBWQ@mail.gmail.com/">Kairui Song</a></p>
+</blockquote>
+<p>That patch is therefore closed from both the MM-maintainer and reporter sides.</p>
+<h3>Patch 2: export <code>swap_ops</code> via a new public header</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260722130615.3163560-3-hch@lst.de/">Patch 2</a> creates <code>include/linux/swap_ops.h</code> and moves the declarations of <code>swap_iocb</code>, <code>swap_ops</code>, and <code>swap_ctx</code> out of <code>mm/swap.h</code> so implementations can live outside <code>mm/page_io.c</code>. Hellwig flagged an unfortunate naming collision with the existing, unrelated <code>swapops.h</code>:</p>
+<blockquote>
+<p>"Note that there already is a swapops.h header, which is totally unrelated to struct swap_ops. The close naming is a bit unfortunate, but I could not think of a better name for this header."
+— <a href="https://lore.kernel.org/linux-nfs/20260722130615.3163560-3-hch@lst.de/">Christoph Hellwig</a></p>
+</blockquote>
+<p>Chris Li did <strong>not</strong> ack this one. He asked whether the commit is a pure code move or whether it also changes a functional/API contract, and he wanted that spelled out in the commit message:</p>
+<blockquote>
+<p>"Can you please clarify if this commit introduces any functional or API level change this commit other than moving the code around? I don't think so, but I just want some clarification. Maybe there is a minor API change to remove the double indirection that I don't see. Anyway, it would be better to spell it out in the commit message."
+— <a href="https://lore.kernel.org/linux-nfs/CACePvbXCoJQD2xoojv1QtZX6FDim8Ar7Mj7KgtLbZ81J9mk8Kg@mail.gmail.com/">Chris Li</a></p>
+</blockquote>
+<p>No reply landed on this v1 thread. Hellwig's v2 series the next morning (<code>&lt;20260723054622.3460249-1-hch@lst.de&gt;</code>) is the implied follow-up.</p>
+<h3>Patch 3: NFS and SMB grow their own <code>swap_ops</code></h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260722130615.3163560-4-hch@lst.de/">Patch 3</a> is the NFS-client-facing change. Today, filesystem swap still takes two indirect calls: MM <code>swap_ops</code> then the filesystem <code>swap_rw</code> method. Hellwig collapses that by letting the filesystem supply the <code>swap_ops</code> table itself.</p>
+<p>The mechanism is a refactor of <code>swap_fs_submit</code> into <code>swap_fs_prepare_rw</code>, which initializes the <code>iov_iter</code> on the caller's stack so NFS and SMB can invoke it directly. Those filesystem-specific ops are then handed to <code>swap_fs_activate</code>. On the NFS side that means:</p>
+<ul>
+<li><code>fs/nfs/direct.c</code> loses the old 20-line swap-direct helper.</li>
+<li><code>fs/nfs/file.c</code> gains the filesystem-local <code>swap_ops</code> and wires them through activate.</li>
+<li><code>include/linux/nfs_fs.h</code> and <code>include/linux/fs.h</code> drop the now-unused <code>swap_rw</code> hook.</li>
+<li>VFS documentation (<code>locking.rst</code>, <code>vfs.rst</code>) is updated to match.</li>
+</ul>
+<p>SMB (<code>fs/smb/client/file.c</code>) gets the same treatment, so swap-over-CIFS follows the same contract.</p>
+<p>Chris Li, who had been waiting to see how the double hop would actually disappear, was unambiguous:</p>
+<blockquote>
+<p>"I am very happy to see the direction this patch is going. Now I see how to get rid of the double indirection. You convinced me with flying colors."
+— <a href="https://lore.kernel.org/linux-nfs/CACePvbVFw6hzEHkaDPA2y4=kTweiKCiBmrD5pL3cFJ3AEUQ8rQ@mail.gmail.com/">Chris Li</a></p>
+</blockquote>
+<p>He acked the patch.</p>
+<h2>NFS client impact</h2>
+<p>This is the first series in the current swap-ops campaign that <strong>changes how the NFS client actually performs swap I/O</strong>, rather than just relocating activate/deactivate hooks. After this lands, swap-over-NFS no longer goes MM <code>swap_ops</code> → generic <code>swap_rw</code> → <code>nfs_direct</code>/<code>nfs_file</code> helpers. NFS owns the ops vector and calls <code>swap_fs_prepare_rw</code> itself. That is a cleanup, not a protocol or on-the-wire change: NFSv3/v4 swapfile semantics are unchanged, but any future NFS swap work must implement <code>struct swap_ops</code> rather than a VFS <code>swap_rw</code> method.</p>
+<p>No NFS-specific review comments arrived this week. The discussion stayed on the MM list side (Hellwig, Li, Song). The code movement in <code>fs/nfs/file.c</code> and the deletion in <code>fs/nfs/direct.c</code> are presented as mechanical consequences of the new helper.</p>
+<h2>Classification and status</h2>
+<table><thead><tr><th>Patch</th><th>Type</th><th>Status this week</th></tr></thead><tbody>
+<tr><td>1/3 single-folio sync writes</td><td>Performance bug fix (zram / synchronous devices)</td><td>Acked by Chris Li and Kairui Song</td></tr>
+<tr><td>2/3 <code>swap_ops.h</code></td><td>Header / API extraction</td><td>Clarification requested; no ack on v1</td></tr>
+<tr><td>3/3 FS-owned <code>swap_ops</code></td><td>Refactor; NFS and SMB client API change</td><td>Acked by Chris Li</td></tr>
+</tbody></table>
+<p><strong>Conclusion:</strong> the zram regression fix and the NFS/SMB ops pushdown have maintainer support. The remaining blocker on this v1 posting is documentation of whether patch 2 is a pure move. A v2 series appeared on July 23 and should be treated as the continuation.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260722130615.3163560-1-hch@lst.de/">2026-07-22 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — swap_ops updates</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260722130615.3163560-2-hch@lst.de/">2026-07-22 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 1/3] mm/swap: revert to single-folio writes for synchronous swap devices</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260722130615.3163560-3-hch@lst.de/">2026-07-22 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 2/3] mm/swap: add a new swap_ops.h header to allow for pluggable swap ops</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260722130615.3163560-4-hch@lst.de/">2026-07-22 Christoph Hellwig <a href="mailto:hch@lst.de">hch@lst.de</a> — [PATCH 3/3] mm/swap: move swap_ops into file systems for file system-based swap</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CACePvbXCoJQD2xoojv1QtZX6FDim8Ar7Mj7KgtLbZ81J9mk8Kg@mail.gmail.com/">2026-07-22 Chris Li <a href="mailto:chrisl@kernel.org">chrisl@kernel.org</a> — Re: [PATCH 2/3] mm/swap: add a new swap_ops.h header to allow for pluggable swap ops</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CACePvbWpxJ-5kzvkFwNRcpxqxsKNowsKkWLC6BtzuabyNZv4oA@mail.gmail.com/">2026-07-22 Chris Li <a href="mailto:chrisl@kernel.org">chrisl@kernel.org</a> — Re: [PATCH 1/3] mm/swap: revert to single-folio writes for synchronous swap devices</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CACePvbVFw6hzEHkaDPA2y4=kTweiKCiBmrD5pL3cFJ3AEUQ8rQ@mail.gmail.com/">2026-07-22 Chris Li <a href="mailto:chrisl@kernel.org">chrisl@kernel.org</a> — Re: [PATCH 3/3] mm/swap: move swap_ops into file systems for file system-based swap</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAMgjq7ArsgdKf-uZ_drQ9Kqtq4i_MMZ+dP+tjNzPrsrR0YPBWQ@mail.gmail.com/">2026-07-23 Kairui Song <a href="mailto:ryncsn@gmail.com">ryncsn@gmail.com</a> — Re: [PATCH 1/3] mm/swap: revert to single-folio writes for synchronous swap devices</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd netlink stats v6: Dai Ngo settles the wdeleg_getattr debate — remove it</title>
+  <meta name="description" content="This thread continues Jeff Layton&#39;s v6 series converting the NFS server-side nfsstat interface from procfs scraping to a generic netlink dump handler, with per-netns accounting for forechannel procedure counts and — new since v5 — NFSv4…">
+  <meta property="og:title" content="nfsd netlink stats v6: Dai Ngo settles the wdeleg_getattr debate — remove it">
+  <meta property="og:description" content="This thread continues Jeff Layton&#39;s v6 series converting the NFS server-side nfsstat interface from procfs scraping to a generic netlink dump handler, with per-netns accounting for forechannel procedure counts and — new since v5 — NFSv4…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-23T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd netlink stats v6: Dai Ngo settles the wdeleg_getattr debate — remove it">
+  <meta name="twitter:description" content="This thread continues Jeff Layton&#39;s v6 series converting the NFS server-side nfsstat interface from procfs scraping to a generic netlink dump handler, with per-netns accounting for forechannel procedure counts and — new since v5 — NFSv4…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-23</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd netlink stats v6: Dai Ngo settles the wdeleg_getattr debate — remove it</h1>
+<h2>Summary</h2>
+<h1>nfsd netlink stats v6: Dai Ngo breaks the tie — <code>wdeleg_getattr</code> should go</h1>
+<h2>Context (brief bridge)</h2>
+<p>This thread continues Jeff Layton's <a href="https://lore.kernel.org/linux-nfs/20260619-exportd-netlink-v6-0-ddef3499793c@kernel.org/">v6 series</a> converting the NFS server-side <code>nfsstat</code> interface from procfs scraping to a generic netlink dump handler, with per-netns accounting for forechannel procedure counts and — new since v5 — NFSv4 backchannel (callback) operations. Last week (<a href="https://lore.kernel.org/linux-nfs/">2026-07-16 summary</a>), Layton and Chuck Lever spent the entire window re-litigating exactly one question: <strong>should the legacy <code>wdeleg_getattr</code> procfs counter be carried over into the new netlink interface, kept as a separate stat, or dropped entirely.</strong> Layton argued for dropping it (CB_GETATTR counts already approximate it), Lever argued for API equivalence between netlink and procfs, and both agreed to defer to <strong>Dai Ngo</strong>, the original author of <code>wdeleg_getattr</code>, who had not yet replied by the end of that window.</p>
+<h2>This Week (July 17): The Original Author Decides</h2>
+<p>The single in-window message is Dai Ngo's long-awaited reply, which closes out the question decisively in Layton's favor.</p>
+<h3>Dai's verdict: the name is wrong and the stat doesn't belong in nfsstats</h3>
+<p>Dai <a href="https://lore.kernel.org/linux-nfs/159e382b-8092-4d0b-8b6a-97a54cd8da41@oracle.com/">weighs in</a> with two concrete points:</p>
+<blockquote>
+<p>"The <code>wdeleg_getattr</code> counter tracks the number of times a GETATTR operation conflicts with an outstanding write delegation. As such, the name <code>wdeleg_getattr</code> does not accurately describe what the counter represents."</p>
+</blockquote>
+<p>And on its place in the interface:</p>
+<blockquote>
+<p>"Furthermore, this statistic probably does not belong in <code>nfsstats</code>. Since there are no known user-space consumers of this counter, it would be better to remove it altogether."</p>
+</blockquote>
+<p>This is a notable reversal from the position Dai presumably held when he added the counter originally — Layton had noted last week that "Dai added wdeleg_getattr originally," and was hoping for his opinion. Dai now concedes both the naming problem and the lack of any consumer, which removes the main obstacle to Layton's preferred outcome.</p>
+<h2>Key Technical Points</h2>
+<ul>
+<li><strong>What <code>wdeleg_getattr</code> actually counts:</strong> GETATTR operations from <em>other</em> clients that conflict with an outstanding write delegation on a file — i.e., the condition that triggers a delegation recall and a CB_GETATTR callback to the delegating client. It is not a protocol operation count in the same sense as the other <code>nfsstats</code> fields, which is why Layton last week called it "sort of an oddity that didn't really belong in this /proc file."</li>
+<li><strong>Why CB_GETATTR approximates it:</strong> As Layton explained last week, the only difference is coalescing — if a second client does GETATTR while a CB_GETATTR is already in flight for the same fh, <code>wdeleg_getattr</code> bumps but the CB_GETATTR counter does not (only one callback goes out). For diagnostic purposes, the callback count is "good enough."</li>
+<li><strong>No user-space consumer:</strong> Both Layton ("nfs-utils doesn't look at it") and now Dai ("there are no known user-space consumers of this counter") confirm nothing in the wild reads this field. This is the decisive practical argument: removing it breaks no tooling.</li>
+</ul>
+<h2>Classification and Significance</h2>
+<ul>
+<li><strong>Type:</strong> This is a <strong>design/ABI decision on a new feature</strong> (the netlink stats handler, patch 3/6 of the v6 series). It is not a protocol change — the underlying wire behavior of delegations and CB_GETATTR callbacks is untouched. There is no bug fix this week; last week's fixes (a use-after-free in patch 5 and a CB_SEQUENCE undercount in patch 6) stand.</li>
+<li><strong>NFS client relevance:</strong> Although the discussion is server-side, it directly affects how NFS <em>client</em> delegation activity is observable. <code>wdeleg_getattr</code> was historically a signal for diagnosing delegation recall storms and backchannel pressure — understanding why a particular file's write delegation got recalled. With its removal, admins will rely on CB_GETATTR counts (now exposed via netlink) as the proxy, which Layton has argued is a sound approximation since it counts actual callbacks sent rather than raw conflict events.</li>
+<li><strong>Outcome:</strong> The thread's open question from last week is now resolved. Dai's endorsement of removal — combined with Layton's earlier position and the confirmed absence of any consumer — strongly points to <code>wdeleg_getattr</code> being <strong>dropped</strong> in v7, at least from the netlink interface. Whether it also disappears from procfs or lingers there as a deprecated field will be a detail for the next revision, but the technical argument for keeping it is effectively gone.</li>
+</ul>
+<h2>Where Things Stand</h2>
+<p>The three-way debate (drop / expose over netlink / keep procfs-only) has collapsed to "remove it." Layton and Lever both deferred to Dai last week; Dai has now spoken, and his answer aligns with dropping the counter. A v7 of the series can proceed without <code>wdeleg_getattr</code> as a first-class stat. The remaining work on this thread is mechanical — updating patch 3/6 (and any related procfs code) to reflect the removal — rather than a further design discussion.</p>
+<h2>Key Messages This Week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/159e382b-8092-4d0b-8b6a-97a54cd8da41@oracle.com/">Dai Ngo — "it would be better to remove it altogether"</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/159e382b-8092-4d0b-8b6a-97a54cd8da41@oracle.com/">2026-07-17 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — Re: [PATCH v6 3/6] nfsd: implement server-stats-get netlink handler</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/159e382b-8092-4d0b-8b6a-97a54cd8da41@oracle.com/">2026-07-17 Dai Ngo <a href="mailto:dai.ngo@oracle.com">dai.ngo@oracle.com</a> — Re: [PATCH v6 3/6] nfsd: implement server-stats-get netlink handler</a></li>
+</ul>
+  </main>
+</body>
+</html>

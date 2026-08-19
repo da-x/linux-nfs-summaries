@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>syzbot hang: rpcbind under nfsd_mutex is a DoS vector</title>
+  <meta name="description" content="Last Thursday, syzbot filed an unreproduced hung-task report: nfsd_nl_cache_flush_doit blocked more than 143 seconds on nfsd_mutex while a concurrent nfsd_nl_listener_set_doit held the same lock. No maintainer had replied by the end of…">
+  <meta property="og:title" content="syzbot hang: rpcbind under nfsd_mutex is a DoS vector">
+  <meta property="og:description" content="Last Thursday, syzbot filed an unreproduced hung-task report: nfsd_nl_cache_flush_doit blocked more than 143 seconds on nfsd_mutex while a concurrent nfsd_nl_listener_set_doit held the same lock. No maintainer had replied by the end of…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-23T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="syzbot hang: rpcbind under nfsd_mutex is a DoS vector">
+  <meta name="twitter:description" content="Last Thursday, syzbot filed an unreproduced hung-task report: nfsd_nl_cache_flush_doit blocked more than 143 seconds on nfsd_mutex while a concurrent nfsd_nl_listener_set_doit held the same lock. No maintainer had replied by the end of…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-23</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>syzbot hang: rpcbind under nfsd_mutex is a DoS vector</h1>
+<h2>Summary</h2>
+<h1>syzbot hang: rpcbind under <code>nfsd_mutex</code> is a multi-vector DoS</h1>
+<h2>Brief bridge from last week</h2>
+<p>Last Thursday, syzbot <a href="https://lore.kernel.org/linux-nfs/6a590ea0.ccd3b023.4fae3.0000.GAE@google.com/">filed</a> an unreproduced hung-task report: <code>nfsd_nl_cache_flush_doit</code> blocked more than 143 seconds on <code>nfsd_mutex</code> while a concurrent <code>nfsd_nl_listener_set_doit</code> held the same lock. No maintainer had replied by the end of that window. This week the report is triaged in earnest — and the diagnosis is worse than a simple long hold.</p>
+<h2>Classification</h2>
+<p>This is a <strong>bug-fix / hardening</strong> discussion, not a protocol change and not a new feature. The hang is in the <strong>NFS server</strong> generic-netlink control plane (<code>fs/nfsd/nfsctl.c</code>), but the root cause sits in <strong>synchronous rpcbind registration</strong> that the kernel performs on behalf of NFSv2/v3 <strong>clients</strong>. The work is therefore an important server-side reliability fix whose failure mode is that clients never see the service in rpcbind.</p>
+<h2>Layton maps several DoS vectors — and one hard one</h2>
+<p>Five days after the report, <a href="https://lore.kernel.org/linux-nfs/a16279675545df12a15c2c6ccc8deee1164d6d57.camel@kernel.org/">Jeff Layton</a> posted the first human analysis. He has already been digging, and he is blunt about the scope:</p>
+<blockquote>
+<p>"I've been doing some investigation on this problem, and I think I pretty much understand it now. There are actually a few different DoS vectors here. Most of them are fairly simple to patch (and I have a few patches for those problems)."</p>
+</blockquote>
+<p>The easy vectors are left unnamed for now. The hard one is structural:</p>
+<blockquote>
+<p>"The hard problem here is that rpcbind registration is done synchronously under the nfsd_mutex. To talk to rpcbind, the kernel has to create a RPC client, which does a RPC ping first. If rpcbind is down then it can take up to a minute for the RPC ping to time out. rpcbind registration failure is not considered fatal, so if it fails the kernel keeps going on. If we couple those delays with a long list of listeners, then it's easy to see how to reproduce the hang."</p>
+</blockquote>
+<p>That last sentence is the missing reproducer. The new netlink <code>listener_set</code> handler can install many sockets in one call; each one may try to register with rpcbind while still holding <code>nfsd_mutex</code>. A down or unresponsive local rpcbind turns each registration into a ~60-second stall. Stack enough listeners and every other nfsd netlink op — cache flush, thread-count changes, export updates — trips the hung-task watchdog, exactly as syzbot observed.</p>
+<p>Layton's proposed structural fix is to get the registration <strong>off</strong> the mutex:</p>
+<blockquote>
+<p>"I think the only real fix here is to do the listener registration outside of the nfsd_mutex. We can either try to drop and reacquire the nfsd_mutex to do the registration or we could move to doing the registration asynchronously outside of the mutex."</p>
+</blockquote>
+<p>He prefers the async path, but flags the race he has not yet designed around:</p>
+<blockquote>
+<p>"I personally like the latter idea better, but I haven't thought enough about how we'd deal with racing listener netlink calls in that case."</p>
+</blockquote>
+<h2>Brown: why wait a minute for a local service?</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/178467050196.3371781.3758158560019971518@noble.neil.brown.name/">Neil Brown</a> pushed back on the timeout first, before the locking:</p>
+<blockquote>
+<p>"Why are we waiting a whole minute for a local service to respond? If it hasn't responded in 1 second, is it ever really likely to?"</p>
+</blockquote>
+<p>He expected a network-level error rather than a full RPC timeout — <code>ENETUNREACH</code> / <code>EHOSTUNREACH</code> exist, but there is no <code>EPORTUNREACH</code>, and rpcbind is not a remote host. His preferred first step is therefore to make <code>rpc_ping</code> fail fast. Failing that, he agrees async registration is reasonable, and he reframes the semantics in a way that matters for clients:</p>
+<blockquote>
+<p>"nfsd doesn't need the registration, only clients do. So delaying it only means we don't get an error on startup which we currently do. This is not something that would be expected in practice. Maybe a kernel warning if registration fails, and hope the sysadmin notices?"</p>
+</blockquote>
+<p>That is the client-facing stake: NFSv2/v3 clients discover the server via rpcbind. A delayed or failed registration does not stop nfsd from serving, but it <em>does</em> leave clients unable to find the service until registration completes — or permanently, if it never does.</p>
+<h2>Layton: a shorter timeout is not enough</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/0e9288a881c9fa6308cd607435192abb408a1dfb.camel@kernel.org/">Layton</a> agrees the minute-long ping looks like a historical leftover — "Is it a throwback to starting rpcbind/portmapper from inetd or something?" — but he rejects timeout-tuning as a complete fix:</p>
+<blockquote>
+<p>"In any case, a smaller timeout would make sense, but even at 1s, you could easily cause a lockup warning with just a few hundred listeners."</p>
+</blockquote>
+<blockquote>
+<p>"I think we need a more structural solution as well."</p>
+</blockquote>
+<p>On the async design, he confirms nfsd already treats v2/v3 registration failure as non-fatal (it already <code>printk</code>s and continues). His real worry is <strong>ordering</strong>:</p>
+<blockquote>
+<p>"My main concern with doing it async would be getting reg/unreg requests out of order and leaving rpcbind with a broken table, but I think we could probably do something like keep a queue of requests and process them in order from a dedicated thread or by driving async RPC submissions serially from callbacks."</p>
+</blockquote>
+<p>A broken rpcbind table is a silent client-facing outage: the server is up, the sockets are listening, but portmap lookups return stale or missing entries. Any async scheme has to serialize register/unregister so that a racing <code>listener_set</code> cannot unreg-then-reg in the wrong order.</p>
+<h2>Brown sketches dropping the mutex across the batch</h2>
+<p>In the last message of the window, <a href="https://lore.kernel.org/linux-nfs/178467790539.3371781.5416276069181909219@noble.neil.brown.name/">Brown</a> questions the premise of "a few hundred listeners" — "Is there a genuine use-case for that?" — and then points at the netlink batching change itself as the amplifier:</p>
+<blockquote>
+<p>"With the old /proc interface we could only add one at a time. The new netlink one adds many at once. Do we really need the mutex across all of that?"</p>
+</blockquote>
+<p>He attached a short sketch (the diff was trimmed at ingest) that explores releasing <code>nfsd_mutex</code> around the multi-listener work rather than holding it for the entire <code>listener_set</code> netlink call. That is closer to Layton's first option — drop and reacquire — than to a fully async rpcbind worker. No one has replied to the sketch yet; the week ends with the design still open.</p>
+<h2>Where things stand</h2>
+<ul>
+<li><strong>Type:</strong> server-side hung-task / DoS bug in the nfsd netlink control plane, with a client-visible rpcbind side effect.</li>
+<li><strong>Root cause (this week's consensus):</strong> synchronous rpcbind registration (including a ~60s <code>rpc_ping</code>) runs under the global <code>nfsd_mutex</code>; netlink <code>listener_set</code> can batch many listeners, so one unresponsive rpcbind wedges every other nfsd netlink op, including <code>nfsd_nl_cache_flush_doit</code>.</li>
+<li><strong>Easy DoS vectors:</strong> Layton says he already has patches; they have not been posted to the list this week.</li>
+<li><strong>Hard fix, still undecided:</strong>
+<ol>
+<li>shorten <code>rpc_ping</code> (Brown's first preference; Layton says necessary but insufficient);</li>
+<li>drop/reacquire <code>nfsd_mutex</code> around registration / the listener batch (Brown's sketch);</li>
+<li>async registration off a serialized queue or callback chain (Layton's preference), with care not to scramble rpcbind's table.</li>
+</ol>
+</li>
+<li><strong>No patch series posted, no Fixes: tag, nothing applied.</strong> The thread is in the design phase.</li>
+</ul>
+<p>The same coarse <code>nfsd_mutex</code> is the lock that now serializes the growing netlink control plane (listeners, cache flush, exports, stats). This week's diagnosis is the first concrete plan to stop treating rpcbind I/O as something that can run while that lock is held.</p>
+<h2>Key messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/a16279675545df12a15c2c6ccc8deee1164d6d57.camel@kernel.org/">Jeff Layton — diagnosis: several DoS vectors; rpcbind under <code>nfsd_mutex</code> is the hard one</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178467050196.3371781.3758158560019971518@noble.neil.brown.name/">Neil Brown — "Why are we waiting a whole minute for a local service?"</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/0e9288a881c9fa6308cd607435192abb408a1dfb.camel@kernel.org/">Jeff Layton — even a 1s timeout locksup with a few hundred listeners; async must stay ordered</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178467790539.3371781.5416276069181909219@noble.neil.brown.name/">Neil Brown — netlink batches many listeners; do we need the mutex across all of that?</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/a16279675545df12a15c2c6ccc8deee1164d6d57.camel@kernel.org/">2026-07-21 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [syzbot] [nfs?] INFO: task hung in nfsd_nl_cache_flush_doit</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178467050196.3371781.3758158560019971518@noble.neil.brown.name/">2026-07-21 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [syzbot] [nfs?] INFO: task hung in nfsd_nl_cache_flush_doit</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/0e9288a881c9fa6308cd607435192abb408a1dfb.camel@kernel.org/">2026-07-21 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [syzbot] [nfs?] INFO: task hung in nfsd_nl_cache_flush_doit</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178467790539.3371781.5416276069181909219@noble.neil.brown.name/">2026-07-21 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [syzbot] [nfs?] INFO: task hung in nfsd_nl_cache_flush_doit</a></li>
+</ul>
+  </main>
+</body>
+</html>
