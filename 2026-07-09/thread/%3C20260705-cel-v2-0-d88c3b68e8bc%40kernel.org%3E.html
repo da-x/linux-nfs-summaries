@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD UAF fix series v2: six-patch teardown/revocation lifetime audit lands with reviews; Sashiko ABBA alarm cleared as false positive</title>
+  <meta name="description" content="Type: Bug fix — a family of use-after-free (UAF) defects in the NFS server (nfsd) client-teardown and state-revocation machinery. This is not a wire-protocol change or new feature, and it is server-side nfs4state.c work rather than NFS…">
+  <meta property="og:title" content="NFSD UAF fix series v2: six-patch teardown/revocation lifetime audit lands with reviews; Sashiko ABBA alarm cleared as false positive">
+  <meta property="og:description" content="Type: Bug fix — a family of use-after-free (UAF) defects in the NFS server (nfsd) client-teardown and state-revocation machinery. This is not a wire-protocol change or new feature, and it is server-side nfs4state.c work rather than NFS…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-09T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSD UAF fix series v2: six-patch teardown/revocation lifetime audit lands with reviews; Sashiko ABBA alarm cleared as false positive">
+  <meta name="twitter:description" content="Type: Bug fix — a family of use-after-free (UAF) defects in the NFS server (nfsd) client-teardown and state-revocation machinery. This is not a wire-protocol change or new feature, and it is server-side nfs4state.c work rather than NFS…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-09</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD UAF fix series v2: six-patch teardown/revocation lifetime audit lands with reviews; Sashiko ABBA alarm cleared as false positive</h1>
+<h2>Summary</h2>
+<h1>NFSD UAF fix series v2: six-patch teardown/revocation lifetime audit lands with reviews; Sashiko ABBA alarm cleared as false positive</h1>
+<p><strong>Type:</strong> Bug fix — a family of use-after-free (UAF) defects in the NFS <em>server</em> (<code>nfsd</code>) client-teardown and state-revocation machinery. This is not a wire-protocol change or new feature, and it is server-side <code>nfs4state.c</code> work rather than NFS <em>client</em> development; the "NFS client" in the subject refers to the <code>nfs4_client</code> object that NFSD tracks on behalf of remote clients.</p>
+<h2>Bridging prior weeks (brief)</h2>
+<p>This thread is the direct payoff of the 6.18.37 crash investigation summarized in <a href="https://lore.kernel.org/linux-nfs/">the stwm.de thread</a>. There, Wolfgang Walter's production fileserver wedged with a NULL-deref oops in <code>remove_blocked_locks()</code> → <code>__destroy_client()</code> → <code>nfsd4_destroy_clientid()</code>, and Chuck Lever <a href="https://lore.kernel.org/linux-nfs/20260703160306.1651327-1-cel@kernel.org/">exonerated the export-cache revert commit</a>, re-scoping the bug as a latent upstream <code>nfs4state.c</code> lifetime defect: "the 6.18.36-good / 6.18.37-bad split is a timing coincidence; I believe the same latent bug is present in both." He committed to drafting an upstream fix "separately," and Wolfgang <a href="https://lore.kernel.org/linux-nfs/fa5b998163ab4d58f104ce508da5675b@stwm.de/">soaked the candidate patch on production</a> with no regressions. This week's v2 series is that fix, now expanded from the single reported crash into a full audit of the same lifetime pattern.</p>
+<h2>This week's discussion</h2>
+<p><strong>Chuck posts v2 — one crash, five sibling races</strong> (<a href="https://lore.kernel.org/linux-nfs/20260705-cel-v2-0-d88c3b68e8bc@kernel.org/">2026-07-06</a>). The cover letter frames the core invariant and how it breaks:</p>
+<blockquote>
+<p>"A NULL-pointer dereference reported during NFSv4 client teardown (patch 1) proved to be one instance of a broader lifetime bug in NFSD's state-revocation machinery. This series fixes the reported crash and the sibling races found by auditing the same pattern, then consolidates the fixes."</p>
+</blockquote>
+<p>The root cause is a missing reference: "A stateid, and a bare lock owner reachable through the client's owner hash, hold only a raw pointer to the owning nfs4_client; a reference on the stateid or owner does not keep the client alive. The client outlives its state solely because <code>__destroy_client()</code> drains that state before <code>free_client()</code> runs." Several paths break that invariant — the laundromat unhashing an expired delegation before re-linking it (patch 2), <code>nfsd4_revoke_states()</code> and its export/NFSv4.0 admin-revoke siblings dropping <code>nn-&gt;client_lock</code> then dereferencing the client again (patches 3–5), and <code>__destroy_client()</code> walking the owner hash with no reference held (patch 1). Changes since v1: "Add matching UAF fixes in several other paths." The series touches only <code>fs/nfsd/netns.h</code> and <code>fs/nfsd/nfs4state.c</code> (+94/−20).</p>
+<p><strong>The individual patches, each with a precise race narrative:</strong></p>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260705-cel-v2-1-d88c3b68e8bc@kernel.org/">Patch 1</a> fixes the reported crash: <code>__destroy_client()</code> walks <code>cl_ownerstr_hashtbl</code> and calls <code>remove_blocked_locks()</code> without holding a reference, so "the per-net laundromat, which reaps timed-out blocked locks from <code>nn-&gt;blocked_locks_lru</code> independently of client state, can free the same lock owner concurrently." The freed, zeroed slab object produces the NULL deref. Fix: hold <code>cl_lock</code> across the walk and take a reference + unhash each lock owner before dropping it. Carries <code>Reported-by: Wolfgang Walter</code> and a <code>Closes:</code> link to his oops report.</li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260705-cel-v2-2-d88c3b68e8bc@kernel.org/">Patch 2</a> closes the delegation-revoke window: "Between the unhash and the revoke the delegation is on neither client-reachable list, so <code>client_has_state()</code> can report no remaining state." A rebooted client whose new incarnation supersedes the old one can run <code>__destroy_client()</code> to completion while <code>revoke_delegation()</code> is still about to dereference <code>clp-&gt;cl_lock</code>. Fix: pin with <code>cl_rpc_users</code> across the revoke.</li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260705-cel-v2-3-d88c3b68e8bc@kernel.org/">Patches 3–5</a> cover the admin-revoke, export-revoke (<code>exportfs -u</code>), and NFSv4.0 revoked-state cleanup paths, all sharing the "drop <code>client_lock</code>, then dereference client" flaw. Notably, patch 3 documents that <code>force_expire_client()</code> does <em>not</em> consult <code>cl_rpc_users</code>, so "the walk must also skip a client that is already expiring."</li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260705-cel-v2-6-d88c3b68e8bc@kernel.org/">Patch 6</a> consolidates: the fixes left "four open-coded copies of one idiom," so Chuck factors the pin-drop into <code>__put_client_locked()</code> with a renew flag, adding <code>put_client_no_renew_*()</code> for the revocation paths that "must not revive the client they are tearing down." No behavior change.</li>
+</ul>
+<p><strong>Neil Brown reviews favorably</strong> (<a href="https://lore.kernel.org/linux-nfs/178331003326.27465.17776206334015632059@noble.neil.brown.name/">2026-07-06</a>):</p>
+<blockquote>
+<p>"Apart from one issue already mentioned in the first patch - which maybe should be fixed with a separate patch - these all look good. Thanks, Reviewed-by: NeilBrown <a href="mailto:neil@brown.name">neil@brown.name</a>"</p>
+</blockquote>
+<p><strong>Jeff Layton reviews most patches but flags patch 2</strong> (<a href="https://lore.kernel.org/linux-nfs/e23f733abb0274d8ecb0404478e5fec8ebe849a2.camel@kernel.org/">2026-07-06</a>):</p>
+<blockquote>
+<p>"This all looks pretty good, aside from patch #2 which seems like it might cause an ABBA deadlock (according to Sashiko). You can add this to patches 1 and 3-5 though: Reviewed-by: Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a>"</p>
+</blockquote>
+<p><strong>Chuck clears the deadlock alarm</strong> (<a href="https://lore.kernel.org/linux-nfs/32ecb693-3d45-4550-b74e-487bd515c111@app.fastmail.com/">2026-07-06</a>):</p>
+<blockquote>
+<p>"Reconfirmed that Sashiko's finding was a false positive."</p>
+</blockquote>
+<p>He thanks Jeff for the reviews. Jeff then <a href="https://lore.kernel.org/linux-nfs/39785ebf72eb7eeb09e006f40b7c2b38cbc0b083.camel@kernel.org/">formally reviewed patch 2</a> once the concern was resolved: "Reviewed-by: Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a>."</p>
+<h2>Technical assessment</h2>
+<ul>
+<li><strong>Classification:</strong> Pure bug fix — a cluster of use-after-free races in <code>nfsd</code>'s NFSv4 client-state lifetime management. No protocol change, no new feature. Server-side only.</li>
+<li><strong>Evolution this week:</strong> The thread moves from diagnosis (prior weeks) to a complete, reviewed fix. Chuck's single-crash v1 became a six-patch audit of the same broken invariant; the one substantive review objection (Sashiko's ABBA-deadlock claim on patch 2) was investigated and dismissed as a false positive within hours, leaving the full series with Reviewed-by tags from both Neil Brown and Jeff Layton.</li>
+<li><strong>Key technical argument:</strong> The recurring flaw is that a stateid/owner reference does not pin the owning <code>nfs4_client</code>, so any path that drops <code>client_lock</code> (or unhashes an object) before re-dereferencing the client opens a UAF window against <code>__destroy_client()</code>. The uniform remedy is to pin with <code>cl_rpc_users</code> under <code>client_lock</code> while skipping already-expiring clients — and patch 6 deduplicates that idiom.</li>
+<li><strong>Status:</strong> Reviewed and ready as of end of window; no merge announcement yet in this thread. A v3 (9 patches) and a v4 (9 patches) with the same lead subject appear in later activity, suggesting further refinement after this week.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260705-cel-v2-0-d88c3b68e8bc@kernel.org/">2026-07-06 Chuck Lever — [PATCH v2 0/6] NFSD: Fix UAFs in client teardown and state revocation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260705-cel-v2-1-d88c3b68e8bc@kernel.org/">2026-07-06 Chuck Lever — [PATCH v2 1/6] NFSD: Prevent lock owner use-after-free during client teardown</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260705-cel-v2-2-d88c3b68e8bc@kernel.org/">2026-07-06 Chuck Lever — [PATCH v2 2/6] NFSD: Prevent client use-after-free during delegation revoke</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260705-cel-v2-3-d88c3b68e8bc@kernel.org/">2026-07-06 Chuck Lever — [PATCH v2 3/6] NFSD: Prevent client use-after-free during admin state revocation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260705-cel-v2-4-d88c3b68e8bc@kernel.org/">2026-07-06 Chuck Lever — [PATCH v2 4/6] NFSD: Prevent client use-after-free during export state revocation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260705-cel-v2-5-d88c3b68e8bc@kernel.org/">2026-07-06 Chuck Lever — [PATCH v2 5/6] NFSD: Prevent client use-after-free during NFSv4.0 revoked-state cleanup</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260705-cel-v2-6-d88c3b68e8bc@kernel.org/">2026-07-06 Chuck Lever — [PATCH v2 6/6] NFSD: Consolidate the revocation-path client unpin</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178331003326.27465.17776206334015632059@noble.neil.brown.name/">2026-07-06 Neil Brown — Re: [PATCH v2 0/6] (Reviewed-by)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/e23f733abb0274d8ecb0404478e5fec8ebe849a2.camel@kernel.org/">2026-07-06 Jeff Layton — Re: [PATCH v2 0/6] (Reviewed-by 1,3–5; ABBA flag on 2)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/32ecb693-3d45-4550-b74e-487bd515c111@app.fastmail.com/">2026-07-06 Chuck Lever — Re: [PATCH v2 0/6] (Sashiko false positive)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/39785ebf72eb7eeb09e006f40b7c2b38cbc0b083.camel@kernel.org/">2026-07-06 Jeff Layton — Re: [PATCH v2 2/6] (Reviewed-by)</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260705-cel-v2-0-d88c3b68e8bc@kernel.org/">2026-07-06 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 0/6] NFSD: Fix UAFs in client teardown and state revocation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260705-cel-v2-2-d88c3b68e8bc@kernel.org/">2026-07-06 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 2/6] NFSD: Prevent client use-after-free during delegation revoke</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260705-cel-v2-1-d88c3b68e8bc@kernel.org/">2026-07-06 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 1/6] NFSD: Prevent lock owner use-after-free during client teardown</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260705-cel-v2-3-d88c3b68e8bc@kernel.org/">2026-07-06 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 3/6] NFSD: Prevent client use-after-free during admin state revocation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260705-cel-v2-5-d88c3b68e8bc@kernel.org/">2026-07-06 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 5/6] NFSD: Prevent client use-after-free during NFSv4.0 revoked-state cleanup</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260705-cel-v2-4-d88c3b68e8bc@kernel.org/">2026-07-06 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 4/6] NFSD: Prevent client use-after-free during export state revocation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260705-cel-v2-6-d88c3b68e8bc@kernel.org/">2026-07-06 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 6/6] NFSD: Consolidate the revocation-path client unpin</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178331003326.27465.17776206334015632059@noble.neil.brown.name/">2026-07-06 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> —  Re: [PATCH v2 0/6] NFSD: Fix UAFs in client teardown and state revocation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/e23f733abb0274d8ecb0404478e5fec8ebe849a2.camel@kernel.org/">2026-07-06 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v2 0/6] NFSD: Fix UAFs in client teardown and state revocation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/32ecb693-3d45-4550-b74e-487bd515c111@app.fastmail.com/">2026-07-06 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v2 0/6] NFSD: Fix UAFs in client teardown and state revocation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/39785ebf72eb7eeb09e006f40b7c2b38cbc0b083.camel@kernel.org/">2026-07-06 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v2 2/6] NFSD: Prevent client use-after-free during delegation revoke</a></li>
+</ul>
+  </main>
+</body>
+</html>

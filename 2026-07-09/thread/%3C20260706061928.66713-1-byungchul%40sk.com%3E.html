@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DEPT v19: Wait/Event Deadlock Tracker Lands with PG_locked and SUNRPC Attention</title>
+  <meta name="description" content="This is a new kernel feature — Byungchul Park&#39;s (SK hynix) 40-patch DEPT (DEPendency Tracker) series, posted as v19 on July 6. It is not an NFS bug fix in itself, but it carries one directly NFS-relevant change: a SUNRPC patch that…">
+  <meta property="og:title" content="DEPT v19: Wait/Event Deadlock Tracker Lands with PG_locked and SUNRPC Attention">
+  <meta property="og:description" content="This is a new kernel feature — Byungchul Park&#39;s (SK hynix) 40-patch DEPT (DEPendency Tracker) series, posted as v19 on July 6. It is not an NFS bug fix in itself, but it carries one directly NFS-relevant change: a SUNRPC patch that…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-09T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="DEPT v19: Wait/Event Deadlock Tracker Lands with PG_locked and SUNRPC Attention">
+  <meta name="twitter:description" content="This is a new kernel feature — Byungchul Park&#39;s (SK hynix) 40-patch DEPT (DEPendency Tracker) series, posted as v19 on July 6. It is not an NFS bug fix in itself, but it carries one directly NFS-relevant change: a SUNRPC patch that…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-09</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>DEPT v19: Wait/Event Deadlock Tracker Lands with PG_locked and SUNRPC Attention</h1>
+<h2>Summary</h2>
+<h1>DEPT v19: A 40-Patch Push to Mainline, With Fresh Scrutiny on Folio Locks and Rust</h1>
+<h2>Classification</h2>
+<p>This is a <strong>new kernel feature</strong> — Byungchul Park's (SK hynix) 40-patch <strong>DEPT (DEPendency Tracker)</strong> series, posted as <strong>v19</strong> on July 6. It is not an NFS bug fix in itself, but it carries one directly NFS-relevant change: a SUNRPC patch that relocates <code>struct rcu_head</code> inside <code>struct rpc_xprt</code>, and its overall mission — catching wait/event deadlocks that Lockdep structurally cannot see — targets exactly the RPC completion, <code>PG_locked</code>, and writeback paths that NFS client developers live in.</p>
+<h2>Bridging Prior Weeks (Briefly)</h2>
+<p>The DEPT series has been under iterative review since December 2025 (v18). Last week's adjacent thread saw Park make a strategic scoping decision: he <strong>deferred the recover-events-tracking patches (33/42–35/42)</strong> out of the initial series, stating they "unnecessarily complicate the initial DEPT patchset and significantly increase the review burden." That trimming is directly reflected in v19's shape — 40 patches instead of 42, with recover-event support explicitly dropped from this round.</p>
+<h2>This Week's Activity (July 3–9)</h2>
+<p>The entire thread activity this week landed on <strong>Monday, July 6</strong> and spilled into <strong>Tuesday, July 7</strong>:</p>
+<ol>
+<li><strong>Park posted the full v19 series</strong> — 40 patches covering the core DEPT engine, lockdep/IRQ integration, annotations for <code>wait_for_completion()</code>, swait, waitqueues, hashed-waitqueues, DMA fences, RCU, mmu notifiers, PG_locked and PG_writeback tracking, a SUNRPC fix, percpu sizing adjustments, a Rust completion helper, documentation, and a unit test.</li>
+<li><strong>Matthew Wilcox (Red Hat) replied</strong> to patch 22/40 (PG_locked tracking), raising substantive false-positive/false-negative concerns about embedding <code>pg_locked_wgen</code> in <code>struct page</code>.</li>
+<li><strong>Park responded</strong> the next day with a detailed technical rebuttal and a commitment to follow-up work on classification.</li>
+<li><strong>Gary Guo (Rust for Linux) replied</strong> to patch 31/40 (unique dept_key per <code>wait_for_completion()</code> caller), flagging that the Rust helper path would collapse all Rust callers into one shared key, defeating the false-positive avoidance the patch is trying to achieve.</li>
+</ol>
+<h3>The Cover Letter's Core Argument</h3>
+<p>Park's cover letter <a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-1-byungchul@sk.com/">v19 00/40</a> frames DEPT as filling a fundamental Lockdep blind spot:</p>
+<blockquote>
+<p>"Lockdep has been our trusted deadlock detector for two decades, but it has a fundamental blind spot: it tracks lock acquisition order, not the actual waits and events that cause deadlocks."</p>
+</blockquote>
+<p>He walks through a three-context folio/mutex interleaving that Lockdep cannot see, then positions DEPT as answering "What is this context waiting for, and what event will wake it up?" The letter also directly addresses the elephant in the room — lockdep's reverted cross-release experiment:</p>
+<blockquote>
+<p>"Cross-release (commit b09be676e0ff2) attempted to extend lockdep with wait/event tracking. It found real bugs but introduced false positives that masked further issues. DEPT learns from that experience with a cleaner design and flexible reporting that makes false positives less disruptive."</p>
+</blockquote>
+<p>And on the merge-now question:</p>
+<blockquote>
+<p>"Now. The annotation journey requires mainline collaboration. Lockdep didn't become useful overnight — it grew through maintainer contributions. DEPT needs the same path."</p>
+</blockquote>
+<p>The series is marked <code>EXPERIMENTAL</code> in Kconfig, and Park lists three real-world deadlocks DEPT has already caught (Sakura/igalia/LG links) as evidence that this is "beyond theory."</p>
+<h3>Key Technical Arguments This Week</h3>
+<p><strong>1. The PG_locked tracking debate (Wilcox ↔ Park)</strong> — the most substantive technical exchange of the week.</p>
+<p>Matthew Wilcox <a href="https://lore.kernel.org/linux-nfs/akvueAxPl8aoLvMR@casper.infradead.org/">raised</a> a concrete false-positive/false-negative scenario: folios F1 and F2 in mapping M1 are correctly locked in order F1→F2 (writeback). After reclaim, the same physical pages reappear in mapping M2 at different indices, where the correct order is now F2→F1. Wilcox's core concern:</p>
+<blockquote>
+<p>"I don't see a part of this patch where we clear pg_locked_wgen when the page is returned to the page allocator. Maybe I missed that."</p>
+</blockquote>
+<p>He argues the dependency should be tracked in the <em>owner</em> of the folio — <code>struct address_space</code> for files, <code>anon_vma</code> for anonymous memory — not in <code>struct page</code> itself:</p>
+<blockquote>
+<p>"I think we should be tracking PG_locked dependencies in the owner of the folio. For files, that would be in the struct address_space."</p>
+</blockquote>
+<p>Park <a href="https://lore.kernel.org/linux-nfs/20260707023542.GA33746@system.software.com/">responded</a> with a layered defense:</p>
+<ul>
+<li>On the stale-wgen concern: "You are right. pg_locked_wgen doesn't get cleared. However, DEPT works this way: ... it's guranteed that pg_locked_wgen has been updated e.i. (1) when DEPT refers to pg_locked_wgen e.i. (2). So I don't think it's a problem."</li>
+<li>On classification: "I think it's a good point but it's a classification issue. folios owned by struct address_space should be classified to e.g. address_space_class and ones owned by struct anon_vma should be classified to e.g. anon_vma_class. I will work on it to apply the insight you just gave but better do it as follow-up patches since the initial patchset is already too big to get reviewed."</li>
+<li>On same-class folio ordering (the F1→F2 pattern within one mapping): "DEPT cannot work with it automatically" — it needs a <code>folio_lock_nested()</code>-style annotation, which Park says he "need[s] to introduce" and that "The work is in progress."</li>
+</ul>
+<p>This is the most important open design question for DEPT's usefulness on NFS: page-lock ordering is precisely where NFS client writeback and readahead paths live.</p>
+<p><strong>2. The Rust dept_key problem (Gary Guo).</strong></p>
+<p>Gary Guo <a href="https://lore.kernel.org/linux-nfs/DJSEK3KA2ECQ.1512A4KGOBSCV@garyguo.net/">flagged</a> a concrete defect in patch 31/40:</p>
+<blockquote>
+<p>"This will cause Rust code to share the same dept_key, so it will have all the false positives that the change is trying to avoid."</p>
+</blockquote>
+<p>His root-cause analysis: the C side uses function-like macros that define per-caller statics (one <code>dept_key</code> per call site), but the Rust helper <code>rust_helper_wait_for_completion()</code> is a plain function — so every Rust caller funnels through one shared key. He proposes borrowing his existing approach for <code>lock_class_key</code> (a linked lore link) to keep the Rust side as a function while still getting per-caller keys, and asks:</p>
+<blockquote>
+<p>"Is dept_key similar to lock_class_key, where only the address matters?"</p>
+</blockquote>
+<p>Park has not yet replied to this as of the end of the window. This is a real bug in v19 for any Rust-based NFS or networking code that uses <code>wait_for_completion()</code>.</p>
+<p><strong>3. The SUNRPC fix (patch 37/40) — the one directly-NFS patch.</strong></p>
+<p>This is a genuine <strong>bug fix</strong> triggered by enabling DEPT: with DEPT's debug instrumentation, <code>offsetof(struct rpc_xprt, rcu)</code> exceeds 4096 bytes, tripping <code>kfree_rcu()</code>'s <code>BUILD_BUG_ON</code>. The fix relocates <code>struct rcu_head</code> to the first field of <code>struct rpc_xprt</code>. It carries a <strong>Reviewed-by from Jeff Layton</strong> (NFS maintainer), which is notable for a patch in a 40-patch series aimed at a different subsystem. The commit message:</p>
+<blockquote>
+<p>"Since kfree_rcu() assumes 'offset of struct rcu_head in a rcu-managed struct &lt; 4096', the offest of struct rcu_head in struct rpc_xprt should not exceed 4096 but does, due to the debug information added by DEPT."</p>
+</blockquote>
+<p>Reported-by: Yunseong Kim. This is the kind of cross-subsystem breakage that only surfaces when a new instrumentation framework is enabled across the whole kernel — and it's already been reviewed by the NFS maintainer.</p>
+<p><strong>4. Other notable v19 changes (no in-thread discussion yet):</strong></p>
+<ul>
+<li><strong>Timeout-aware reporting</strong> (patches 15–20): New <code>CONFIG_DEPT_AGGRESSIVE_TIMEOUT_WAIT</code> Kconfig lets users suppress reports involving timed-out waits, which Park notes "don't actually cause deadlocks" but are "worth informing the circular dependency for some cases where, for example, timeout is used to avoid a deadlock."</li>
+<li><strong>External wgen</strong> (patch 21): For classes like PG_locked where embedding a full <code>dept_map</code> in every <code>struct page</code> is too expensive, DEPT now supports a minimal timestamp-based "wgen" instead.</li>
+<li><strong>RCU dept_key collision fix</strong> by Yunseong Kim (patch 34): fixes key collisions between different RCU wait types.</li>
+<li><strong>Percpu sizing</strong> (patch 38): increases <code>PERCPU_DYNAMIC_SIZE_SHIFT</code> when DEPT is enabled on large-PAGE_SIZE architectures, to accommodate the percpu data DEPT adds.</li>
+<li><strong>Unit test</strong> (patch 40): a basic selftest for DEPT itself.</li>
+</ul>
+<h2>Evolution of the Discussion</h2>
+<p>The arc this week moved from <strong>announcement → immediate technical scrutiny</strong>:</p>
+<ol>
+<li><strong>July 6, 06:19 UTC:</strong> Park posts all 40 patches in one burst.</li>
+<li><strong>July 6, 18:06 UTC:</strong> Wilcox engages with the most architecturally risky patch (PG_locked in <code>struct page</code>), offering a concrete counter-example and a design alternative (owner-based tracking).</li>
+<li><strong>July 7, 02:35 UTC:</strong> Park responds with a point-by-point technical defense, concedes the classification improvement is needed, and commits to follow-up patches — but holds the line on the current v19 shape.</li>
+<li><strong>July 7, 14:18 UTC:</strong> Gary Guo identifies a real defect in the Rust integration path (shared dept_key), proposing a fix pattern from his prior <code>lock_class_key</code> work.</li>
+</ol>
+<p>The discussion is still early — only two of the 40 patches have drawn replies, and neither Park nor any maintainer has posted an overall verdict on the series. The Wilcox exchange is the most substantive; the Guo reply is a concrete bug report that will need a code fix before merge.</p>
+<h2>Significance for NFS Client Development</h2>
+<ul>
+<li><strong>The SUNRPC <code>rcu_head</code> relocation</strong> is the only patch with direct NFS-tree impact, and it already has Jeff Layton's Reviewed-by. It's a defensive fix — without it, any kernel built with <code>CONFIG_DEPT</code> fails to compile <code>net/sunrpc/xprt.o</code>.</li>
+<li><strong>PG_locked tracking (patch 22/40) is where DEPT's value for NFS becomes concrete.</strong> NFS client readahead, writeback, and direct-I/O paths all sleep on page locks. The Wilcox/Park exchange identifies the key design gap: per-page wgen vs. per-owner (address_space/anon_vma) classification. Until that's resolved, DEPT's folio-lock deadlock detection will have both false positives (stale wgen across reclaim) and false negatives (same-class ordering within a mapping).</li>
+<li><strong>The Rust dept_key bug</strong> matters for any Rust-based kernel components (including potential future NFS client code in Rust) that use <code>wait_for_completion()</code>.</li>
+<li><strong>No new NFS protocol changes or NFS client bug fixes</strong> were introduced this week. The thread is entirely about the DEPT infrastructure and its one necessary SUNRPC accommodation.</li>
+</ul>
+<h2>Final Conclusions (as of window close)</h2>
+<ul>
+<li>v19 is posted; the series is leaner than v18 (recover-events deferred).</li>
+<li>One patch (37/40, SUNRPC rcu_head) has NFS maintainer review.</li>
+<li>Two patches have open technical questions: 22/40 (PG_locked classification — Park committed to follow-up work) and 31/40 (Rust shared dept_key — Guo proposed a fix pattern, awaiting Park's response).</li>
+<li>No merge decision, no overall series verdict from any maintainer yet. The thread is in the early-review phase.</li>
+</ul>
+<h2>Key Messages</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-1-byungchul@sk.com/">v19 cover letter</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-2-byungchul@sk.com/">Patch 01/40: core DEPT implementation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-23-byungchul@sk.com/">Patch 22/40: PG_locked tracking</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/akvueAxPl8aoLvMR@casper.infradead.org/">Wilcox's PG_locked review</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260707023542.GA33746@system.software.com/">Park's response to Wilcox</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-32-byungchul@sk.com/">Patch 31/40: unique dept_key per completion caller</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/DJSEK3KA2ECQ.1512A4KGOBSCV@garyguo.net/">Guo's Rust dept_key concern</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-38-byungchul@sk.com/">Patch 37/40: SUNRPC rcu_head relocation</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-2-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 01/40] dept: implement DEPT(DEPendency Tracker)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-1-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 00/40] DEPT(DEPendency Tracker)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-3-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 02/40] dept: add single event dependency tracker APIs</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-4-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 03/40] dept: add lock dependency tracker APIs</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-5-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 04/40] dept: tie to lockdep and IRQ tracing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-6-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 05/40] dept: add proc knobs to show stats and dependency graph</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-7-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 06/40] dept: distinguish each kernel context from another</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-8-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 07/40] dept: distinguish each work from another</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-9-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 08/40] dept: add a mechanism to refill the internal memory pools on running out</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-11-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 10/40] dept: apply sdt_might_sleep_{start,end}() to wait_for_completion()/complete()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-10-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 09/40] dept: record the latest one out of consecutive waits of the same class</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-12-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 11/40] dept: apply sdt_might_sleep_{start,end}() to swait</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-13-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 12/40] dept: apply sdt_might_sleep_{start,end}() to waitqueue wait</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-14-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 13/40] dept: apply sdt_might_sleep_{start,end}() to hashed-waitqueue wait</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-15-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 14/40] dept: apply sdt_might_sleep_{start,end}() to dma fence</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-16-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 15/40] dept: track timeout waits separately with a new Kconfig</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-17-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 16/40] dept: apply timeout consideration to wait_for_completion()/complete()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-18-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 17/40] dept: apply timeout consideration to swait</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-22-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 21/40] dept: make dept able to work with an external wgen</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-20-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 19/40] dept: apply timeout consideration to hashed-waitqueue wait</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-19-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 18/40] dept: apply timeout consideration to waitqueue wait</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-26-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 25/40] dept: add documents for dept</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-21-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 20/40] dept: apply timeout consideration to dma fence wait</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-23-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 22/40] dept: track PG_locked with dept</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-27-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 26/40] cpu/hotplug: use a weaker annotation in AP thread</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-25-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 24/40] locking/lockdep: prevent various lockdep assertions when lockdep_off()'ed</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-24-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 23/40] dept: print staged wait's stacktrace on report</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-29-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 28/40] dept: assign unique dept_key to each distinct dma fence caller</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-28-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 27/40] dept: assign dept map to mmu notifier invalidation synchronization</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-31-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 30/40] dept: make dept stop from working on debug_locks_off()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-30-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 29/40] dept: make dept aware of lockdep_set_lock_cmp_fn() annotation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-32-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 31/40] dept: assign unique dept_key to each distinct wait_for_completion() caller</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-34-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 33/40] dept: call dept_hardirqs_off() in local_irq_*() regardless of irq state</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-33-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 32/40] completion, dept: introduce init_completion_dmap() API</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-35-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 34/40] rcu/update: fix same dept key collision between various types of RCU</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-36-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 35/40] dept: introduce APIs to set page usage and use subclasses_evt for the usage</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-37-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 36/40] dept: track PG_writeback with dept</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-38-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 37/40] SUNRPC: relocate struct rcu_head to the first field of struct rpc_xprt</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-39-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 38/40] mm: percpu: increase PERCPU_DYNAMIC_SIZE_SHIFT on DEPT and large PAGE_SIZE</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-40-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 39/40] rust: completion: Add __rust_helper to rust_helper_wait_for_completion()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706061928.66713-41-byungchul@sk.com/">2026-07-06 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — [PATCH v19 40/40] dept: implement a basic unit test for dept</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/akvueAxPl8aoLvMR@casper.infradead.org/">2026-07-06 Matthew Wilcox <a href="mailto:willy@infradead.org">willy@infradead.org</a> — Re: [PATCH v19 22/40] dept: track PG_locked with dept</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260707023542.GA33746@system.software.com/">2026-07-07 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — Re: [PATCH v19 22/40] dept: track PG_locked with dept</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/DJSEK3KA2ECQ.1512A4KGOBSCV@garyguo.net/">2026-07-07 "Gary Guo" <a href="mailto:gary@garyguo.net">gary@garyguo.net</a> — Re: [PATCH v19 31/40] dept: assign unique dept_key to each distinct wait_for_completion() caller</a></li>
+</ul>
+  </main>
+</body>
+</html>

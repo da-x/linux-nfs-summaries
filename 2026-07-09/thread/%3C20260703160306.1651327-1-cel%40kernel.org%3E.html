@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>6.18.37 nfsd crash: reporter validates Chuck Lever&#39;s UAF patch on production, no regressions in a week of soak</title>
+  <meta name="description" content="Type: Bug-fix validation / regression investigation (NFS server side — nfsd state management, not client development or a protocol change). This week&#39;s three messages close out the diagnostic phase that began with Chuck Lever&#39;s exoneration…">
+  <meta property="og:title" content="6.18.37 nfsd crash: reporter validates Chuck Lever&#39;s UAF patch on production, no regressions in a week of soak">
+  <meta property="og:description" content="Type: Bug-fix validation / regression investigation (NFS server side — nfsd state management, not client development or a protocol change). This week&#39;s three messages close out the diagnostic phase that began with Chuck Lever&#39;s exoneration…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-09T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="6.18.37 nfsd crash: reporter validates Chuck Lever&#39;s UAF patch on production, no regressions in a week of soak">
+  <meta name="twitter:description" content="Type: Bug-fix validation / regression investigation (NFS server side — nfsd state management, not client development or a protocol change). This week&#39;s three messages close out the diagnostic phase that began with Chuck Lever&#39;s exoneration…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-09</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>6.18.37 nfsd crash: reporter validates Chuck Lever's UAF patch on production, no regressions in a week of soak</h1>
+<h2>Summary</h2>
+<h1>6.18.37 nfsd crash: reporter soaks Chuck Lever's candidate UAF fix on the production fileserver</h1>
+<p><strong>Type:</strong> Bug-fix validation / regression investigation (NFS <em>server</em> side — <code>nfsd</code> state management, not client development or a protocol change). This week's three messages close out the diagnostic phase that began with Chuck Lever's <a href="https://lore.kernel.org/linux-nfs/20260703160306.1651327-1-cel@kernel.org/">exoneration of the export-cache revert</a> earlier in the same window: Wolfgang Walter now reports a clean soak test of Chuck's candidate fix.</p>
+<h2>Bridging prior weeks (brief)</h2>
+<p>Per the <a href="https://lore.kernel.org/linux-nfs/">prior summary</a>, the thread started with Wolfgang reporting a production NFSv4.2 fileserver wedging on 6.18.37 and his bisect pointing at commit <code>95f9eb19d5e6</code> ("Revert 'NFSD: Defer sub-object cleanup in export put callbacks'"). Chuck Lever then <a href="https://lore.kernel.org/linux-nfs/20260703160306.1651327-1-cel@kernel.org/">delivered the decisive analytical pivot</a>: the oops sits entirely in <code>fs/nfsd/nfs4state.c</code> (<code>remove_blocked_locks()</code> → <code>__destroy_client()</code> → <code>nfsd4_destroy_clientid()</code>), code the suspect commit never touched, so "the 6.18.36-good / 6.18.37-bad split is a timing coincidence; I believe the same latent bug is present in both." Chuck offered two paths forward — run KASAN on the production box, or test his forthcoming candidate patch as "the least disruptive way to confirm" — and committed to drafting an upstream fix separately.</p>
+<h2>This week's discussion</h2>
+<p><strong>Wolfgang accepts the re-framing and picks the low-disruption path</strong> (<a href="https://lore.kernel.org/linux-nfs/3d80d1812ab903dbc831fef122d3cc75@stwm.de/">2026-07-03</a>). Acknowledging Chuck's verdict, he notes "Ok. I run v6.18.37 with the patch reverted since about a day (just for the record). But according to your analysis, that's just a coincidence." He is receptive to KASAN — "I think the memory usage should not be a problem, higher cpu usage neither" — but flags the fundamental difficulty of chasing an intermittent race on production:</p>
+<blockquote>
+<p>"But as it is a coincidence the probability to catch that error is probably very low. We use v6.18 kernels since v6.18.1 on that fileserver and this error never occured before."</p>
+</blockquote>
+<p>He asks whether the bug might be firing silently — "Or do you think it happens more often, but without symptoms, and KASAN would detect it?" — and settles on testing Chuck's patch:</p>
+<blockquote>
+<p>"So I will try running a v3.18.37 + your patch applied. This of course can not prove that it fixes the problem because it almost never happens, but probably this would detect if if the patch had side effects."</p>
+</blockquote>
+<p><strong>Chuck confirms the limitation of the test</strong> (<a href="https://lore.kernel.org/linux-nfs/ad301582-cb44-42cd-ab3f-c90f7c3dc11a@app.fastmail.com/">2026-07-03</a>). He validates Wolfgang's reasoning about release correlation and sharpens the diagnosis:</p>
+<blockquote>
+<p>"I think it's more likely that your 50 client workload hit a particular race that exposed a pre-existing UAF. KASAN will change execution timing, certainly, but I can't predict whether it will make the race window bigger."</p>
+</blockquote>
+<p>He then states candidly what the soak test can and cannot prove:</p>
+<blockquote>
+<p>"So you can only test whether my patch causes new regressions, not whether it prevents your crasher. :-("</p>
+</blockquote>
+<p><strong>Wolfgang reports a clean one-week soak</strong> (<a href="https://lore.kernel.org/linux-nfs/fa5b998163ab4d58f104ce508da5675b@stwm.de/">2026-07-06</a>). After running the patched kernel on the production box:</p>
+<blockquote>
+<p>"6.18.37 + your patch is running here since saturday with no problems."</p>
+</blockquote>
+<h2>Technical assessment</h2>
+<ul>
+<li><strong>Classification:</strong> Bug fix — a suspected use-after-free in the NFSv4 client-state teardown path (<code>remove_blocked_locks()</code> walking a corrupted/freed lock list during <code>nfsd4_destroy_clientid()</code>). Server-side <code>nfsd</code> state management; not a wire-protocol change or new feature, and not NFS <em>client</em> development.</li>
+<li><strong>Evolution this week:</strong> The thread moves from diagnosis to validation. Chuck's earlier file-scope argument (the suspect commit cannot be the cause) is accepted by the reporter, who abandons the revert-the-revert experiment in favor of testing the candidate fix. Chuck explicitly scopes what that test proves — regression-freeness only, not crash-prevention — given the race's rarity ("almost never happens" on a box running 6.18 since v6.18.1).</li>
+<li><strong>Key technical arguments:</strong> (1) The 50-client workload likely "hit a particular race that exposed a pre-existing UAF"; (2) KASAN's timing perturbation makes it an unreliable trigger for this specific window; (3) the only actionable signal from production is absence of regressions under the patch.</li>
+<li><strong>Status:</strong> Unresolved but progressing favorably. The candidate fix has passed a ~4-day production soak with no regressions, which clears the "no side effects" bar Chuck set. What remains open: (a) confirmation that the patch actually prevents the crasher — still pending KASAN output or another natural occurrence; (b) mainline submission of the fix, since Chuck's position is that "the fix belongs in mainline first and is then backported to 6.18.y." The patch itself was not part of this thread's window (Chuck said he would send it "separately"), so its review and merge are the likely next development.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/3d80d1812ab903dbc831fef122d3cc75@stwm.de/">2026-07-03 Wolfgang Walter <a href="mailto:linux@stwm.de">linux@stwm.de</a> — Re: 6.18.37 has problems with nfs4 (server), 6.18.36 works</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ad301582-cb44-42cd-ab3f-c90f7c3dc11a@app.fastmail.com/">2026-07-03 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: 6.18.37 has problems with nfs4 (server), 6.18.36 works</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/fa5b998163ab4d58f104ce508da5675b@stwm.de/">2026-07-06 Wolfgang Walter <a href="mailto:linux@stwm.de">linux@stwm.de</a> — Re: 6.18.37 has problems with nfs4 (server), 6.18.36 works</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/3d80d1812ab903dbc831fef122d3cc75@stwm.de/">2026-07-03 Wolfgang Walter <a href="mailto:linux@stwm.de">linux@stwm.de</a> — Re: 6.18.37 has problems with nfs4 (server), 6.18.36 works</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ad301582-cb44-42cd-ab3f-c90f7c3dc11a@app.fastmail.com/">2026-07-03 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: 6.18.37 has problems with nfs4 (server), 6.18.36 works</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/fa5b998163ab4d58f104ce508da5675b@stwm.de/">2026-07-06 Wolfgang Walter <a href="mailto:linux@stwm.de">linux@stwm.de</a> — Re: 6.18.37 has problems with nfs4 (server), 6.18.36 works</a></li>
+</ul>
+  </main>
+</body>
+</html>

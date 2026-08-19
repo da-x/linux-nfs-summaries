@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd: do_lookup_open() switchover hits three correctness landmines; re-roll requested</title>
+  <meta name="description" content="Thread: [PATCH v2 14/14] nfsd: use do_lookup_open() for non-creating open requests too. (root &lt;20260705222032.1240057-15-neilb@ownmail.net&gt;) Week: ending 2026-07-09 · In-window messages: 1">
+  <meta property="og:title" content="nfsd: do_lookup_open() switchover hits three correctness landmines; re-roll requested">
+  <meta property="og:description" content="Thread: [PATCH v2 14/14] nfsd: use do_lookup_open() for non-creating open requests too. (root &lt;20260705222032.1240057-15-neilb@ownmail.net&gt;) Week: ending 2026-07-09 · In-window messages: 1">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-09T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd: do_lookup_open() switchover hits three correctness landmines; re-roll requested">
+  <meta name="twitter:description" content="Thread: [PATCH v2 14/14] nfsd: use do_lookup_open() for non-creating open requests too. (root &lt;20260705222032.1240057-15-neilb@ownmail.net&gt;) Week: ending 2026-07-09 · In-window messages: 1">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-09</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd: do_lookup_open() switchover hits three correctness landmines; re-roll requested</h1>
+<h2>Summary</h2>
+<h1>nfsd: <code>do_lookup_open()</code> for non-creating opens — three correctness concerns force a re-roll</h1>
+<p><strong>Thread:</strong> [PATCH v2 14/14] nfsd: use do_lookup_open() for non-creating open requests too. (root <a href="mailto:20260705222032.1240057-15-neilb@ownmail.net">20260705222032.1240057-15-neilb@ownmail.net</a>)
+<strong>Week:</strong> ending 2026-07-09 · <strong>In-window messages:</strong> 1</p>
+<h2>The big picture</h2>
+<p>Neil Brown's v2 series "nfsd: refactor nfs4_create_file()" is a long-running cleanup of the NFSv4 server-side open/create path. The final patch (14/14) flips plain, non-creating OPEN requests over to the new <code>do_lookup_open()</code> helper that was built for the create path. This week's single in-window message — <a href="https://lore.kernel.org/linux-nfs/20260706143647.1243020-1-cel@kernel.org/">Chuck Lever's review</a> — is a heavyweight objection: three correctness regressions, each with a concrete failure mode, and an explicit request that the series be re-rolled before it can land.</p>
+<p>This is <strong>a bug-fix / regression-prevention discussion on top of a refactor</strong>, not a new feature or protocol change. The NFSv4 wire protocol is untouched; the concern is entirely about what the server does (or stops doing) when it resolves and opens an existing file handle for a client OPEN.</p>
+<h2>Context: how we got here</h2>
+<p>The series has been iterating since at least a June RFC ("VFS/nfsd: replace dentry_create()") and v2 was posted 2026-07-05. Chuck's reply is framed as a follow-up to automated review tooling rather than a first-pass read:</p>
+<blockquote>
+<p>"Thanks for jumping on the Sashiko findings. Codex review identified three correctness concerns which I've confirmed with Claude are not false positives"</p>
+</blockquote>
+<p>That framing matters journalistically: this is an example of AI-assisted patch review (Sashiko, Codex, Claude) doing the first-line triage on a kernel mailing list, with a human maintainer confirming each finding before it goes to the author. The three items below are the confirmed findings.</p>
+<h2>The three correctness concerns</h2>
+<h3>1. Unconditional <code>mnt_want_write()</code> breaks read-only mounts for plain reads</h3>
+<p><code>do_lookup_open()</code> grabs write access on the parent mount unconditionally:</p>
+<blockquote>
+<p>"error = mnt_want_write(parent-&gt;mnt); if (error) return ERR_PTR(error);"</p>
+<p>"Fine for a create. But a read-only OPEN with no create now returns -EROFS on anything mounted read-only at the VFS layer: squashfs, iso9660, a read-only bind mount, a snapshot."</p>
+</blockquote>
+<p>The old code path only asked for write when <code>nfsd_open()</code> actually opened the file, and for <code>O_RDONLY</code> it never asked at all. Chuck is careful to draw a line between this and the NFS export <code>ro=</code> option:</p>
+<blockquote>
+<p>"Worth stressing that this isn't the 'ro' export option. That keeps the underlying mount writable and is enforced in nfsd, so it's fine. Only genuinely read-only mounts break, which is probably why it slipped past testing."</p>
+</blockquote>
+<p>His proposed fix: make the <code>mnt_want_write()</code> conditional on <code>O_CREAT</code>, since "the read-only-open setattr path already re-takes write for itself, so it shouldn't need the blanket grab."</p>
+<h3>2. Opening before type-checking turns OPEN into a DoS vector</h3>
+<p><code>do_lookup_open()</code> runs <code>dentry_open()</code> on <em>any</em> positive dentry; the regular-file check (<code>nfsd_check_obj_isreg()</code>) only happens after <code>nfsd4_open_file()</code> returns. With no <code>O_NONBLOCK</code>, an OPEN of an existing FIFO blocks in <code>fifo_open()</code> waiting for a peer — while still holding the parent directory's <code>i_rwsem</code> from <code>start_creating()</code>:</p>
+<blockquote>
+<p>"One client can pin an nfsd thread and the parent directory that way; a handful of them and the pool is spent. A device node does the same thing through its -&gt;open."</p>
+</blockquote>
+<p>Chuck concedes this isn't strictly new to 14/14 — an earlier patch ("always open file in nfsd4_create_file()") already opened existing files for the UNCHECKED case — but the final switchover extends the exposure to plain reads. His suggestion: "could we check <code>d_is_reg()</code> ahead of the <code>dentry_open()</code>?"</p>
+<h3>3. Mount-crossing and export revalidation silently dropped</h3>
+<p>The old <code>nfsd_lookup_dentry()</code> went through <code>nfsd_mountpoint()</code> and <code>nfsd_cross_mnt()</code>, revalidating the export it crossed into. The new path is "a plain one-component lookup" that composes the filehandle against the <em>parent</em> export:</p>
+<blockquote>
+<p>"Bind-mount one regular file over another inside an export and the new path hands back the covered file instead of the mounted one, with no check_nfsd_access() on the real target."</p>
+</blockquote>
+<p>He scopes it honestly — "Narrow, since only file-over-file mounts reach it (a directory trips the isreg check)" — but flags that "the behavior did change," i.e. this is a silent semantic regression in access control for a corner case.</p>
+<h2>Where things stand</h2>
+<p>Chuck closes by noting the fixes may not all live in 14/14:</p>
+<blockquote>
+<p>"Actually some of the suspect logic is added in earlier patches, only to be exposed by this final switchover patch, so I'll wait for a re-roll."</p>
+</blockquote>
+<p>So the thread ends (for this week) with the v2 series effectively <strong>NACK'd pending a v3</strong> that must:</p>
+<ol>
+<li>Make <code>mnt_want_write()</code> conditional on <code>O_CREAT</code> in <code>do_lookup_open()</code>.</li>
+<li>Check <code>d_is_reg()</code> before calling <code>dentry_open()</code>, restoring the pre-open type gate.</li>
+<li>Restore mount-crossing / export revalidation (or explicitly justify its removal) for the file-over-file bind-mount case.</li>
+</ol>
+<p>No reply from Neil Brown landed inside this week's window; the ball is in his court to re-roll the series. Given the prior RFC→v2 cadence and the fact that two of the three issues trace back to earlier patches in the same series, expect a v3 that touches more than just 14/14.</p>
+<h2>Why it matters for NFS server users</h2>
+<ul>
+<li><strong>Read-only exports on read-only filesystems</strong> (ISO images, squashfs appliances, ZFS/Btrfs snapshots served over NFS) would have started failing plain <code>O_RDONLY</code> opens with <code>-EROFS</code> — a user-visible regression that testing missed because the common case is a writable mount.</li>
+<li><strong>Server availability:</strong> the FIFO/device-node pinning issue is a trivially triggerable resource-exhaustion path against the nfsd thread pool, holding a directory lock while blocked.</li>
+<li><strong>Access control:</strong> dropping <code>check_nfsd_access()</code> on the real target for file-over-file bind mounts is a (narrow) authorization bypass surface that maintainers will not want in mainline.</li>
+</ul>
+<h2>Key messages</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706143647.1243020-1-cel@kernel.org/">Chuck Lever's review of 14/14</a> — the sole in-window message; carries all three findings and the re-roll request.</li>
+<li>Thread root: Neil Brown's <a href="https://lore.kernel.org/linux-nfs/20260705222032.1240057-15-neilb@ownmail.net/">PATCH v2 14/14</a> (posted just before this window; body not in scope here).</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706143647.1243020-1-cel@kernel.org/">2026-07-06 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v2 14/14] nfsd: use do_lookup_open() for non-creating open requests too.</a></li>
+</ul>
+  </main>
+</body>
+</html>

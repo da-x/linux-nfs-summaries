@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSv3 O_WRONLY|O_CREAT EACCES: vendor appliance CREATE behavior vs. NFSD, and the UNCHECKED semantics debate</title>
+  <meta name="description" content="This is a bug-fix / regression-investigation thread on the Linux NFS client, now narrowed to a server-side protocol-conformance question. The core incident: after upgrading from kernel 6.1 LTS to 6.12 LTS, an application doing…">
+  <meta property="og:title" content="NFSv3 O_WRONLY|O_CREAT EACCES: vendor appliance CREATE behavior vs. NFSD, and the UNCHECKED semantics debate">
+  <meta property="og:description" content="This is a bug-fix / regression-investigation thread on the Linux NFS client, now narrowed to a server-side protocol-conformance question. The core incident: after upgrading from kernel 6.1 LTS to 6.12 LTS, an application doing…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-09T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSv3 O_WRONLY|O_CREAT EACCES: vendor appliance CREATE behavior vs. NFSD, and the UNCHECKED semantics debate">
+  <meta name="twitter:description" content="This is a bug-fix / regression-investigation thread on the Linux NFS client, now narrowed to a server-side protocol-conformance question. The core incident: after upgrading from kernel 6.1 LTS to 6.12 LTS, an application doing…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-09</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSv3 O_WRONLY|O_CREAT EACCES: vendor appliance CREATE behavior vs. NFSD, and the UNCHECKED semantics debate</h1>
+<h2>Summary</h2>
+<h1>NFSv3 <code>O_WRONLY|O_CREAT</code> EACCES: the UNCHECKED-semantic dispute over a vendor appliance</h1>
+<h2>Overview</h2>
+<p>This is a <strong>bug-fix / regression-investigation</strong> thread on the Linux NFS <em>client</em>, now narrowed to a server-side protocol-conformance question. The core incident: after upgrading from kernel 6.1 LTS to 6.12 LTS, an application doing <code>open(O_WRONLY|O_CREAT)</code> on a <strong>pre-existing file</strong> began failing with <code>EACCES</code> (permission denied) when the client has write permission on the file but <em>not</em> on the containing directory. This week's two in-window messages — Tian Lan of Jane Street identifying the offending server, and NFS maintainer Chuck Lever supplying the RFC-level analysis — establish that the Linux client is behaving correctly and that the fault lies with a non-conformant vendor appliance.</p>
+<h2>Bridging prior context (brief)</h2>
+<p>The thread opened on July 6 when <a href="https://lore.kernel.org/linux-nfs/20260706213435.659381-1-tilan@janestreet.com/">Tian Lan reported</a> that the kernel "would now issue an additional CREATE rpc call to the remote NFS server regardless if the target file pre-exists or not," and that this extra <code>CREATE</code> could return <code>EACCES</code>, failing the whole <code>openat</code>. He traced the behavior change to commit <code>7c6c5249f061</code> ("NFS: add atomic_open for NFSv3 to handle O_TRUNC correctly.") and asked whether it was intentional, since it "breaks existing user's application code." <a href="https://lore.kernel.org/linux-nfs/122c658755fcb4b2d1264a7fd62fa8eda571f67b.camel@kernel.org/">Trond Myklebust</a> — the thread root of this summary — replied that NFSv3 CREATE "is supposed to ignore the directory permissions if the file already exists," and asked which server was in use. This week's messages are the answer to that question, plus the protocol analysis it triggered.</p>
+<h2>This week's activity (July 7)</h2>
+<h3>Tian Lan identifies the server and frames the divergence</h3>
+<p>In <a href="https://lore.kernel.org/linux-nfs/20260707144357.2920584-1-tilan@janestreet.com/">his July 7 reply</a>, Tian confirms the permission error was reproduced "against a vendor appliance," while the same test against Linux NFSD produced no errors — "due to differences in behavior from the CREATE RPC implementation." He lays out the contrast crisply:</p>
+<blockquote>
+<p><strong>NFSD behavior</strong></p>
+<ul>
+<li>CREATE RPC (UNCHECKED mode) returns the filehandle of the existing file along with the file's attributes</li>
+</ul>
+<p><strong>Vendor appliance</strong></p>
+<ul>
+<li>CREATE RPC (UNCHECKED mode) always attempts to create a new file and returns the new filehandle. This explains why we are seeing permission denied error from openat syscall.</li>
+</ul>
+</blockquote>
+<p>He quotes RFC 1813 ("UNCHECKED means that the file should be created without checking for the existence of a duplicate file...") and concedes, "It seems like the vendor's implementation matches more closely to what the 'standard' describes, but the behavior might not be what a normal user would expect. I guess there is no win-win situation here."</p>
+<p>Tian also pressed on the client-side design: he asked whether the kernel should always do a LOOKUP before deciding to send CREATE, noting that in the current code "the lookup happens after the atomic_open which does the CREATE rpc" (citing <code>fs/namei.c</code>).</p>
+<h3>Chuck Lever settles the interpretation with RFC 7530</h3>
+<p>In <a href="https://lore.kernel.org/linux-nfs/dfe72971-5478-45dd-82c1-0aa2e1156aee@app.fastmail.com/">his July 7 reply</a>, Chuck Lever reframes the question using NFSv4's clarifying text rather than RFC 1813's ambiguous wording:</p>
+<blockquote>
+<p>"Compare RFC 7530's UNCHECKED4. It says explicitly that if the object already exists, a non-exclusive create does not recreate it. The existing object is used and the supplied attributes are applied."</p>
+</blockquote>
+<p>He then states his position directly:</p>
+<blockquote>
+<p>"IMHO the correct interpretation, the one consistent with the rest of NFSv3, with NFSv4's clarifying text, and with POSIX, is NFSD's, not the vendor's. UNCHECKED governs error-vs-no-error on a duplicate, not recreate-vs-reuse."</p>
+</blockquote>
+<p>Rather than let it end at opinion, Lever pointed to concrete ways to confirm: look for an RFC 1813 erratum or WG/implementor-list guidance requiring re-creation, and — most decisively — "It would also be sensible to check how Solaris NFSv3 behaves, as it is a reference implementation for RFC 1813."</p>
+<h2>Key technical arguments</h2>
+<ul>
+<li><strong>The client change was deliberate and race-safe.</strong> Commit <code>7c6c5249f061</code> made the NFSv3 client send CREATE unconditionally on <code>O_CREAT</code> opens (via <code>atomic_open</code>) to handle <code>O_TRUNC</code> correctly. Trond had already noted that even the old LOOKUP-then-CREATE path "had a potential for races that could have caused the client to send it against an existing file." The new design is more correct; it simply exposes server non-conformance that was previously hidden.</li>
+<li><strong>UNCHECKED means "don't error," not "recreate."</strong> Lever's central argument is that UNCHECKED governs whether a duplicate is an <em>error</em>, not whether the object is <em>replaced</em>. NFSD's reuse-and-apply-attributes behavior matches RFC 7530's UNCHECKED4, POSIX <code>open(O_CREAT)</code>, and the rest of NFSv3.</li>
+<li><strong>The vendor appliance is the outlier.</strong> Its "always create fresh, return a new filehandle" behavior triggers <code>EACCES</code> when the client lacks directory write permission — exactly the failure Tian observed.</li>
+</ul>
+<h2>Final conclusions (as of this week)</h2>
+<ol>
+<li>The Linux NFSv3 client's unconditional-CREATE behavior is <strong>correct and should not be reverted</strong>; it is the server-side deviation that is at fault.</li>
+<li>NFSD's UNCHECKED semantics (reuse existing file, apply attributes) are the conforming interpretation, backed by RFC 7530's clarifying text.</li>
+<li>The remaining empirical question — does the RFC 1813 reference implementation (Solaris) agree with NFSD? — was left open at Lever's suggestion and is answered in a later message in this thread (see the companion summary), where Tian reports that Solaris 11.4 behaves like Linux NFSD, confirming the vendor appliance deviates.</li>
+<li><strong>No client-side patch is expected.</strong> The workaround (stripping <code>O_CREAT</code> when opening a known pre-existing file for write) remains necessary against this specific vendor appliance until the vendor fixes its CREATE implementation.</li>
+</ol>
+<h2>Classification &amp; impact</h2>
+<ul>
+<li><strong>Type:</strong> Bug fix / regression investigation — a deliberate NFSv3 <em>client</em> improvement (<code>7c6c5249f061</code>) exposing a latent <em>server-side</em> protocol non-conformance.</li>
+<li><strong>NFS client development relevance:</strong> The <code>atomic_open</code> path is validated as the right design (it removes lookup/create TOCTOU races). The fix belongs on the server side; the client is not at fault.</li>
+<li><strong>User impact:</strong> Applications doing <code>open(O_WRONLY|O_CREAT)</code> on pre-existing files in directories where the user lacks write permission will keep failing against this vendor appliance on 6.12+ kernels until the vendor corrects its CREATE behavior.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260707144357.2920584-1-tilan@janestreet.com/">2026-07-07 Tian Lan <a href="mailto:tilan@janestreet.com">tilan@janestreet.com</a> — RE: RE:nfs: opening a file with O_WRONLY|O_CREAT flags can result in permission denied error</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/dfe72971-5478-45dd-82c1-0aa2e1156aee@app.fastmail.com/">2026-07-07 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: nfs: opening a file with O_WRONLY|O_CREAT flags can result in permission denied error</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260707144357.2920584-1-tilan@janestreet.com/">2026-07-07 tilan@janestreet.com — RE: RE:nfs: opening a file with O_WRONLY|O_CREAT flags can result in permission denied error</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/dfe72971-5478-45dd-82c1-0aa2e1156aee@app.fastmail.com/">2026-07-07 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: nfs: opening a file with O_WRONLY|O_CREAT flags can result in permission denied error</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD: v3 series fixes client use-after-frees across teardown and state revocation</title>
+  <meta name="description" content="Type: Bug fix (a coordinated set of nine lifetime/race fixes, plus one cleanup and one reference-count leak fix) — no protocol or feature change.">
+  <meta property="og:title" content="NFSD: v3 series fixes client use-after-frees across teardown and state revocation">
+  <meta property="og:description" content="Type: Bug fix (a coordinated set of nine lifetime/race fixes, plus one cleanup and one reference-count leak fix) — no protocol or feature change.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-09T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSD: v3 series fixes client use-after-frees across teardown and state revocation">
+  <meta name="twitter:description" content="Type: Bug fix (a coordinated set of nine lifetime/race fixes, plus one cleanup and one reference-count leak fix) — no protocol or feature change.">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-09</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD: v3 series fixes client use-after-frees across teardown and state revocation</h1>
+<h2>Summary</h2>
+<h1>NFSD: Fix UAFs in client teardown and state revocation (v3)</h1>
+<p><strong>Type:</strong> Bug fix (a coordinated set of nine lifetime/race fixes, plus one cleanup and one reference-count leak fix) — no protocol or feature change.</p>
+<h2>What happened this week</h2>
+<p>On Tuesday, July 7, NFS server maintainer Chuck Lever posted <a href="https://lore.kernel.org/linux-nfs/20260707-cel-v3-0-7c0cc16fd54f@kernel.org/">the third revision of a nine-patch series</a> titled "NFSD: Fix UAFs in client teardown and state revocation." All ten messages in the thread this week are Chuck's own postings of the cover letter and the nine patches; no replies or review comments landed inside the summary window, so the discussion is at the "posted for review" stage.</p>
+<p>The series grew out of a field report: patch 1 carries <code>Reported-by: Wolfgang Walter &lt;linux@stwm.de&gt;</code> and closes his NULL-dereference report from client teardown. In the cover letter, Chuck frames the whole problem as one recurring pattern:</p>
+<blockquote>
+<p>"An NFSv4 stateid, and a bare lock owner reachable through the client's owner hash, hold only a raw pointer to the owning nfs4_client. That client outlives its state only because __destroy_client() drains every stateid and owner before free_client() runs."</p>
+</blockquote>
+<p>And the consequence of breaking that invariant:</p>
+<blockquote>
+<p>"The NULL-pointer dereference reported during client teardown was one such race; auditing the pattern found more across the revocation and laundromat-reaping paths."</p>
+</blockquote>
+<h2>The core technical argument</h2>
+<p>The series' central fix is uniform: whenever a path drops <code>nn-&gt;client_lock</code> while still holding only a stateid or owner (which does <em>not</em> pin the client), it must first take a <code>cl_rpc_users</code> pin so that teardown blocks until the work completes. Chuck explains the subtlety of why "just pin" is not enough:</p>
+<blockquote>
+<p>"force_expire_client() stops consulting cl_rpc_users once its wait has passed, so a pin taken then would not hold the client; the walk must instead leave that client's state for its own teardown to drain. Testing the expiry and taking the pin under nn-&gt;client_lock is what makes the choice atomic against the expiry."</p>
+</blockquote>
+<p>He also flags a new lock-ordering edge introduced by the fixes:</p>
+<blockquote>
+<p>"Pinning the client from these paths introduces a lock-order edge that did not exist before: nn-&gt;client_lock now nests outside the inner region of nn-&gt;deleg_lock and outside nn-&gt;blocked_locks_lock, both leaf acquisitions everywhere else. The nesting is one-directional, and netns.h records the deleg_lock relationship; a reaping path added later must take nn-&gt;client_lock first."</p>
+</blockquote>
+<h2>Patch-by-patch highlights (all posted 2026-07-07)</h2>
+<ul>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260707-cel-v3-1-7c0cc16fd54f@kernel.org/">1/9 — lock owner UAF during client teardown</a>:</strong> the reported crash. A lock owner whose only reference is a blocked lock stays on <code>cl_ownerstr_hashtbl</code>; <code>client_has_state()</code> doesn't count it, so <code>DESTROY_CLIENTID</code> can reach <code>__destroy_client()</code> with such owners present, and the per-net laundromat reaping blocked locks "frees the owner as __destroy_client() dereferences it." Fix: hold <code>cl_lock</code> across the walk, take a reference and unhash each owner. <code>Fixes: 68ef3bc31664</code>.</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260707-cel-v3-2-7c0cc16fd54f@kernel.org/">2/9 — delegation revoke</a>:</strong> the laundromat unhashes an expired delegation, drops <code>deleg_lock</code>, then relinks it under <code>cl_lock</code> — "In that window the delegation is on neither list, so client_has_state() can report no remaining state." Pin with <code>cl_rpc_users</code>; skip already-expiring clients. <code>Fixes: 3bd64a5ba171</code>.</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260707-cel-v3-3-7c0cc16fd54f@kernel.org/">3/9 — admin state revocation</a>:</strong> <code>nfsd4_revoke_states()</code> drops <code>nn-&gt;client_lock</code> across <code>revoke_one_stid()</code>, which dereferences the client. Pin under <code>client_lock</code>, skipping clients whose <code>cl_time</code> is already zero. <code>Fixes: 1c13bf9f2e3c</code>.</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260707-cel-v3-4-7c0cc16fd54f@kernel.org/">4/9 — export state revocation</a>:</strong> same race in <code>nfsd4_revoke_export_states()</code>; notably "exportfs -u drives this path through NFSD_CMD_UNLOCK_EXPORT, so an administrator removing an export can race a client expiry." <code>Fixes: 2eac189bb059</code>.</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260707-cel-v3-5-7c0cc16fd54f@kernel.org/">5/9 — NFSv4.0 revoked-state cleanup</a>:</strong> <code>nfs40_clean_admin_revoked()</code> runs from the laundromat, so "a periodic sweep can race force_expire_client() driven by a write to the clients/&lt;id&gt;/ctl file." Same skip-expiring/pin pattern. <code>Fixes: d688d8585e6b</code>.</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260707-cel-v3-6-7c0cc16fd54f@kernel.org/">6/9 — consolidate unpin</a>:</strong> pure cleanup, "No change in behavior." Factors the four open-coded pin-drop sites into <code>__put_client_locked()</code> with new <code>put_client_no_renew_*()</code> helpers, because the existing renew helpers "would resurrect the client whose state is being revoked."</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260707-cel-v3-7-7c0cc16fd54f@kernel.org/">7/9 — blocked-lock reaping</a>:</strong> a bare lock owner on <code>nn-&gt;blocked_locks_lru</code> holds only a raw client pointer; when the laundromat reaps it, "a concurrent force_expire_client() can free the client before nfs4_put_stateowner() runs." Pin before dropping <code>nn-&gt;blocked_locks_lock</code>. <code>Fixes: 7919d0a27f1e</code>.</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260707-cel-v3-8-7c0cc16fd54f@kernel.org/">8/9 — close_lru reaping</a>:</strong> an openowner left on <code>nn-&gt;close_lru</code> keeps its last closed stateid with only a raw client pointer; "Nothing pins the client across that window." Pin before dropping <code>client_lock</code>; <code>__destroy_client()</code> then cleans up its own entries. <code>Fixes: 217526e7ecc9</code>.</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260707-cel-v3-9-7c0cc16fd54f@kernel.org/">9/9 — svc_export leak</a>:</strong> the audit's unrelated find: <code>free_ol_stateid_reaplist()</code> frees stateids via <code>-&gt;sc_free()</code> directly, bypassing <code>nfs4_put_stid()</code>, so "the export stays pinned and blocks unmount for the lifetime of the stateid." <code>Fixes: ba0cde5dc81d</code>.</li>
+</ul>
+<h2>Evolution across revisions</h2>
+<p>The v3 cover letter documents what changed since earlier rounds: v2 had already "Add[ed] matching UAF fixes in several other paths," and v3 adds three items, each attributed to a reviewer — "Fix client UAF in laundromat blocked-lock reaping (Neil)," "Fix client UAF in laundromat close_lru reaping (sashiko)," and "Fix svc_export leak when reaping open stateids (sashiko)." Patches 1–5 carry <code>Reviewed-by</code> tags from both NeilBrown and Jeff Layton; patches 7, 8, and 9 (the v3 additions) do not yet.</p>
+<h2>Status / conclusion</h2>
+<p>As of the end of this week's window, the series has been posted but no replies, acks, or objections appear in the thread — it is awaiting review, with the two newest fixes (blocked-lock and close_lru reaping) and the export-leak fix still missing formal Reviewed-by tags. For NFS server users, the practical stakes are real: these are crash-class bugs on client expiry/delegation paths, plus an admin-action race (<code>exportfs -u</code>) and a leak that can block unmounting exports.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260707-cel-v3-1-7c0cc16fd54f@kernel.org/">2026-07-07 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 1/9] NFSD: Prevent lock owner use-after-free during client teardown</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260707-cel-v3-0-7c0cc16fd54f@kernel.org/">2026-07-07 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 0/9] NFSD: Fix UAFs in client teardown and state revocation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260707-cel-v3-2-7c0cc16fd54f@kernel.org/">2026-07-07 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 2/9] NFSD: Prevent client use-after-free during delegation revoke</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260707-cel-v3-3-7c0cc16fd54f@kernel.org/">2026-07-07 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 3/9] NFSD: Prevent client use-after-free during admin state revocation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260707-cel-v3-5-7c0cc16fd54f@kernel.org/">2026-07-07 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 5/9] NFSD: Prevent client use-after-free during NFSv4.0 revoked-state cleanup</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260707-cel-v3-4-7c0cc16fd54f@kernel.org/">2026-07-07 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 4/9] NFSD: Prevent client use-after-free during export state revocation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260707-cel-v3-6-7c0cc16fd54f@kernel.org/">2026-07-07 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 6/9] NFSD: Consolidate the revocation-path client unpin</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260707-cel-v3-7-7c0cc16fd54f@kernel.org/">2026-07-07 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 7/9] NFSD: Prevent client use-after-free during blocked-lock reaping</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260707-cel-v3-9-7c0cc16fd54f@kernel.org/">2026-07-07 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 9/9] NFSD: Release the export reference when reaping open stateids</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260707-cel-v3-8-7c0cc16fd54f@kernel.org/">2026-07-07 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 8/9] NFSD: Prevent client use-after-free during close_lru reaping</a></li>
+</ul>
+  </main>
+</body>
+</html>

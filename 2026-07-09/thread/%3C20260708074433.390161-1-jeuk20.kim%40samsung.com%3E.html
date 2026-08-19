@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSv4/flexfiles: two-patch series fixes v4.0 DS NULL deref and adds loosely coupled DS support</title>
+  <meta name="description" content="This week&#39;s thread is a new feature plus bug fix pair, squarely in NFS client development territory (the fs/nfs/flexfilelayout/, fs/nfs/filelayout/, fs/nfs/nfs4client.c, and fs/nfs/nfs4session.c paths). It is not a wire-protocol change —…">
+  <meta property="og:title" content="NFSv4/flexfiles: two-patch series fixes v4.0 DS NULL deref and adds loosely coupled DS support">
+  <meta property="og:description" content="This week&#39;s thread is a new feature plus bug fix pair, squarely in NFS client development territory (the fs/nfs/flexfilelayout/, fs/nfs/filelayout/, fs/nfs/nfs4client.c, and fs/nfs/nfs4session.c paths). It is not a wire-protocol change —…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-09T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSv4/flexfiles: two-patch series fixes v4.0 DS NULL deref and adds loosely coupled DS support">
+  <meta name="twitter:description" content="This week&#39;s thread is a new feature plus bug fix pair, squarely in NFS client development territory (the fs/nfs/flexfilelayout/, fs/nfs/filelayout/, fs/nfs/nfs4client.c, and fs/nfs/nfs4session.c paths). It is not a wire-protocol change —…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-09</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSv4/flexfiles: two-patch series fixes v4.0 DS NULL deref and adds loosely coupled DS support</h1>
+<h2>Summary</h2>
+<h1>NFSv4/flexfiles: two-patch series fixes v4.0 DS NULL deref and adds loosely coupled DS support</h1>
+<h2>Classification</h2>
+<p>This week's thread is a <strong>new feature plus bug fix</strong> pair, squarely in <strong>NFS client development</strong> territory (the <code>fs/nfs/flexfilelayout/</code>, <code>fs/nfs/filelayout/</code>, <code>fs/nfs/nfs4client.c</code>, and <code>fs/nfs/nfs4session.c</code> paths). It is not a wire-protocol change — the series implements an already-specified RFC 8435 behavior that the client had been ignoring, and it fixes a pre-existing crash on a code path that has been broken since v4.0 data servers were first allowed.</p>
+<h2>The submission (July 8)</h2>
+<p>Jeuk Kim (Samsung) posted a two-patch series on July 8 titled [PATCH 0/2] NFSv4/flexfiles: support loosely coupled data servers](https://lore.kernel.org/linux-nfs/20260708074433.390161-1-jeuk20.kim@samsung.com/). The cover letter frames the problem in one sentence:</p>
+<blockquote>
+<p>"RFC 8435 allows a flexfiles data server to be loosely coupled, i.e. an NFS server that does not advertise EXCHGID4_FLAG_USE_PNFS_DS via EXCHANGE_ID. The client currently ignores the ffdv_tightly_coupled flag and treats every DS as tightly coupled, so NFSv4.1+ I/O to a loosely coupled DS fails during DS setup."</p>
+</blockquote>
+<p>The series touches nine files with 37 insertions and 20 deletions — a modest footprint for what is effectively two distinct defects in the same DS-connect path:</p>
+<ul>
+<li><strong>Patch 1/2</strong> (bug fix): <a href="https://lore.kernel.org/linux-nfs/20260708074433.390161-2-jeuk20.kim@samsung.com/">NFSv4/flexfiles: fix NULL dereference for NFSv4.0 data servers</a></li>
+<li><strong>Patch 2/2</strong> (feature): <a href="https://lore.kernel.org/linux-nfs/20260708074433.390161-3-jeuk20.kim@samsung.com/">NFSv4/flexfiles: support loosely coupled data servers</a></li>
+</ul>
+<h2>Patch 1/2 — the v4.0 DS NULL-dereference fix</h2>
+<p>This is a <strong>bug fix</strong> with a <code>Fixes:</code> tag pointing at commit <code>a7878ca14008</code> ("nfs: flexfilelayout: remove v3-only data server limitation"), meaning the crash has been latent ever since the v3-only restriction was lifted. Kim's diagnosis is precise about the root cause:</p>
+<blockquote>
+<p>"flexfiles accepts NFSv4.0 data servers, but two NFSv4 code paths assume the data server client has a session. Unlike NFSv4.1+, an NFSv4.0 client has no session (clp-&gt;cl_session is NULL; it uses clp-&gt;cl_slot_tbl), so I/O to a v4.0 flexfiles DS oopses."</p>
+</blockquote>
+<p>Two specific dereferences are called out:</p>
+<ol>
+<li>
+<p><strong><code>nfs4_init_ds_session()</code></strong> — "dereferences <code>clp-&gt;cl_session-&gt;session_state</code> while seeding the DS lease. It also only seeds <code>cl_lease_time</code> when <code>NFS4_SESSION_INITING</code> is set; without a session that never happens, so <code>cl_lease_time</code> stays 0 and <code>nfs4_renew_state()</code> busy-loops, requeuing every 5 seconds." The fix seeds the lease whenever there is no session and returns before touching session state.</p>
+</li>
+<li>
+<p><strong><code>ff_layout_async_handle_error_v4()</code></strong> — "dereferences <code>clp-&gt;cl_session-&gt;fc_slot_table</code> on every DS I/O error." The fix falls back to the v4.0 transport slot table (<code>clp-&gt;cl_slot_tbl</code>) when there is no session.</p>
+</li>
+</ol>
+<p>The busy-loop detail is particularly noteworthy: even if a user dodged the first NULL deref, the second symptom — <code>nfs4_renew_state()</code> requeuing every five seconds forever because <code>cl_lease_time</code> never got seeded — would have kept the client in a degraded state. This is the kind of bug that is easy to miss in casual testing because it only fires when the data server happens to be NFSv4.0 rather than 4.1+.</p>
+<h2>Patch 2/2 — loosely coupled DS support</h2>
+<p>This is the <strong>new feature</strong> half of the series, implementing an RFC 8435 §2.3/§4.1 behavior the client had been silently ignoring. Kim's explanation of why the current code breaks:</p>
+<blockquote>
+<p>"Two things force that assumption on an NFSv4.1+ DS:</p>
+<ol>
+<li><code>nfs4_set_ds_client()</code> always sets <code>NFS_CS_PNFS</code> on the new client, so EXCHANGE_ID is sent with <code>EXCHGID4_FLAG_USE_PNFS_DS</code>.</li>
+<li><code>nfs4_init_ds_session()</code> then calls <code>is_ds_client()</code> and returns <code>-ENODEV</code> if the reply does not carry <code>EXCHGID4_FLAG_USE_PNFS_DS</code>."</li>
+</ol>
+</blockquote>
+<p>The conceptual point is clean: "A loosely coupled DS is just a normal NFS server and does not act in the pNFS DS role, so the client must not require it to advertise that role." The fix threads the decoded <code>ds_versions[0].tightly_coupled</code> flag from the flexfiles driver down to the DS connect path; when it is false, both the <code>NFS_CS_PNFS</code> flag and the <code>is_ds_client()</code> check are skipped. The file layout driver always passes <code>true</code> because "NFSv4.1 file layout data servers use the pNFS DS role" — so this patch is a flexfiles-specific behavior change that leaves the filelayout path untouched.</p>
+<h2>Evolution of the discussion</h2>
+<p>The thread is in its <strong>opening stage</strong> as of the end of this week's window (2026-07-10). All three in-window messages are Kim's own postings (cover letter + two patches) on July 8; no reviewer or maintainer has replied within the window. The only later activity in the thread is a single reply from Tigran Mkrtchyan (DESY) on August 6, which falls outside this week's scope and is not summarized here.</p>
+<p>There is no prior-week history to bridge: this is a fresh submission with no earlier revisions of the same series on the list. The closest related work is the long-running <a href="https://lore.kernel.org/linux-nfs/20250924162050.634451-1-jcurley@purestorage.com/">flexfiles striped-layouts RFC</a> from Pure Storage (jcurley), which is a different feature and does not overlap with this series.</p>
+<h2>Key technical arguments</h2>
+<ol>
+<li>
+<p><strong>The v4.0 DS crash is a long-dormant latent bug.</strong> The <code>Fixes:</code> tag (<code>a7878ca14008</code>) dates back to when the v3-only restriction was removed, so any deployment that has been using NFSv4.0 flexfiles data servers on a recent kernel has been exposed to both the NULL deref and the lease-renewal busy loop. This is a genuine correctness fix, not a hardening nicety.</p>
+</li>
+<li>
+<p><strong>The loosely coupled DS feature closes an RFC 8435 compliance gap.</strong> The client was decoding the <code>tightly_coupled</code> flag from GETDEVICEINFO but then ignoring it on the connect path. For any deployment that follows the RFC and runs a loosely coupled DS (a plain NFS server that does not advertise the pNFS DS role), I/O to that DS has been failing at setup with <code>-ENODEV</code>. The fix is small (thread one boolean down the call chain) but unblocks a documented deployment topology.</p>
+</li>
+<li>
+<p><strong>The two patches are complementary on the same code path.</strong> Patch 1 fixes the v4.0 case (no session at all); Patch 2 fixes the v4.1+ loosely-coupled case (session exists but must not carry the pNFS DS flag). Together they make the flexfiles DS connect path handle all three documented topologies: tightly coupled v4.1+, loosely coupled v4.1+, and v4.0 (which is implicitly loosely coupled since there is no EXCHANGE_ID at all).</p>
+</li>
+</ol>
+<h2>Relevance to NFS client development</h2>
+<p>This is one of the more directly client-facing threads this week. The flexfiles layout driver is a first-class pNFS client component, and the series touches core <code>nfs4client.c</code> / <code>nfs4session.c</code> infrastructure that other layout drivers also use (the filelayout driver is updated in passing to pass <code>true</code> for the new parameter). The v4.0 NULL-dereference fix in particular is the kind of crash-class bug that maintainers typically want to see backported to stable once reviewed.</p>
+<h2>Status at window close</h2>
+<ul>
+<li><strong>Posted:</strong> July 8 (all three messages)</li>
+<li><strong>Reviewed:</strong> No replies within the window</li>
+<li><strong>Applied:</strong> Not yet</li>
+<li><strong>Expected next step:</strong> Review from the NFS client maintainers (Trond Myklebust / Anna Schumaker), with a likely question about whether the v4.0 fix should carry a <code>Cc: stable</code> given its <code>Fixes:</code> tag</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260708074433.390161-1-jeuk20.kim@samsung.com/">2026-07-08 Jeuk Kim — [PATCH 0/2] NFSv4/flexfiles: support loosely coupled data servers</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260708074433.390161-2-jeuk20.kim@samsung.com/">2026-07-08 Jeuk Kim — [PATCH 1/2] NFSv4/flexfiles: fix NULL dereference for NFSv4.0 data servers</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260708074433.390161-3-jeuk20.kim@samsung.com/">2026-07-08 Jeuk Kim — [PATCH 2/2] NFSv4/flexfiles: support loosely coupled data servers</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260708074433.390161-1-jeuk20.kim@samsung.com/">2026-07-08 Jeuk Kim <a href="mailto:jeuk20.kim@gmail.com">jeuk20.kim@gmail.com</a> — [PATCH 0/2] NFSv4/flexfiles: support loosely coupled data servers</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260708074433.390161-2-jeuk20.kim@samsung.com/">2026-07-08 Jeuk Kim <a href="mailto:jeuk20.kim@gmail.com">jeuk20.kim@gmail.com</a> — [PATCH 1/2] NFSv4/flexfiles: fix NULL dereference for NFSv4.0 data servers</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260708074433.390161-3-jeuk20.kim@samsung.com/">2026-07-08 Jeuk Kim <a href="mailto:jeuk20.kim@gmail.com">jeuk20.kim@gmail.com</a> — [PATCH 2/2] NFSv4/flexfiles: support loosely coupled data servers</a></li>
+</ul>
+  </main>
+</body>
+</html>

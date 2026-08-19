@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>lockd: bitmap-based fix for multiple NLM_SHARE grants from one owner lands in nfsd-testing</title>
+  <meta name="description" content="This week, a long-running bug fix on the NFS server side reached its v3 and was merged into nfsd-testing. The patch addresses a correctness flaw in how the Linux NFSv3/NLM (Network Lock Manager) share handler tracks open file state when a…">
+  <meta property="og:title" content="lockd: bitmap-based fix for multiple NLM_SHARE grants from one owner lands in nfsd-testing">
+  <meta property="og:description" content="This week, a long-running bug fix on the NFS server side reached its v3 and was merged into nfsd-testing. The patch addresses a correctness flaw in how the Linux NFSv3/NLM (Network Lock Manager) share handler tracks open file state when a…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-09T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="lockd: bitmap-based fix for multiple NLM_SHARE grants from one owner lands in nfsd-testing">
+  <meta name="twitter:description" content="This week, a long-running bug fix on the NFS server side reached its v3 and was merged into nfsd-testing. The patch addresses a correctness flaw in how the Linux NFSv3/NLM (Network Lock Manager) share handler tracks open file state when a…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-09</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>lockd: bitmap-based fix for multiple NLM_SHARE grants from one owner lands in nfsd-testing</h1>
+<h2>Summary</h2>
+<h2>lockd: preserving multiple NLM_SHARE grants from the same owner</h2>
+<p>This week, a long-running bug fix on the NFS server side reached its v3 and was merged into <code>nfsd-testing</code>. The patch addresses a correctness flaw in how the Linux NFSv3/NLM (Network Lock Manager) share handler tracks open file state when a single client owner issues multiple <code>NLM_SHARE</code> calls against the same <code>(file, owner)</code> tuple.</p>
+<h3>The bug</h3>
+<p>Oscar Ou of Synology <a href="https://lore.kernel.org/linux-nfs/20260703063856.2423734-1-oscarou@synology.com/">posted v3 of the patch</a> on Friday, July 3, describing a scenario that is "particularly visible to Windows-style clients that map each open of a file to a distinct NLM_SHARE, all carrying the same NLM owner handle." The core problem:</p>
+<blockquote>
+<p>"the current implementation overwrites the recorded access and deny modes with the latest pair. A subsequent NLM_UNSHARE then drops the entire entry, even if other grants were implicitly subsumed by the most recent SHARE."</p>
+</blockquote>
+<p>Ou illustrated the failure with a concrete four-step sequence:</p>
+<ol>
+<li><code>SHARE(access=RW, deny=W)</code> → entry <code>[RW, deny W]</code></li>
+<li><code>SHARE(access=R, deny=N)</code> → entry <code>[R, deny N]</code> <em>(the RW/W pair is silently overwritten)</em></li>
+<li><code>UNSHARE(access=R, deny=N)</code> → <strong>entry freed entirely</strong></li>
+<li><code>UNSHARE(access=RW, deny=W)</code> → nothing left to release</li>
+</ol>
+<p>The result: the first open's share protection vanishes prematurely, undermining the advisory lock/share semantics that NFSv3 clients rely on for file coordination.</p>
+<h3>The fix: a u16 bitmap instead of refcounts</h3>
+<p>Because <code>fsh_access</code> and <code>fsh_mode</code> each take values in <code>{0..3}</code>, there are only 16 possible <code>(access, deny)</code> pairs. Ou's solution tracks each pair with a single bit in a <code>u16</code> bitmap, indexed by <code>(access &lt;&lt; 2) | deny</code>. <code>SHARE</code> sets the bit; <code>UNSHARE</code> clears it. The aggregate <code>s_access</code> and <code>s_mode</code> fields are recomputed as the union of all set bits, and the entry is freed only when the bitmap reaches zero.</p>
+<p>A key design consideration Ou highlighted in the v3 cover letter was idempotency under UDP retransmission:</p>
+<blockquote>
+<p>"NLM has no duplicate reply cache, so both SHARE and UNSHARE handlers must be idempotent under UDP retransmit."</p>
+</blockquote>
+<p>This is why v3 replaced the per-value refcount approach from v2 with a bitmap:</p>
+<blockquote>
+<p>"setting or clearing a single bit is idempotent, whereas incrementing and decrementing a refcount is not."</p>
+</blockquote>
+<p>The patch also extends <code>nlmsvc_unshare_file()</code> to accept the access and deny modes as arguments so the correct bit can be cleared, with the two callers in <code>svcproc.c</code> (NLMv3) and <code>svc4proc.c</code> (NLMv4) updated accordingly. The change spans four files (<code>fs/lockd/share.h</code>, <code>svc4proc.c</code>, <code>svcproc.c</code>, <code>svcshare.c</code>) with 44 insertions and 8 deletions.</p>
+<h3>Backport considerations</h3>
+<p>Notably, Ou included <strong>no <code>Fixes:</code> tag</strong>, explaining:</p>
+<blockquote>
+<p>"The fix depends on the xdrgen regeneration to reject out-of-range fsh_access / fsh_mode on the wire, so a Fixes: tag would mislead -stable backporters."</p>
+</blockquote>
+<p>This makes the patch dependent on Chuck Lever's earlier "lockd: Regenerate NLMv4 XDR code" change, which adds range validation for the share fields.</p>
+<h3>Merged</h3>
+<p>The turnaround was swift. On Saturday, July 4, <a href="https://lore.kernel.org/linux-nfs/178318668544.3488896.1908137356659270173.b4-ty@b4/">Chuck Lever confirmed</a>:</p>
+<blockquote>
+<p>"Applied to nfsd-testing, thanks!"</p>
+</blockquote>
+<p>The commit landed as <code>c8c45fb61a5ff3eb786e4aa434b534b605ab657e</code>.</p>
+<h3>Significance for NFS client development</h3>
+<p>While this is a server-side fix in the lockd/NLM share code, its impact ripples directly to NFSv3 clients—especially Windows interop scenarios via Samba or similar gateways. Clients that open the same file multiple times under a single owner handle will no longer see their earlier share grants silently discarded. The idempotency guarantee under UDP retransmit also strengthens reliability for lossy network paths, which is a common concern in enterprise NFS deployments. This is a textbook example of a subtle state-management bug fix that improves correctness without any protocol change: the NLM wire format is untouched; only the kernel's internal bookkeeping changes.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260703063856.2423734-1-oscarou@synology.com/">2026-07-03 Oscar Ou <a href="mailto:oscarou@synology.com">oscarou@synology.com</a> — [PATCH v3] lockd: preserve multiple NLM_SHARE grants from the same owner</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178318668544.3488896.1908137356659270173.b4-ty@b4/">2026-07-04 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v3] lockd: preserve multiple NLM_SHARE grants from the same owner</a></li>
+</ul>
+  </main>
+</body>
+</html>

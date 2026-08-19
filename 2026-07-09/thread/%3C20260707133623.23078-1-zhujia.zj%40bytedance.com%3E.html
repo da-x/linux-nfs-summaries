@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSv4: pin the superblock for active state owners (production umount/reclaim race)</title>
+  <meta name="description" content="Type: Bug fix — a use-after-free / lifetime-mismatch in the NFSv4 client&#39;s open-state recovery path, triggered when state reclaim races with unmount.">
+  <meta property="og:title" content="NFSv4: pin the superblock for active state owners (production umount/reclaim race)">
+  <meta property="og:description" content="Type: Bug fix — a use-after-free / lifetime-mismatch in the NFSv4 client&#39;s open-state recovery path, triggered when state reclaim races with unmount.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-09T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSv4: pin the superblock for active state owners (production umount/reclaim race)">
+  <meta name="twitter:description" content="Type: Bug fix — a use-after-free / lifetime-mismatch in the NFSv4 client&#39;s open-state recovery path, triggered when state reclaim races with unmount.">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-09</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSv4: pin the superblock for active state owners (production umount/reclaim race)</h1>
+<h2>Summary</h2>
+<h1>NFSv4: pin the superblock for active state owners</h1>
+<p><strong>Type:</strong> Bug fix — a use-after-free / lifetime-mismatch in the NFSv4 client's open-state recovery path, triggered when state reclaim races with unmount.</p>
+<h2>What happened this week</h2>
+<p>The thread consists of a single message this week: <a href="https://lore.kernel.org/linux-nfs/20260707133623.23078-1-zhujia.zj@bytedance.com/">a patch from Jia Zhu (ByteDance)</a>, posted July 7, which proposes pinning the superblock for as long as an NFSv4 state owner is active. No replies or review discussion had landed by the end of the week window (July 9), so this summary covers only the patch's motivation and design.</p>
+<h2>The bug: open state outliving its filesystem</h2>
+<p>Zhu describes a race observed <strong>in production</strong>, where NFSv4 state recovery — for example after a server reboot or lease expiration — races with unmount. The core lifetime problem is that "NFSv4 open state can outlive the file and dentry that created it."</p>
+<p>The patch lays out the interleaving precisely:</p>
+<pre><code>state manager                    umount
+
+nfs4_run_state_manager()
+  nfs4_do_reclaim()
+    nfs4_reclaim_open_state()
+      refcount_inc(&amp;state-&gt;count)
+      ...
+                                      close last file
+                                      generic_shutdown_super()
+                                        "Busy inodes after unmount"
+                                      nfs_free_server()
+      nfs4_put_open_state()
+        iput(inode)
+          evict()
+            nfs_clear_inode()
+              nfs_zap_acl_cache()
+</code></pre>
+<p>The visible symptom is the VFS warning, which Zhu identifies as "the visible symptom of that lifetime mismatch: superblock teardown proceeds even though the NFS open state still pins an inode." The dangerous consequence follows once <code>nfs_free_server()</code> has run: the state manager's later <code>nfs4_put_open_state()</code> drops the last open-state reference and calls <code>iput(inode)</code>, which can evict an NFS inode whose server data is already freed — "causing crashes at <code>nfs_zap_acl_cache()</code>."</p>
+<p>Zhu notes the bug is reproducible by delaying the reclaim path just before <code>nfs4_put_open_state()</code>, then closing the last file and unmounting.</p>
+<h2>The fix</h2>
+<p>The patch (33 insertions, 7 deletions in <code>fs/nfs/nfs4state.c</code>) takes a reference-counting approach: "Pin the superblock while a state owner is active, and drop the pin when the owner becomes idle again, so the NFS server stays alive until all open state associated with the owner has been released." In other words, the superblock's lifetime is now tied to the liveness of the state owner rather than to the last open file/dentry, which closes the window in which the superblock's active count could drop to zero between <code>refcount_inc(&amp;state-&gt;count)</code> and <code>nfs4_put_open_state()</code>.</p>
+<p>The patch carries an "Assisted-by: Codex:GPT-5" tag alongside Zhu's sign-off.</p>
+<h2>Status and outlook</h2>
+<p>As of the week ending 2026-07-09, the patch has no on-list review yet. Given that it touches core NFSv4 state-owner lifetime semantics and addresses a crash observed in production, expect scrutiny from the NFS maintainers on whether pinning/unpinning the superblock around owner activity is the right granularity (versus, e.g., holding a server reference directly), and on the exact points where "active" and "idle" transitions are detected. Worth watching for follow-up in the coming days.</p>
+<h2>Key messages</h2>
+<ul>
+<li>[PATCH] NFSv4: pin the superblock for active state owners — Jia Zhu, 2026-07-07 (id://<a href="mailto:20260707133623.23078-1-zhujia.zj@bytedance.com">20260707133623.23078-1-zhujia.zj@bytedance.com</a>)</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260707133623.23078-1-zhujia.zj@bytedance.com/">2026-07-07 "Jia Zhu" <a href="mailto:zhujia.zj@bytedance.com">zhujia.zj@bytedance.com</a> — [PATCH] NFSv4: pin the superblock for active state owners</a></li>
+</ul>
+  </main>
+</body>
+</html>

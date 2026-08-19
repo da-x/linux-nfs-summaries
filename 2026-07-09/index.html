@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS client: flexfiles v4.0 DS NULL-deref fix, folio DIO debate resolves; NFSD UAF audit series lands in testing</title>
+  <meta name="description" content="A heavy week for NFS client correctness work — a long-dormant flexfiles v4.0 data-server crash fix, the resolution of the three-week folio-based direct I/O debate, and a batch of client-side lifetime/accounting fixes — alongside a big…">
+  <meta property="og:title" content="NFS client: flexfiles v4.0 DS NULL-deref fix, folio DIO debate resolves; NFSD UAF audit series lands in testing">
+  <meta property="og:description" content="A heavy week for NFS client correctness work — a long-dormant flexfiles v4.0 data-server crash fix, the resolution of the three-week folio-based direct I/O debate, and a batch of client-side lifetime/accounting fixes — alongside a big…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-09T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS client: flexfiles v4.0 DS NULL-deref fix, folio DIO debate resolves; NFSD UAF audit series lands in testing">
+  <meta name="twitter:description" content="A heavy week for NFS client correctness work — a long-dormant flexfiles v4.0 data-server crash fix, the resolution of the three-week folio-based direct I/O debate, and a batch of client-side lifetime/accounting fixes — alongside a big…">
+  <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../index.html">Summaries</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS client: flexfiles v4.0 DS NULL-deref fix, folio DIO debate resolves; NFSD UAF audit series lands in testing</h1>
+<p><em>Week ending 2026-07-09</em></p>
+<h1>Week ending 2026-07-09</h1>
+<p>A heavy week for NFS <em>client</em> correctness work — a long-dormant flexfiles v4.0 data-server crash fix, the resolution of the three-week folio-based direct I/O debate, and a batch of client-side lifetime/accounting fixes — alongside a big server-side milestone: Chuck Lever's NFSD use-after-free audit series reaching v4 and landing in <code>nfsd-testing</code>, plus the long-running sunrpc <code>pool_mode</code> rework being applied.</p>
+<h2>Critical bugs &amp; fixes</h2>
+<h3>NFS client</h3>
+<ul>
+<li><strong>Flexfiles: NULL deref for NFSv4.0 data servers + loosely coupled DS support</strong> — Jeuk Kim (Samsung) posted a two-patch series (<a href="thread/%253C20260708074433.390161-1-jeuk20.kim%2540samsung.com%253E.html">thread</a>) that fixes a latent crash (<code>Fixes: a7878ca14008</code>) where <code>nfs4_init_ds_session()</code> and <code>ff_layout_async_handle_error_v4()</code> dereference <code>clp-&gt;cl_session</code> on a v4.0 DS (no session), leaving <code>cl_lease_time</code> at 0 and busy-looping the renew state manager. The second patch implements RFC 8435 loosely-coupled DS support, which the client had been silently ignoring. Awaiting review; likely <code>Cc: stable</code> candidate.</li>
+<li><strong>NFSv3 <code>O_WRONLY|O_CREAT</code> EACCES regression</strong> — Tian Lan (Jane Street) reported that 6.12's <code>atomic_open</code> change now issues an unconditional CREATE RPC, which a non-conformant server answers with EACCES when the user lacks directory write permission on a pre-existing file (<a href="thread/%253C20260706213435.659381-1-tilan%2540janestreet.com%253E.html">thread</a>). Trond Myklebust pushed back that NFSv3 CREATE must ignore directory permissions on existing files and asked which server is in use — the thread is a live regression investigation, no patch yet.</li>
+<li><strong><code>nfs4_listxattr</code> NULL deref + size undercount</strong> — Achilles Gaikwad's fix for the <code>security_inode_listsecurity()</code> interface change (v2) was reviewed by Paul Moore and routed through the NFS tree by Anna Schumaker (<a href="thread/%253C20260703102759.9626-1-achillesgaikwad%2540gmail.com%253E.html">thread</a>). Side note: Paul is separately bisecting an unrelated NFS regression that appeared between v7.1 and v7.2-rc1 while testing this fix.</li>
+<li><strong>NFSv4 superblock pin for active state owners</strong> — Jia Zhu (ByteDance) proposed pinning the superblock while a state owner is active to close a production umount/reclaim race that oopses in <code>nfs_zap_acl_cache()</code> (<a href="thread/%253C20260707133623.23078-1-zhujia.zj%2540bytedance.com%253E.html">thread</a>). No review yet; expect scrutiny on the pin granularity.</li>
+<li><strong>Delayed delegation return list</strong> — Guangshuo Li's one-line fix restores the retry path that Christoph Hellwig's January rework left inert: <code>nfs_end_delegation_return()</code> was moving delayed delegations to <code>delegations_return</code> instead of <code>delegations_delayed</code>, so the clear helper always returned false (<a href="thread/%253C20260704164217.228078-1-lgs201920130244%2540gmail.com%253E.html">thread</a>).</li>
+<li><strong>Unstable-write accounting inflation</strong> — Benjamin Coddington (Hammerspace) flagged that <code>nfs_folio_mark_unstable()</code>/<code>clear_commit()</code> charge the <em>whole folio</em> per request, so a 2 MiB folio split into 512 4 KiB requests inflates writeback counters by up to 512× and can hard-throttle every buffered writer on the host (including nfsd). <code>Fixes: 0c493b5cf16e</code> (2022), <code>Cc: stable</code> (<a href="thread/%253C96cb0f45621309481c96cb1e81ef3175257161ec.1783436588.git.bcodding%2540hammerspace.com%253E.html">thread</a>).</li>
+<li><strong>Symlink target cache hardening</strong> — ZhangGuoDong (KylinOS) proposed a 6-line check that the instantiated inode is actually a symlink before caching the target folio, backed by a vmcore showing <code>nfs_readdir_clear_array()</code> misinterpreting the data as a readdir array on unmount (<a href="thread/%253C20260703065448.210255-1-zhang.guodong%2540linux.dev%253E.html">thread</a>).</li>
+<li><strong>sunrpc pipefs UAF</strong> — Luxiao Xu's patch keeps <code>clnt-&gt;pipefs_sb</code> honest across late mount/remount events so <code>rpc_clnt_remove_pipedir()</code> doesn't skip cleanup and leave dentries pointing at a freed <code>rpc_clnt</code> (<code>Fixes: bfca5fb4e97c</code>, stable) (<a href="thread/%253Ccover.1783393213.git.rakukuip%2540gmail.com%253E.html">thread</a>).</li>
+<li><strong>fhandle detached-mount NULL deref</strong> — Guangshuo Li's 3-line fix treats a concurrently-detached mount as not capable in <code>capable_wrt_mount()</code> (<a href="thread/%253C20260708130648.767811-1-lgs201920130244%2540gmail.com%253E.html">thread</a>).</li>
+<li><strong>rpc.gssd resource leaks</strong> — Thiago Becker (Red Hat) fixed a <code>clnt_info</code> refcount leak and a missing <code>pthread_attr_destroy()</code> in <code>start_upcall_thread</code>, both found by Claude Sonnet 4.5 (<a href="thread/%253C20260703163946.2185163-1-tbecker%2540redhat.com%253E.html">thread</a>).</li>
+<li><strong>nfs-utils mountd netlink</strong> — Scott Mayhew's three-patch series fixes a <code>nfsstat</code> build break, documents the <code>--no-netlink</code> option in <code>nfs.conf</code>, and disables netlink when falling back to <code>/proc</code> (avoiding indefinite mount hangs on SELinux systems lacking <code>CAP_NET_ADMIN</code>). Reviewed-by Jeff Layton (<a href="thread/%253C20260707205752.313031-1-smayhew%2540redhat.com%253E.html">thread</a>).</li>
+</ul>
+<h3>NFS server (nfsd / lockd)</h3>
+<ul>
+<li><strong>NFSD UAF audit series — v4 in nfsd-testing</strong> — Chuck Lever's nine-patch series fixing a family of use-after-free races in <code>nfs4state.c</code> client teardown and state revocation reached v4 on July 9 with Reviewed-by from Jeff Layton on the new patches, and was pushed to <code>nfsd-testing</code> (<a href="thread/%253C20260705-cel-v2-0-d88c3b68e8bc%2540kernel.org%253E.html">v2 thread</a>, <a href="thread/%253C20260709-cel-v4-0-1d519d9be0cb%2540kernel.org%253E.html">v4 thread</a>). The series fixes seven UAF/NULL-deref races plus one <code>svc_export</code> leak, all rooted in the same architectural pattern: raw pointers to <code>nfs4_client</code> that rely on lock discipline rather than reference counting. This is the direct payoff of Wolfgang Walter's 6.18.37 production crash — Chuck <a href="thread/%253C114a396bac4fc5e1aa730ea58d59a78f%2540stwm.de%253E.html">exonerated the export-cache revert commit</a> on July 3 and re-scoped the bug as a latent upstream <code>nfs4state.c</code> defect present in both 6.18.36 and 6.18.37. The original <a href="thread/%253C20260703173943.3242873-1-cel%2540kernel.org%253E.html">RFC patch</a> was the first single-crash fix; v2 expanded it into a six-patch audit, and v4 added blocked-lock reaping, close_lru reaping, and the export-leak fixes.</li>
+<li><strong>nfsd copy offload lifetime bugs (v2)</strong> — Jeff Layton posted a ten-patch series fixing publish races, async-copy UAFs, stale IDR entries, an ownership hole allowing any authenticated client to cancel another's copy-notify stateid, and revoke-path UAFs in NFSv4.2 inter-server COPY (<a href="thread/%253C20260709-nfsd-testing-v2-0-0a1ba233bf87%2540kernel.org%253E.html">thread</a>). Chuck Lever flagged two new issues in patch 03/10 (missing <code>nfs4_free_copy_state()</code> and uninitialized <code>cb_stateid</code>), so a v3 is expected. Notably, the bugs were found via LLM inspection (kres + agentic review).</li>
+<li><strong>pynfs copy offload test suite</strong> — Layton also posted a 13-patch pynfs series adding real COPY/OFFLOAD_STATUS/OFFLOAD_CANCEL/COPY_NOTIFY tests including inter-server copy, plus a fix for a misnamed XDR union arm that made <code>op.copy_notify()</code> raise TypeError (<a href="thread/%253C20260709-copy-v1-0-849bf581d7cb%2540kernel.org%253E.html">thread</a>). One test is explicitly designed to catch an inverted TTL check in the kernel's async-copy reaper.</li>
+<li><strong>lockd NLM_SHARE bitmap fix merged</strong> — Oscar Ou (Synology) v3, using a <code>u16</code> bitmap instead of refcounts for idempotency under UDP retransmit, was applied to <code>nfsd-testing</code> on July 4 (<a href="thread/%253C20260703063856.2423734-1-oscarou%2540synology.com%253E.html">bitmap thread</a>, <a href="thread/%253Cbdce0570-b584-444b-b78e-a5a2cc5b85ad%2540app.fastmail.com%253E.html">refcount rejection</a>).</li>
+<li><strong>nfsd <code>nfs4_create_file()</code> refactor (v2)</strong> — NeilBrown's 14-patch series preparing nfsd for a new VFS <code>lookup_open()</code> interface received full review from Jeff Layton, including a genuine bug fix for silently dropped client attributes on <code>NFS4_CREATE_EXCLUSIVE4_1</code> and a resolved delegation-recall debate (<a href="thread/%253C20260705222032.1240057-1-neilb%2540ownmail.net%253E.html">thread</a>).</li>
+<li><strong>Stable backports</strong> — A wave of nfsd fixes landed in stable queues this week: write-verifier reset on deferred writeback errors (silent data loss, 5.10.y/5.15.y), layout stid release on setlease failure (UAF, 5.10.y/5.15.y/6.1.y/6.6.y/6.12.y/6.18.y), mtime/ctime on CLONE with delegated attributes (6.18.y), and CB_GETATTR change-detection fix (6.12.y). See <a href="thread/%253C2026070204-festivity-sternness-523f%2540gregkh%253E.html">write verifier 5.10</a>, <a href="thread/%253C2026070228-repeater-synthesis-1c1b%2540gregkh%253E.html">layout stid 5.10</a>, <a href="thread/%253C20260702202409.1583677-1-cel%2540kernel.org%253E.html">6.18.y series</a>, <a href="thread/%253C20260702202749.1618630-1-cel%2540kernel.org%253E.html">6.12.y series</a>.</li>
+</ul>
+<h2>Major trends &amp; ongoing debates</h2>
+<h3>NFS client direct I/O folio debate resolves</h3>
+<p>The three-week argument over whether <code>page_folio()</code> is safe in the new <code>iov_iter_extract_pages()</code> path reached a concrete resolution. Christoph Hellwig confirmed that kernel-side direct I/O users exist (loop, zloop, nvmet, scsi target, <strong>nfsd</strong>), making the kvec-iterator concern real rather than theoretical. The agreed path forward: NFS should reuse the block layer's <code>get_contig_folio_len()</code> helper rather than hand-rolling folio grouping or relying on the "every page is a folio" invariant. Hellwig endorsed splitting the folio patch out as a standalone prerequisite to unblock the rest of Pranjal Shrivastava's modernization series (<a href="thread/%253C20260616134000.2733403-1-praan%2540google.com%253E.html">thread</a>). A v3 is expected.</p>
+<h3>sunrpc pool_mode: applied to nfsd-testing</h3>
+<p>After five revisions and a month-plus of review, Jeff Layton's series hardcoding <code>pool_mode</code> to pernode and fixing the empty-pool connection-starvation bug was <a href="thread/%253C20260706-sunrpc-pool-mode-v5-0-6c4ee7cd89aa%2540kernel.org%253E.html">applied to nfsd-testing</a> on July 6. The series eliminates indefinite client connection hangs on multi-NUMA servers with fewer nfsd threads than NUMA nodes, and removes a modulus from the <code>svc_pool_for_cpu()</code> hotpath. A brief interface-design debate about whether to make the new accessor static-inline was resolved on module-boundary hygiene grounds (Layton kept <code>struct svc_pool_map</code> private to sunrpc.ko). A follow-on patch dropping a dead <code>if</code> check was <a href="thread/%253C20260708-pool-mode-v1-1-98e9e106ebf3%2540kernel.org%253E.html">folded in within an hour</a>.</p>
+<h3>netfslib bvecq refactor (v5)</h3>
+<p>David Howells posted v5 of his 21-patch series replacing netfslib's <code>folio_queue</code>/<code>rolling_buffer</code> with segmented <code>bio_vec[]</code> chains, touching NFS, AFS, CIFS, and cachefiles. The series carries two direct NFS client fixes (<code>nfs_netfs_issue_read()</code> ENOMEM and double-terminate) and is aimed at the VFS tree via Christian Brauner (<a href="thread/%253C20260706152737.1231312-1-dhowells%2540redhat.com%253E.html">thread</a>). No review replies yet in-window.</p>
+<h3>NFS/localio: inline IO + tracepoint fix</h3>
+<p>Mike Snitzer posted a three-patch series making LOCALIO issue IO inline when not in a memory-reclaim context, eliminating an unnecessary workqueue hop for O_DIRECT and fsync-driven commits (<a href="thread/%253C20260706160549.97580-1-snitzer%2540kernel.org%253E.html">thread</a>). He also fixed a misleading offset in the <code>nfs_local_dio_misaligned</code> tracepoint (cut-n-paste bug reporting start_len instead of middle_offset) (<a href="thread/%253C20260708213610.19001-1-snitzer%2540kernel.org%253E.html">thread</a>). Both await review.</p>
+<h3>AI-assisted development becomes routine</h3>
+<p>Multiple patches this week carry <code>Assisted-by:</code> tags for LLM tools: Chris Mason's layout-stid fix (kres/claude-opus-4-7), Jia Zhu's superblock pin (Codex:GPT-5), Luxiao Xu's pipefs UAF (Codex:gpt-5.4), Thiago Becker's rpc.gssd leaks (Claude Sonnet 4.5), Benjamin Coddington's writeback accounting fix (Claude Sonnet 5), and Jeff Layton's copy offload series (kres + agentic review). The pattern is now standard on the list, with human developers filtering false positives before submission.</p>
+<h2>Discussions this week</h2>
+<ul>
+<li><a href="thread/%253C20251205071855.72743-1-byungchul%2540sk.com%253E.html">Re: [PATCH v18 34/42] dept: add module support for struct dept_event_site and dept_event_site_dep</a></li>
+<li><a href="thread/%253C20260619203107.606359-1-ernis%2540linux.microsoft.com%253E.html">Re: [PATCH rdma-next v8] RDMA: Change capability fields in ib_device_attr from int to u32</a></li>
+<li><a href="thread/%253C20260701-sunrpc-pool-mode-v4-0-b3d867e4c8f9%2540kernel.org%253E.html"> Re: [PATCH v4 1/4] sunrpc: route to a populated pool in svc_pool_for_cpu()</a></li>
+<li><a href="thread/%253C20260616134000.2733403-1-praan%2540google.com%253E.html">Re: [PATCH v2 6/7] nfs: Optimize direct I/O to use folios for requests</a></li>
+<li><a href="thread/%253C20260616134000.2733403-7-praan%2540google.com%253E.html">Re: [PATCH v2 6/7] nfs: Optimize direct I/O to use folios for requests</a></li>
+<li><a href="thread/%253C7ee3bcfdd6126c93cbb1c219bf601182b95c10d9.camel%2540kernel.org%253E.html">Re: [PATCH v2 6/7] nfs: Optimize direct I/O to use folios for requests</a></li>
+<li><a href="thread/%253CajGGpDvzZdkGtSbN%2540google.com%253E.html">Re: [PATCH v2 6/7] nfs: Optimize direct I/O to use folios for requests</a></li>
+<li><a href="thread/%253C114a396bac4fc5e1aa730ea58d59a78f%2540stwm.de%253E.html">Re: 6.18.37 has problems with nfs4 (server), 6.18.36 works</a></li>
+<li><a href="thread/%253C20260703160306.1651327-1-cel%2540kernel.org%253E.html">Re: 6.18.37 has problems with nfs4 (server), 6.18.36 works</a></li>
+<li><a href="thread/%253C2026070204-festivity-sternness-523f%2540gregkh%253E.html">[PATCH 5.10.y] nfsd: reset write verifier on deferred writeback errors</a></li>
+<li><a href="thread/%253C2026070204-septum-trimness-cb0f%2540gregkh%253E.html">[PATCH 5.15.y] nfsd: reset write verifier on deferred writeback errors</a></li>
+<li><a href="thread/%253C20260703034048.1602590-1-cel%2540kernel.org%253E.html">Re: [PATCH 5.10.y] nfsd: reset write verifier on deferred writeback errors</a></li>
+<li><a href="thread/%253C20260703033705.1572486-1-cel%2540kernel.org%253E.html">Re: [PATCH 5.15.y] nfsd: reset write verifier on deferred writeback errors</a></li>
+<li><a href="thread/%253C2026070228-repeater-synthesis-1c1b%2540gregkh%253E.html">[PATCH 5.10.y] nfsd: release layout stid on setlease failure</a></li>
+<li><a href="thread/%253C2026070228-deny-tattered-d0df%2540gregkh%253E.html">[PATCH 5.15.y] nfsd: release layout stid on setlease failure</a></li>
+<li><a href="thread/%253C20260703033954.1602126-1-cel%2540kernel.org%253E.html">Re: [PATCH 5.10.y] nfsd: release layout stid on setlease failure</a></li>
+<li><a href="thread/%253C20260703033815.1573400-1-cel%2540kernel.org%253E.html">Re: [PATCH 5.15.y] nfsd: release layout stid on setlease failure</a></li>
+<li><a href="thread/%253C20260702214135.533354-1-cel%2540kernel.org%253E.html">Re: [PATCH 6.6.y 1/2] nfsd: release layout stid on setlease failure</a></li>
+<li><a href="thread/%253C20260703033243.1539871-1-cel%2540kernel.org%253E.html">[PATCH 6.1.y 1/2] nfsd: release layout stid on setlease failure</a></li>
+<li><a href="thread/%253C20260702202409.1583677-1-cel%2540kernel.org%253E.html">Re: [PATCH 6.18.y 1/3] nfsd: update mtime/ctime on CLONE in presense of delegated attributes</a></li>
+<li><a href="thread/%253C20260702202749.1618630-1-cel%2540kernel.org%253E.html">Re: [PATCH 6.12.y 1/2] nfsd: fix file change detection in CB_GETATTR</a></li>
+<li><a href="thread/%253C20260703173943.3242873-1-cel%2540kernel.org%253E.html">[RFC PATCH] NFSD: Prevent lock owner use-after-free during client teardown</a></li>
+<li><a href="thread/%253C20260705-cel-v2-0-d88c3b68e8bc%2540kernel.org%253E.html">[PATCH v2 0/6] NFSD: Fix UAFs in client teardown and state revocation</a></li>
+<li><a href="thread/%253C20260707-cel-v3-0-7c0cc16fd54f%2540kernel.org%253E.html">[PATCH v3 1/9] NFSD: Prevent lock owner use-after-free during client teardown</a></li>
+<li><a href="thread/%253C20260709-cel-v4-0-1d519d9be0cb%2540kernel.org%253E.html">[PATCH v4 1/9] NFSD: Prevent lock owner use-after-free during client teardown</a></li>
+<li><a href="thread/%253C20260705222032.1240057-1-neilb%2540ownmail.net%253E.html">[PATCH v2 00/14] nfsd: refactor nfs4_create_file()</a></li>
+<li><a href="thread/%253C20260705222032.1240057-15-neilb%2540ownmail.net%253E.html">Re: [PATCH v2 14/14] nfsd: use do_lookup_open() for non-creating open requests too.</a></li>
+<li><a href="thread/%253C20260706-sunrpc-pool-mode-v5-0-6c4ee7cd89aa%2540kernel.org%253E.html">[PATCH v5 0/5] sunrpc: hardcode pool_mode to pernode, remove other modes</a></li>
+<li><a href="thread/%253C20260708-pool-mode-v1-1-98e9e106ebf3%2540kernel.org%253E.html">[PATCH] sunrpc: drop unneeded nrpools check in svc_pool_for_cpu()</a></li>
+<li><a href="thread/%253C20260706061928.66713-1-byungchul%2540sk.com%253E.html">[PATCH v19 01/40] dept: implement DEPT(DEPendency Tracker)</a></li>
+<li><a href="thread/%253C20260706152737.1231312-1-dhowells%2540redhat.com%253E.html">[PATCH v5 00/21] netfs: Keep track of folios in a segmented bio_vec[] chain</a></li>
+<li><a href="thread/%253C20260706153408.1231650-1-dhowells%2540redhat.com%253E.html">[PATCH v5 00/21] netfs: Keep track of folios in a segmented bio_vec[] chain</a></li>
+<li><a href="thread/%253C20260706160549.97580-1-snitzer%2540kernel.org%253E.html">[PATCH 0/3] NFS/localio: issue IO inline when not reclaiming memory</a></li>
+<li><a href="thread/%253C20260708213610.19001-1-snitzer%2540kernel.org%253E.html">[PATCH] NFS/localio: fix nfs_local_dio_misaligned tracepoint</a></li>
+<li><a href="thread/%253C20260703063856.2423734-1-oscarou%2540synology.com%253E.html">[PATCH v3] lockd: preserve multiple NLM_SHARE grants from the same owner</a></li>
+<li><a href="thread/%253Cbdce0570-b584-444b-b78e-a5a2cc5b85ad%2540app.fastmail.com%253E.html">Re: [PATCH v2] lockd: refcount NLM_SHARE access/deny modes</a></li>
+<li><a href="thread/%253C20260706213435.659381-1-tilan%2540janestreet.com%253E.html">nfs: opening a file with O_WRONLY|O_CREAT flags can result in permission denied error</a></li>
+<li><a href="thread/%253Cdfe72971-5478-45dd-82c1-0aa2e1156aee%2540app.fastmail.com%253E.html">RE nfs: opening a file with O_WRONLY|O_CREAT flags can result in permission denied error</a></li>
+<li><a href="thread/%253C122c658755fcb4b2d1264a7fd62fa8eda571f67b.camel%2540kernel.org%253E.html">RE: RE:nfs: opening a file with O_WRONLY|O_CREAT flags can result in permission denied error</a></li>
+<li><a href="thread/%253C20260703065448.210255-1-zhang.guodong%2540linux.dev%253E.html">[PATCH] NFS: Verify symlink inode before caching target</a></li>
+<li><a href="thread/%253C20260703102759.9626-1-achillesgaikwad%2540gmail.com%253E.html">[PATCH] NFSv4.2: fix nfs4_listxattr NULL pointer dereference</a></li>
+<li><a href="thread/%253CCAHC9VhS3_NCZm_GmF-nxPxJ_EPCsScEa%252B%253Dy8vBqqneq-M00%253DuA%2540mail.gmail.com%253E.html">Re: [PATCH] NFSv4.2: fix nfs4_listxattr NULL pointer dereference</a></li>
+<li><a href="thread/%253C20260703163946.2185163-1-tbecker%2540redhat.com%253E.html">[PATCH 0/2] rpc.gssd: Two resource leaks</a></li>
+<li><a href="thread/%253C20260704164217.228078-1-lgs201920130244%2540gmail.com%253E.html">[PATCH] NFS: Fix delayed delegation return list handling</a></li>
+<li><a href="thread/%253C20260704172300.254447-1-lgs201920130244%2540gmail.com%253E.html">[PATCH] nfsd: Fix dentry refcount leak in nfsd_set_fh_dentry()</a></li>
+<li><a href="thread/%253C20260707133623.23078-1-zhujia.zj%2540bytedance.com%253E.html">[PATCH] NFSv4: pin the superblock for active state owners</a></li>
+<li><a href="thread/%253C20260707205752.313031-1-smayhew%2540redhat.com%253E.html">[nfs-utils PATCH 1/3] configure: update check of system netlink headers</a></li>
+<li><a href="thread/%253C20260708074433.390161-1-jeuk20.kim%2540samsung.com%253E.html">[PATCH 0/2] NFSv4/flexfiles: support loosely coupled data servers</a></li>
+<li><a href="thread/%253C20260708130648.767811-1-lgs201920130244%2540gmail.com%253E.html">[PATCH] fhandle: handle detached mounts in capable_wrt_mount()</a></li>
+<li><a href="thread/%253C20260708154510.6794-1-petr.pavlu%2540suse.com%253E.html">[PATCH 0/2] Bring includes in linux/kmod.h up to date</a></li>
+<li><a href="thread/%253C20260709-copy-v1-0-849bf581d7cb%2540kernel.org%253E.html">[PATCH pynfs 00/13] server41tests: add some tests for copy offload</a></li>
+<li><a href="thread/%253C20260709-nfsd-testing-v2-0-0a1ba233bf87%2540kernel.org%253E.html">[PATCH v2 00/10] nfsd: copy offload fixes</a></li>
+<li><a href="thread/%253C20260709055211.2498307-1-ernis%2540linux.microsoft.com%253E.html">[PATCH v10 rdma-next] RDMA: Change capability fields in ib_device_attr from int to u32</a></li>
+<li><a href="thread/%253C96cb0f45621309481c96cb1e81ef3175257161ec.1783436588.git.bcodding%2540hammerspace.com%253E.html">[PATCH] NFS: Charge unstable writes by request size, not folio size</a></li>
+<li><a href="thread/%253CCALWcw%253DHsVbqgnBE%252BfW%253DqO9ULPww8_0amGjgw-f11FuoV2%253DftOA%2540mail.gmail.com%253E.html">Re: NFS swap with RDMA?</a></li>
+<li><a href="thread/%253CSA1PR06MB1135309B2E478CE0323EF04BCE1FF2%2540SA1PR06MB11353.namprd06.prod.outlook.com%253E.html">NFS mount option rdirplus</a></li>
+<li><a href="thread/%253Ccover.1782148639.git.abo%2540medichon.fr%253E.html">Re: [PATCH 2/2] nfs: refactor pNFS functions using clear_and_wake_up_bit</a></li>
+<li><a href="thread/%253Ccover.1783393213.git.rakukuip%2540gmail.com%253E.html">[PATCH 1/1] sunrpc: fix use-after-free in __rpc_clnt_handle_event and __rpc_clnt_remove_pipedir</a></li>
+<li><a href="thread/%253C20260703060329.896125-1-ernis%2540linux.microsoft.com%253E.html">[PATCH rdma-next v9] RDMA: Change capability fields in ib_device_attr from int to u32</a></li>
+</ul>
+  </main>
+</body>
+</html>

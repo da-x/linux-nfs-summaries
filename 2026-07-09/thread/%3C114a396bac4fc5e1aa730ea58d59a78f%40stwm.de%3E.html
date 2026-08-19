@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>6.18.37 nfsd crash: Chuck Lever exonerates export-cache revert, points at latent nfs4state use-after-free</title>
+  <meta name="description" content="Type: Bug fix / regression investigation (NFS server side — nfsd, not the client). This week&#39;s single message is Chuck Lever&#39;s decisive analytical pivot in an ongoing debugging exchange with reporter Wolfgang Walter over a hard lockup that…">
+  <meta property="og:title" content="6.18.37 nfsd crash: Chuck Lever exonerates export-cache revert, points at latent nfs4state use-after-free">
+  <meta property="og:description" content="Type: Bug fix / regression investigation (NFS server side — nfsd, not the client). This week&#39;s single message is Chuck Lever&#39;s decisive analytical pivot in an ongoing debugging exchange with reporter Wolfgang Walter over a hard lockup that…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-09T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="6.18.37 nfsd crash: Chuck Lever exonerates export-cache revert, points at latent nfs4state use-after-free">
+  <meta name="twitter:description" content="Type: Bug fix / regression investigation (NFS server side — nfsd, not the client). This week&#39;s single message is Chuck Lever&#39;s decisive analytical pivot in an ongoing debugging exchange with reporter Wolfgang Walter over a hard lockup that…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-09</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>6.18.37 nfsd crash: Chuck Lever exonerates export-cache revert, points at latent nfs4state use-after-free</h1>
+<h2>Summary</h2>
+<h1>6.18.37 nfsd crash: suspect commit cleared, focus shifts to a latent <code>nfs4state.c</code> bug</h1>
+<p><strong>Type:</strong> Bug fix / regression investigation (NFS <em>server</em> side — <code>nfsd</code>, not the client). This week's single message is Chuck Lever's decisive analytical pivot in an ongoing debugging exchange with reporter Wolfgang Walter over a hard lockup that appeared in stable kernel 6.18.37 but not 6.18.36.</p>
+<h2>Bridging prior weeks (brief)</h2>
+<p>The thread began with Wolfgang's report of a production NFSv4.2 fileserver wedging on 6.18.37, and his bisect pointing at commit <code>95f9eb19d5e6</code> ("Revert 'NFSD: Defer sub-object cleanup in export put callbacks'") — the only NFS-server delta between 6.18.36 and 6.18.37. In the prior week's window, <a href="https://lore.kernel.org/linux-nfs/20260701234349.354512-1-cel@kernel.org/">Chuck Lever opened the investigation</a> by validating that bisect and asking for (a) a complete kernel log from the first stall line onward and (b) a "revert-the-revert" diagnostic build to A/B test the suspect commit. <a href="https://lore.kernel.org/linux-nfs/114a396bac4fc5e1aa730ea58d59a78f@stwm.de/">Wolfgang then supplied the missing crash data</a>: a null-pointer Oops in <code>remove_blocked_locks()</code> → <code>__destroy_client()</code> → <code>nfsd4_destroy_clientid()</code> during a COMPOUND, on an NFS 4.2 / <code>sec=krb5p</code> box with ~50 users connected and clients actively disconnecting. He committed to running the diagnostic build.</p>
+<h2>This week's discussion</h2>
+<p><strong>Chuck Lever clears the suspect commit and re-frames the bug as latent upstream</strong> (<a href="https://lore.kernel.org/linux-nfs/20260703160306.1651327-1-cel@kernel.org/">2026-07-03</a>). Writing to Wolfgang and stable@, Chuck delivers a "short version" that overturns the bisect's conclusion:</p>
+<blockquote>
+<p>"Short version for stable@: 6.18.37 does not need a revert of 95f9eb19d5e6 ("Revert 'NFSD: Defer sub-object cleanup in export put callbacks'"). That commit is correct for 6.18, and it is not the cause of Wolfgang's crash. Please leave it in place."</p>
+</blockquote>
+<p>His reasoning is a clean file-level argument: the suspect revert touches only <code>fs/nfsd/export.c</code>, <code>export.h</code>, and <code>nfsctl.c</code>, whereas the oops sits entirely in <code>fs/nfsd/nfs4state.c</code>:</p>
+<blockquote>
+<p>"Wolfgang's oops is in remove_blocked_locks() -&gt; __destroy_client() -&gt; nfsd4_destroy_clientid(), entirely within fs/nfsd/nfs4state.c, which the revert does not modify. That path is byte-for-byte identical across 6.18.36, 6.18.37, and current mainline, so the revert cannot have introduced the bug and no missing backport repairs it."</p>
+</blockquote>
+<p>He then draws the key conclusion about the A/B split:</p>
+<blockquote>
+<p>"The 6.18.36-good / 6.18.37-bad split is a timing coincidence; I believe the same latent bug is present in both."</p>
+</blockquote>
+<p>Because the defect exists upstream as well, Chuck redirects the fix path:</p>
+<blockquote>
+<p>"Because the defect is present upstream as well, the fix belongs in mainline first and is then backported to 6.18.y and the other affected trees."</p>
+</blockquote>
+<p><strong>New diagnostic plan — KASAN instead of the revert-the-revert build.</strong> Chuck explicitly withdraws his earlier experiment ("you do not need the revert-the-revert build I suggested earlier; that experiment no longer tells us anything") and asks Wolfgang to run a KASAN-enabled 6.18.37 kernel, giving exact config knobs (<code>CONFIG_KASAN=y</code>, <code>CONFIG_KASAN_GENERIC=y</code>, <code>CONFIG_KASAN_INLINE=y</code>, <code>CONFIG_STACKTRACE=y</code>) and explaining what evidence it will produce:</p>
+<blockquote>
+<p>"When it trips, KASAN prints a 'BUG: KASAN: use-after-free' report with 'Allocated by' and 'Freed by' call stacks. That report, in full, is what I need -- it should land in /var/log/messages just as the last oops did."</p>
+</blockquote>
+<p>He flags the practical cost — "KASAN roughly doubles memory use and adds CPU cost, so weigh that before running it on the production server" — and offers a fallback (full log from the first stall line onward, all CPU backtraces, via netconsole or serial). Finally, Chuck commits to producing a fix proactively:</p>
+<blockquote>
+<p>"I will draft a candidate upstream fix from the analysis so far and send it separately. If KASAN on the production box is not an option, testing that patch may be the least disruptive way to confirm."</p>
+</blockquote>
+<p>He closes with thanks for "the careful report and the bisect."</p>
+<h2>Technical assessment</h2>
+<ul>
+<li><strong>Classification:</strong> A bug-fix hunt — specifically a suspected use-after-free / list-corruption in the NFSv4 client-state teardown path (<code>remove_blocked_locks()</code> walking a corrupted or freed lock list while destroying a client ID). It is squarely server-side <code>nfsd</code> state management, not a wire-protocol change or new feature. (The task's emphasis on NFS <em>client</em> development does not apply to this thread.)</li>
+<li><strong>Evolution of the discussion:</strong> The investigation has flipped. Last week the leading hypothesis was that commit <code>95f9eb19d5e6</code> changed export-cache cleanup timing and created the UAF window; this week Chuck rules that out by showing the faulting code path is untouched by the commit and identical across 6.18.36, 6.18.37, and mainline. The bug is re-characterized as a <em>latent</em> upstream defect in <code>nfs4state.c</code> that 6.18.37 merely exposed through timing.</li>
+<li><strong>Key technical argument:</strong> A file-scope / code-path identity argument — the oops lives in code the suspect commit never modified, so neither reverting it nor backporting anything to it can help; the fix must land in mainline first.</li>
+<li><strong>Open questions for next week:</strong> (1) whether Wolfgang can run KASAN on the production box or will fall back to a full stall log / testing Chuck's patch; (2) the content of the "candidate upstream fix" Chuck says he will send separately — no such patch appears in this week's window, so its arrival and review are the likely next development.</li>
+</ul>
+<h2>Status</h2>
+<p>Unresolved as of end of window. The suspect commit has been exonerated and left in place; the bug is re-scoped to a latent upstream <code>nfs4state.c</code> defect. Awaiting either KASAN output from Wolfgang or his test of Chuck's forthcoming candidate fix before the patch can be confirmed and backported.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260703160306.1651327-1-cel@kernel.org/">2026-07-03 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: 6.18.37 has problems with nfs4 (server), 6.18.36 works</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260703160306.1651327-1-cel@kernel.org/">2026-07-03 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: 6.18.37 has problems with nfs4 (server), 6.18.36 works</a></li>
+</ul>
+  </main>
+</body>
+</html>

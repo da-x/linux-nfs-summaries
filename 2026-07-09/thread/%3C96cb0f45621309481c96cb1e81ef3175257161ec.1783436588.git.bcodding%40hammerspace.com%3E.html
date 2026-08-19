@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS: Fix writeback accounting inflation when folios are split into multiple requests</title>
+  <meta name="description" content="Status: New patch posted (no replies yet this week) Type: Bug fix (memory/dirty-page accounting), targeted for stable trees Author: Benjamin Coddington (Hammerspace)">
+  <meta property="og:title" content="NFS: Fix writeback accounting inflation when folios are split into multiple requests">
+  <meta property="og:description" content="Status: New patch posted (no replies yet this week) Type: Bug fix (memory/dirty-page accounting), targeted for stable trees Author: Benjamin Coddington (Hammerspace)">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-09T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS: Fix writeback accounting inflation when folios are split into multiple requests">
+  <meta name="twitter:description" content="Status: New patch posted (no replies yet this week) Type: Bug fix (memory/dirty-page accounting), targeted for stable trees Author: Benjamin Coddington (Hammerspace)">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-09</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS: Fix writeback accounting inflation when folios are split into multiple requests</h1>
+<h2>Summary</h2>
+<h1>NFS: Charge unstable writes by request size, not folio size</h1>
+<p><strong>Status:</strong> New patch posted (no replies yet this week)
+<strong>Type:</strong> Bug fix (memory/dirty-page accounting), targeted for stable trees
+<strong>Author:</strong> Benjamin Coddington (Hammerspace)</p>
+<h2>What happened this week</h2>
+<p>The thread opened — and as of the end of the window, still stands alone — with a single patch from <a href="https://lore.kernel.org/linux-nfs/96cb0f45621309481c96cb1e81ef3175257161ec.1783436588.git.bcodding@hammerspace.com/">Benjamin Coddington</a> on July 7, sent to linux-nfs and cc'd to stable. There is no prior-week history for this thread; it began with this posting.</p>
+<h2>The bug: writeback accounting inflated by a factor of N</h2>
+<p>The patch targets a subtle but potentially severe accounting defect in the NFS client's unstable-write path. Coddington explains the mechanics clearly:</p>
+<blockquote>
+<p>"nfs_folio_mark_unstable() and nfs_folio_clear_commit() charge and uncharge NR_WRITEBACK/WB_WRITEBACK by folio_nr_pages(folio) once per <em>request</em> added to or removed from a commit list. This is correct only when a folio has a single associated request."</p>
+</blockquote>
+<p>The problem emerges whenever the client splits one large folio into multiple sub-folio write requests — which happens routinely in two scenarios:</p>
+<ol>
+<li><strong>pNFS FlexFiles striping</strong> with a stripe unit smaller than the folio size, and</li>
+<li><strong>plain wsize-limited splitting</strong> of buffered writes.</li>
+</ol>
+<p>In both cases, each of the N resulting requests independently charges the <em>entire</em> folio's page count into the global writeback counters:</p>
+<blockquote>
+<p>"each of the N requests independently charges the whole folio's page count, inflating the accounting by a factor of N per folio."</p>
+</blockquote>
+<h2>Why it matters: system-wide hard throttling</h2>
+<p>The consequence is not merely a cosmetic counter error. With large folios (up to 2 MiB on modern systems) and small stripe units, the inflation reaches "multiple orders of magnitude":</p>
+<blockquote>
+<p>"a 2 MiB folio split into 512 4 KiB requests can charge up to 512x its real size, pushing global dirty+writeback accounting past the system's dirty threshold and forcing every buffered writer on the host into the hard-throttle path, including unrelated in-kernel NFS server threads sharing the box."</p>
+</blockquote>
+<p>In other words, a single NFS client workload with FlexFiles striping can throttle <em>all</em> buffered writers on the machine — including an unrelated in-kernel NFS server (nfsd) — because the global dirty+writeback accounting is driven past <code>dirty_ratio</code>/<code>dirty_background_ratio</code> by phantom pages.</p>
+<h2>The fix</h2>
+<p>The remedy, as Coddington summarizes, is straightforward: "Charge each request only for the pages it actually covers." The patch touches three files — <code>fs/nfs/internal.h</code>, <code>fs/nfs/pnfs_nfs.c</code>, and <code>fs/nfs/write.c</code> (16 insertions, 12 deletions) — to make the charge/uncharge calls use the per-request byte/page span rather than the whole folio's page count.</p>
+<h2>Provenance and regression window</h2>
+<p>The bug was introduced by the folio conversion of buffered writes:</p>
+<blockquote>
+<p>"Fixes: 0c493b5cf16e ("NFS: Convert buffered writes to use folios")"</p>
+</blockquote>
+<p>That commit landed in the v5.17 cycle (2022), so this is a long-standing latent bug that only becomes acute once large folios and pNFS FlexFiles striping combine on the same workload. The <code>Cc: stable</code> tag indicates Coddington considers it suitable for backport to maintained stable trees.</p>
+<p>Notably, the patch carries an "Assisted-By: Claude Sonnet 5" trailer — a first for linux-nfs in this dataset, and worth watching as AI-assisted kernel development becomes more visible on the list.</p>
+<h2>Where things stand</h2>
+<p>As of the close of the week (2026-07-10), the patch has no replies, reviews, or acks yet. Given its <code>Fixes</code> tag and stable cc, expect it to be picked up in the next merge window or a stable update if reviewers are satisfied. The discussion remains open for review comments in the coming days.</p>
+<h2>Key takeaways</h2>
+<ul>
+<li><strong>Bug class:</strong> accounting error (over-charging writeback pages), not a data-corruption or protocol issue.</li>
+<li><strong>Trigger conditions:</strong> large folios + pNFS FlexFiles small stripe units, or wsize-limited splitting of large writes.</li>
+<li><strong>Impact scope:</strong> system-wide dirty-throttling, affecting unrelated writers including in-kernel nfsd.</li>
+<li><strong>Fix:</strong> per-request page accounting instead of per-folio; small, targeted diff across three files.</li>
+<li><strong>Regression origin:</strong> the 2022 folio conversion (commit 0c493b5cf16e).</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/96cb0f45621309481c96cb1e81ef3175257161ec.1783436588.git.bcodding@hammerspace.com/">2026-07-07 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — [PATCH] NFS: Charge unstable writes by request size, not folio size</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd: stable backport — release layout stid on setlease failure (5.10.y)</title>
+  <meta name="description" content="This thread is a short, single-exchange stable-tree item: a backported bug fix for the NFS server (nfsd) was queued by Sasha Levin for the 5.10.y LTS series. It is squarely a bug fix — specifically a use-after-free / dangling-pointer fix…">
+  <meta property="og:title" content="nfsd: stable backport — release layout stid on setlease failure (5.10.y)">
+  <meta property="og:description" content="This thread is a short, single-exchange stable-tree item: a backported bug fix for the NFS server (nfsd) was queued by Sasha Levin for the 5.10.y LTS series. It is squarely a bug fix — specifically a use-after-free / dangling-pointer fix…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-09T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd: stable backport — release layout stid on setlease failure (5.10.y)">
+  <meta name="twitter:description" content="This thread is a short, single-exchange stable-tree item: a backported bug fix for the NFS server (nfsd) was queued by Sasha Levin for the 5.10.y LTS series. It is squarely a bug fix — specifically a use-after-free / dangling-pointer fix…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-09</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd: stable backport — release layout stid on setlease failure (5.10.y)</h1>
+<h2>Summary</h2>
+<h1>nfsd: release layout stid on setlease failure — 5.10.y stable backport</h1>
+<h2>What happened this week</h2>
+<p>This thread is a short, single-exchange stable-tree item: a backported bug fix for the NFS server (nfsd) was queued by Sasha Levin for the 5.10.y LTS series. It is squarely a <strong>bug fix</strong> — specifically a use-after-free / dangling-pointer fix in the pNFS layout stateid teardown path — rather than a new feature or protocol change.</p>
+<h2>The patch and its technical argument</h2>
+<p>Chuck Lever posted <a href="https://lore.kernel.org/linux-nfs/20260703033954.1602126-1-cel@kernel.org/">the 5.10.y backport</a> of Chris Mason's commit <code>30d55c8aabb2</code> ("nfsd: release layout stid on setlease failure"). The submission lays out a precise two-part defect:</p>
+<blockquote>
+<p>"nfs4_alloc_stid() publishes the new stid into cl-&gt;cl_stateids via idr_alloc_cyclic() under cl_lock before returning to nfsd4_alloc_layout_stateid(). When nfsd4_layout_setlease() then fails, the error path frees the layout stateid directly with kmem_cache_free() without ever calling idr_remove(), leaving the IDR slot pointing at freed slab memory. Any subsequent IDR walker (states_show, client teardown) dereferences the dangling pointer."</p>
+</blockquote>
+<p>In other words, the failure path was bypassing the proper IDR bookkeeping and leaving a stale slot that later readers (<code>states_show</code>, client teardown) would dereference against freed slab memory — a classic use-after-free on the NFS server side.</p>
+<p>The fix replaces the ad-hoc cleanup with the canonical teardown:</p>
+<blockquote>
+<p>"The correct teardown for an IDR-published stid is nfs4_put_stid(), which removes the IDR slot under cl_lock, dispatches sc_free (nfsd4_free_layout_stateid) to release ls-&gt;ls_file via nfsd4_close_layout(), and drops the nfs4_file reference in its tail."</p>
+</blockquote>
+<p>A second, subtler obstacle was identified: <code>nfsd4_free_layout_stateid()</code> inspects <code>ls-&gt;ls_fence_work</code> via <code>delayed_work_pending()</code>, but <code>INIT_DELAYED_WORK()</code> only ran <em>after</em> the setlease call — so on the failure path the destructor would touch an uninitialized delayed_work. The upstream fix hoisted the <code>ls_fenced</code> / <code>ls_fence_delay</code> / <code>INIT_DELAYED_WORK</code> initialization above the <code>nfsd4_layout_setlease()</code> call and collapsed the manual <code>nfsd_file_put + put_nfs4_file + kmem_cache_free</code> cleanup into a single <code>nfs4_put_stid(stp)</code>.</p>
+<h2>The 5.10.y adaptation (key detail for LTS readers)</h2>
+<p>The backport is not verbatim. Chuck Lever's changelog notes the important divergence:</p>
+<blockquote>
+<p>"[ cel: no ls_fence_work in 5.10.y; dropped INIT_DELAYED_WORK hunk ]"</p>
+</blockquote>
+<p>Because the 5.10.y tree predates the <code>ls_fence_work</code> delayed-work machinery, only the IDR-release portion of the fix applies — the patch shrinks to a one-line change (<code>fs/nfsd/nfs4layouts.c | 4 +---</code>, 1 insertion, 3 deletions). The bug being fixed traces back to:</p>
+<blockquote>
+<p>"Fixes: c5c707f96fc9 ("nfsd: implement pNFS layout recalls")"</p>
+</blockquote>
+<p>The patch carries <code>Reviewed-by: Jeff Layton &lt;jlayton@kernel.org&gt;</code> and is marked <code>Cc: stable@vger.kernel.org</code>. (Notably, the commit also credits an AI assistant via <code>Assisted-by: kres (claude-opus-4-7)</code>.)</p>
+<h2>Conclusion / status</h2>
+<p>Sasha Levin confirmed acceptance the same day:</p>
+<blockquote>
+<p>"Queued for 5.10.y, thanks!" — <a href="https://lore.kernel.org/linux-nfs/2026070315-stable-reply-0012@kernel.org/">Sasha Levin</a></p>
+</blockquote>
+<p>The thread is therefore <strong>closed and resolved</strong>: the dangling-IDR-slot use-after-free in the nfsd pNFS layout setlease failure path is fixed upstream and now queued for the 5.10.y stable release. No further discussion, objections, or follow-up patches occurred this week.</p>
+<h2>Context / bridging</h2>
+<p>This is a self-contained stable backport thread (one patch + one ack); it does not overlap with the other in-window threads summarized this week. It should be read as the LTS-stable mirror of Chris Mason's upstream nfsd layout-stateid fix, trimmed to fit the older 5.10.y codebase.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/2026070315-stable-reply-0012@kernel.org/">2026-07-04 Sasha Levin <a href="mailto:sashal@kernel.org">sashal@kernel.org</a> — Re: [PATCH 5.10.y] nfsd: release layout stid on setlease failure</a></li>
+</ul>
+  </main>
+</body>
+</html>

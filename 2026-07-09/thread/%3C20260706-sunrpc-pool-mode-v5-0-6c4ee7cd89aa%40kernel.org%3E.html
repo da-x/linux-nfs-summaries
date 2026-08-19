@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>sunrpc pool_mode v5: hardcode pernode + empty-pool fixes applied to nfsd-testing; sv_nrpools accessor debate winds down</title>
+  <meta name="description" content="Type: Server-side bug fix + cleanup in the sunrpc (NFS server) layer. This is not an NFS client feature or a wire-protocol change — it concerns how nfsd schedules RPC work across NUMA pools on the server. But the reliability stakes for any…">
+  <meta property="og:title" content="sunrpc pool_mode v5: hardcode pernode + empty-pool fixes applied to nfsd-testing; sv_nrpools accessor debate winds down">
+  <meta property="og:description" content="Type: Server-side bug fix + cleanup in the sunrpc (NFS server) layer. This is not an NFS client feature or a wire-protocol change — it concerns how nfsd schedules RPC work across NUMA pools on the server. But the reliability stakes for any…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-09T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="sunrpc pool_mode v5: hardcode pernode + empty-pool fixes applied to nfsd-testing; sv_nrpools accessor debate winds down">
+  <meta name="twitter:description" content="Type: Server-side bug fix + cleanup in the sunrpc (NFS server) layer. This is not an NFS client feature or a wire-protocol change — it concerns how nfsd schedules RPC work across NUMA pools on the server. But the reliability stakes for any…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-09</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>sunrpc pool_mode v5: hardcode pernode + empty-pool fixes applied to nfsd-testing; sv_nrpools accessor debate winds down</h1>
+<h2>Summary</h2>
+<h1>sunrpc pool_mode v5: the series lands in nfsd-testing, with a brief interface-design coda</h1>
+<p><strong>Type:</strong> Server-side bug fix + cleanup in the sunrpc (NFS server) layer. This is <em>not</em> an NFS client feature or a wire-protocol change — it concerns how <code>nfsd</code> schedules RPC work across NUMA pools on the server. But the reliability stakes for any client talking to a multi-NUMA NFS server are concrete, and they're the reason this series has drawn attention all summer.</p>
+<h2>Bridging prior weeks (brief)</h2>
+<p>This is the fifth revision of a series that has been running since mid-June. The core problem was flagged early by Chuck Lever: when <code>nrservs &lt; number of NUMA nodes</code>, trailing pools end up with zero threads, and because each thread services only its own pool, a transport enqueued on an empty pool hangs indefinitely. <a href="https://lore.kernel.org/linux-nfs/7c27731fdb20928f8a8bedc5c286cde20057aef2.camel@kernel.org/">The v4 review round closed out last week</a> with NeilBrown's <code>Reviewed-by</code> on all four patches, the <code>Fixes:</code> tag settled on <code>bfd241600a3b</code>, and two open items carried into v5: add a tracepoint/comment for the "no pool has any threads" fallback path, and (per NeilBrown's standing suggestion) eliminate the redundant <code>serv.sv_nrpools</code> field.</p>
+<h2>This week's activity (July 3–9)</h2>
+<h3>The v5 series is posted (July 6)</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260706-sunrpc-pool-mode-v5-0-6c4ee7cd89aa@kernel.org/">Jeff Layton posted v5</a> as a five-patch set, expanding the prior four by splitting off the <code>sv_nrpools</code> elimination. In the cover letter he framed what was new:</p>
+<blockquote>
+<p>"This has a few small fixes and comment cleanups and also implements Neil's suggestion to remove serv.sv_nrpools."</p>
+</blockquote>
+<p>He called out that patches #1 and #3 "address what is a shortcoming of the existing code -- namely that the server can be configured to schedule RPCs to pools with no threads in them," and noted the last two patches carry the side benefit of "getting the modulus out of the svc_pool_for_cpu() hotpath."</p>
+<p>The five patches, in order:</p>
+<ol>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260706-sunrpc-pool-mode-v5-1-6c4ee7cd89aa@kernel.org/">route to a populated pool in <code>svc_pool_for_cpu()</code></a></strong> — the actual bug fix. Layton describes the failure precisely: "a transport that lands on a threadless pool is enqueued on sp_xprts and never picked up: the connection hangs indefinitely." The fix makes <code>svc_pool_for_cpu()</code> skip empty pools, "trading NUMA locality for a guarantee that the work is actually serviced." Tagged <code>Fixes: bfd241600a3b ("[PATCH] knfsd: make rpc threads pools numa aware")</code>.</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260706-sunrpc-pool-mode-v5-2-6c4ee7cd89aa@kernel.org/">hardcode pool_mode to pernode, remove other modes</a></strong> — the behavioral change. Layton's rationale: "Today, pernode is the right choice everywhere." On single-node hosts it "degenerates to exactly one pool, identical to the old 'global' mode," while on multi-NUMA hosts it gives proper thread affinity and NUMA-local allocation. The <code>SVC_POOL_AUTO/GLOBAL/PERCPU/PERNODE</code> enum, the mode-selection heuristic, and all mode-based switch statements are removed. The module parameter and netlink interfaces are preserved for backward compatibility — "Writing any of the four documented mode names still succeeds silently," reading always returns <code>"pernode"</code>, and a deprecation notice is emitted.</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260706-sunrpc-pool-mode-v5-3-6c4ee7cd89aa@kernel.org/">guarantee a thread per pool when auto-distributing</a></strong> — the belt-and-braces companion to patch 1: "Floor each pool at one thread when auto-distributing a non-zero count, so no pool is left empty." Carries NeilBrown's <code>Reviewed-by</code>.</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260706-sunrpc-pool-mode-v5-4-6c4ee7cd89aa@kernel.org/">tear down pool counters before dropping the pool map reference</a></strong> — a latent-leak fix that only becomes live once <code>sv_nrpools</code> is gone. Layton explains: "a derived loop bound would read as zero for the last pooled service and skip svc_pool_destroy_counters() entirely, leaking the percpu counters." Reordering makes it safe; "No functional change."</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260706-sunrpc-pool-mode-v5-5-6c4ee7cd89aa@kernel.org/">derive the pool count instead of caching it in <code>sv_nrpools</code></a></strong> — NeilBrown's long-requested simplification, now implemented via a new <code>svc_serv_nrpools()</code> accessor. Layton argues the field "carries no unique information" relative to <code>sv_is_pooled</code>, and that "Doing this also removes a modulus operation from svc_pool_for_cpu(), which should make for more efficient RPC queueing."</li>
+</ol>
+<h3>Chuck applies the series (July 6)</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/178337103119.1752692.17102361450604849930.b4-ty@b4/">Chuck Lever's reply</a> is the headline of the week — terse and decisive:</p>
+<blockquote>
+<p>"Applied to nfsd-testing, thanks!"</p>
+</blockquote>
+<p>He lists all five commit hashes, confirming the full set landed in the NFS testing tree on the same day it was posted. After a month-and-a-half of review across five revisions, the series is in.</p>
+<h3>NeilBrown reviews patch 5/5 and raises two nits (July 6)</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/178337823128.27465.5531515481696438438@noble.neil.brown.name/">NeilBrown's reply</a> to the final patch is approving but flags two details:</p>
+<blockquote>
+<p>"I would make this a static-inline."</p>
+</blockquote>
+<p>And on an <code>if</code> condition in the new code:</p>
+<blockquote>
+<p>"The values stored in svc_pool_map.to_pool are all less than svc_pool_map.npools. So that if() condition cannot be true."</p>
+</blockquote>
+<p>He then explicitly scoped both as non-blocking and signed off:</p>
+<blockquote>
+<p>"But those two things don't reduce the correctness of the patch. Reviewed-by: NeilBrown <a href="mailto:neil@brown.name">neil@brown.name</a>. Thanks for doing this."</p>
+</blockquote>
+<h3>The interface-design debate (July 6–8)</h3>
+<p>Layton's <a href="https://lore.kernel.org/linux-nfs/3496ed08e534a3e81dfe4168d4b2bc3c325d829a.camel@kernel.org/">immediate reply</a> accepted the dead-<code>if</code> point ("Ahh good point. I guess we can remove that if statement. I can send Chuck a follow-on patch") but pushed back on making it static-inline, because <code>svc_pool_map</code> is file-local to <code>svc.c</code>:</p>
+<blockquote>
+<p>"That would mean that we would have to export svc_pool_map, which is currently private to svc.c."</p>
+</blockquote>
+<p>NeilBrown <a href="https://lore.kernel.org/linux-nfs/178348882124.3371781.3092732814258907420@noble.neil.brown.name/">pressed the point</a> on July 8, questioning why exporting the struct was worse than exporting the accessor:</p>
+<blockquote>
+<p>"Why is exporting svc_pool_map more problematic than exporting svc_serv_nrpools? I think it would be good for at least the code in svc_pool_for_cpu() to inline the function."</p>
+</blockquote>
+<p>Layton <a href="https://lore.kernel.org/linux-nfs/6f703524141a195ad1e4f16b1b1d16ffa2073189.camel@kernel.org/">drew a firm line</a> on module-boundary hygiene:</p>
+<blockquote>
+<p>"Doing what you suggest would increase the interface 'surface' between sunrpc.ko and nfsd.ko... Why expose so many internal details to other modules when all we need is this one accessor? I think keeping this interface small is preferable."</p>
+</blockquote>
+<p>NeilBrown <a href="https://lore.kernel.org/linux-nfs/178355109748.3371781.17923928016828009638@noble.neil.brown.name/">conceded gracefully</a> on July 8, striking the classic kernel-reviewing balance between abstract and concrete cost:</p>
+<blockquote>
+<p>"In general, yes. But it is not without cost... Interface size has an abstract value. Code size can have concrete value. Comparing them is subjective I guess. I have no concrete evidence that there is a problem, so I'll stop objecting."</p>
+</blockquote>
+<p>Layton <a href="https://lore.kernel.org/linux-nfs/44491689bfb3340f618829da785a302594f476f4.camel@kernel.org/">closed the exchange</a> with a door left ajar for future evidence:</p>
+<blockquote>
+<p>"Your point is certainly valid, and this <em>is</em> a hot path. If we can demonstrate that this matters, then I'd be happy to revisit the idea. I don't have the cycles to do so at the moment though."</p>
+</blockquote>
+<h2>Key technical arguments &amp; evolution</h2>
+<ol>
+<li><strong>The series is merged into nfsd-testing.</strong> After five revisions and a month-plus of review, Chuck Lever applied all five patches on July 6. This is the decisive event of the week — the long-running debate has resolved in favor of the code.</li>
+<li><strong>Two complementary fixes for the empty-pool hang.</strong> Patch 1/5 is the reactive safety net (route to a populated pool if the chosen one is empty); patch 3/5 is the proactive prevention (floor each auto-distributed pool at one thread). Together they guarantee "the work is actually serviced" rather than leaving a client's transport stranded on a threadless pool.</li>
+<li><strong>The <code>sv_nrpools</code> elimination finally landed</strong> — NeilBrown's standing suggestion from the v4 round, now realized as the <code>svc_serv_nrpools()</code> accessor with the side benefit of removing a modulus from the <code>svc_pool_for_cpu()</code> hot path.</li>
+<li><strong>A module-boundary principle settled the last open question.</strong> The static-inline debate ended not on performance grounds (NeilBrown had no concrete evidence of a problem) but on interface hygiene: Layton preferred keeping <code>struct svc_pool_map</code> private to <code>sunrpc.ko</code> over exposing it to <code>nfsd.ko</code>. The dead-<code>if</code> nit is accepted and will be cleaned up in a follow-on patch to Chuck.</li>
+</ol>
+<h2>Relevance to NFS client development</h2>
+<p>While this is server-side sunrpc code, the consequences for clients are direct:</p>
+<ul>
+<li><strong>The starvation fix (patch 1/5) eliminates indefinite connection hangs.</strong> A client connecting to an NFS server with fewer nfsd threads than NUMA nodes — or one misconfigured with zero threads on some pools — would previously have its transport enqueued on an empty pool and hang forever. The populated-pool fallback ensures the work is serviced, at worst paying a cross-NUMA latency penalty rather than stalling.</li>
+<li><strong>The pernode default (patch 2/5) changes NUMA behavior for all NFS servers.</strong> Services that previously ran with a single global pool now get one pool per NUMA node by default, improving thread affinity and NUMA-local memory allocation — a latency win for clients on multi-NUMA hosts.</li>
+<li><strong>The modulus elimination (patch 5/5) tightens the enqueue path</strong> on busy servers handling many concurrent client connections.</li>
+</ul>
+<h2>Final status (as of window close)</h2>
+<p>The v5 series is <strong>applied to nfsd-testing</strong> with all five patches carrying review sign-off. The only remaining item is mechanical: Layton will send Chuck a small follow-on patch to remove the dead <code>if</code> condition in patch 5/5 that NeilBrown flagged. The static-inline question is parked — Layton is willing to revisit it "if we can demonstrate that this matters," but has no cycles to benchmark it now. No new patches or objections appeared after July 8; the thread is effectively concluded pending that cleanup.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706-sunrpc-pool-mode-v5-0-6c4ee7cd89aa@kernel.org/">2026-07-06 Jeff Layton — [PATCH v5 0/5] sunrpc: hardcode pool_mode to pernode, remove other modes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706-sunrpc-pool-mode-v5-1-6c4ee7cd89aa@kernel.org/">2026-07-06 Jeff Layton — [PATCH v5 1/5] sunrpc: route to a populated pool in svc_pool_for_cpu()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706-sunrpc-pool-mode-v5-2-6c4ee7cd89aa@kernel.org/">2026-07-06 Jeff Layton — [PATCH v5 2/5] sunrpc: hardcode pool_mode to pernode, remove other modes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706-sunrpc-pool-mode-v5-3-6c4ee7cd89aa@kernel.org/">2026-07-06 Jeff Layton — [PATCH v5 3/5] sunrpc: guarantee a thread per pool when auto-distributing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706-sunrpc-pool-mode-v5-4-6c4ee7cd89aa@kernel.org/">2026-07-06 Jeff Layton — [PATCH v5 4/5] sunrpc: tear down pool counters before dropping the pool map reference</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706-sunrpc-pool-mode-v5-5-6c4ee7cd89aa@kernel.org/">2026-07-06 Jeff Layton — [PATCH v5 5/5] sunrpc: derive the pool count instead of caching it in sv_nrpools</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178337103119.1752692.17102361450604849930.b4-ty@b4/">2026-07-06 Chuck Lever — Re: [PATCH v5 0/5] (applied to nfsd-testing)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178337823128.27465.5531515481696438438@noble.neil.brown.name/">2026-07-06 NeilBrown — Re: [PATCH v5 5/5] (Reviewed-by + two nits)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/3496ed08e534a3e81dfe4168d4b2bc3c325d829a.camel@kernel.org/">2026-07-06 Jeff Layton — Re: [PATCH v5 5/5] (svc_pool_map is private)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178348882124.3371781.3092732814258907420@noble.neil.brown.name/">2026-07-08 NeilBrown — Re: [PATCH v5 5/5] (why is exporting the struct worse?)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/6f703524141a195ad1e4f16b1b1d16ffa2073189.camel@kernel.org/">2026-07-08 Jeff Layton — Re: [PATCH v5 5/5] (keep the interface small)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178355109748.3371781.17923928016828009638@noble.neil.brown.name/">2026-07-08 NeilBrown — Re: [PATCH v5 5/5] (I'll stop objecting)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/44491689bfb3340f618829da785a302594f476f4.camel@kernel.org/">2026-07-08 Jeff Layton — Re: [PATCH v5 5/5] (happy to revisit if demonstrated)</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706-sunrpc-pool-mode-v5-0-6c4ee7cd89aa@kernel.org/">2026-07-06 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v5 0/5] sunrpc: hardcode pool_mode to pernode, remove other modes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706-sunrpc-pool-mode-v5-1-6c4ee7cd89aa@kernel.org/">2026-07-06 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v5 1/5] sunrpc: route to a populated pool in svc_pool_for_cpu()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706-sunrpc-pool-mode-v5-2-6c4ee7cd89aa@kernel.org/">2026-07-06 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v5 2/5] sunrpc: hardcode pool_mode to pernode, remove other modes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706-sunrpc-pool-mode-v5-3-6c4ee7cd89aa@kernel.org/">2026-07-06 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v5 3/5] sunrpc: guarantee a thread per pool when auto-distributing</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706-sunrpc-pool-mode-v5-4-6c4ee7cd89aa@kernel.org/">2026-07-06 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v5 4/5] sunrpc: tear down pool counters before dropping the pool map reference</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706-sunrpc-pool-mode-v5-5-6c4ee7cd89aa@kernel.org/">2026-07-06 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v5 5/5] sunrpc: derive the pool count instead of caching it in sv_nrpools</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178337103119.1752692.17102361450604849930.b4-ty@b4/">2026-07-06 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v5 0/5] sunrpc: hardcode pool_mode to pernode, remove other modes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178337823128.27465.5531515481696438438@noble.neil.brown.name/">2026-07-06 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v5 5/5] sunrpc: derive the pool count instead of caching it in sv_nrpools</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/3496ed08e534a3e81dfe4168d4b2bc3c325d829a.camel@kernel.org/">2026-07-06 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v5 5/5] sunrpc: derive the pool count instead of caching it in sv_nrpools</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178348882124.3371781.3092732814258907420@noble.neil.brown.name/">2026-07-08 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v5 5/5] sunrpc: derive the pool count instead of caching it in sv_nrpools</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/6f703524141a195ad1e4f16b1b1d16ffa2073189.camel@kernel.org/">2026-07-08 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v5 5/5] sunrpc: derive the pool count instead of caching it in sv_nrpools</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178355109748.3371781.17923928016828009638@noble.neil.brown.name/">2026-07-08 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v5 5/5] sunrpc: derive the pool count instead of caching it in sv_nrpools</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/44491689bfb3340f618829da785a302594f476f4.camel@kernel.org/">2026-07-08 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v5 5/5] sunrpc: derive the pool count instead of caching it in sv_nrpools</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD: RFC patch fixes lock owner use-after-free on client teardown</title>
+  <meta name="description" content="Classification: Bug fix (memory-safety / use-after-free in the NFSv4 server state code)">
+  <meta property="og:title" content="NFSD: RFC patch fixes lock owner use-after-free on client teardown">
+  <meta property="og:description" content="Classification: Bug fix (memory-safety / use-after-free in the NFSv4 server state code)">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-09T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSD: RFC patch fixes lock owner use-after-free on client teardown">
+  <meta name="twitter:description" content="Classification: Bug fix (memory-safety / use-after-free in the NFSv4 server state code)">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-09</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD: RFC patch fixes lock owner use-after-free on client teardown</h1>
+<h2>Summary</h2>
+<h1>NFSD: Prevent lock owner use-after-free during client teardown</h1>
+<p><strong>Classification:</strong> Bug fix (memory-safety / use-after-free in the NFSv4 server state code)</p>
+<h2>What happened this week</h2>
+<p>The thread consists of a single message this week: an RFC patch posted by Chuck Lever on 2026-07-03, <a href="https://lore.kernel.org/linux-nfs/20260703173943.3242873-1-cel@kernel.org/">NFSD: Prevent lock owner use-after-free during client teardown</a>. No replies have landed in the window yet, so the discussion is at its opening stage — a proposed fix awaiting review.</p>
+<h2>The bug</h2>
+<p>The patch addresses a use-after-free (UAF) in <code>__destroy_client()</code> in <code>fs/nfsd/nfs4state.c</code>. As Lever describes it:</p>
+<blockquote>
+<p>"After __destroy_client() releases a client's open owners, a lock owner whose only remaining reference is a blocked lock (nbl) is left on cl_ownerstr_hashtbl. client_has_state() does not account for a bare lock owner, so DESTROY_CLIENTID can reach __destroy_client() with these lock owners still present."</p>
+</blockquote>
+<p>The dangerous sequence: <code>__destroy_client()</code> walks <code>cl_ownerstr_hashtbl</code> and calls <code>remove_blocked_locks()</code> on each lock owner <strong>without holding a reference</strong>. Meanwhile, the per-net "laundromat" thread independently reaps timed-out blocked locks from <code>nn-&gt;blocked_locks_lru</code>. The two paths only serialize on <code>blocked_locks_lock</code> for the list splice — not for the lock owner's lifetime.</p>
+<blockquote>
+<p>"The laundromat can therefore free the lock owner while __destroy_client() is about to dereference it, and the freed, zeroed slab object produces a NULL dereference in remove_blocked_locks()."</p>
+</blockquote>
+<h2>The fix</h2>
+<p>Lever notes that the analogous path <code>nfsd4_release_lockowner()</code> already handles this correctly:</p>
+<blockquote>
+<p>"nfsd4_release_lockowner() holds a reference across the same call; __destroy_client() does not."</p>
+</blockquote>
+<p>The patch (13 insertions, 3 deletions in <code>fs/nfsd/nfs4state.c</code>) makes <code>__destroy_client()</code> follow suit: hold <code>cl_lock</code> across the walk, take a reference and unhash each lock owner before dropping the lock, so the laundromat cannot free the owner underneath the loop. The lock is released before calling <code>remove_blocked_locks()</code> and <code>nfs4_put_stateowner()</code>, which take <code>blocked_locks_lock</code> and <code>cl_lock</code> respectively (avoiding a deadlock).</p>
+<h2>Provenance</h2>
+<ul>
+<li><strong>Reported-by:</strong> Wolfgang Walter <code>&lt;linux@stwm.de&gt;</code></li>
+<li><strong>Closes:</strong> <a href="https://lore.kernel.org/linux-nfs/6eccafaaaa60651ef091257c3439c46b@stwm.de/">original bug report</a></li>
+<li><strong>Fixes:</strong> <code>68ef3bc31664</code> ("nfsd: remove blocked locks on client teardown")</li>
+</ul>
+<h2>Outlook</h2>
+<p>Marked as RFC, the patch is early in review. The race window it closes — between the laundromat's independent reaping and the client-teardown walk — is subtle, so expect scrutiny on the lock-ordering argument (cl_lock vs. blocked_locks_lock) from other NFS maintainers in the coming days.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260703173943.3242873-1-cel@kernel.org/">2026-07-03 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [RFC PATCH] NFSD: Prevent lock owner use-after-free during client teardown</a></li>
+</ul>
+  </main>
+</body>
+</html>

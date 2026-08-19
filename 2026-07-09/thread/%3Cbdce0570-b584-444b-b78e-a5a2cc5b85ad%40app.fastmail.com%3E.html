@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>lockd NLM_SHARE refcount abandoned for idempotent bitmap after UDP retransmit concerns</title>
+  <meta name="description" content="Type: Bug fix (NFSv3/NLM server-side share-state handling in fs/lockd), with a protocol-interpretation argument at its core.">
+  <meta property="og:title" content="lockd NLM_SHARE refcount abandoned for idempotent bitmap after UDP retransmit concerns">
+  <meta property="og:description" content="Type: Bug fix (NFSv3/NLM server-side share-state handling in fs/lockd), with a protocol-interpretation argument at its core.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-09T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="lockd NLM_SHARE refcount abandoned for idempotent bitmap after UDP retransmit concerns">
+  <meta name="twitter:description" content="Type: Bug fix (NFSv3/NLM server-side share-state handling in fs/lockd), with a protocol-interpretation argument at its core.">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-09</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>lockd NLM_SHARE refcount abandoned for idempotent bitmap after UDP retransmit concerns</h1>
+<h2>Summary</h2>
+<h2>lockd: NLM_SHARE access/deny tracking — refcount approach rejected, idempotent bitmap adopted</h2>
+<p><strong>Type:</strong> Bug fix (NFSv3/NLM server-side share-state handling in <code>fs/lockd</code>), with a protocol-interpretation argument at its core.</p>
+<h3>The one message this week</h3>
+<p>This thread carries a single in-window message: <a href="https://lore.kernel.org/linux-nfs/20260703035331.2414135-1-oscarou@synology.com/">Oscar Ou's reply</a> to <a href="https://lore.kernel.org/linux-nfs/bdce0570-b584-444b-b78e-a5a2cc5b85ad@app.fastmail.com/">Chuck Lever's Jul 01 review of the v2 patch</a>. It is a decisive turning point in a multi-week exchange: Oscar concedes the reference-count design is fundamentally incompatible with NLM's retransmit semantics and commits to rebuilding the fix around a per-(access, deny) bitmap.</p>
+<h3>Bridge from prior weeks (brief)</h3>
+<p>The discussion began on Jun 30 with <a href="https://lore.kernel.org/linux-nfs/20260630093820.2162344-1-oscarou@synology.com/">Oscar's original patch</a>, which introduced per-value refcounts for NLM_SHARE access/deny modes to stop a later SHARE from overwriting an earlier one and a single UNSHARE from freeing the whole entry. Chuck's <a href="https://lore.kernel.org/linux-nfs/d8c309bb-37f8-4465-8abf-ba34db499ae1@app.fastmail.com/">Jun 30 review</a> raised early concerns; Oscar posted <a href="https://lore.kernel.org/linux-nfs/20260701052645.2213483-1-oscarou@synology.com/">v2</a> on Jul 01, and Chuck's <a href="https://lore.kernel.org/linux-nfs/bdce0570-b584-444b-b78e-a5a2cc5b85ad@app.fastmail.com/">Jul 01 review</a> (the thread root) delivered the substantive technical objection that this week's message answers.</p>
+<h3>The core technical argument</h3>
+<p>Chuck's review hinged on one invariant: <strong>NLM has no duplicate reply cache (DRC), so every request handler must be idempotent under retransmission.</strong> He pointed at <code>nlmsvc_dispatch()</code>, which "runs the procedure directly for every request that arrives, with nothing to absorb a retransmit," and noted that LOCK/UNLOCK/CANCEL/FREE_ALL all satisfy this. The refcount broke it in both directions:</p>
+<ul>
+<li><strong>Stale reservation (SHARE side):</strong> a replayed SHARE over UDP increments the bucket a second time, so a single matching UNSHARE leaves <code>s_access_counts[3] = 1</code>, and "the entry is never freed" — leaving a stale share that denies later conflicting opens.</li>
+<li><strong>Premature release (UNSHARE side):</strong> a retransmitted UNSHARE decrements past the point where the client still holds an open, so "a conflicting open from another owner would now be granted."</li>
+</ul>
+<p>Chuck proposed tracking the <em>set</em> of held (access, deny) pairs in a <code>u16</code> mask — one bit per <code>(access &lt;&lt; 2 | deny)</code> — because "setting or clearing a bit is idempotent, so a replayed SHARE or UNSHARE lands on the same mask." He flagged the tradeoff: two opens with an identical (access, deny) pair collapse to one bit, losing the count.</p>
+<h3>This week's resolution</h3>
+<p>Oscar accepted every point and confirmed the protocol reading that makes the bitmap safe. On the RFC 1813 question he wrote:</p>
+<blockquote>
+<p>"RFC 1813 is silent on repeat semantics for SHARE / UNSHARE, and section 4.5 explicitly treats non-idempotent requests as something a reply cache has to protect, which lockd doesn't run for NLM. So collapsing identical (access, deny) opens from one owner into a single bit stays inside the protocol, and it buys back the idempotency the other NLM handlers already assume."</p>
+</blockquote>
+<p>He laid out the concrete shape he would use for v3:</p>
+<blockquote>
+<p><code>#define LOCKD_FSH_BIT(a, d)  BIT(((a) &lt;&lt; 2) | (d))</code>
+<code>SHARE:   share-&gt;s_held_mask |=  LOCKD_FSH_BIT(access, mode);</code>
+<code>UNSHARE: share-&gt;s_held_mask &amp;= ~LOCKD_FSH_BIT(access, mode);</code></p>
+</blockquote>
+<p>with <code>s_access</code>/<code>s_mode</code> recomputed as the union over set bits and the entry freed once the mask is zero. He also acknowledged Chuck's process note that a revised series must go out as its own top-level thread — "Understood, thanks -- v3 will go out as its own top-level thread with a [PATCH v3] subject."</p>
+<h3>Final outcome (bridged forward)</h3>
+<p>Oscar followed through the same day: he posted <a href="https://lore.kernel.org/linux-nfs/20260703063856.2423734-1-oscarou@synology.com/">the v3 patch</a> as a new top-level thread, retitled "lockd: preserve multiple NLM_SHARE grants from the same owner," which replaced the refcount with the <code>u16</code> bitmap and added access/deny arguments to <code>nlmsvc_unshare_file()</code>. Notably it carries <strong>no Fixes: tag</strong> — Oscar explained the fix "depends on the xdrgen regeneration to reject out-of-range fsh_access / fsh_mode on the wire, so a Fixes: tag would mislead -stable backporters." Chuck then <a href="https://lore.kernel.org/linux-nfs/178318668544.3488896.1908137356659270173.b4-ty@b4/">applied it to nfsd-testing</a> (commit <code>c8c45fb61a5ff3eb786e4aa434b534b605ab657e</code>), closing the loop.</p>
+<h3>Bottom line</h3>
+<p>A proposed fix for a real NFSv3/NLM share-state bug (multiple opens from one owner clobbering each other's access/deny modes, especially visible to Windows-style clients) was rejected in favor of an idempotent bitmap after the maintainer showed that per-value refcounts violate NLM's retransmit-safety invariant over UDP. The discussion is a clean example of protocol-conformance reasoning (RFC 1813 §4.5 on non-idempotent requests and reply caches) driving a design decision, and it resolved within days with the v3 bitmap accepted into nfsd-testing.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260703035331.2414135-1-oscarou@synology.com/">2026-07-03 Oscar Ou <a href="mailto:oscarou@synology.com">oscarou@synology.com</a> — Re: [PATCH v2] lockd: refcount NLM_SHARE access/deny modes</a></li>
+</ul>
+  </main>
+</body>
+</html>

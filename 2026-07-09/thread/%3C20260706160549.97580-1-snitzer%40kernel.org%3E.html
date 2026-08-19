@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS/localio: conditional inline IO to cut workqueue latency</title>
+  <meta name="description" content="Category: Bug fix / performance improvement (removes an unnecessary workqueue hop in the LOCALIO path).">
+  <meta property="og:title" content="NFS/localio: conditional inline IO to cut workqueue latency">
+  <meta property="og:description" content="Category: Bug fix / performance improvement (removes an unnecessary workqueue hop in the LOCALIO path).">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-09T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS/localio: conditional inline IO to cut workqueue latency">
+  <meta name="twitter:description" content="Category: Bug fix / performance improvement (removes an unnecessary workqueue hop in the LOCALIO path).">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-09</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS/localio: conditional inline IO to cut workqueue latency</h1>
+<h2>Summary</h2>
+<h1>NFS/localio: issue IO inline when not reclaiming memory</h1>
+<p><strong>Category:</strong> Bug fix / performance improvement (removes an unnecessary workqueue hop in the LOCALIO path).</p>
+<h2>Overview</h2>
+<p>On 2026-07-06, Mike Snitzer posted a three-patch series to linux-nfs that makes the NFS LOCALIO data and commit paths issue IO <strong>inline</strong> when the submitting context is not a memory-reclaim worker. The change targets a latency and parallelism regression introduced by an earlier commit that unconditionally bounced every LOCALIO read/write/commit through a dedicated <code>!WQ_MEM_RECLAIM</code> workqueue.</p>
+<h2>Background: Why the workqueue hop exists</h2>
+<p>Snitzer explained the origin of the current design in the <a href="https://lore.kernel.org/linux-nfs/20260706160549.97580-1-snitzer@kernel.org/">cover letter</a>:</p>
+<blockquote>
+<p>"That intermediate hop was introduced by commit b9f5dd57f4a5 ("nfs/localio: use dedicated workqueues for filesystem read and write") because: LOCALIO submits IO directly into a stacked local filesystem (e.g. XFS) which may in turn flush its own !WQ_MEM_RECLAIM workqueue. Doing so from a WQ_MEM_RECLAIM worker -- most importantly writeback's wb_workfn running on bdi_wq -- or from an explicit PF_MEMALLOC reclaim task trips check_flush_dependency() and risks a forward-progress deadlock."</p>
+</blockquote>
+<p>The problem is that the hazard only materializes in reclaim contexts. For ordinary application-driven IO, the workqueue hop is pure overhead:</p>
+<blockquote>
+<p>"For ordinary application/task submission -- e.g. O_DIRECT, or an fsync-driven commit -- the workqueue hop buys nothing: it just adds a context switch and scheduling latency per IO and throws away the NFS client's inherent application-context parallelism."</p>
+</blockquote>
+<h2>The Solution: A New Workqueue-Core Helper</h2>
+<p>The core of the series is a new exported helper in <code>kernel/workqueue.c</code>:</p>
+<p><strong><code>current_is_workqueue_mem_reclaim()</code></strong> — reports whether <code>%current</code> is a <code>WQ_MEM_RECLAIM</code> worker, using "exactly the predicate check_flush_dependency() warns on." Snitzer noted it mirrors existing context-introspection helpers like <code>current_is_workqueue_rescuer()</code> and <code>current_work()</code>, which is why the patch carries Ccs to Tejun Heo, Lai Jiangshan, and LKML.</p>
+<p>A new NFS-side helper, <strong><code>nfs_local_defer_io()</code></strong>, combines this test with the existing <code>PF_MEMALLOC</code> check to decide per-IO whether to defer to <code>nfslocaliod_workqueue</code> or run inline.</p>
+<h2>Patch-by-Patch Breakdown</h2>
+<h3><a href="https://lore.kernel.org/linux-nfs/20260706160549.97580-2-snitzer@kernel.org/">Patch 1/3</a>: Inline read and write</h3>
+<p>Adds <code>current_is_workqueue_mem_reclaim()</code> to the workqueue core and applies the gating to <code>nfs_local_do_read()</code> and <code>nfs_local_do_write()</code>. Key safety arguments:</p>
+<ul>
+<li><strong>Buffered writeback still bounces</strong> — <code>wb_workfn</code> is a <code>WQ_MEM_RECLAIM</code> worker, so it continues to defer.</li>
+<li><strong>O_DIRECT and app-context submission now run inline.</strong></li>
+<li><strong>Completion path unchanged:</strong> "when the underlying filesystem returns -EIOCBQUEUED, the kiocb ki_complete callback … can run in bottom-half context and so must still defer the pgio completion (nfs_local_pgio_release -&gt; rpc_call_done) to nfsiod_workqueue via nfs_local_pgio_aio_complete()."</li>
+</ul>
+<p>Snitzer also flagged a stack-depth consideration for reviewers: "The inline path now stacks the NFS pgio path plus the underlying filesystem's -&gt;write_iter/-&gt;read_iter (and vfs_fsync_range) in task context. … feedback on inline stack headroom under deeply-stacking filesystems (XFS especially) is welcome."</p>
+<h3><a href="https://lore.kernel.org/linux-nfs/20260706160549.97580-3-snitzer@kernel.org/">Patch 2/3</a>: Remove dead FLUSH_SYNC handling</h3>
+<p>A cleanup patch with "no functional change." The <code>FLUSH_SYNC</code> branch in <code>nfs_local_commit()</code> has been dead since LOCALIO was first introduced (commit 70ba381e1a43), because every caller strips it before dispatch. The patch removes the dead branch, the now-unused <code>ctx-&gt;done</code> completion plumbing, and the unused <code>"how"</code> parameter from <code>nfs_local_commit()</code>.</p>
+<h3><a href="https://lore.kernel.org/linux-nfs/20260706160549.97580-4-snitzer@kernel.org/">Patch 3/3</a>: Inline commit (fsync)</h3>
+<p>Extends the same gating to the commit path. The writeback-triggered commit (<code>nfs_write_inode()</code> → <code>__nfs_commit_inode()</code>) still defers because it runs under <code>wb_workfn</code> on the <code>WQ_MEM_RECLAIM</code> bdi_wq. Application-context commits — <code>fsync</code>, O_DIRECT, and NFSv4.2 copy/clone — now run inline.</p>
+<blockquote>
+<p>"Completion (nfs_commit_release_pages -&gt; nfs_commit_end) then runs synchronously in the submitting context; higher layers already cope with this, as __nfs_commit_inode() dispatches the commit async and waits for it separately via wait_on_commit()."</p>
+</blockquote>
+<h2>Statistics</h2>
+<table><thead><tr><th>File</th><th>Changes</th></tr></thead><tbody>
+<tr><td><code>fs/nfs/localio.c</code></td><td>+56 / −16 (net)</td></tr>
+<tr><td><code>kernel/workqueue.c</code></td><td>+24</td></tr>
+<tr><td><code>include/linux/workqueue.h</code></td><td>+1</td></tr>
+<tr><td><code>fs/nfs/internal.h</code></td><td>+2 / −2</td></tr>
+<tr><td><code>fs/nfs/write.c</code></td><td>+1 / −1</td></tr>
+</tbody></table>
+<p><strong>Total:</strong> 71 insertions, 16 deletions across 5 files.</p>
+<h2>Status</h2>
+<p>As of the end of this week's window (2026-07-09), no replies or review comments have appeared on the thread. The series is in its initial posting phase, awaiting feedback from the NFS maintainers and workqueue subsystem maintainers.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706160549.97580-1-snitzer@kernel.org/">2026-07-06 Mike Snitzer <a href="mailto:snitzer@hammerspace.com">snitzer@hammerspace.com</a> — [PATCH 0/3] NFS/localio: issue IO inline when not reclaiming memory</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706160549.97580-2-snitzer@kernel.org/">2026-07-06 Mike Snitzer <a href="mailto:snitzer@hammerspace.com">snitzer@hammerspace.com</a> — [PATCH 1/3] NFS/localio: issue IO inline when not in a memory-reclaim context</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706160549.97580-3-snitzer@kernel.org/">2026-07-06 Mike Snitzer <a href="mailto:snitzer@hammerspace.com">snitzer@hammerspace.com</a> — [PATCH 2/3] NFS/localio: remove dead FLUSH_SYNC handling from nfs_local_commit</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706160549.97580-4-snitzer@kernel.org/">2026-07-06 Mike Snitzer <a href="mailto:snitzer@hammerspace.com">snitzer@hammerspace.com</a> — [PATCH 3/3] NFS/localio: issue commit inline when not in a memory-reclaim context</a></li>
+</ul>
+  </main>
+</body>
+</html>

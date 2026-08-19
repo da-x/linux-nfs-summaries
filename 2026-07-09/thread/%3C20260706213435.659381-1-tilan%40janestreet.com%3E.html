@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSv3 O_WRONLY|O_CREAT open can fail with EACCES after 6.12 atomic_open change</title>
+  <meta name="description" content="A short but pointed bug-report thread opened on the linux-nfs list this week, concerning a regression in NFSv3 client behavior around open(O_WRONLY|O_CREAT) on pre-existing files.">
+  <meta property="og:title" content="NFSv3 O_WRONLY|O_CREAT open can fail with EACCES after 6.12 atomic_open change">
+  <meta property="og:description" content="A short but pointed bug-report thread opened on the linux-nfs list this week, concerning a regression in NFSv3 client behavior around open(O_WRONLY|O_CREAT) on pre-existing files.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-07-09T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSv3 O_WRONLY|O_CREAT open can fail with EACCES after 6.12 atomic_open change">
+  <meta name="twitter:description" content="A short but pointed bug-report thread opened on the linux-nfs list this week, concerning a regression in NFSv3 client behavior around open(O_WRONLY|O_CREAT) on pre-existing files.">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-07-09</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSv3 O_WRONLY|O_CREAT open can fail with EACCES after 6.12 atomic_open change</h1>
+<h2>Summary</h2>
+<p>A short but pointed bug-report thread opened on the linux-nfs list this week, concerning a regression in NFSv3 client behavior around <code>open(O_WRONLY|O_CREAT)</code> on pre-existing files.</p>
+<h2>The report: a permission-denied surprise after upgrading to 6.12</h2>
+<p>Tian Lan of Jane Street <a href="https://lore.kernel.org/linux-nfs/20260706213435.659381-1-tilan@janestreet.com/">opened the thread</a> reporting that their applications began failing with <code>EACCES</code> after a kernel upgrade from 6.1 LTS to 6.12 LTS:</p>
+<blockquote>
+<p>"We recently noticed there is a behavior change w.r.t opening a file with the O_WRONLY|O_CREAT flags over the NFSv3 protocol after upgrading the kernel from 6.1 LTS to 6.12 LTS. From the packets capturing, it seems like the kernel would now issue an additional CREATE rpc call to the remote NFS server regardless if the target file pre-exists or not."</p>
+</blockquote>
+<p>The failure mode is subtle and worth spelling out: when the client only has <em>write</em> permission on the pre-existing file but no write permission on the containing directory, the extra <code>CREATE</code> RPC can return <code>EACCES</code>, causing the whole <code>openat</code> syscall to fail even though opening the existing file for writing should succeed. Tian traced the behavior change to commit <code>7c6c5249f061</code> ("NFS: add atomic_open for NFSv3 to handle O_TRUNC correctly."), and asked whether the new behavior was intentional, since it "breaks existing user's application code." They noted they currently work around it by stripping <code>O_CREAT</code> when opening a known pre-existing file for write, but would prefer not to.</p>
+<h2>The maintainer's response: this should not happen</h2>
+<p>Trond Myklebust, the Linux NFS client maintainer, <a href="https://lore.kernel.org/linux-nfs/122c658755fcb4b2d1264a7fd62fa8eda571f67b.camel@kernel.org/">replied</a> the same day with a firm position that the observed behavior is not what the protocol requires:</p>
+<blockquote>
+<p>"NFSv3 CREATE is supposed to ignore the directory permissions if the file already exists. That is required in order to support basic POSIX open(O_CREAT) behaviour."</p>
+</blockquote>
+<p>He also pushed back on the framing that the old code was safe, noting that even the pre-<code>atomic_open</code> path — which did a <code>LOOKUP</code> before deciding whether to send <code>CREATE</code> — "had a potential for races that could have caused the client to send it against an existing file." In other words, the regression is not simply "the new code sends CREATE when the old code didn't"; rather, per Trond, a conforming server should tolerate a <code>CREATE</code> on an existing file without enforcing directory write permission.</p>
+<p>Trond closed by asking which NFS server Tian was using — a diagnostic question that matters because the EACCES could be coming from a non-conformant server-side implementation of <code>CREATE</code>, not (only) from the client's new RPC pattern.</p>
+<h2>Where things stand</h2>
+<ul>
+<li><strong>Classification:</strong> bug fix / regression investigation, triggered by a deliberate feature change (<code>atomic_open</code> for NFSv3 to handle <code>O_TRUNC</code> correctly).</li>
+<li><strong>Client-side takeaway:</strong> the 6.12 <code>atomic_open</code> path now issues <code>CREATE</code> unconditionally on <code>O_CREAT</code> opens; that is arguably more race-safe than the old LOOKUP-then-CREATE flow, but it relies on servers honoring the NFSv3 rule that directory permissions are ignored when the file already exists.</li>
+<li><strong>Open question:</strong> whether the reported EACCES originates from a non-conformant server (Trond's hypothesis) or from a client-side path that still enforces/propagates the error. The thread is waiting on Tian's answer about the server in use; no patch has been posted yet this week.</li>
+<li><strong>User impact:</strong> applications doing <code>open(O_WRONLY|O_CREAT)</code> on pre-existing files in directories where the user lacks write permission are affected on 6.12+ kernels until this is resolved or a client-side guard is added.</li>
+</ul>
+<p>The discussion is fresh (both messages landed on 2026-07-06) and there is no prior-week history for this thread to bridge from.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260706213435.659381-1-tilan@janestreet.com/">2026-07-06 Tian Lan <a href="mailto:tilan@janestreet.com">tilan@janestreet.com</a> — nfs: opening a file with O_WRONLY|O_CREAT flags can result in permission denied error</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/122c658755fcb4b2d1264a7fd62fa8eda571f67b.camel@kernel.org/">2026-07-06 Trond Myklebust <a href="mailto:trondmy@kernel.org">trondmy@kernel.org</a> — Re: nfs: opening a file with O_WRONLY|O_CREAT flags can result in permission denied error</a></li>
+</ul>
+  </main>
+</body>
+</html>
