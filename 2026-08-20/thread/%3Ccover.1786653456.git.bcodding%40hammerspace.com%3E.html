@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS client: size LAYOUTGET buffers for wide flexfiles layouts</title>
+  <meta name="description" content="This week the NFS client thread on wide flexfiles LAYOUTGET replies moved from a six-patch Hammerspace series posted just before the window to a clean review from Jeff Layton.">
+  <meta property="og:title" content="NFS client: size LAYOUTGET buffers for wide flexfiles layouts">
+  <meta property="og:description" content="This week the NFS client thread on wide flexfiles LAYOUTGET replies moved from a six-patch Hammerspace series posted just before the window to a clean review from Jeff Layton.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS client: size LAYOUTGET buffers for wide flexfiles layouts">
+  <meta name="twitter:description" content="This week the NFS client thread on wide flexfiles LAYOUTGET replies moved from a six-patch Hammerspace series posted just before the window to a clean review from Jeff Layton.">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS client: size LAYOUTGET buffers for wide flexfiles layouts</h1>
+<h2>Summary</h2>
+<p>This week the NFS client thread on wide flexfiles LAYOUTGET replies moved from a six-patch Hammerspace series posted just before the window to a clean review from Jeff Layton.</p>
+<p>The work is a <strong>client bug fix plus a follow-on feature</strong>, not a protocol change. Benjamin Coddington’s <a href="https://lore.kernel.org/linux-nfs/cover.1786653456.git.bcodding@hammerspace.com/">cover letter</a> states the problem in blunt terms: the flexfiles layout driver “caps its LAYOUTGET reply buffer at a single page, which limits a striped layout segment to roughly 28 ff_data_server4 entries — far below the 4096-stripe decode limit the client otherwise advertises.” A server striping wider than that returns <code>NFS4ERR_TOOSMALL</code>, the client falls back to MDS I/O, “and pNFS never engages for those files.”</p>
+<h2>The standalone TOOSMALL fail-over bug</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/57c201555a87e999cd2de1747901f3b6cc3d5792.1786653456.git.bcodding@hammerspace.com/">Patch 1</a> is tagged <code>Fixes:</code> / <code>Cc: stable</code> and is the only patch that is a pure correctness fix. RFC 8881 §18.43.3 says the MDS must return <code>NFS4ERR_TOOSMALL</code> when the layout for the requested range is larger than <code>loga_maxcount</code>. Today <code>nfs4_stat_to_errno()</code> maps that to <code>-ETOOSMALL</code>, nothing in the layoutget path recognizes it, and <code>nfs_error_is_fatal()</code> does not treat it as fatal. The result, Coddington wrote, is that <code>pnfs_update_layout()</code> “clears the layout fail bit and returns no segment”:</p>
+<blockquote>
+<p>"The I/O falls back to the MDS, but because no fail bit was set, every subsequent pageio attempt sends another LAYOUTGET that is doomed to the same NFS4ERR_TOOSMALL. Files whose layouts do not fit the reply buffer never use pNFS and pay an extra round trip on every pageio."</p>
+</blockquote>
+<p>The fix maps <code>-ETOOSMALL</code> to <code>-EMSGSIZE</code> in the layoutget exception handler and has <code>pnfs_update_layout()</code> treat it like <code>NFS4ERR_LAYOUTUNAVAILABLE</code>: mark the layout mode failed and stay on the MDS.</p>
+<p>That is the patch <a href="https://lore.kernel.org/linux-nfs/0386c7cf81b5028b790e5dc6962b69a31d745ffc.camel@kernel.org/">Jeff Layton</a> reviewed this week. His only objection was editorial, aimed at an LLM-assisted comment:</p>
+<blockquote>
+<p>"nit: LLMs sure love to generate some overly-wordy comments. I think the last sentence here is not particularly helpful, and subject to bitrot as the code changes over time. I'd just drop it."</p>
+</blockquote>
+<p>He did not challenge the error mapping or the fail-bit policy.</p>
+<h2>Growing the LAYOUTGET reply buffer</h2>
+<p>Patches 2–5 are the feature work that makes wide layouts actually fetchable.</p>
+<ul>
+<li>
+<p><a href="https://lore.kernel.org/linux-nfs/0653ae1c2d2565701982bd8887fbce987e406308.1786653456.git.bcodding@hammerspace.com/">Patch 2</a> stops advertising a fixed <code>PNFS_LAYOUT_MAXSIZE</code> (4096) in <code>loga_maxcount</code> regardless of the allocated reply buffer. Block and SCSI layouts already allocate a session-sized buffer but still tell the server “4KB or TOOSMALL,” so a large extent list can fail even when the client has room. <code>loga_maxcount</code> is now derived from the page array actually allocated.</p>
+</li>
+<li>
+<p><a href="https://lore.kernel.org/linux-nfs/fc0b7acee2bb88de24825e27d6598bbeca9669db.1786653456.git.bcodding@hammerspace.com/">Patch 3</a> retries LAYOUTGET once with the reply buffer raised to the session’s maximum response size — “the same bound GETDEVICEINFO already uses.” There is no size hint in the TOOSMALL error and the page array is freed when the RPC completes, so Coddington prefers a single jump to the ceiling over incremental growth. The common path is unchanged: the first LAYOUTGET still uses the driver’s default buffer; larger buffers are allocated only against servers that actually hand out wide layouts.</p>
+</li>
+<li>
+<p><a href="https://lore.kernel.org/linux-nfs/c883c5d4c08ae3f7ec605e69beebd0145792ab13.1786653456.git.bcodding@hammerspace.com/">Patch 4</a> is a related client bug fix for non-conformant servers. <code>decode_layoutget()</code> already detects a layout body larger than the provided buffer (“server cheating in layoutget reply”) but maps it to <code>-EINVAL</code>, which <code>pnfs_update_layout()</code> treats as transient — the same doomed-retry loop as unhandled TOOSMALL. The patch returns <code>-EMSGSIZE</code> from that check so the oversized-reply path shares the retry-then-fail-over recovery.</p>
+</li>
+<li>
+<p><a href="https://lore.kernel.org/linux-nfs/05a40a0ca55e214c9593b1cf717dde9b2b3d7bb9.1786653456.git.bcodding@hammerspace.com/">Patch 5</a> remembers the escalated size on <code>nfs_server</code> and uses it as the floor for later LAYOUTGET reply buffers. That is also what lets the LAYOUTGET attached to OPEN succeed: “the lgopen path is best-effort with no retry of its own,” so without a learned size it would fail with TOOSMALL at every open against a wide-striping server. The field is a racy hint that only ever grows toward the session maximum; a stale-low read “merely costs one escalation round trip.”</p>
+</li>
+</ul>
+<p><a href="https://lore.kernel.org/linux-nfs/e68826b1ff9d6b60fe018c1eed72e8a09840762e.1786653456.git.bcodding@hammerspace.com/">Patch 6</a> then moves the decoded per-mirror stripe array to <code>kvzalloc_objs()</code>. Each stripe is roughly 300 bytes; a 2048-stripe mirror is a ~600KB contiguous allocation that can fail under fragmentation once the reply buffer is no longer page-capped. The vmalloc fallback is unavailable under <code>memalloc_noio</code> (swap over pNFS); that case “simply behaves as before.”</p>
+<p>Coddington explicitly left two gaps for follow-up: the decoded per-stripe footprint (<code>nfs4_ff_layout_ds_stripe</code> embeds localio and layoutstats state most stripes never use), and the client still “decodes only the first <code>logr_layout</code> entry of a LAYOUTGET reply and silently discards the rest.” A related series on flexfiles device notifications and caching is independent and applies in either order. The series was wire-validated against reffs at stripe widths 2 and 64, covering both the conformant TOOSMALL path and the buffer-overrun path.</p>
+<h2>This week’s conclusion</h2>
+<p>About an hour after the comment nit, <a href="https://lore.kernel.org/linux-nfs/87bd83fcbd5622579460411db8862b7e5fcbc076.camel@kernel.org/">Layton</a> reviewed the whole series:</p>
+<blockquote>
+<p>"Aside from my minor comment nit, this looks good."</p>
+</blockquote>
+<p>He added <code>Reviewed-by: Jeff Layton &lt;jlayton@kernel.org&gt;</code>. There was no other in-window traffic: no NAK, no request to split the stable fix from the buffer-growth work, and no push-back on treating both RFC-conformant TOOSMALL and “server cheating” overruns as <code>-EMSGSIZE</code>. The series is therefore sitting with a single, minor comment-wording request and a full review tag, awaiting a v2 comment trim or maintainer pickup.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/0386c7cf81b5028b790e5dc6962b69a31d745ffc.camel@kernel.org/">2026-08-14 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 1/6] NFSv4.1/pnfs: suspend pNFS on NFS4ERR_TOOSMALL from LAYOUTGET</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/87bd83fcbd5622579460411db8862b7e5fcbc076.camel@kernel.org/">2026-08-14 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 0/6] NFS: size the LAYOUTGET reply buffer for wide flexfiles layouts</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>lockd client fixes for lockowner allocation failure</title>
+  <meta name="description" content="This week’s linux-nfs traffic closed out a client-side lockd (NLM) bug-fix series from Ran Hongyun, targeting two residual holes on the nlmclnt_find_lockowner() allocation-failure path in nlmclnt_proc(). The discussion is neither a new…">
+  <meta property="og:title" content="lockd client fixes for lockowner allocation failure">
+  <meta property="og:description" content="This week’s linux-nfs traffic closed out a client-side lockd (NLM) bug-fix series from Ran Hongyun, targeting two residual holes on the nlmclnt_find_lockowner() allocation-failure path in nlmclnt_proc(). The discussion is neither a new…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="lockd client fixes for lockowner allocation failure">
+  <meta name="twitter:description" content="This week’s linux-nfs traffic closed out a client-side lockd (NLM) bug-fix series from Ran Hongyun, targeting two residual holes on the nlmclnt_find_lockowner() allocation-failure path in nlmclnt_proc(). The discussion is neither a new…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>lockd client fixes for lockowner allocation failure</h1>
+<h2>Summary</h2>
+<p>This week’s linux-nfs traffic closed out a <strong>client-side lockd (NLM) bug-fix</strong> series from Ran Hongyun, targeting two residual holes on the <code>nlmclnt_find_lockowner()</code> allocation-failure path in <code>nlmclnt_proc()</code>. The discussion is neither a new feature nor a protocol change: it is a correctness rewrite of the NLM client’s file-lock private-state setup, plus a related reference leak, both triggered when lockowner allocation fails.</p>
+<h2>Brief bridge from earlier this week</h2>
+<p>Two days earlier, <a href="https://lore.kernel.org/linux-nfs/20260817060820.963195-1-ranhongyun1@huawei.com/">Ran posted a one-line v1</a> that cleared <code>fl-&gt;fl_ops</code> after <code>nlmclnt_locks_init_private()</code> left it set with a NULL owner. <a href="https://lore.kernel.org/linux-nfs/e7b2ae795a489a07f6f494b8f596f05db0ddc688.camel@kernel.org/">Jeff Layton accepted the diagnosis</a> but rejected the structure:</p>
+<blockquote>
+<p>"The fix looks correct, but I don't like the way that the initialization and cleanup is spread across multiple functions. I think it would be better to just get rid of nlmclnt_locks_init_private() altogether and open code what it does in the single caller (nlmclnt_proc())."</p>
+</blockquote>
+<p>He also flagged a second preexisting leak of the references taken by <code>nlmclnt_alloc_call()</code>, and asked Ran to spin a v2 that fixed both. That rewrite arrived on Wednesday as a two-patch series.</p>
+<h2>The v2 series: two bugs, one failure path</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260819074641.1586137-1-ranhongyun1@huawei.com/">Ran’s cover letter</a> framed both patches as sharing a single trigger: <code>nlmclnt_find_lockowner()</code> returning NULL from allocation failure inside <code>nlmclnt_proc()</code>. The series touches only <code>fs/lockd/clntproc.c</code> (19 lines changed) and is squarely NFS <strong>client</strong> lockd work.</p>
+<h3>Patch 1: NULL deref in <code>nlmclnt_locks_release_private</code></h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260819074641.1586137-2-ranhongyun1@huawei.com/">Patch 1</a> restates the crash path that v1 already diagnosed. <code>nlmclnt_locks_init_private()</code> unconditionally installs <code>fl-&gt;fl_ops</code> even when the lockowner lookup fails. <code>nlmclnt_proc()</code> then notices the missing owner and returns <code>-ENOMEM</code>, but the VFS later tears the lock down through <code>locks_release_private()</code>. A non-NULL <code>fl_ops</code> is treated as a signal to call <code>fl_release_private</code>, which lands in <code>nlmclnt_locks_release_private()</code> and dereferences the NULL <code>fl-&gt;fl_u.nfs_fl.owner</code>.</p>
+<p>Ran’s call-chain sketch is unchanged from v1:</p>
+<blockquote>
+<p>"nlmclnt_locks_init_private() unconditionally sets fl-&gt;fl_ops even when nlmclnt_find_lockowner() returns NULL due to allocation failure. When locks_release_private() later sees a non-NULL fl_ops, it calls fl_release_private, which dereferences fl-&gt;fl_u.nfs_fl.owner."</p>
+</blockquote>
+<p>What changed is the <em>shape</em> of the fix. Instead of clearing <code>fl_ops</code> after the fact, Ran inlined the helper into its only caller so that ops are installed only after a successful <code>nlmclnt_find_lockowner()</code>:</p>
+<blockquote>
+<p>"Fix it by inlining nlmclnt_locks_init_private() into its single caller nlmclnt_proc(), so that fl_ops is only set after nlmclnt_find_lockowner() succeeds"</p>
+</blockquote>
+<p>That is exactly the structure Jeff asked for. The patch is tagged <code>Fixes: bf8848918d75 ("lockd: handle lockowner allocation failure in nlmclnt_proc()")</code> — the same residual hole as v1. The earlier commit already tried to handle lockowner allocation failure, but it only checked the owner pointer and returned <code>-ENOMEM</code>; it did not prevent the helper from installing ops first.</p>
+<h3>Patch 2: reference leak on the same error path</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260819074641.1586137-3-ranhongyun1@huawei.com/">Patch 2</a> addresses the second bug Jeff called out. If <code>nlmclnt_find_lockowner()</code> fails, <code>nlmclnt_release_call()</code> is invoked <em>before</em> <code>call-&gt;a_callback_data</code> is assigned. The release helper therefore passes NULL into <code>nlmclnt_ops-&gt;nlmclnt_release_call()</code>, which skips cleanup, and the references taken by <code>nlmclnt_alloc_call()</code> leak.</p>
+<p>The fix is a one-line reorder: assign <code>a_callback_data</code> before the lockowner check so the error path can actually free those references. Ran tagged it <code>Fixes: b1ece737f44f ("lockd: Introduce nlmclnt_operations")</code>, tying the leak to the introduction of the NLM client operations hook rather than to the later lockowner-failure handling. That is an important client-side distinction: the NULL deref is a leftover from <code>bf8848918d75</code>, while the leak is older and lives in the <code>nlmclnt_operations</code> callback plumbing.</p>
+<p>Together the two patches make the <code>-ENOMEM</code> path in <code>nlmclnt_proc()</code> actually unwind: no NLM lock ops on a lock that never got an owner, and a proper drop of the <code>nlm_rqst</code> (and associated host/client state) that <code>nlmclnt_alloc_call()</code> already took.</p>
+<h2>Review: v2 accepted, with a process nit and a merge ping</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/b1462b84906d030c65f6c6d8d9de46927e1f2c15.camel@kernel.org/">Jeff Layton reviewed the series the same day</a>. He first noted a process nit — the cover was not marked as a respin:</p>
+<blockquote>
+<p>"nit: usually when you send a new version of a patchset you should declare it as "v2". So "PATCH v2 0/2", etc... Using the b4 command makes this easy to track."</p>
+</blockquote>
+<p>On substance he was satisfied, and he also pointed at an earlier, less complete attempt at the same NULL deref from July:</p>
+<blockquote>
+<p>"New version looks good. Note it looks like Shuangpeng Bai sent a less complete patch for this problem back in July that I just noticed. Your version seems more correct though."</p>
+</blockquote>
+<p>That July patch (<a href="https://lore.kernel.org/linux-nfs/20260717172809.1591290-1-shuangpeng.kernel@gmail.com/">Shuangpeng Bai, 2026-07-17</a>) cleared <code>fl_ops</code> before init and installed NLM ops only after a successful lockowner allocation, but it did not inline the helper and did not touch the <code>nlmclnt_alloc_call()</code> leak. Jeff’s comparison is the client-side takeaway: Ran’s v2 is the more complete unwind of the failure path. He added:</p>
+<blockquote>
+<p>"Reviewed-by: Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a>"</p>
+</blockquote>
+<p>The next day <a href="https://lore.kernel.org/linux-nfs/b17182c347ab5cc092a50cb16c9c11dc9fe449bc.camel@kernel.org/">Jeff followed up to route the patches</a>, making the tree ownership explicit:</p>
+<blockquote>
+<p>"To be clear, these are client-side patches. Anna/Trond, can you pick these up?"</p>
+</blockquote>
+<p>That ping is the week’s practical conclusion. Lockd straddles client and server, and these changes live entirely in <code>fs/lockd/clntproc.c</code> on the NLM <em>client</em> path (<code>nlmclnt_proc</code>, <code>nlmclnt_locks_init_private</code>, <code>nlmclnt_release_call</code>). They belong in the NFS client tree, not nfsd.</p>
+<h2>Where the week left it</h2>
+<p>By Thursday the technical argument was settled:</p>
+<ul>
+<li>The NULL dereference in <code>nlmclnt_locks_release_private()</code> is real; the preferred fix is to delete <code>nlmclnt_locks_init_private()</code> and install <code>fl_ops</code> only after a valid lockowner exists.</li>
+<li>The same error path leaked <code>nlmclnt_alloc_call()</code> references because <code>a_callback_data</code> was assigned too late for <code>nlmclnt_release_call()</code> to run the <code>nlmclnt_operations</code> cleanup hook.</li>
+<li>Jeff’s <code>Reviewed-by</code> is on the series, and he has asked Anna Schumaker / Trond Myklebust to take the patches into the NFS client tree.</li>
+</ul>
+<p>No Acked-by from the client maintainers and no merge confirmation appeared in-thread before the window closed. The remaining action is pickup, not redesign. For NFS client development the lesson is local but sharp: lockowner allocation failure in <code>nlmclnt_proc()</code> was only half-handled by <code>bf8848918d75</code>, and the NLM client operations callback introduced by <code>b1ece737f44f</code> made the error path even more brittle by requiring <code>a_callback_data</code> to be valid before any early <code>nlmclnt_release_call()</code>. Ran’s inlined, reordered unwind is the intended close of both holes.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260819074641.1586137-2-ranhongyun1@huawei.com/">2026-08-19 Ran Hongyun <a href="mailto:ranhongyun1@huawei.com">ranhongyun1@huawei.com</a> — [PATCH 1/2] lockd: fix NULL pointer dereference in nlmclnt_locks_release_private</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260819074641.1586137-3-ranhongyun1@huawei.com/">2026-08-19 Ran Hongyun <a href="mailto:ranhongyun1@huawei.com">ranhongyun1@huawei.com</a> — [PATCH 2/2] lockd: fix reference leak on lockowner allocation failure in nlmclnt_proc</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260819074641.1586137-1-ranhongyun1@huawei.com/">2026-08-19 Ran Hongyun <a href="mailto:ranhongyun1@huawei.com">ranhongyun1@huawei.com</a> — [PATCH 0/2] lockd: fix two bugs on nlmclnt_find_lockowner() failure path</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/b1462b84906d030c65f6c6d8d9de46927e1f2c15.camel@kernel.org/">2026-08-19 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 0/2] lockd: fix two bugs on nlmclnt_find_lockowner() failure path</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/b17182c347ab5cc092a50cb16c9c11dc9fe449bc.camel@kernel.org/">2026-08-20 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 0/2] lockd: fix two bugs on nlmclnt_find_lockowner() failure path</a></li>
+</ul>
+  </main>
+</body>
+</html>

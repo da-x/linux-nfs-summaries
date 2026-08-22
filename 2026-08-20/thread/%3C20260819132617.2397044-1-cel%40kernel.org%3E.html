@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD v7.3 pull: CB_NOTIFY directory delegations land in mainline</title>
+  <meta name="description" content="Chuck Lever posted the NFSD updates for v7.3 on 19 August, and the kernel.org pr-tracker bot confirmed the next day that Linus merged tag nfsd-7.3 as d141ec2825b4d3ec52f27c43bdd864090159273a. There was no on-list review of the pull itself:…">
+  <meta property="og:title" content="NFSD v7.3 pull: CB_NOTIFY directory delegations land in mainline">
+  <meta property="og:description" content="Chuck Lever posted the NFSD updates for v7.3 on 19 August, and the kernel.org pr-tracker bot confirmed the next day that Linus merged tag nfsd-7.3 as d141ec2825b4d3ec52f27c43bdd864090159273a. There was no on-list review of the pull itself:…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSD v7.3 pull: CB_NOTIFY directory delegations land in mainline">
+  <meta name="twitter:description" content="Chuck Lever posted the NFSD updates for v7.3 on 19 August, and the kernel.org pr-tracker bot confirmed the next day that Linus merged tag nfsd-7.3 as d141ec2825b4d3ec52f27c43bdd864090159273a. There was no on-list review of the pull itself:…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD v7.3 pull: CB_NOTIFY directory delegations land in mainline</h1>
+<h2>Summary</h2>
+<h1>NFSD v7.3 pull: CB_NOTIFY directory delegations land in mainline</h1>
+<h2>Summary</h2>
+<p>Chuck Lever posted the <a href="https://lore.kernel.org/linux-nfs/20260819132617.2397044-1-cel@kernel.org/">NFSD updates for v7.3</a> on 19 August, and the kernel.org <a href="https://lore.kernel.org/linux-nfs/178725579517.459220.5890818837859986957.pr-tracker-bot@kernel.org/">pr-tracker bot</a> confirmed the next day that Linus merged tag <code>nfsd-7.3</code> as <code>d141ec2825b4d3ec52f27c43bdd864090159273a</code>. There was no on-list review of the pull itself: two messages, a merge, and a cycle closed.</p>
+<p>The pull is a <strong>feature drop plus a large bug-fix harvest</strong>, not a wire-protocol rewrite. The headline for NFS <em>client</em> development is Jeff Layton’s <strong>CB_NOTIFY</strong> work on NFSv4.1 directory delegations. knfsd used to recall a directory delegation the moment the directory changed. It now watches delegated directories through fsnotify and pushes adds, removes, renames, and directory attribute changes — with the filehandle and attributes of the affected entry — so a client that implements directory delegations can keep its dcache instead of throwing it away. Some of the <code>NOTIFY4_*</code> flags come from RFC 8881bis and live in <code>nfs_common</code>, so the client tree already has the constants.</p>
+<p>The rest of the tag is netlink stats that continue the v7.2 work, a hard-coded SUNRPC <code>pernode</code> thread pool, an async COPY offload rework, a long list of NFSv4 state-revocation use-after-free fixes, and Chris Mason’s SUNRPC/svcrdma hardening. One patch in the pile is an actual <code>fs/nfs</code> client fix: a localio ref leak on <code>nfs_uuid_add_file</code> failure.</p>
+<h2>Classification</h2>
+<ul>
+<li><strong>New feature:</strong> CB_NOTIFY for NFSv4.1 directory delegations; netlink <code>server-stats-get</code> plus per-netns callback counters.</li>
+<li><strong>Protocol surface:</strong> RFC 8881bis <code>NOTIFY4_*</code> flags in <code>nfs_common</code>; CB_NOTIFY encode/decode on the server callback path. Clients that do not speak CB_NOTIFY still see the old recall-on-change behaviour only if they never asked for notifications.</li>
+<li><strong>Bug fixes / hardening:</strong> NFSv4 client-unpin UAFs on revoke/teardown, async COPY stateid races, DRC/IO percpu-counter contention, GSS/RDMA length checks, lockd NLMv4 GRANTED_MSG and SHARE-grant bugs, and a localio ref leak on the client.</li>
+</ul>
+<h2>What clients actually get from CB_NOTIFY</h2>
+<p>Lever’s release notes put the client-cache story first:</p>
+<blockquote>
+<p>"Jeff Layton contributed CB_NOTIFY support to NFSD's NFSv4.1 directory delegations. The server used to recall a delegation as soon as the directory changed. NFSD now watches delegated directories through fsnotify and reports adds, removes, renames, and directory attribute changes, carrying the filehandle and attributes of the affected entry, so clients can keep their caches. Some of the NOTIFY4 flags come from RFC 8881bis."</p>
+</blockquote>
+<p>That is the operational change. A Linux NFS client that holds a directory delegation no longer has to treat every mkdir/unlink/rename on that directory as “delegation is dead, revalidate everything.” The server:</p>
+<ul>
+<li>takes a directory lease with an ignore mask,</li>
+<li>updates the fsnotify mark when the delegation is set or dropped,</li>
+<li>applies the client’s notify mask to the delegation,</li>
+<li>marshals a <code>fattr4</code> (and the filehandle) from completed args without needing a <code>svc_fh</code> or even an export for <code>fattr4_change</code>,</li>
+<li>sends child attributes, directory attribute changes, and the filehandle in the CB_NOTIFY payload,</li>
+<li>tracks requested child and directory attributes separately so GET_DIR_DELEGATION’s reply-size estimate is honest.</li>
+</ul>
+<p>The callback ops <code>prepare</code> hook is now a bool return, <code>fi_deleg_file</code> is RCU-protected, and there are dedicated CB_NOTIFY data structures plus encode/decode linkages in <code>nfs4callback.c</code> / <code>xdr4cb.h</code>. <code>fs/nfs/callback.c</code> and <code>callback_xdr.c</code> move a few lines in this tag; the heavy lifting is server-side, but the shared <code>NOTIFY4_*</code> flags in <code>nfs_common</code> are what a client implementation will compile against.</p>
+<p>This is the server half of a multi-week directory-delegation push. Earlier in the same week Lever’s CB_RECALL_ANY series named <code>RCA4_TYPE_MASK_DIR_DLG</code> so clients that <em>do</em> implement directory delegations can return them under recall-any pressure. CB_NOTIFY is the complementary piece: keep the cache when the directory is still delegated, instead of only teaching clients how to give the delegation back.</p>
+<h2>Netlink stats, and why nfsstat on a client host cares</h2>
+<p>Layton also finished the v7.2 netlink stats work:</p>
+<blockquote>
+<p>"A new server-stats-get operation reports what /proc/net/rpc/nfsd publishes, plus NFSv4 callback counts, and SUNRPC now keeps its per-procedure call counts per network namespace, so a container sees its own numbers. nfsstat reads all of this over netlink, with a procfs fallback for older kernels."</p>
+</blockquote>
+<p>SUNRPC drops the unused <code>svc_version.vs_count</code> field and counts NFSv4 callback operations per netns, exported through the same genetlink family. That is a server ABI, but it is the ABI <code>nfsstat</code> on a client-and-server host (or a container that runs both) will use. The procfs fallback keeps older userland working.</p>
+<h2>Thread pools: pernode or nothing</h2>
+<blockquote>
+<p>"SUNRPC's service thread pool mode selection is gone. Pernode is the right choice on any host we run today, so the auto, global, and percpu modes have been removed. A single-node host still gets one pool. A multi-NUMA host now gets a pool per node. sunrpc.pool_mode accepts the old names but no longer selects anything."</p>
+</blockquote>
+<p><code>svc_pool_for_cpu()</code> now routes to a populated pool; auto-distribution guarantees a thread per pool; pool counters are torn down before the pool-map reference is dropped; the pool count is derived instead of cached in <code>sv_nrpools</code>. Ameer Hamza’s one-liner restores <code>NUMA_NO_NODE</code> for svc thread allocations in the vestigial global path. Client mounts do not see a mount-option change; they see more predictable nfsd thread placement on multi-node servers.</p>
+<h2>Bug fixes that matter to clients</h2>
+<p>The release notes call the remainder “bug fixes, clean-ups, and small optimizations,” then name the ones that have been eating client workloads:</p>
+<blockquote>
+<p>"an async COPY offload rework from Jeff Layton, more use-after-free fixes in the NFSv4 state revocation paths, percpu counter contention removed from the reply cache and IO accounting, and a long list of hardening fixes from Chris Mason."</p>
+</blockquote>
+<p><strong>State-revocation UAFs.</strong> Lever’s series is a client-lifetime audit of every walk that can race with <code>nfs4_client</code> teardown: lock-owner free during client teardown, delegation revoke, admin state revocation, export state revocation, NFSv4.0 revoked-state cleanup, blocked-lock reaping, <code>close_lru</code> reaping, plus a consolidated revocation-path client unpin and a released export ref when reaping open stateids. Walkers are annotated with caller preconditions and gated on <code>NFSD_NET_UP</code>. Zhenghang Xiao sets <code>SC_STATUS_FREED</code> in <code>nfsd4_drop_revoked_stid</code> for delegations. From the client’s point of view these are the “server oopsed while recalling my state” class of bugs.</p>
+<p><strong>Async COPY.</strong> Layton splits <code>nfsd4_copy</code> into transient vs durable async copy objects, makes the copy-offload stateid a first-class <code>nfs4_stid</code>, fixes UAF in copy cancel/shutdown, a stale <code>s2s_cp_stateids</code> IDR entry, copy-notify stateid publish-before-init, client-ownership checks on cancel, and revoke-before-drop of copy-notify stateids. Lever resets the write verifier when async COPY writeback fails and samples the writeback-error cursor before the COPY loop. Inter-server COPY clients should no longer see a server crash or a ghost stateid after cancel.</p>
+<p><strong>Session / DRC / filecache.</strong> Slot 0 now counts in <code>nfsd_total_target_slots</code>; on-demand DRC growth is bounded by the thread ceiling; an off-by-one in DRC bucket pruning is gone; percpu counters are out of DRC memory accounting, reply-cache stats, and IO byte accounting. Session slots in use are no longer freed; <code>NFSD4_CALLBACK_RUNNING</code> is deferred in <code>deleg_reaper</code> and cleared on a failed recall queue. Filecache shutdown no longer races shrinker/GC/fsnotify; <code>nfsd_file_do_acquire()</code> will not use a non-opened file (NeilBrown); inter-server COPY setup failure no longer leaks an <code>nfsd_file</code>.</p>
+<p><strong>Callback and compound robustness.</strong> <code>cl_cb_session</code> is RCU-protected so session teardown cannot UAF the callback path. Compound arg release clears <code>opcnt</code> to stop an OOB read. <code>rpc_status</code> dumpit gets a read barrier and real error handling. SUNRPC defers <code>rq_argp</code>/<code>rq_resp</code> free until after an RCU grace period. Backchannel is closed before the callback service is destroyed.</p>
+<p><strong>Client-visible protocol nits.</strong> <code>nfsd4_delegreturn()</code> now matches the filehandle. nseconds in TIME_DELEG decode paths are validated. Reclaim LOCK after <code>RECLAIM_COMPLETE</code> is rejected. <code>FL_SLEEP</code> is no longer set for every LOCK type. Unsupported <code>netloc4</code> types return <code>NFS4ERR_NOTSUPP</code>. Nikol Kuklev fixes a NULL deref in <code>nfsd4_setattr</code> for delegated timestamp attributes — the server half of the delegated-timestamp work that has been on the list since last year.</p>
+<p><strong>The one in-tree NFS client fix.</strong> Chris Mason’s <code>NFS/localio: fix ref leak on nfs_uuid_add_file failure</code> is in <code>fs/nfs_common/nfslocalio.c</code>. Localio is the client/server shortcut; a failed UUID insert no longer leaks a file ref on the client side of that handshake. Adjacent nfsd localio patches hold RCU across the <code>cmpxchg</code> retry and size the <code>fh_verify</code> server sockaddr slot by <code>xpt_locallen</code>.</p>
+<p><strong>lockd.</strong> Olga Kornievskaia fixes NLMv4 <code>GRANTED_MSG</code> handling. Oscar Ou unswaps arguments in <code>nlmsvc_match_ip()</code> and preserves multiple <code>NLM_SHARE</code> grants from the same owner. Michael Bommarito pins the next file across <code>nlm_inspect_file</code> lock-drop. NLM clients (NFSv3, and anyone still using lockd) are the audience.</p>
+<p><strong>Hardening.</strong> Mason’s 23 patches clamp GSS/krb5 token lengths, reject short MIC/wrap tokens, fix svcrdma chunk arithmetic and empty Write/Reply chunks, reject oversized Read segments, and close gssx option-array error paths. Lever adds more svcrdma position/budget checks and rejects inline replies that overflow the pull-up buffer. These are not client code changes; they are why a hostile or truncated RPC no longer takes the server — and the client’s outstanding requests — down with it.</p>
+<h2>Same-week client context (not in this pull)</h2>
+<p>This tag does <strong>not</strong> contain the in-window NFS <em>client</em> patches that were still on the list the same days:</p>
+<ul>
+<li>Jimmy Zuber’s <a href="https://lore.kernel.org/linux-nfs/20260819015111.2743908-1-jamz@amazon.com/">restore <code>d_drop()</code> on failed <code>nfs_mkdir()</code></a> (stale negative after the 6.15 mkdir-returns-dentry conversion) is unreviewed and not in <code>nfsd-7.3</code>.</li>
+<li>NeilBrown’s <a href="https://lore.kernel.org/linux-nfs/20260815042707.2535717-1-neilb@ownmail.net/">negative-dentry RFC v2</a> only touches <code>nfs_clear_verifier_directory()</code> so the client can use a common child iterator; it is VFS, not this pull.</li>
+<li>Petr Vorel’s nfs-utils getport FTBFS fix is userspace.</li>
+</ul>
+<p>Directory-delegation clients that want CB_NOTIFY from v7.3 knfsd still need their own client-side CB_NOTIFY consumer; this pull ships the server and the shared flags.</p>
+<h2>Final conclusions</h2>
+<ul>
+<li><strong>Disposition:</strong> merged to <code>torvalds/linux.git</code> on 20 August. No maintainer debate on the pull thread.</li>
+<li><strong>Headline for NFS client development:</strong> knfsd can now <em>notify</em> instead of <em>recall</em> on delegated directories. A client that implements NFSv4.1 directory delegations plus CB_NOTIFY can keep child dentries and attributes across mkdir/unlink/rename. RFC 8881bis notify flags are in <code>nfs_common</code>.</li>
+<li><strong>Stability:</strong> the revocation-path client-unpin series and the async COPY stateid rework are the important bug fixes for long-lived NFSv4.1/4.2 clients. The localio ref-leak fix is the only <code>fs/nfs</code> code change in the tag.</li>
+<li><strong>Ops:</strong> <code>sunrpc.pool_mode</code> is a no-op selector; pernode is mandatory. <code>nfsstat</code> grows a netlink path with procfs fallback. Containers see their own RPC procedure counts.</li>
+<li>Lever closed the notes with thanks, not a remaining-work list:</li>
+</ul>
+<blockquote>
+<p>"Sincere thanks to all contributors, reviewers, testers, and bug reporters who participated in the v7.3 NFSD development cycle."</p>
+</blockquote>
+<h2>Key messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260819132617.2397044-1-cel@kernel.org/">Chuck Lever: NFSD 7.3 pull request and release notes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178725579517.459220.5890818837859986957.pr-tracker-bot@kernel.org/">pr-tracker-bot: merged to torvalds/linux.git</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260819132617.2397044-1-cel@kernel.org/">2026-08-19 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [GIT PULL] NFSD updates for v7.3</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178725579517.459220.5890818837859986957.pr-tracker-bot@kernel.org/">2026-08-20 pr-tracker-bot@kernel.org — Re: [GIT PULL] NFSD updates for v7.3</a></li>
+</ul>
+  </main>
+</body>
+</html>

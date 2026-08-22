@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD header include hygiene for nfsd.h and xdr.h</title>
+  <meta name="description" content="This week Chuck Lever posted a three-patch NFSD header-cleanup series that trims transitive includes out of the server’s widely pulled-in headers. It is neither a protocol change nor a client-side bug fix: the work is strictly server-side…">
+  <meta property="og:title" content="NFSD header include hygiene for nfsd.h and xdr.h">
+  <meta property="og:description" content="This week Chuck Lever posted a three-patch NFSD header-cleanup series that trims transitive includes out of the server’s widely pulled-in headers. It is neither a protocol change nor a client-side bug fix: the work is strictly server-side…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSD header include hygiene for nfsd.h and xdr.h">
+  <meta name="twitter:description" content="This week Chuck Lever posted a three-patch NFSD header-cleanup series that trims transitive includes out of the server’s widely pulled-in headers. It is neither a protocol change nor a client-side bug fix: the work is strictly server-side…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD header include hygiene for nfsd.h and xdr.h</h1>
+<h2>Summary</h2>
+<p>This week Chuck Lever posted a three-patch <a href="https://lore.kernel.org/linux-nfs/20260818140035.12740-1-cel@kernel.org/">NFSD header-cleanup series</a> that trims transitive includes out of the server’s widely pulled-in headers. It is neither a protocol change nor a client-side bug fix: the work is strictly server-side include hygiene, aimed at making <code>fs/nfsd/nfsd.h</code> stop acting as a dump for NFS protocol types that the header itself never uses.</p>
+<p>Jeff Layton reviewed all three patches the next day with no technical objections. There was no further debate, and the series stands as reviewed.</p>
+<h2>Why <code>nfsd.h</code> was carrying NFSv3 definitions</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260818140035.12740-1-cel@kernel.org/">Patch 1</a> is the core of the series. Lever’s diagnosis is blunt:</p>
+<blockquote>
+<p>"fs/nfsd/nfsd.h is included throughout the server, yet it uses no NFSv3 protocol definition of its own. The <code>&lt;linux/nfs3.h&gt;</code> include there served only to make those definitions reach the few source files that need them, by way of nfsd.h itself or the xdr.h chain that pulls it in."</p>
+</blockquote>
+<p>The practical effect of that hidden include was that any <code>.c</code> file which needed <code>NFS3_*</code> constants could compile without declaring the dependency. Lever moves the include to the actual consumers — <code>nfsfh.c</code>, <code>nfsctl.c</code>, <code>nfs3xdr.c</code>, <code>nfs3proc.c</code>, and <code>nfs2acl.c</code> — and drops it from <code>nfsd.h</code>:</p>
+<blockquote>
+<p>"Give each consumer its own include and drop the one in nfsd.h, so the header no longer carries a dependency unrelated to its contents."</p>
+</blockquote>
+<p>That is a classic include-what-you-use cleanup. It does not change NFSv3 encoding, ACCESS bits, or filehandle layout; it only stops the common server header from smuggling protocol constants into every translation unit. <a href="https://lore.kernel.org/linux-nfs/a9f2abf308195babe35013b37987688262bfc95d.camel@kernel.org/">Layton reviewed it</a> without comment beyond <code>Reviewed-by</code>.</p>
+<h2>Direct <code>struct nfs_fh</code> includes, paving a later <code>nfs.h</code> drop</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260818140035.12740-2-cel@kernel.org/">Patch 2</a> applies the same rule to filehandle types. <code>struct nfsd4_copy</code> embeds a <code>struct nfs_fh</code>, and <code>nlm_fopen()</code> in lockd reads that object’s size and data fields. Neither <code>fs/nfsd/xdr4.h</code> nor <code>fs/nfsd/lockd.c</code> included the header that defines the type; both reached it through <code>nfsd.h</code> → <code>&lt;linux/nfs.h&gt;</code>.</p>
+<p>Lever adds <code>#include &lt;linux/nfs_fh.h&gt;</code> in both places, and states the follow-on goal explicitly:</p>
+<blockquote>
+<p>"Add the direct include to both files, so nfsd.h can later drop the <code>&lt;linux/nfs.h&gt;</code> it carries for no use of its own."</p>
+</blockquote>
+<p>This patch is therefore a prerequisite, not the final drop of <code>&lt;linux/nfs.h&gt;</code> from <code>nfsd.h</code>. The series does not yet remove that include; it only makes the remaining consumers self-contained so a later patch can. <a href="https://lore.kernel.org/linux-nfs/72f0650a983f9af16f774a772f01ee1e081dc381.camel@kernel.org/">Layton reviewed this one</a> as well.</p>
+<p>For NFS client readers, the interesting angle is the direction of travel rather than any client code change. Lever has been peeling NFS client headers out of other subsystems (notably LOCALIO earlier this cycle). Here the same discipline is applied on the server: protocol and filehandle types should be included where they are used, not re-exported from a catch-all <code>nfsd.h</code>. That reduces the chance that a client-header tweak silently rebuilds, or worse, silently type-checks, large parts of nfsd.</p>
+<h2>Header-guard provenance in <code>xdr.h</code></h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260818140035.12740-3-cel@kernel.org/">Patch 3</a> is a six-line mechanical cleanup of include guards in <code>fs/nfsd/xdr.h</code>. Lever’s one-line rationale:</p>
+<blockquote>
+<p>"Make the header guards less ambiguous about their provenance."</p>
+</blockquote>
+<p>The new guard is <code>_LINUX_NFSD_XDR_H</code>. <a href="https://lore.kernel.org/linux-nfs/dab1f7a1c5c349eda6539c1059bd2364f7ed718c.camel@kernel.org/">Layton’s review</a> again carries no extra commentary.</p>
+<h2>Outcome</h2>
+<p>By 19 August the entire series had <a href="https://lore.kernel.org/linux-nfs/a9f2abf308195babe35013b37987688262bfc95d.camel@kernel.org/">Reviewed-by: Jeff Layton</a> on every patch. No v2 was requested, no compile or runtime concern was raised, and no client-visible behavior is intended to change. The unfinished item Lever himself flagged is the subsequent removal of <code>&lt;linux/nfs.h&gt;</code> from <code>nfsd.h</code>, which this series only enables.</p>
+<p><strong>Classification:</strong> NFSD include-hygiene / refactor, not a bug fix and not a protocol change. Client impact is none in this week’s patches; the value for client development is the continued uncoupling of shared NFS headers from nfsd’s common include graph.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260818140035.12740-1-cel@kernel.org/">2026-08-18 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 1/3] NFSD: Move the nfs3.h include out of nfsd.h</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260818140035.12740-2-cel@kernel.org/">2026-08-18 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 2/3] NFSD: Include &lt;linux/nfs_fh.h&gt; where struct nfs_fh is used</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260818140035.12740-3-cel@kernel.org/">2026-08-18 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 3/3] NFSD: Clean up header guards in fs/nfsd/xdr.h</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/a9f2abf308195babe35013b37987688262bfc95d.camel@kernel.org/">2026-08-19 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 1/3] NFSD: Move the nfs3.h include out of nfsd.h</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/72f0650a983f9af16f774a772f01ee1e081dc381.camel@kernel.org/">2026-08-19 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 2/3] NFSD: Include &lt;linux/nfs_fh.h&gt; where struct nfs_fh is used</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/dab1f7a1c5c349eda6539c1059bd2364f7ed718c.camel@kernel.org/">2026-08-19 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH 3/3] NFSD: Clean up header guards in fs/nfsd/xdr.h</a></li>
+</ul>
+  </main>
+</body>
+</html>

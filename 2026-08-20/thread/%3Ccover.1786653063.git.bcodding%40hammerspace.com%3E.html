@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Flexfiles device notifications: v1 paused for sashiko issues</title>
+  <meta name="description" content="This week’s only traffic on Benjamin Coddington’s 21-patch NFS client series is a pause, not a review. The v1 cover letter landed on 13 August, just outside the window; on 14 August Coddington told reviewers to hold off:">
+  <meta property="og:title" content="Flexfiles device notifications: v1 paused for sashiko issues">
+  <meta property="og:description" content="This week’s only traffic on Benjamin Coddington’s 21-patch NFS client series is a pause, not a review. The v1 cover letter landed on 13 August, just outside the window; on 14 August Coddington told reviewers to hold off:">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Flexfiles device notifications: v1 paused for sashiko issues">
+  <meta name="twitter:description" content="This week’s only traffic on Benjamin Coddington’s 21-patch NFS client series is a pause, not a review. The v1 cover letter landed on 13 August, just outside the window; on 14 August Coddington told reviewers to hold off:">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Flexfiles device notifications: v1 paused for sashiko issues</h1>
+<h2>Summary</h2>
+<p>This week’s only traffic on Benjamin Coddington’s 21-patch NFS client series is a pause, not a review. The v1 cover letter landed on 13 August, just outside the window; on 14 August <a href="https://lore.kernel.org/linux-nfs/2D458D42-8968-4233-B18E-2B37DDA360E0@hammerspace.com/">Coddington told reviewers</a> to hold off:</p>
+<blockquote>
+<p>"Note to reviewers - this one had numerous problems identified by sashiko: https://sashiko.dev/#/patchset/cover.1786653063.git.bcodding%40hammerspace.com</p>
+<p>I'm working on a v2.."</p>
+</blockquote>
+<p>No human review comments arrived this week. The series remains a client-side mix of stable-bound striped-layout bug fixes, RFC 8881 <code>CB_NOTIFY_DEVICEID</code> implementation, and cache scaling for wide flexfiles mounts. A related LAYOUTGET-buffer series is independent and not part of this thread.</p>
+<h2>Why the client needs this</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/cover.1786653063.git.bcodding@hammerspace.com/">Coddington’s cover letter</a> frames the problem as a wide-stripe flexfiles mount that “puts hundreds to ~1000 distinct deviceIDs in play for a single mount.” The client’s <code>CB_NOTIFY_DEVICEID</code> path does not actually refresh mappings under live layouts, deviceID-deletion race recovery from RFC 8881 is missing, and the device caches were sized for far fewer servers. He tested the series end-to-end against reffs (a notification-capable reference server) at 256 and 1000 devices, including KASAN and lockdep under concurrent notification storms.</p>
+<h2>Stable-bound striped-layout bugs (patches 1–4)</h2>
+<p>The first four patches are standalone client bug fixes, all <code>Cc: stable</code>.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/b59cd6c4b551436a39d097ce280a18543d312bf1.1786653063.git.bcodding@hammerspace.com/">Patch 1</a> repairs the <code>CB_NOTIFY_DEVICEID</code> XDR decoder. <code>decode_devicenotify_args()</code> gated consumption of the trailing <code>ndc_immediate</code> boolean on <code>cbd_layout_type</code> instead of <code>cbd_notify_type</code>. Layout type is never equal to <code>NOTIFY_DEVICEID4_CHANGE</code> (2), so the flag was “silently lost for a single CHANGE, and a multi-item <code>cnda_changes&lt;&gt;</code> array misaligned after the first item and failed with <code>NFS4ERR_INVAL</code>/<code>BADXDR</code>.”</p>
+<p><a href="https://lore.kernel.org/linux-nfs/ed7900410a357aed1d2f81c8e2a64b37a47603f7.1786653063.git.bcodding@hammerspace.com/">Patch 2</a> widens flexfiles read data-server selection from <code>u32</code> to <code>u64</code>. Truncating the file offset before <code>nfs4_ff_layout_calc_dss_id()</code> meant striped reads at offsets ≥ 4 GiB probed availability and sized coalescing against the wrong stripe’s DS. Coddington notes the actual read recomputes <code>dss_id</code> from the full offset, “so data is not corrupted”; the write path already used the full offset.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/3d211bb3dcbb29c63936db084848afed5eaa1f4f.1786653063.git.bcodding@hammerspace.com/">Patches 3 and 4</a> fix page coalescing that could straddle a stripe boundary and send bytes to the wrong data server. Flexfiles has no <code>pattern_offset</code> and partitions on absolute file offset (RFC 8435 §6), but <code>ff_layout_pg_test()</code> inherited files-layout segment-relative bounds. The files layout itself had the complementary bug: coalescing used <code>pls_range.offset</code> while DS selection used <code>pattern_offset</code>. Aligned / whole-file layouts are unchanged.</p>
+<h2>Making CHANGE work under live layouts (patches 5–13)</h2>
+<p>This is the core client feature work. RFC 8881 §12.2.10 lets a server re-point a deviceID without recalling layouts, but today the client only unhashes the cached device. References pinned inside layout segments keep sending I/O to the old mapping until the layouts are freed.</p>
+<p>The flexfiles driver is first given its own device-node references: <a href="https://lore.kernel.org/linux-nfs/347fed6d627802ef28c9f7388a3e780f57c5589c.1786653063.git.bcodding@hammerspace.com/">across DS setup</a>, <a href="https://lore.kernel.org/linux-nfs/7097ba9fda3d014765fcda84c3c0f3ad1e7a18f8.1786653063.git.bcodding@hammerspace.com/">carried on each in-flight I/O</a> as <code>ds_dev</code> on <code>nfs_pgio_header</code> / <code>nfs_commit_data</code>, and <a href="https://lore.kernel.org/linux-nfs/1d8c7401ddbb9be8c2d8faa2f14963f13e6df4cf.1786653063.git.bcodding@hammerspace.com/">held through layoutstats encoding</a> so a later CHANGE cannot UAF the XDR path. <a href="https://lore.kernel.org/linux-nfs/41b1948ff52f8d334cd0ac2dce3dfc8855e8fb73.1786653063.git.bcodding@hammerspace.com/">Patch 8</a> then marks the pinned <code>mirror_ds</code> pointer <code>__rcu</code>, with try-ref / cmpxchg install patterned after <code>get_huge_zero_folio()</code>.</p>
+<p>A new <code>reresolve_deviceid</code> layout-driver hook walks live layouts under <code>i_lock</code> and must not drop device-node references itself, because the final put can sleep. Flexfiles implements in-place re-resolve by exchanging the matching stripe’s pinned node for NULL; in-flight I/O finishes on the old node, and the next I/O re-resolves via <code>GETDEVICEINFO</code>. <a href="https://lore.kernel.org/linux-nfs/69c2469b68ad86b9d3340b211945bc376de22168.1786653063.git.bcodding@hammerspace.com/">CHANGE is then dispatched</a> to that walker instead of being treated identically to DELETE.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/16a5260e13676499924667e3c203c0e89d366169.1786653063.git.bcodding@hammerspace.com/">Patch 12</a> honors <code>ndc_immediate</code>: the old node is marked unavailable so paths still holding a reference stop selecting it, except when the walk races a freshly installed mapping (distinguished by hashed-ness). Without the flag, pending I/O drains on the old mapping. <a href="https://lore.kernel.org/linux-nfs/c5fb003dffc63416370fbfa25b98e4226acf13b2.1786653063.git.bcodding@hammerspace.com/">Patch 13</a> adds a change epoch so a <code>GETDEVICEINFO</code> reply that raced a CHANGE is discarded rather than re-caching the pre-change mapping (RFC 8881 §18.40.4).</p>
+<h2>DELETE race recovery (patches 14–17)</h2>
+<p>RFC 8881 §18.40.4 requires the client to handle a DELETE for a deviceID that live layouts still reference — something “a conformant server never sends.” The series adds a <code>layout_references_deviceid</code> hook and walkers, then a state-manager step (<code>NFS4CLNT_DEVICEID_DELETE</code>) because the callback thread cannot issue fore-channel RPCs. Suspects are <code>TEST_STATEID</code>’d; revoked layouts are recovered with <code>FREE_STATEID</code>. If a referring layout is still valid, <a href="https://lore.kernel.org/linux-nfs/f0c494531a4097aebcd7c11af94224c544ad64ac.1786653063.git.bcodding@hammerspace.com/">the delete is confirmed with a raw <code>GETDEVICEINFO</code></a> (the usual helper swallows RPC status and cannot distinguish <code>NFS4ERR_NOENT</code>). Device gone plus a still-valid layout means a faulty server and lease recovery; an erroneous DELETE leaves the cache and layout intact. A DELETE with no live references keeps today’s cheap unhash path.</p>
+<h2>Scaling the device caches (patches 18–21)</h2>
+<p>The global deviceid hash grows from 32 to 256 buckets (load factor ~4 at 1000 devices). The per-net data-server cache moves from a single list to hash buckets, then is <a href="https://lore.kernel.org/linux-nfs/80584abd9bb30509483e42ad12ba75543c9d5d1f.1786653063.git.bcodding@hammerspace.com/">keyed by address set</a>. That also fixes a latent aliasing bug: the old comparator matched on subset rather than equality and “merged two data servers whenever one’s address set contained the other’s.”</p>
+<p>Finally, flexfiles gains a <code>dataserver_nconnect</code> module parameter. DS clients otherwise inherit MDS <code>nconnect</code>; at ~1000 DSes and <code>nconnect=16</code> that is “~16k sockets and their slot tables for little gain on a workload striping across the DSes anyway.” Default 0 preserves inherit-from-MDS behavior.</p>
+<h2>Status this week</h2>
+<p>v1 is not under active review. Coddington has already flagged automated sashiko findings and is preparing v2; a later v2 cover (<code>[PATCH v2 00/23]</code>) exists as a separate thread and is out of this week’s scope. Until that lands, the client still does not implement live-layout CHANGE, still has the four stable-bound striped-layout bugs, and still cannot scale device caches to a thousand-DS flexfiles mount.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/2D458D42-8968-4233-B18E-2B37DDA360E0@hammerspace.com/">2026-08-14 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — Re: [PATCH 00/21] NFS: flexfiles device notifications and caching for wide striped layouts</a></li>
+</ul>
+  </main>
+</body>
+</html>

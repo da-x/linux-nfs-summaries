@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSv4.1 client rejects zero back-channel ca_maxrequests</title>
+  <meta name="description" content="This week’s linux-nfs traffic includes a tightly scoped NFSv4.1 client bug fix from Paula that closes a server-controlled slab out-of-bounds write in the back-channel slot table. The thread is a single patch posting dated 19 August; there…">
+  <meta property="og:title" content="NFSv4.1 client rejects zero back-channel ca_maxrequests">
+  <meta property="og:description" content="This week’s linux-nfs traffic includes a tightly scoped NFSv4.1 client bug fix from Paula that closes a server-controlled slab out-of-bounds write in the back-channel slot table. The thread is a single patch posting dated 19 August; there…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSv4.1 client rejects zero back-channel ca_maxrequests">
+  <meta name="twitter:description" content="This week’s linux-nfs traffic includes a tightly scoped NFSv4.1 client bug fix from Paula that closes a server-controlled slab out-of-bounds write in the back-channel slot table. The thread is a single patch posting dated 19 August; there…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSv4.1 client rejects zero back-channel ca_maxrequests</h1>
+<h2>Summary</h2>
+<p>This week’s linux-nfs traffic includes a tightly scoped <strong>NFSv4.1 client bug fix</strong> from <a href="https://lore.kernel.org/linux-nfs/20260819170109.8132-1-paula@bynar.io/">Paula</a> that closes a <strong>server-controlled slab out-of-bounds write</strong> in the back-channel slot table. The thread is a single patch posting dated 19 August; there were <strong>no review replies</strong> inside the week window.</p>
+<h2>What broke</h2>
+<p>The defect lives in session setup, not in a protocol change. After <code>CREATE_SESSION</code>, <code>nfs4_verify_back_channel_attrs()</code> is supposed to vet the attributes the server returns before those numbers size the callback slot table. Paula’s diagnosis is that the back-channel path never mirrored the fore-channel guard:</p>
+<blockquote>
+<p>"Unlike its fore channel sibling <code>nfs4_verify_fore_channel_attrs()</code>, it never rejects a back channel <code>ca_maxrequests</code> (<code>rcvd-&gt;max_reqs</code>) of zero."</p>
+</blockquote>
+<p>A zero <code>max_reqs</code> then reaches <code>nfs4_realloc_slot_table()</code> / <code>nfs4_reset_slot_table()</code>, which compute <code>server_highest_slotid</code> and <code>max_slotid</code> as <code>max_reqs - 1</code>. Because the arithmetic is unsigned:</p>
+<blockquote>
+<p>"The subtraction is unsigned, so zero underflows to <code>0xffffffff</code> and is stored as the table's slot-id ceiling."</p>
+</blockquote>
+<p>With both ceilings poisoned, the later checks in <code>nfs4_lookup_slot()</code> (<code>slotid &lt;= max_slotid</code>) and <code>validate_seqid()</code> (<code>csa_slotid &gt; server_highest_slotid</code>) no longer constrain the slot id on a <code>CB_SEQUENCE</code>. <code>nfs4_lock_slot()</code> then does <code>__set_bit(slotid, tbl-&gt;used_slots)</code> against a <strong>fixed</strong> <code>used_slots[]</code> of <code>SLOT_TABLE_SZ</code> (16 unsigned longs, 1024 bits). Paula’s concrete example is a <code>csa_slotid</code> of 3584, which sets a bit <strong>448 bytes past the array</strong> — a deterministic write into the neighbouring slab object.</p>
+<p>KASAN reports the hit as a size-8 <em>read</em> in <code>nfs4_lock_slot</code> because <code>__set_bit()</code> is a read-modify-write and the sanitizer flags the load; Paula is explicit that the store is the real defect:</p>
+<blockquote>
+<p>"KASAN labels the access below "Read of size 8" because <code>__set_bit()</code> is a read-modify-write and the sanitizer flags the load; the store is the actual defect, hence "out-of-bounds write"."</p>
+</blockquote>
+<p>The reported call chain is the NFSv4 callback kthread: <code>nfs4_callback_sequence</code> → <code>nfs4_try_to_lock_slot</code> → <code>nfs4_lock_slot</code>, with the slot table allocated during <code>nfs4_alloc_session</code> / <code>nfs41_init_client</code> on the mount path.</p>
+<h2>Attack surface (client)</h2>
+<p>This is a <strong>malicious-server</strong> issue, not a local mount-option footgun. The back-channel attributes come from the server’s <code>CREATE_SESSION</code> reply:</p>
+<blockquote>
+<p>"The attributes are chosen by the server in its CREATE_SESSION response: a malicious or compromised NFSv4.1 server, on the wire, with no authentication under <code>sec=sys</code>, and before the mount completes."</p>
+</blockquote>
+<p>And:</p>
+<blockquote>
+<p>"The slot id is server-controlled, so the write offset is attacker-chosen and deterministic."</p>
+</blockquote>
+<p>Paula marks it reachable on any <code>CONFIG_NFS_V4_1</code> client that mounts an NFSv4.1 export from a server the attacker controls or can spoof. That is a classic pre-mount, <code>sec=sys</code> callback-path write — important for anyone shipping an NFSv4.1 client against untrusted or MITM-able servers.</p>
+<h2>The proposed fix</h2>
+<p>The patch itself is two added lines in <code>fs/nfs/nfs4proc.c</code>: reject a zero back-channel <code>ca_maxrequests</code> in <code>nfs4_verify_back_channel_attrs()</code>, matching the existing fore-channel check. The <code>-EINVAL</code> then bubbles through <code>nfs4_verify_channel_attrs()</code> and <strong>aborts</strong> <code>nfs4_proc_create_session()</code> before <code>nfs4_update_session()</code> can install the underflowed ceiling.</p>
+<blockquote>
+<p>"Reject a zero back channel <code>ca_maxrequests</code> in <code>nfs4_verify_back_channel_attrs()</code>, as <code>nfs4_verify_fore_channel_attrs()</code> already does, so the underflow never sizes the slot table."</p>
+</blockquote>
+<p>It is tagged <code>Fixes: 5405fc44c337 ("NFSv4.x: Add kernel parameter to control the callback server")</code> and <code>Cc: stable@vger.kernel.org</code>, so the intent is a <strong>stable backport</strong>, not a new feature. The posting also carries <code>Assisted-by: Bynario AI</code>.</p>
+<h2>Status this week</h2>
+<p>No maintainer or reviewer comments landed on the thread before the 21 August cutoff. The technical argument on the list is therefore still Paula’s uncontested write-up: treat a zero back-channel <code>ca_maxrequests</code> as illegal at verification time, rather than trying to harden <code>nfs4_lock_slot()</code> after the slot-id ceiling has already wrapped. Until review, the client still accepts that zero and can size the callback slot table to <code>0xffffffff</code>.</p>
+<p>This sits in a small cluster of contemporaneous <strong>client-side bounds-check</strong> patches from the same author (decoder OOBs on pNFS layout types / GETDEVICEINFO, plus a SUNRPC <code>xdr_inline_pages()</code> write), but those are separate threads; this one is specifically the <strong>NFSv4.1 back-channel slot-table underflow</strong>.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260819170109.8132-1-paula@bynar.io/">2026-08-19 Paula <a href="mailto:paula@bynar.io">paula@bynar.io</a> — [PATCH] NFSv4.1: fix out-of-bounds write from zero back channel ca_maxrequests</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd: slab overwrite in the NFSv4.1 session reply cache</title>
+  <meta name="description" content="This week Chuck Lever posted a two-patch nfsd series that closes a KASAN-confirmed slab overwrite in the NFSv4.1 session reply cache. The report is a server-side memory-safety bug, triggerable by a client that can establish a session;…">
+  <meta property="og:title" content="nfsd: slab overwrite in the NFSv4.1 session reply cache">
+  <meta property="og:description" content="This week Chuck Lever posted a two-patch nfsd series that closes a KASAN-confirmed slab overwrite in the NFSv4.1 session reply cache. The report is a server-side memory-safety bug, triggerable by a client that can establish a session;…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd: slab overwrite in the NFSv4.1 session reply cache">
+  <meta name="twitter:description" content="This week Chuck Lever posted a two-patch nfsd series that closes a KASAN-confirmed slab overwrite in the NFSv4.1 session reply cache. The report is a server-side memory-safety bug, triggerable by a client that can establish a session;…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd: slab overwrite in the NFSv4.1 session reply cache</h1>
+<h2>Summary</h2>
+<p>This week Chuck Lever posted a two-patch nfsd series that closes a KASAN-confirmed slab overwrite in the NFSv4.1 session reply cache. The report is a server-side memory-safety bug, triggerable by a client that can establish a session; there is no Linux NFS client code change in the series, and as of 18 August it has drawn no review replies.</p>
+<h2>What landed on the list</h2>
+<p>On 18 August, <a href="https://lore.kernel.org/linux-nfs/20260817-jean-v1-0-9e356596ab85@kernel.org/">Chuck Lever posted</a> <code>[PATCH 0/2] nfsd: fix a slab overwrite in the NFSv4.1 session reply cache</code>. The cover letter credits Jérémy Jean with a private report and a KUnit fixture that reproduces the write under KASAN. The fixture is not included.</p>
+<p>The trigger is a legal CREATE_SESSION negotiation followed by a cachethis SEQUENCE:</p>
+<blockquote>
+<p>"A client that can establish a session can negotiate ca_maxresponsesize_cached down to NFSD_MIN_HDR_SEQ_SZ, which leaves every slot's sl_data[] zero bytes long, and then send a cachethis SEQUENCE whose COMPOUND tag fills the narrowed reply buffer. The SEQUENCE result is never encoded, cstate.data_offset stays zero, and the whole reply is copied past the end of the slot."</p>
+</blockquote>
+<p>That is a protocol-legal client, not a parser smash. Once the cached-reply ceiling is at <code>NFSD_MIN_HDR_SEQ_SZ</code>, <code>nfsd4_alloc_slot()</code> hands every slot a zero-length <code>sl_data[]</code>. A long COMPOUND tag then fills the already-narrowed reply buffer so it holds the SEQUENCE opcode but not the status word that follows.</p>
+<h2>Why the copy is not clamped</h2>
+<p>Lever walks through why a one-line clamp in <code>nfsd4_store_cache_entry()</code> is the wrong fix. That helper derives the copy length from <code>cstate.data_offset</code> and never compares it with the slot allocation. Clamping would stop the write, but:</p>
+<blockquote>
+<p>"the slot would then hold a truncated reply that a retry replays as a complete one, and the slot seqid has already been consumed by that point. RFC 8881 Section 2.10.6.1.2 requires an error returned from SEQUENCE to leave the slot untouched, so the size has to be settled before the slot is accepted."</p>
+</blockquote>
+<p>The copy itself is therefore left alone. The new check runs <em>ahead</em> of <code>xdr_restrict_buflen()</code>, which only fails once headers and tag overrun the negotiated limit. Adding the fixed-size SEQUENCE result on top also rejects a request that leaves no room for the reply the client asked to have cached — a request that cannot produce a complete reply today either.</p>
+<h2>Patch 1: preflight SEQUENCE before accepting the slot</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260817-jean-v1-1-9e356596ab85@kernel.org/">Patch 1</a>, authored by Jean and signed off by Lever, is the actual fix. It sits in <code>nfsd4_sequence()</code> in <code>fs/nfsd/nfs4state.c</code>.</p>
+<p>The failure chain is:</p>
+<ol>
+<li><code>nfsd4_sequence()</code> narrows the reply buffer to the session's cached-reply limit <em>before</em> it accepts the slot seqid.</li>
+<li>A COMPOUND tag can fill that buffer until it holds the SEQUENCE opcode but not the following status word.</li>
+<li><code>nfsd4_encode_operation()</code> returns without running <code>nfsd4_encode_sequence()</code>, so <code>cstate.data_offset</code> stays zero.</li>
+<li><code>op-&gt;status</code> is left at <code>nfs_ok</code>, so the COMPOUND is treated as success.</li>
+<li><code>nfsd4_store_cache_entry()</code> declines to cache a lone SEQUENCE that returned an error, but that test reads the (still-ok) status, so it proceeds.</li>
+<li>The copy starts at offset zero and dumps the whole reply — RPC and COMPOUND headers included — into the zero-length <code>sl_data[]</code>.</li>
+</ol>
+<p>The KASAN splat Jean's fixture produced:</p>
+<pre><code>BUG: KASAN: slab-out-of-bounds in read_bytes_from_xdr_buf+0x1bc/0x390
+Write of size 80 at addr ffff888003a549cd by task kunit_try_catch/24
+ __asan_memcpy+0x38/0x60
+ read_bytes_from_xdr_buf+0x1bc/0x390
+ nfsd4_sequence_done+0x5b0/0x810
+ nfs4svc_encode_compoundres+0x1bf/0x240
+</code></pre>
+<p>The COMPOUND tag is among the bytes written past the slot, so a client that later retries can pick up most of the overflow.</p>
+<p>The patch checks that the fixed-size SEQUENCE result, plus room for a following operation's error status, fits the negotiated limit <em>before</em> narrowing the buffer and consuming the slot seqid. The slot and its reply cache stay unchanged, matching RFC 8881 §2.10.6.1.2.</p>
+<p>It carries <code>Fixes: 47ee52986472 ("nfsd4: adjust buflen to session channel limit")</code> — the commit that first taught nfsd to shrink the reply buffer to the session channel limit. An <code>Assisted-by: Codex:gpt-5</code> tag is also present.</p>
+<h2>Patch 2: encode-header failure must set op-&gt;status</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260817-jean-v1-2-9e356596ab85@kernel.org/">Patch 2</a> is Lever's follow-on guard in <code>nfsd4_encode_operation()</code> (<code>fs/nfsd/nfs4xdr.c</code>). When the reply buffer has no room for an operation's opcode and status word, the encoder currently leaves <code>op-&gt;status</code> untouched. <code>nfsd4_proc_compound()</code> then reads the leftover <code>nfs_ok</code> as success and continues, so the reply counts an operation whose result was never encoded.</p>
+<p>The patch reports the failure through <code>nfsd4_check_resp_size()</code>, which the rest of the function already uses. That returns <code>NFS4ERR_REP_TOO_BIG</code>, or <code>NFS4ERR_REP_TOO_BIG_TO_CACHE</code> on a session, and the COMPOUND ends at that operation.</p>
+<p>Lever is explicit that this is not the overwrite fix:</p>
+<blockquote>
+<p>"Two paths narrow the reply buffer: nfsd4_sequence(), which rejects a SEQUENCE result that does not fit, and nfsd4_encode_splice_read(), which can leave a single XDR word in the head page. Whether a COMPOUND reaches that boundary is unproven, so this is a guard rather than a fix."</p>
+</blockquote>
+<p>Together the two patches are 29 insertions across <code>nfs4state.c</code> and <code>nfs4xdr.c</code>. Base commit is <code>76427d869120552a1a82e1f1488d9f8311827d84</code>.</p>
+<h2>Client angle and status</h2>
+<p>Nothing here changes the Linux NFS client. The interesting client-facing point is that the overwrite is reachable from a session-capable peer that merely negotiates a tiny <code>ca_maxresponsesize_cached</code> and then sends a cachethis SEQUENCE with a fat COMPOUND tag. A well-behaved Linux client will not do that in ordinary use; a malicious or fuzzer client will. The series therefore belongs with nfsd's session-slot and DRC hardening, not with client reconnect or I/O path work.</p>
+<p>No Acked-by, Reviewed-by, or follow-up questions appeared in the window. The KUnit fixture remains private, so reviewers will have to reconstruct the reproducer from the KASAN trace and the SEQUENCE preflight logic.</p>
+<p><strong>Bottom line:</strong> this is a bug fix, not a feature or protocol change. Jean found a slab overwrite in the NFSv4.1 reply cache; Lever's series refuses the SEQUENCE <em>before</em> the slot is accepted rather than truncating a cached reply after the fact, and adds a related encode-status guard. Review is still open.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260817-jean-v1-0-9e356596ab85@kernel.org/">2026-08-18 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 0/2] nfsd: fix a slab overwrite in the NFSv4.1 session reply cache</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260817-jean-v1-1-9e356596ab85@kernel.org/">2026-08-18 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 1/2] nfsd: preflight SEQUENCE replies before accepting a slot</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260817-jean-v1-2-9e356596ab85@kernel.org/">2026-08-18 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 2/2] nfsd: set op-&gt;status when an operation's header cannot be encoded</a></li>
+</ul>
+  </main>
+</body>
+</html>

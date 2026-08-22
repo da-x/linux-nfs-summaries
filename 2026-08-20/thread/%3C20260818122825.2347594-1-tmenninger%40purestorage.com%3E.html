@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>xprtrdma hang: serialize FRWR unmap_sync against disconnect</title>
+  <meta name="description" content="This week’s linux-nfs traffic includes a client-side RDMA hang fix from Tim Menninger (Pure Storage), targeting a long-standing race in the xprtrdma FRWR path that can stall rpciod during rapid disconnect/reconnect. The thread is a bug…">
+  <meta property="og:title" content="xprtrdma hang: serialize FRWR unmap_sync against disconnect">
+  <meta property="og:description" content="This week’s linux-nfs traffic includes a client-side RDMA hang fix from Tim Menninger (Pure Storage), targeting a long-standing race in the xprtrdma FRWR path that can stall rpciod during rapid disconnect/reconnect. The thread is a bug…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="xprtrdma hang: serialize FRWR unmap_sync against disconnect">
+  <meta name="twitter:description" content="This week’s linux-nfs traffic includes a client-side RDMA hang fix from Tim Menninger (Pure Storage), targeting a long-standing race in the xprtrdma FRWR path that can stall rpciod during rapid disconnect/reconnect. The thread is a bug…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>xprtrdma hang: serialize FRWR unmap_sync against disconnect</h1>
+<h2>Summary</h2>
+<p>This week’s linux-nfs traffic includes a client-side RDMA hang fix from Tim Menninger (Pure Storage), targeting a long-standing race in the xprtrdma FRWR path that can stall <code>rpciod</code> during rapid disconnect/reconnect. The thread is a <strong>bug fix</strong>, not a protocol change: <code>frwr_unmap_sync()</code> can post <code>LOCAL_INV</code> work after <code>rpcrdma_xprt_disconnect()</code> has already drained the QP, then sleep forever waiting for a CQE that will never arrive.</p>
+<h2>The hang</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260818122825.2347594-1-tmenninger@purestorage.com/">Menninger’s v1</a> describes a four-step race:</p>
+<ol>
+<li><code>frwr_unmap_sync()</code> snapshots <code>r_xprt-&gt;rx_ep</code></li>
+<li><code>rpcrdma_xprt_disconnect()</code> drains the QP</li>
+<li><code>frwr_unmap_sync()</code> posts <code>LOCAL_INV</code> WRs after the drain</li>
+<li>No CQE arrives, so <code>wait_for_completion()</code> blocks indefinitely</li>
+</ol>
+<p>The hung task sits on the <code>rpciod</code> workqueue:</p>
+<blockquote>
+<p>"Workqueue: rpciod rpc_async_schedule [sunrpc]<br />
+wait_for_completion()<br />
+frwr_unmap_sync()<br />
+xprt_rdma_free()<br />
+xprt_release()"</p>
+</blockquote>
+<p>The reproduction is pNFS-flavored: v7.2-rc6 under load with repeated data-server restarts to force QP disconnect/reconnect cycling. Without the fix, Menninger hit the hang twice in six attempts; with it, 300 cycles stayed clean. The same stall has been seen on v6.8 and v6.18.34. v1 tagged <code>Fixes: c9918ff56dfb</code> ("xprtrdma: Add ro_unmap_sync method for FRWR") and CCed stable.</p>
+<p>The proposed serialization was an <code>rx_unmap_rwsem</code> plus an <code>rx_unmap_active</code> inflight counter. <code>frwr_unmap_sync()</code> takes the read side through <code>ib_post_send()</code>, then drops it before waiting so disconnect can take the write side and drain. Disconnect then waits for the counter to hit zero before tearing down endpoint and MR state.</p>
+<h2>Chuck Lever: real bug, too much new machinery</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/6ac343d6-f220-4e18-b3f0-cf2a456afc67@app.fastmail.com/">Chuck Lever</a> agreed on the diagnosis and on the rwsem closing the post-after-drain window, but pushed back hard on the shape of the fix:</p>
+<blockquote>
+<p>"I agree there is a bug. The proposed fix introduces technical debt that I would rather not see in-tree. Importantly, there are areas where you can reuse existing code instead of open-coding, the Fixes: tag might be wrong, and a few code comments need updating as part of the fix."</p>
+</blockquote>
+<p>On the history, Lever walked the FRWR timeline: <code>c9918ff56dfb</code> landed in v4.5 when <code>rx_ep</code> was still an embedded struct, <code>frwr_op_unmap_sync()</code> posted to <code>ia-&gt;ri_id-&gt;qp</code>, and disconnect flushed CQs without draining the QP. <code>ib_drain_qp()</code> arrived in v4.7; the sync unmap moved to <code>xprt_rdma_free()</code> in v5.3. The race as described needs a freeable <code>rx_ep</code> and the <code>r_xprt-&gt;rx_ep = NULL</code> store, both from v5.7:</p>
+<blockquote>
+<p>"Should the tag be:<br />
+Fixes: e28ce90083f0 ("xprtrdma: kmalloc rpcrdma_ep separate from rpcrdma_xprt")"</p>
+</blockquote>
+<p>That also undercuts v1’s claim that the race has existed “since synchronous FRWR invalidation was introduced.”</p>
+<p>Lever also asked why only the sync path is special. <code>xprt_rdma_free()</code> runs from <code>xprt_release()</code> after <code>-&gt;release_xprt</code> has dropped the transport send lock, so it is the one <code>LOCAL_INV</code> poster disconnect is not already serialized against. <code>frwr_unmap_async()</code> runs inline from <code>rpcrdma_wc_receive()</code> → <code>rpcrdma_reply_handler()</code>, which <code>ib_drain_rq()</code> orders ahead of <code>ib_drain_sq()</code>.</p>
+<p>The rest of the review is about not inventing new lifetime tracking:</p>
+<ul>
+<li>The kernel-doc for <code>frwr_unmap_sync()</code> still says it always sleeps until mapped memory is safe; an early return when <code>rx_ep</code> is NULL is only correct because <code>rpcrdma_reqs_reset()</code> has already released that request’s MRs.</li>
+<li>The comment claiming “the RPC reply handler won’t call us unless <code>re_id-&gt;qp</code> is a valid pointer” is leftover from the async path and does not describe <code>xprt_rdma_free()</code>.</li>
+<li><strong><code>rx_unmap_active</code> could go away.</strong> The waiter sleeps on <code>mr-&gt;mr_linv_done</code>, which <code>rpcrdma_mrs_destroy()</code> can free; moving the completion onto <code>struct rpcrdma_req</code> (still alive for the duration of <code>xprt_rdma_free()</code>) would decouple that. Endpoint lifetime after <code>up_read()</code> could be an <code>rpcrdma_ep_get()</code> / <code>rpcrdma_ep_put()</code> pair instead of a counter. Together that would drop the atomic, the <code>wait_var_event()</code> in disconnect, and the <code>atomic_set()</code> in setup, “and leave the rwsem with one job.”</li>
+<li>Putting the lock on <code>struct rpcrdma_ep</code> was considered, but Lever noted <code>rpcrdma_xprt_drain()</code> already fences the receive side with <code>ep-&gt;re_receiving</code> / <code>ep-&gt;re_done</code>, and an rwsem on the transport outlives every endpoint it guards.</li>
+</ul>
+<h2>v2: reuse existing lifetime objects</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260820211700.318824-1-tmenninger@everpuredata.com/">Menninger’s v2</a> takes Lever’s review almost point-for-point.</p>
+<p>The <code>Fixes:</code> tag moves to <code>e28ce90083f0</code>. The changelog now spells out the async-versus-sync ordering:</p>
+<blockquote>
+<p>"frwr_unmap_async() runs inline from Receive completion processing. rpcrdma_xprt_drain() drains the Receive Queue before the Send Queue, so asynchronous LOCAL_INV Work Requests are submitted before Send Queue drain. frwr_unmap_sync(), however, runs from xprt_rdma_free() after the transport send lock has been released, so it is not ordered against disconnect."</p>
+</blockquote>
+<p>Mechanically, v2:</p>
+<ul>
+<li>Keeps <code>rx_unmap_rwsem</code> on <code>struct rpcrdma_xprt</code> (an endpoint-resident lock cannot protect the initial <code>rx_ep</code> lookup).</li>
+<li>Holds the read side while sampling <code>rx_ep</code>, building the <code>LOCAL_INV</code> chain, and posting; disconnect holds the write side across QP drain and teardown; the read side is dropped <strong>before</strong> waiting so drain can complete the posted WRs.</li>
+<li>Rechecks <code>rl_registered</code> after acquiring the rwsem, in case disconnect reset the request while the reader was blocked, and returns without posting.</li>
+<li>Moves the synchronous invalidation completion from the final MR onto <code>struct rpcrdma_req</code>.</li>
+<li>Takes an endpoint reference across the wait and the error path.</li>
+<li><strong>Removes <code>rx_unmap_active</code> and the disconnect-side wait.</strong></li>
+<li>Updates the transport-recovery comments, LOCAL_INV wake kernel-doc, <code>frwr_unmap_sync()</code> kernel-doc, and the QP-posting locking comment.</li>
+</ul>
+<p>Retest on the same pNFS restart loop: hang twice in six attempts without the fix; none across 200 cycles with v2.</p>
+<p>As of the week’s close, v2 is on the list and awaiting further review. The discussion has already narrowed from “add a new inflight counter” to “serialize the one unmap path that QP drain does not already order, using the request and endpoint objects that already outlive the wait.”</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260818122825.2347594-1-tmenninger@purestorage.com/">2026-08-18 tmenninger@purestorage.com — [PATCH] xprtrdma: serialize unmap_sync with xprt_disconnect</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/6ac343d6-f220-4e18-b3f0-cf2a456afc67@app.fastmail.com/">2026-08-18 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH] xprtrdma: serialize unmap_sync with xprt_disconnect</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260820211700.318824-1-tmenninger@everpuredata.com/">2026-08-20 Tim Menninger <a href="mailto:tmenninger@everpuredata.com">tmenninger@everpuredata.com</a> — [PATCH v2] xprtrdma: serialize unmap_sync with xprt_disconnect</a></li>
+</ul>
+  </main>
+</body>
+</html>

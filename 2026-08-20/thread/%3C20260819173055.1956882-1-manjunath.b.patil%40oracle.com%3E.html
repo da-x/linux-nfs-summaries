@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SUNRPC timeout logs gain client and transport IDs</title>
+  <meta name="description" content="This week’s thread is a client-side observability improvement, not a protocol change and not a functional bug fix. Manjunath Patil posted a one-file SUNRPC patch that enriches the ratelimited RPC timeout messages in rpc_check_timeout()…">
+  <meta property="og:title" content="SUNRPC timeout logs gain client and transport IDs">
+  <meta property="og:description" content="This week’s thread is a client-side observability improvement, not a protocol change and not a functional bug fix. Manjunath Patil posted a one-file SUNRPC patch that enriches the ratelimited RPC timeout messages in rpc_check_timeout()…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="SUNRPC timeout logs gain client and transport IDs">
+  <meta name="twitter:description" content="This week’s thread is a client-side observability improvement, not a protocol change and not a functional bug fix. Manjunath Patil posted a one-file SUNRPC patch that enriches the ratelimited RPC timeout messages in rpc_check_timeout()…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>SUNRPC timeout logs gain client and transport IDs</h1>
+<h2>Summary</h2>
+<h2>Overview</h2>
+<p>This week’s thread is a <strong>client-side observability improvement</strong>, not a protocol change and not a functional bug fix. <a href="https://lore.kernel.org/linux-nfs/20260819173055.1956882-1-manjunath.b.patil@oracle.com/">Manjunath Patil</a> posted a one-file SUNRPC patch that enriches the ratelimited RPC timeout messages in <code>rpc_check_timeout()</code> (<code>net/sunrpc/clnt.c</code>) so NFS operators can tell a server stall from a transport that is disconnected, reconnecting, or on a different connection.</p>
+<p>The discussion stayed entirely in-window (19–20 August 2026). There is no prior-week history. By Thursday evening the patch had a <code>Reviewed-by</code> from Petr Vorel, a resolved style nit, and no maintainer merge decision yet.</p>
+<h2>The diagnostic gap</h2>
+<p>Patil’s cover letter is blunt about the current logs:</p>
+<blockquote>
+<p>"The existing RPC timeout messages identify only the RPC program and server name. That makes it difficult to distinguish a server-side response stall from a transport that is disconnected, reconnecting, or using a different connection."</p>
+</blockquote>
+<p>The patch therefore adds four compact fields to those messages:</p>
+<ul>
+<li>RPC <strong>client id</strong> (<code>clid</code>)</li>
+<li><strong>transport id</strong> (<code>xprt</code>)</li>
+<li>current transport <strong>connection cookie</strong> (<code>cc</code>)</li>
+<li>RPC <strong>task owner</strong></li>
+</ul>
+<p>Those values are meant to line up with <code>rpcctl</code> and other transport state. The example NFS line is:</p>
+<pre><code>nfs: server 192.168.50.1 clid=4 xprt=1 cc=1 owner=6245
+not responding, timed out
+</code></pre>
+<p>The diff is small (20 lines in <code>clnt.c</code>: 13 insertions, 7 deletions). The new locals <code>req</code> and <code>xprt</code> are declared in <code>rpc_check_timeout()</code>, then used only on the expired-timeout path so the printk can print <code>clnt-&gt;cl_clid</code>, <code>xprt-&gt;id</code> / cookie, and the task owner. The patch carries <code>Assisted-by: Codex:gpt-5</code>.</p>
+<p>For NFS client debugging this is the useful part: a soft-mount timeout that used to say only “server X not responding” can now be correlated with a specific RPC client, a specific <code>xprt</code>, and whether the connection cookie has rolled — i.e., whether the transport was replaced underneath the task.</p>
+<h2>Review: praise, then a pointer-ordering nit</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260820111303.455807-1-pvorel@suse.cz/">Petr Vorel</a> replied the next morning with an immediate thumbs-up:</p>
+<blockquote>
+<p>"Nice improvement, thanks!"</p>
+</blockquote>
+<p>and closed with <code>Reviewed-by: Petr Vorel &lt;pvorel@suse.cz&gt;</code> plus “The rest LGTM.”</p>
+<p>His only question was readability versus safety: should <code>req</code> and <code>xprt</code> be assigned at the top of the function, before the <code>RPC_SIGNALLED(task)</code> check?</p>
+<blockquote>
+<p>"nit: Would it work to assign req and task earlier (just readability?) Or is it not safe before checking RPC_SIGNALLED(task)?"</p>
+</blockquote>
+<p>He sketched the more compact form:</p>
+<pre><code>struct rpc_clnt *clnt = task-&gt;tk_client;
+struct rpc_rqst *req = task-&gt;tk_rqstp;
+struct rpc_xprt *xprt = req-&gt;rq_xprt;
+</code></pre>
+<p>That is the only technical push-back in the thread.</p>
+<h2>Why the assignments stay late</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/8e43238e-f06d-4da1-a898-2bdc1d827e81@oracle.com/">Patil</a> thanked Vorel for the tag and declined to hoist the pointers. The ordering is intentional, not leftover style:</p>
+<blockquote>
+<p>"I kept the assignments after RPC_SIGNALLED(task) intentionally, preserving the existing behavior where a signalled task returns before we dereference task-&gt;tk_rqstp. xprt is also needed only after xprt_adjust_timeout(req) reports an expired timeout."</p>
+</blockquote>
+<p>In other words: a signalled RPC task must still bail out without touching <code>tk_rqstp</code>, and the transport pointer is only required on the path that actually emits the timeout diagnostic. He would rather keep that existing control flow, while leaving the door open if maintainers prefer the earlier assignments:</p>
+<blockquote>
+<p>"I would prefer to retain the current ordering for those reasons. Also I am open if maintainers chose to alter it."</p>
+</blockquote>
+<h2>Closure this week</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260820185922.GA511595@pevik/">Vorel</a> accepted the rationale without asking for a v2:</p>
+<blockquote>
+<p>"Understand, fair enough."</p>
+</blockquote>
+<p>and on the “keep current ordering unless maintainers say otherwise” stance, simply:</p>
+<blockquote>
+<p>"+1"</p>
+</blockquote>
+<p>That is where the week ends. The patch is reviewed, the only nit is resolved in favor of the safer late dereference, and no NFS maintainer (Trond, Anna, Jeff, etc.) has Acked or queued it yet.</p>
+<h2>Takeaway for NFS client work</h2>
+<p>This is a <strong>diagnostics / observability</strong> change on the SUNRPC client timeout path that NFS hangs off. It does not alter timeout policy, reconnect, or rebind; it makes the existing ratelimited “not responding, timed out” line usable when a host has multiple RPC clients or multiplexed transports. The client-id / xprt-id / connection-cookie / owner tuple is the practical hook for matching dmesg against <code>rpcctl</code>. Until a maintainer picks it up, the code stays as posted: extra fields in the printk, pointers still assigned after the <code>RPC_SIGNALLED</code> guard.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260819173055.1956882-1-manjunath.b.patil@oracle.com/">2026-08-19 Manjunath Patil <a href="mailto:manjunath.b.patil@oracle.com">manjunath.b.patil@oracle.com</a> — [PATCH] SUNRPC: add transport details to timeout diagnostics</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260820111303.455807-1-pvorel@suse.cz/">2026-08-20 Petr Vorel <a href="mailto:pvorel@suse.cz">pvorel@suse.cz</a> — [PATCH] SUNRPC: add transport details to timeout diagnostics</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/8e43238e-f06d-4da1-a898-2bdc1d827e81@oracle.com/">2026-08-20 manjunath.b.patil@oracle.com — Re: [PATCH] SUNRPC: add transport details to timeout diagnostics</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260820185922.GA511595@pevik/">2026-08-20 Petr Vorel <a href="mailto:pvorel@suse.cz">pvorel@suse.cz</a> — Re: [PATCH] SUNRPC: add transport details to timeout diagnostics</a></li>
+</ul>
+  </main>
+</body>
+</html>

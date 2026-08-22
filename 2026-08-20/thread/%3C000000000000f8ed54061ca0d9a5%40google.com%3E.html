@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>syzbot finds a reproducer for hung nfsd_umount</title>
+  <meta name="description" content="This week’s only traffic on the long-running hung-task report is a syzbot follow-up: the bot now has a C reproducer for INFO: task hung in nfsd_umount, still reproducing on current upstream. The issue is an NFSD (server) bug, not an NFS…">
+  <meta property="og:title" content="syzbot finds a reproducer for hung nfsd_umount">
+  <meta property="og:description" content="This week’s only traffic on the long-running hung-task report is a syzbot follow-up: the bot now has a C reproducer for INFO: task hung in nfsd_umount, still reproducing on current upstream. The issue is an NFSD (server) bug, not an NFS…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="syzbot finds a reproducer for hung nfsd_umount">
+  <meta name="twitter:description" content="This week’s only traffic on the long-running hung-task report is a syzbot follow-up: the bot now has a C reproducer for INFO: task hung in nfsd_umount, still reproducing on current upstream. The issue is an NFSD (server) bug, not an NFS…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>syzbot finds a reproducer for hung nfsd_umount</h1>
+<h2>Summary</h2>
+<p>This week’s only traffic on the long-running hung-task report is a syzbot follow-up: the bot now has a C reproducer for <code>INFO: task hung in nfsd_umount</code>, still reproducing on current upstream. The issue is an <strong>NFSD (server) bug</strong>, not an NFS client problem — a mutex stall around <code>nfsd_umount</code> / <code>nfsd_mutex</code> that can freeze nfsd control-plane writes and concurrent unmounts.</p>
+<h2>This week: a reproducer, same hang, slightly different lock picture</h2>
+<p>On 16 August 2026, <a href="https://lore.kernel.org/linux-nfs/6a818d97.9ebadd4d.20b15e.0015.GAE@google.com/">syzbot reported</a> that it had finally produced a syz and C reproducer against upstream <code>3eb40771c00a</code> (<code>Merge tag 'soc-fixes-7.2-3'</code>). The bot asked maintainers to tag any fix with:</p>
+<blockquote>
+<p>"Reported-by: syzbot+b568ba42c85a332a88ee@syzkaller.appspotmail.com"</p>
+</blockquote>
+<p>and offered the usual <code>#syz test:</code> workflow. Nobody from linux-nfs replied in-window.</p>
+<p>The new traces still show tasks blocked more than 143 seconds in D state. One <code>syz-executor</code> thread is stuck in <code>nfsd_umount</code> → <code>nfsd_shutdown_threads</code> waiting on <code>nfsd_mutex</code>:</p>
+<pre><code>nfsd_shutdown_threads+0x5b/0xf0 fs/nfsd/nfssvc.c:576
+nfsd_umount+0x3b/0x60 fs/nfsd/nfsctl.c:1365
+deactivate_locked_super+...
+cleanup_mnt+...
+</code></pre>
+<p>Three sibling executor threads are stuck on the same mutex from the nfsctl write path:</p>
+<pre><code>write_ports+0xa5/0xcc0 fs/nfsd/nfsctl.c:860
+nfsctl_transaction_write+0x106/0x1a0 fs/nfsd/nfsctl.c:112
+</code></pre>
+<p>The lock dump makes the contention explicit. Two unmounts hold distinct <code>s_umount</code> locks and then take <code>nfsd_mutex</code> in <code>nfsd_shutdown_threads</code>; three <code>write_ports</code> callers hold <code>sb_writers</code> and then wait on that same global <code>nfsd_mutex</code>. In other words, a slow (or stuck) nfsd thread-shutdown serializes every concurrent port-file write and every other nfsd superblock teardown.</p>
+<p>That is a sharper picture than the 2024 original. The first report had <code>nfsd_nl_listener_set_doit</code> as the other <code>nfsd_mutex</code> holder; this week’s reproducer instead hammers the classic <code>/proc/fs/nfsd/portlist</code> (<code>write_ports</code>) path against concurrent <code>nfsd_umount</code>. The NMI all-CPU backtrace that Neil Brown asked for in 2024 did fire, but the sibling CPU was in a batman-adv multicast workqueue (<code>batadv_mcast_mla_update</code>), not in nfsd — so the dump still does not show <em>why</em> the mutex owner is sitting in <code>nfsd_shutdown_threads</code>.</p>
+<p>No patch, no <code>#syz fix:</code>, and no human analysis landed this week. The bug remains open, now with a downloadable C reproducer, disk image, and vmlinux.</p>
+<h2>Brief bridge from 2024</h2>
+<p>syzbot <a href="https://lore.kernel.org/linux-nfs/000000000000f8ed54061ca0d9a5@google.com/">first filed the hang</a> on 7 July 2024 against 6.10-rc6, <strong>without</strong> a reproducer. The stuck stack was already <code>nfsd_umount</code> → <code>nfsd_shutdown_threads</code> taking <code>nfsd_mutex</code>, with a second task holding that mutex in <code>nfsd_nl_listener_set_doit</code>.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/9825cc5ff85d4a2a4ce1c955f49681bef8d03442.camel@kernel.org/">Jeff Layton</a> immediately flagged the missing stack on the mutex owner:</p>
+<blockquote>
+<p>"Above there are two tasks that are holding/blocked on the nfsd_mutex. The first is the stuck thread. The second is a task that took it in nfsd_nl_listener_set_doit. I don't see a way to exit that function without releasing that mutex, so it seems likely that thread is stuck too for some reason. Unfortunately, we don't have a stack trace from that task, so I can't tell what it's doing."</p>
+</blockquote>
+<p><a href="https://lore.kernel.org/linux-nfs/172039726840.11489.12386749198888516742@noble.neil.brown.name/">Neil Brown</a> argued the owner was not blocked on another lock (or lockdep would have listed it) and guessed a sleep/spin inside transport teardown:</p>
+<blockquote>
+<p>"I wonder if it could be looping in svc_xprt_destroy_all(), and sitting in the msleep() when the hang is detected so there are no locks to report."</p>
+</blockquote>
+<p>He asked for <code>/proc/sys/kernel/hung_task_all_cpu_backtrace</code>. <a href="https://lore.kernel.org/linux-nfs/42600ff8-512f-bea1-848c-2cc1c823cb76@afaics.de/">Harald Dunkel</a> enabled that sysctl on a production NFS server and reported a possibly related hang of nfsd inside a legacy-cgroup container that also surfaced as an OOM on login. A later MIME follow-up from Harald did not add a usable backtrace to the list.</p>
+<h2>Status</h2>
+<p>This is a <strong>bug</strong>, not a feature or protocol change: a hung-task / possible deadlock in NFSD’s global <code>nfsd_mutex</code> during <code>nfsd_umount</code>, now shown to interact with <code>write_ports</code> as well as netlink listener setup. Two years on, the hang still reproduces on upstream, but maintainers finally have a C reproducer. Until someone posts a patch (or a <code>#syz test:</code> experiment) against <code>nfsd_shutdown_threads</code> / <code>svc_xprt_destroy_all</code>, the report stays open.</p>
+<p>NFS <strong>client</strong> code is not implicated here; the stacks and locks are entirely on the server (<code>fs/nfsd/nfssvc.c</code>, <code>fs/nfsd/nfsctl.c</code>).</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/6a818d97.9ebadd4d.20b15e.0015.GAE@google.com/">2026-08-16 syzbot <a href="mailto:syzbot+b568ba42c85a332a88ee@syzkaller.appspotmail.com">syzbot+b568ba42c85a332a88ee@syzkaller.appspotmail.com</a> — Re: [syzbot] [nfs?] INFO: task hung in nfsd_umount</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Empty auth.unix.gid upcalls cached as positive group lists</title>
+  <meta name="description" content="This is a bug-fix thread, not a protocol change or a new feature. TrueNAS engineer Ameer Hamza posted a one-liner for net/sunrpc/svcauth_unix.c that stops knfsd from treating a failed mountd group lookup as a successful empty…">
+  <meta property="og:title" content="Empty auth.unix.gid upcalls cached as positive group lists">
+  <meta property="og:description" content="This is a bug-fix thread, not a protocol change or a new feature. TrueNAS engineer Ameer Hamza posted a one-liner for net/sunrpc/svcauth_unix.c that stops knfsd from treating a failed mountd group lookup as a successful empty…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Empty auth.unix.gid upcalls cached as positive group lists">
+  <meta name="twitter:description" content="This is a bug-fix thread, not a protocol change or a new feature. TrueNAS engineer Ameer Hamza posted a one-liner for net/sunrpc/svcauth_unix.c that stops knfsd from treating a failed mountd group lookup as a successful empty…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Empty auth.unix.gid upcalls cached as positive group lists</h1>
+<h2>Summary</h2>
+<h2>Overview</h2>
+<p>This is a <strong>bug-fix</strong> thread, not a protocol change or a new feature. TrueNAS engineer <a href="https://lore.kernel.org/linux-nfs/20260814172507.1474519-1-ameer.hamza@truenas.com/">Ameer Hamza</a> posted a one-liner for <code>net/sunrpc/svcauth_unix.c</code> that stops knfsd from treating a failed mountd group lookup as a successful empty supplementary-group list. The fallout is on the <strong>NFS server</strong>, not the NFS client: a transient NSS/winbind/sssd hiccup can strip a uid of every supplementary group on every export for the full <code>auth.unix.gid</code> TTL (30 minutes by default), including for RPCSEC_GSS clients that otherwise carry a complete group vector.</p>
+<p>The v1 patch itself was not NAK'd. <a href="https://lore.kernel.org/linux-nfs/032eae35-e958-4c87-9185-3896250eb7e1@app.fastmail.com/">Chuck Lever</a> asked only that the same defect on the newer mountd <strong>netlink</strong> path be split into a second patch with its own <code>Fixes:</code> tag. Hamza agreed the same day and promised a v2 series.</p>
+<h2>The failure mode</h2>
+<p>With <code>rpc.mountd --manage-gids</code>, the kernel asks userspace for the supplementary groups of each AUTH_UNIX (and, via <code>svcauth_gss_set_client()</code>, RPCSEC_GSS) uid. When <code>getpwuid()</code> or <code>getgrouplist()</code> fails — Hamza's example is winbind or sssd being briefly unreachable — mountd answers the <code>auth.unix.gid</code> channel with <strong>zero groups</strong>. <code>unix_gid_parse()</code> currently installs that reply as a <strong>positive</strong> cache entry. <code>svcauth_unix_set_client()</code> then <strong>replaces</strong> the RPC credential's group list with that empty list on every subsequent request.</p>
+<p>Hamza's commit message is blunt about the blast radius:</p>
+<blockquote>
+<p>"One failed lookup strips that uid of all supplementary groups on every export for up to mountd's configured TTL (30 minutes by default), long after the NSS backend has recovered."</p>
+</blockquote>
+<p>The semantic argument for treating a zero-group reply as a lookup failure rather than a valid empty membership is that a successful <code>getgrouplist(3)</code> <strong>cannot</strong> return an empty list:</p>
+<blockquote>
+<p>"mountd cannot send an empty list for a successful lookup, since getgrouplist(3) always includes at least the user's primary group, so a zero-group reply can only mean the lookup failed."</p>
+</blockquote>
+<p>The intended recovery path already exists. Recording the reply as a <strong>negative</strong> cache entry makes <code>unix_gid_find()</code> return <code>-ENOENT</code>, so <code>svcauth_unix_set_client()</code> keeps the groups the RPC credential already carries. Hamza presents that as the fallback promised by commit <code>3fc605a2aa38</code> ("knfsd: allow the server to provide a gid list when using AUTH_UNIX authentication") and as the same state <code>try_to_negate_entry()</code> already creates when no listener holds the channel open. The patch is tagged <code>Fixes: 3fc605a2aa38</code>.</p>
+<p>The change is seven added lines in <code>unix_gid_parse()</code>. Hamza notes it applies unmodified (fuzz 0) to every maintained stable tree from 5.10.y through 7.1.y, and was tested on a live 6.12-based server over NFSv3 and NFSv4.0–v4.2 with both <code>sec=sys</code> and <code>sec=krb5</code>.</p>
+<h2>Reproducer</h2>
+<p>The commit message includes a tight in-kernel reproducer for any server running <code>rpc.mountd --manage-gids</code>. User <code>alice</code> is a supplementary member of group <code>proj</code>; <code>/srv/proj</code> is <code>root:proj</code> mode 0750:</p>
+<pre><code>runuser -u alice -- cat /mnt/proj/data          # ok
+# the reply mountd sends when getpwuid()/getgrouplist() fail:
+echo "$(id -u alice) $(( $(date +%s) + 600 )) 0" \
+    &gt; /proc/net/rpc/auth.unix.gid/channel
+runuser -u alice -- cat /mnt/proj/data          # EACCES until
+                                                # refresh/flush/expiry
+</code></pre>
+<p>That is the client-visible symptom: a previously authorized NFS client (or local <code>runuser</code> over a mount) suddenly gets <code>EACCES</code> until the poisoned positive entry expires or is flushed, even after NSS has recovered.</p>
+<h2>Review: split the netlink twin</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/032eae35-e958-4c87-9185-3896250eb7e1@app.fastmail.com/">Chuck Lever</a> did not dispute the diagnosis or the channel-path fix. His only request was process and completeness:</p>
+<blockquote>
+<p>"Looks like the same bug exists for the new mountd netlink mechanism. Since that instance of the bug arrived in a different commit, that fix needs to be a separate patch with its own Fixes: tag."</p>
+<p>"Can you make this a two-patch series?"</p>
+</blockquote>
+<p>That is a stable-tree hygiene point: the classic <code>/proc/net/rpc/auth.unix.gid/channel</code> parser and the newer netlink unix_gid path landed in different commits, so they cannot share a single <code>Fixes:</code> tag even if the user-visible failure is the same.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/an966NrsO26fe8tm@hamza-PC/">Hamza</a> accepted immediately:</p>
+<blockquote>
+<p>"Sure, will send v2 with the netlink fix as a separate patch. Thanks for taking a look."</p>
+</blockquote>
+<h2>Conclusion this week</h2>
+<p>v1 is a narrowly scoped knfsd/sunrpc <strong>bug fix</strong>: empty <code>auth.unix.gid</code> replies must be negative cache entries so a failed mountd lookup does not wipe supplementary groups for AUTH_UNIX and RPCSEC_GSS clients. There was no disagreement on the semantics. The thread closed the same day with an agreement to respin as a two-patch series covering both the classic channel parser and the netlink path. Follow-on review of that v2 series (<code>[PATCH v2 0/2] sunrpc: don't strip a uid's groups when the mountd group lookup fails</code>) is a separate thread.</p>
+<p>NFS <strong>client</strong> code is not modified here; the client-visible impact is the spurious <code>EACCES</code> on group-restricted exports after a transient server-side NSS failure.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260814172507.1474519-1-ameer.hamza@truenas.com/">2026-08-14 Ameer Hamza <a href="mailto:ameer.hamza@truenas.com">ameer.hamza@truenas.com</a> — [PATCH] sunrpc: treat empty auth.unix.gid replies as negative entries</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/032eae35-e958-4c87-9185-3896250eb7e1@app.fastmail.com/">2026-08-14 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH] sunrpc: treat empty auth.unix.gid replies as negative entries</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/an966NrsO26fe8tm@hamza-PC/">2026-08-14 Ameer Hamza <a href="mailto:ameer.hamza@truenas.com">ameer.hamza@truenas.com</a> — Re: [PATCH] sunrpc: treat empty auth.unix.gid replies as negative entries</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>sunrpc: keep groups when mountd GID lookup fails</title>
+  <meta name="description" content="This week closed a long-standing NFS server authorization bug in the sunrpc auth.unix.gid cache: a transient name-service failure under rpc.mountd --manage-gids was being cached as a successful empty group list, stripping a UID of every…">
+  <meta property="og:title" content="sunrpc: keep groups when mountd GID lookup fails">
+  <meta property="og:description" content="This week closed a long-standing NFS server authorization bug in the sunrpc auth.unix.gid cache: a transient name-service failure under rpc.mountd --manage-gids was being cached as a successful empty group list, stripping a UID of every…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="sunrpc: keep groups when mountd GID lookup fails">
+  <meta name="twitter:description" content="This week closed a long-standing NFS server authorization bug in the sunrpc auth.unix.gid cache: a transient name-service failure under rpc.mountd --manage-gids was being cached as a successful empty group list, stripping a UID of every…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>sunrpc: keep groups when mountd GID lookup fails</h1>
+<h2>Summary</h2>
+<p>This week closed a long-standing NFS <em>server</em> authorization bug in the sunrpc <code>auth.unix.gid</code> cache: a transient name-service failure under <code>rpc.mountd --manage-gids</code> was being cached as a <em>successful</em> empty group list, stripping a UID of every supplementary group for the rest of mountd's TTL. The two-patch v2 series from Ameer Hamza (TrueNAS) was reviewed, Acked in spirit by Jeff Layton, and applied to <code>nfsd-testing</code> by Chuck Lever the same day.</p>
+<p>The work is a <strong>bug fix</strong>, not a protocol change and not a client-side feature. The client still sends the groups it thinks it has; the server was throwing them away. That matters for any NFSv3/v4 <code>sec=sys</code> or <code>sec=krb5</code> mount whose access depends on supplementary groups (project directories, shared homes, AD/winbind setups).</p>
+<h2>From v1: same bug, two transports</h2>
+<p>Hours earlier Hamza posted a single-patch v1 that only fixed the classic <code>/proc/net/rpc/auth.unix.gid/channel</code> parser. <a href="https://lore.kernel.org/linux-nfs/032eae35-e958-4c87-9185-3896250eb7e1@app.fastmail.com/">Chuck Lever asked</a> for a split:</p>
+<blockquote>
+<p>"Looks like the same bug exists for the new mountd netlink mechanism. Since that instance of the bug arrived in a different commit, that fix needs to be a separate patch with its own Fixes: tag."</p>
+</blockquote>
+<p>Hamza agreed and sent v2 the same evening.</p>
+<h2>The failure mode</h2>
+<p>On a server running <code>rpc.mountd --manage-gids</code>, a brief <code>getpwuid()</code> / <code>getgrouplist()</code> failure (winbind or sssd unreachable) makes mountd answer the <code>auth.unix.gid</code> upcall with <strong>zero groups</strong>. The kernel treated that as a valid positive cache entry. <code>svcauth_unix_set_client()</code> then replaced the RPC credential's group list with the empty one on every subsequent request — including RPCSEC_GSS via <code>svcauth_gss_set_client()</code>. <a href="https://lore.kernel.org/linux-nfs/20260814221953.108837-1-ameer.hamza@truenas.com/">Hamza's cover letter</a> put the blast radius plainly:</p>
+<blockquote>
+<p>"One failed lookup strips that uid of all supplementary groups on every export for up to mountd's configured TTL (30 minutes by default), long after the NSS backend has recovered."</p>
+</blockquote>
+<p>The semantic argument is that mountd <strong>cannot</strong> send an empty list for a successful lookup: <code>getgrouplist(3)</code> always includes at least the user's primary group, so a zero-group reply can only mean the lookup failed. Recording it as a negative entry makes <code>unix_gid_find()</code> return <code>-ENOENT</code>, and <code>svcauth_unix_set_client()</code> keeps the groups the RPC credential already carries — the fallback promised by commit <code>3fc605a2aa38</code> ("knfsd: allow the server to provide a gid list when using AUTH_UNIX authentication") and the same state <code>try_to_negate_entry()</code> already creates when no listener holds the channel open.</p>
+<p>The reproducer is a one-liner against the classic channel: after a successful <code>cat</code> of a <code>0750 root:proj</code> file as a user whose <em>supplementary</em> group is <code>proj</code>, injecting</p>
+<pre><code>echo "$(id -u alice) $(( $(date +%s) + 600 )) 0" &gt; /proc/net/rpc/auth.unix.gid/channel
+</code></pre>
+<p>turns the next access into <code>EACCES</code> until refresh, flush, or expiry.</p>
+<h2>Patch 1: classic <code>/proc</code> channel</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260814221953.108837-2-ameer.hamza@truenas.com/">Patch 1</a> (<code>sunrpc: treat empty auth.unix.gid replies as negative entries</code>) teaches <code>unix_gid_parse()</code> to install a <code>CACHE_NEGATIVE</code> entry when the reply carries zero groups. Seven lines in <code>net/sunrpc/svcauth_unix.c</code>. Hamza reported it tested on a live 6.12 server over NFSv3 and NFSv4.0–v4.2 with both <code>sec=sys</code> and <code>sec=krb5</code>, and said it applies unmodified (fuzz 0) to every maintained stable tree from 5.10.y through 7.1.y. Fixes tag: <code>3fc605a2aa38</code>.</p>
+<h2>Patch 2: netlink NEGATIVE flag</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260814221953.108837-3-ameer.hamza@truenas.com/">Patch 2</a> (<code>sunrpc: honor the netlink unix_gid NEGATIVE flag</code>) is the same defect on the newer netlink upcall. The protocol already has <code>SUNRPC_A_UNIX_GID_NEGATIVE</code> for failed lookups, and mountd sends it, but <code>sunrpc_nl_parse_one_unix_gid()</code> only allocated an empty group list without propagating the flag — so a flagged reply still became a <em>positive</em> empty entry. The two-line fix sets <code>CACHE_NEGATIVE</code> for flagged replies, matching the netlink <code>ip_map</code> path. An empty GIDS list <em>without</em> the flag remains a positive entry. Fixes tag: <code>0850e8603cd7</code> ("sunrpc: add netlink upcall for the auth.unix.gid cache"). Build- and static-checked (sparse, W=1) but not runtime-tested.</p>
+<h2>A leftover netlink-generation hole</h2>
+<p>While reviewing the netlink path, Hamza documented a related but separate issue: in steady-state netlink-only operation, mountd currently receives <strong>no</strong> <code>unix_gid</code> upcalls at all. <code>unix_gid_upcall()</code> still gates request generation on <code>cache_listeners_exist()</code>, which counts only classic-channel writers, and netlink-mode mountd opens no <code>/proc</code> channels. A flagged reply reaches the parser today only via the 30-second post-close grace window, a concurrent classic-channel writer, or a direct <code>SUNRPC_CMD_UNIX_GID_SET_REQS</code>. Patch 2 therefore fixes parser semantics <em>ahead</em> of that; making upcall generation netlink-aware needs a per-cache listener signal (mountd subscribes to the notification group even without <code>--manage-gids</code>) and was left for a separate, runtime-tested series.</p>
+<h2>Review and merge</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/3b34e782725fed9a661a4c77ab875f1bd755fcd8.camel@kernel.org/">Jeff Layton</a> asked whether that follow-up series was coming, then signed off:</p>
+<blockquote>
+<p>"Do you intend to send the separate series for this?"</p>
+<p>"Good catch. Both of these look good to me."</p>
+</blockquote>
+<p><a href="https://lore.kernel.org/linux-nfs/aoBb18TpdIe77NOI@hamza-PC/">Hamza declined for now</a>:</p>
+<blockquote>
+<p>"Not at the moment. I may take a look later if it is still open."</p>
+</blockquote>
+<p><a href="https://lore.kernel.org/linux-nfs/178681105303.93379.12774054259768112149.b4-ty@b4/">Chuck Lever applied both patches to nfsd-testing</a> the same afternoon:</p>
+<ul>
+<li>[1/2] <code>sunrpc: treat empty auth.unix.gid replies as negative entries</code> → <code>e865ae50d85a5585eb29cd67dfb0f776da1aa0c9</code></li>
+<li>[2/2] <code>sunrpc: honor the netlink unix_gid NEGATIVE flag</code> → <code>76427d869120552a1a82e1f1488d9f8311827d84</code></li>
+</ul>
+<h2>Client-facing takeaway</h2>
+<p>No NFS <em>client</em> code changes. The client impact is that group-based access on <code>--manage-gids</code> servers no longer collapses for half an hour after a brief NSS glitch: the server keeps the groups already on the RPC credential instead of replacing them with an empty list. Operators of AD/winbind/sssd NFS servers, and anyone exporting <code>0750</code> project trees keyed off supplementary groups, are the audience. The netlink upcall-generation gap remains open; until that follow-up lands, netlink-only mountd still may not <em>ask</em> for GID maps in the first place.</p>
+<p>Both patches carry <code>Assisted-by: Claude:claude-fable-5</code>.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260814221953.108837-1-ameer.hamza@truenas.com/">2026-08-14 Ameer Hamza <a href="mailto:ameer.hamza@truenas.com">ameer.hamza@truenas.com</a> — [PATCH v2 0/2] sunrpc: don't strip a uid's groups when the mountd group lookup fails</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260814221953.108837-2-ameer.hamza@truenas.com/">2026-08-14 Ameer Hamza <a href="mailto:ameer.hamza@truenas.com">ameer.hamza@truenas.com</a> — [PATCH v2 1/2] sunrpc: treat empty auth.unix.gid replies as negative entries</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260814221953.108837-3-ameer.hamza@truenas.com/">2026-08-14 Ameer Hamza <a href="mailto:ameer.hamza@truenas.com">ameer.hamza@truenas.com</a> — [PATCH v2 2/2] sunrpc: honor the netlink unix_gid NEGATIVE flag</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/3b34e782725fed9a661a4c77ab875f1bd755fcd8.camel@kernel.org/">2026-08-15 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v2 0/2] sunrpc: don't strip a uid's groups when the mountd group lookup fails</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aoBb18TpdIe77NOI@hamza-PC/">2026-08-15 Ameer Hamza <a href="mailto:ameer.hamza@truenas.com">ameer.hamza@truenas.com</a> — Re: [PATCH v2 0/2] sunrpc: don't strip a uid's groups when the mountd group lookup fails</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178681105303.93379.12774054259768112149.b4-ty@b4/">2026-08-15 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v2 0/2] sunrpc: don't strip a uid's groups when the mountd group lookup fails</a></li>
+</ul>
+  </main>
+</body>
+</html>

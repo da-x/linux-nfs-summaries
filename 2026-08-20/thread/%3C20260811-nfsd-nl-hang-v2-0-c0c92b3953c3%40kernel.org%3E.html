@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD netlink listeners: rpcbind registration to become non-fatal</title>
+  <meta name="description" content="This week&#39;s discussion on Jeff Layton&#39;s v2 hardening series for the NFSD netlink listener path closed the argument over partial rpcbind unwind and settled a mergeable policy: rpcbind registration failures will be treated as non-fatal for…">
+  <meta property="og:title" content="NFSD netlink listeners: rpcbind registration to become non-fatal">
+  <meta property="og:description" content="This week&#39;s discussion on Jeff Layton&#39;s v2 hardening series for the NFSD netlink listener path closed the argument over partial rpcbind unwind and settled a mergeable policy: rpcbind registration failures will be treated as non-fatal for…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSD netlink listeners: rpcbind registration to become non-fatal">
+  <meta name="twitter:description" content="This week&#39;s discussion on Jeff Layton&#39;s v2 hardening series for the NFSD netlink listener path closed the argument over partial rpcbind unwind and settled a mergeable policy: rpcbind registration failures will be treated as non-fatal for…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD netlink listeners: rpcbind registration to become non-fatal</h1>
+<h2>Summary</h2>
+<p>This week's discussion on Jeff Layton's v2 hardening series for the NFSD netlink listener path closed the argument over partial rpcbind unwind and settled a mergeable policy: <strong>rpcbind registration failures will be treated as non-fatal for NFSv2/v3</strong>, patch 4/8 will be dropped, and the remaining patches will be re-rolled around that change.</p>
+<p>This is a <strong>bug-fix / hardening</strong> series, not a protocol change. It targets <code>nfsd_nl_listener_set_doit()</code> stalls under <code>nfsd_mutex</code> that syzbot keeps hitting, plus leftover rpcbind mappings and a netns leak in the new selftests. The durable fix Layton still wants — asynchronous rpcbind RPCs so they no longer run under <code>nfsd_mutex</code> — remains a later patchset.</p>
+<h2>Prior week, briefly</h2>
+<p>On 11 August Layton posted <a href="https://lore.kernel.org/linux-nfs/20260811-nfsd-nl-hang-v2-0-c0c92b3953c3@kernel.org/">PATCH v2 0/8</a> ("nfsd/sunrpc: harden the netlink listener interfaces"). The series validates transport names before taking <code>nfsd_mutex</code>, caps <code>listener_set</code> at 1024 entries, keeps the first <code>svc_register()</code> error, unwinds partial rpcbind registrations, bounds the local rpcbind client to a 1s attempt, reports listener failures via extack, and adds nfsd selftests with a per-netns rpcbind stub.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260811-nfsd-nl-hang-v2-4-c0c92b3953c3@kernel.org/">Patch 4/8</a> was the new piece versus v1: if <code>svc_register()</code> fails after some <code>[program, version]</code> entries have already been set, unwind them, because the caller then tears the listener down while those mappings still point at a closed port. <code>XPT_RPCB_UNREG</code> is only set later in <code>svc_udp_init()</code>/<code>svc_tcp_init()</code>, so <code>svc_delete_xprt()</code> never runs on this path.</p>
+<p>Chuck Lever immediately objected. For an IPv4 listener the port-zero callback falls through <code>__svc_rpcb_register4()</code> to <code>rpcb_register()</code>, and <strong>PMAPPROC_UNSET ignores its protocol argument</strong>, so unwinding a partial TCP registration could also wipe mappings for existing listeners on other transports. "It might be that the best the kernel can do here is tear everything down if one registration fails," he wrote in <a href="https://lore.kernel.org/linux-nfs/e1706a70-d9f8-423e-9462-2d77b2e444b1@app.fastmail.com/">his 11 August review</a>.</p>
+<p>Layton then floated making rpcbind errors non-fatal — <code>pr_warn()</code> and leave cleanup to the admin — rather than blocking even longer to unregister. Lever replied that he had been thinking of a <strong>declarative administrative UI</strong>: if the kernel cannot apply the requested configuration, it should fail back to the previous one. He also suggested moving rpcbind registration into userspace after the kernel listener is up. That exchange closed last week without a decision.</p>
+<p>Separately, Lever flagged a <strong>netns leak</strong> in <a href="https://lore.kernel.org/linux-nfs/20260811-nfsd-nl-hang-v2-8-c0c92b3953c3@kernel.org/">patch 8/8</a>: the kselftest fixture leaves a live listener pinning the namespace. He suggested dropping any leftover serv from <code>FIXTURE_TEARDOWN()</code> via <code>listener_set(NULL, 0)</code> / <code>threads_set(0)</code>.</p>
+<h2>This week: policy, not more unwind code</h2>
+<p>On 14 August Layton <a href="https://lore.kernel.org/linux-nfs/a8f5840cf3f2cbf71de7a1f3957f70d9897adfa2.camel@kernel.org/">rejected both of Lever's alternatives as too large for this series</a>. A true fail-back-to-previous-config model is "possible, but difficult":</p>
+<blockquote>
+<p>"The original /proc interfaces were never this clean, so making the underlying bits behave this way for the netlink interfaces, but not the legacy /proc ones will be hard."</p>
+</blockquote>
+<p>The kernel also does not currently preserve the old listener table, which that model would require.</p>
+<p>Pushing rpcbind into userspace is likewise possible — a new boolean on the listener call meaning "don't do any rpcbind registration," then userspace registers if the kernel understands the flag — but:</p>
+<blockquote>
+<p>"That's a major undertaking though and I don't like fundamentally changing the interface here, particularly when we'll still have to cope with doing this from the kernel for legacy cases."</p>
+</blockquote>
+<p>He restated the non-fatal policy as the least-worst option:</p>
+<blockquote>
+<p>"I still think the best solution of all would be to just say 'henceforth, rpcbind registration is non-fatal'. That just leaves the kernel succeeding the listener set today when it would have failed before, but will still printk() an appropriate warning in that case, so the admin should be aware that rpcbind registration failed, even though the server is up."</p>
+</blockquote>
+<p>He asked Lever, plainly, what would make the series mergeable.</p>
+<h2>Conclusion: re-roll instructions</h2>
+<p>Lever <a href="https://lore.kernel.org/linux-nfs/a33c928b-d579-47c5-8a54-714277398f05@app.fastmail.com/">accepted the policy the same day</a>:</p>
+<blockquote>
+<p>"Fair enough, let's go with that."</p>
+</blockquote>
+<p>He then gave a concrete v3 punch list:</p>
+<ul>
+<li><strong>Keep</strong> patches 1, 2, 3 and 5 unchanged (transport-name validation, 1024-entry cap, first-error preservation in <code>svc_register()</code>, 1s local rpcbind timeout).</li>
+<li><strong>Drop</strong> patch 4/8 (the partial-registration unwind that collides with <code>PMAPPROC_UNSET</code>).</li>
+<li><strong>Make registration failure non-fatal for NFSv2 and NFSv3</strong>, as Layton proposed. That is the behavioural heart of the re-roll: today <code>nfsd_version3</code> does not set <code>vs_rpcb_optnl</code>, so a v3-enabled server with no reachable rpcbind fails to bring up any listener; after the change the listener stays up and the admin is warned. NFSv4 is already optional via <code>vs_rpcb_optnl</code>.</li>
+<li><strong>Extend the extack in patch 6/8</strong> so netlink can report a listener that came up <em>without</em> registering. <code>write_ports()</code> only has dmesg; Lever asked whether the netlink path can do better.</li>
+<li><strong>Fix the netns leak in patch 8/8.</strong></li>
+<li><strong>Move any test that asserts unwind or abort</strong> onto the new non-fatal failure policy (in particular <code>sem_register_refused</code>, which currently requires <code>-EACCES</code> and no leftover listener when the stub answers <code>RPCBPROC_SET</code> with FALSE).</li>
+</ul>
+<p>No v3 was posted in this window. The series remains aimed at v7.4. Client-side NFS is not touched; the user-visible change for administrators is that a v2/v3 nfsd listener will now come up even when local rpcbind is down or refuses SET, with a printk (and, on the netlink path, an extack) instead of aborting startup.</p>
+<p><strong>Status:</strong> design agreement, awaiting v3. Key remaining work is the non-fatal <code>svc_register()</code> policy, richer extack, the selftest netns teardown, and retargeting tests that currently require abort-on-rpcbind-failure.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/a8f5840cf3f2cbf71de7a1f3957f70d9897adfa2.camel@kernel.org/">2026-08-14 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v2 4/8] SUNRPC: undo partial rpcbind registrations when svc_register() fails</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/a33c928b-d579-47c5-8a54-714277398f05@app.fastmail.com/">2026-08-14 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v2 4/8] SUNRPC: undo partial rpcbind registrations when svc_register() fails</a></li>
+</ul>
+  </main>
+</body>
+</html>

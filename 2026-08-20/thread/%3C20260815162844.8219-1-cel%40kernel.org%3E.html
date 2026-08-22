@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SUNRPC rejects already-claimed sockets on NFSD portlist</title>
+  <meta name="description" content="This week Chuck Lever posted a tightly scoped bug fix for the NFSD/SUNRPC server socket path, closing a syzbot-triggered kernel stack overflow that could be provoked by handing the same file descriptor to /proc/fs/nfsd/portlist twice. The…">
+  <meta property="og:title" content="SUNRPC rejects already-claimed sockets on NFSD portlist">
+  <meta property="og:description" content="This week Chuck Lever posted a tightly scoped bug fix for the NFSD/SUNRPC server socket path, closing a syzbot-triggered kernel stack overflow that could be provoked by handing the same file descriptor to /proc/fs/nfsd/portlist twice. The…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="SUNRPC rejects already-claimed sockets on NFSD portlist">
+  <meta name="twitter:description" content="This week Chuck Lever posted a tightly scoped bug fix for the NFSD/SUNRPC server socket path, closing a syzbot-triggered kernel stack overflow that could be provoked by handing the same file descriptor to /proc/fs/nfsd/portlist twice. The…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>SUNRPC rejects already-claimed sockets on NFSD portlist</h1>
+<h2>Summary</h2>
+<p>This week Chuck Lever posted a tightly scoped <strong>bug fix</strong> for the NFSD/SUNRPC server socket path, closing a syzbot-triggered kernel stack overflow that could be provoked by handing the same file descriptor to <code>/proc/fs/nfsd/portlist</code> twice. The discussion stayed on the server side of SUNRPC (<code>net/sunrpc/svcsock.c</code> and <code>fs/nfsd/nfsctl.c</code>); there is no NFS client change in this thread. Jeff Layton reviewed the patch and flagged a changelog inaccuracy about which TCP callback actually recurses.</p>
+<h2>The failure: double-attach of <code>svc_sock</code></h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260815162844.8219-1-cel@kernel.org/">Lever’s v1 patch</a> explains that writing the same socket descriptor into <code>portlist</code> twice attaches a second <code>svc_sock</code> to one underlying socket. <code>svc_setup_socket()</code> first saves the socket’s existing callbacks, then installs SUNRPC’s own. On the second attach those “old” callbacks are already SUNRPC’s, so the new <code>svc_sock</code> records <code>svc_write_space()</code> as the previous <code>write_space</code> handler.</p>
+<p>For UDP that immediately detonates: <code>svc_udp_init()</code> calls <code>svc_sock_setbufsize()</code>, which invokes the saved write-space callback, and <code>svc_write_space()</code> then calls itself until the stack guard page is hit:</p>
+<blockquote>
+<p>"Writing the same socket descriptor to /proc/fs/nfsd/portlist twice attaches a second svc_sock to one socket. svc_setup_socket() saves the socket's callbacks before installing its own, so the second attach records svc_write_space() as the old write_space callback. svc_udp_init() invokes that callback by way of svc_sock_setbufsize(), and svc_write_space() then calls itself until the kernel stack is exhausted"</p>
+</blockquote>
+<p>The posted splat is a classic unbounded recursion:</p>
+<pre><code>BUG: TASK stack guard page was hit at ffffc900037d7ff8
+ svc_write_space+0x90/0x2b0 net/sunrpc/svcsock.c:429
+ svc_write_space+0xe6/0x2b0 net/sunrpc/svcsock.c:430
+ ... 700 more ...
+ svc_sock_setbufsize+0x18d/0x220 net/sunrpc/svcsock.c:386
+ svc_udp_init / svc_setup_socket / svc_addsock
+ __write_ports_addfd / write_ports / nfsctl_transaction_write
+</code></pre>
+<p>Lever notes the same chaining exists on TCP via saved <code>data_ready</code> / <code>state_change</code> callbacks, so a TCP descriptor added twice recurses on the next incoming segment rather than during setup. Reaching the path requires a writer on <code>portlist</code>; the nfsd filesystem does not set <code>FS_USERNS_MOUNT</code>, so the reproducer needs <code>CAP_SYS_ADMIN</code> in the initial user namespace. The report is credited to syzbot (<code>syzbot+54cdc566f64abf51b7f1@syzkaller.appspotmail.com</code>), with a <code>Fixes:</code> tag on <code>b41b66d63c73</code> (“knfsd: allow sockets to be passed to nfsd via 'portlist'”).</p>
+<h2>The fix: refuse sockets that already have <code>sk_user_data</code></h2>
+<p>The code change is three lines in <code>net/sunrpc/svcsock.c</code>: reject a socket that already carries <code>sk_user_data</code> before <code>svc_setup_socket()</code> claims it. Lever’s rationale is broader than the recursion itself. Because <code>svc_setup_socket()</code> overwrites that field unconditionally, NFSD would corrupt <em>any</em> socket another consumer had already claimed, even if the callbacks did not recurse:</p>
+<blockquote>
+<p>"Reject a socket that already carries sk_user_data. svc_setup_socket() overwrites that field unconditionally, so a socket some other consumer has claimed is one NFSD would corrupt whether or not the callbacks recurse."</p>
+</blockquote>
+<p>That is a defensive ownership check on the shared SUNRPC server socket layer used by NFSD when administrators inject listening (or datagram) sockets through <code>portlist</code>, rather than a protocol change or a new feature.</p>
+<h2>Review: ack on the code, pedantry on the TCP changelog</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/9223c486ff90585a56556d810901c2cbcec85bae.camel@kernel.org/">Jeff Layton</a> replied two days later with a Reviewed-by and an enthusiastic:</p>
+<blockquote>
+<p>"Nice catch!"</p>
+</blockquote>
+<p>He then relayed a changelog nit (attributed to Claude) about which TCP callbacks actually recurse. Lever’s cover letter named <code>svc_data_ready()</code> and <code>svc_tcp_state_change()</code>. Layton walks through <code>svc_tcp_init()</code> and points out that <code>write_ports</code> requires <code>listen(3)</code> for <code>SOCK_STREAM</code>, and for a listening socket <code>svc_tcp_init()</code> only replaces <code>sk_data_ready</code> with <code>svc_tcp_listen_data_ready</code>. <code>sk_state_change</code> and <code>sk_write_space</code> are left alone on a listener, so the second <code>svc_setup_socket()</code> saves <code>svc_tcp_listen_data_ready()</code> into <code>sk_odata</code>, and that is the function that chains into the saved callback:</p>
+<blockquote>
+<p>"sk_state_change and sk_write_space are left alone on a listener, so the second svc_setup_socket() saves svc_tcp_listen_data_ready() into sk_odata and the recursion runs there instead"</p>
+</blockquote>
+<p>The non-listen branch does install <code>svc_data_ready()</code> and <code>svc_tcp_state_change()</code>, but <code>svc_addsock()</code> only reaches it for a descriptor that is not listening, and <code>svc_tcp_init()</code> then immediately deferred-closes that transport unless the socket is already <code>TCP_SYN_RECV</code> or <code>TCP_ESTABLISHED</code>. Layton’s closing question:</p>
+<blockquote>
+<p>"Should the paragraph name svc_tcp_listen_data_ready() instead?"</p>
+</blockquote>
+<h2>Status this week</h2>
+<p>The thread is a <strong>server-side bug fix</strong>, not an NFS client change and not a protocol update. The technical argument for the code (refuse sockets that already have <code>sk_user_data</code>) was uncontested; the only follow-up is a request to name <code>svc_tcp_listen_data_ready()</code> in the changelog for the listening-TCP recursion path. No v2 appeared in this window, and there is no maintainer merge ack yet beyond Layton’s <code>Reviewed-by</code>.</p>
+<p>For NFS client readers the takeaway is indirect: the defect lives entirely in NFSD’s <code>portlist</code> socket-injection path and the shared SUNRPC <code>svc_sock</code> setup, so client RPC/transport code is unaffected. The interesting server lesson is that callback-save/restore in <code>svc_setup_socket()</code> is not idempotent, and <code>sk_user_data</code> is the right ownership bit to fail closed on before NFSD overwrites another consumer’s socket.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260815162844.8219-1-cel@kernel.org/">2026-08-15 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v1] SUNRPC: Reject a socket that already has an svc_sock attached</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/9223c486ff90585a56556d810901c2cbcec85bae.camel@kernel.org/">2026-08-17 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v1] SUNRPC: Reject a socket that already has an svc_sock attached</a></li>
+</ul>
+  </main>
+</body>
+</html>

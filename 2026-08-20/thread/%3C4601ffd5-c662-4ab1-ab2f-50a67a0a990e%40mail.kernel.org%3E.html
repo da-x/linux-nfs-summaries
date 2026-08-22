@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>syzbot AI patch for nfsd listener hang; Layton points to rpcbind</title>
+  <meta name="description" content="On Thursday, 20 August, syzbot posted an AI-generated patch from Slawomir Stepien titled [PATCH] nfsd: prevent hung task in nfsd_nl_listener_set_doit(). Hours later Jeff Layton declined the diagnosis, pointed at his already-posted…">
+  <meta property="og:title" content="syzbot AI patch for nfsd listener hang; Layton points to rpcbind">
+  <meta property="og:description" content="On Thursday, 20 August, syzbot posted an AI-generated patch from Slawomir Stepien titled [PATCH] nfsd: prevent hung task in nfsd_nl_listener_set_doit(). Hours later Jeff Layton declined the diagnosis, pointed at his already-posted…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="syzbot AI patch for nfsd listener hang; Layton points to rpcbind">
+  <meta name="twitter:description" content="On Thursday, 20 August, syzbot posted an AI-generated patch from Slawomir Stepien titled [PATCH] nfsd: prevent hung task in nfsd_nl_listener_set_doit(). Hours later Jeff Layton declined the diagnosis, pointed at his already-posted…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>syzbot AI patch for nfsd listener hang; Layton points to rpcbind</h1>
+<h2>Summary</h2>
+<h1>syzbot AI patch for <code>nfsd_nl_listener_set_doit</code> hang — maintainers already have a better diagnosis</h1>
+<h2>Summary</h2>
+<p>On Thursday, 20 August, syzbot <a href="https://lore.kernel.org/linux-nfs/4601ffd5-c662-4ab1-ab2f-50a67a0a990e@mail.kernel.org/">posted</a> an AI-generated patch from Slawomir Stepien titled <code>[PATCH] nfsd: prevent hung task in nfsd_nl_listener_set_doit()</code>. Hours later <a href="https://lore.kernel.org/linux-nfs/699bacb503758fbe2ebf01f3e8aca95e3eee4128.camel@kernel.org/">Jeff Layton</a> declined the diagnosis, pointed at his already-posted hardening series, and restated the real stall: <strong>synchronous rpcbind registration under <code>nfsd_mutex</code></strong>, not <code>request_module()</code>.</p>
+<p>This is a <strong>bug-fix / hardening</strong> discussion, not a protocol change and not a new feature. The hang lives in the NFS <strong>server</strong> generic-netlink control plane (<code>nfsd_nl_listener_set_doit()</code> in <code>fs/nfsd/nfsctl.c</code>), but it is the same lock that serializes every nfsd admin op — including the ones that bring listeners up for <strong>clients</strong>. The thread is new this week; it is the syzbot-AI follow-up to the July hung-task reports and to Layton’s in-flight <a href="https://lore.kernel.org/linux-nfs/20260811-nfsd-nl-hang-v2-0-c0c92b3953c3@kernel.org/">nfsd-nl-hang v2 series</a>.</p>
+<h2>The proposed patch</h2>
+<p>syzbot’s cover letter (signed off by Stepien, <code>Assisted-by: Gemini:gemini-3.6-flash Gemini:gemini-3.1-pro-preview syzbot</code>) describes an unbounded loop over <code>NFSD_A_SERVER_SOCK_ADDR</code> attributes in <code>nfsd_nl_listener_set_doit()</code>. For each attribute the kernel calls <code>svc_xprt_create_from_sa()</code>, which “may synchronously invoke <code>request_module()</code> to load the corresponding transport module.” A large batch of invalid transport names, the letter argues, turns that into a long sequential module-load storm <strong>while holding the global <code>nfsd_mutex</code></strong>, so a concurrent <code>nfsd_nl_version_get_doit</code> trips the hung-task watchdog:</p>
+<blockquote>
+<p>"If a user provides a large number of invalid transport names, <code>request_module()</code> is called sequentially for each, taking a massive amount of time. Since this entire process occurs while holding the global <code>nfsd_mutex</code>, it blocks other tasks attempting to acquire the mutex and triggers a hung task timeout."</p>
+</blockquote>
+<p>The dump matches the July reports: the waiter is another nfsd netlink <code>doit</code> (<code>nfsd_nl_version_get_doit</code> at <code>nfsctl.c:1889</code>); the holder is <code>nfsd_nl_listener_set_doit</code> at <code>nfsctl.c:1964</code>, with <code>cb_lock</code> and <code>nfsd_mutex</code> taken. The letter also notes two extra defects: the loop does not break when <code>svc_xprt_create_from_sa()</code> fails, and <code>svc_find_listener()</code> walks <code>serv-&gt;sv_permsocks</code> per attribute, giving O(N²) cost.</p>
+<p>The proposed fix is small and defensive:</p>
+<ul>
+<li>A <strong>hard cap of 128</strong> <code>NFSD_A_SERVER_SOCK_ADDR</code> attributes per netlink message, enforced <strong>before</strong> taking <code>nfsd_mutex</code>.</li>
+<li><strong>Break the loop</strong> on the first listener-creation failure, so invalid configs do not keep calling <code>request_module()</code>.</li>
+</ul>
+<p><code>Fixes: 16a471177496 ("NFSD: add listener-{set,get} netlink command")</code>. The patch is tagged as an AI-generated syzbot submission; the signer is expected to take review comments.</p>
+<h2>Layton: the LLM got the wrong slow path</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/699bacb503758fbe2ebf01f3e8aca95e3eee4128.camel@kernel.org/">Layton</a> replied the same morning. He had already run an LLM over the same dump and it produced the same <code>request_module()</code> story — and he says that story is wrong:</p>
+<blockquote>
+<p>"My LLM latched onto the same explanation, but the request module upcalls are actually quite quick and have some other gates on them that make this problem hard to hit in practice."</p>
+</blockquote>
+<p>The stall that actually trips the watchdog is <strong>rpcbind registration</strong>, which can sit in a local <code>rpc_ping</code> for tens of seconds per listener when rpcbind is down or slow. That is the diagnosis he and Neil Brown reached in July on the <code>nfsd_nl_cache_flush_doit</code> hang, and it is what his v2 series is already hardening around (transport-name validation before the mutex, a 1024-entry cap, a 1s local rpcbind timeout, first-error preservation, extack). The durable fix is still larger:</p>
+<blockquote>
+<p>"The real problem is rpcbind registration, which can be quite slow. The fix for that is to make the registration asynchronous, and to not trigger errors on rpcbind registration failure. That's a bigger project, but let us know if you're interested!"</p>
+</blockquote>
+<p>He then pointed Stepien/syzbot at the series that already contains “a similar fix to this one, along with some others”:</p>
+<blockquote>
+<p>"In any case, I've sent a series that includes a similar fix to this one, along with some others: https://lore.kernel.org/linux-nfs/20260811-nfsd-nl-hang-v2-0-c0c92b3953c3@kernel.org/"</p>
+</blockquote>
+<blockquote>
+<p>"I'll try to get the follow-on series out later today or tomorrow."</p>
+</blockquote>
+<p>The message trails off mid-sentence (“I have a patch series in progress for this already, which also”) — likely a leftover from an earlier draft — but the intent is clear: <strong>do not take the 128-cap / break-on-error AI patch as the merge candidate</strong>. A cap is useful (Layton’s own series uses 1024, not 128), and breaking on first create failure is reasonable hygiene, but they do not address the slow path that actually holds <code>nfsd_mutex</code>.</p>
+<h2>How this sits next to the in-flight hang series</h2>
+<p>Earlier this week, on the overlapping <a href="https://lore.kernel.org/linux-nfs/20260811-nfsd-nl-hang-v2-0-c0c92b3953c3@kernel.org/">nfsd-nl-hang v2 thread</a>, Chuck Lever accepted Layton’s policy that <strong>rpcbind registration failure becomes non-fatal for NFSv2/v3</strong>, patch 4/8 (partial rpcbind unwind) is dropped, and v3 will re-roll around that plus a netns leak fix in the new selftests. That series is the real vehicle for the cap, the pre-mutex transport-name check, the 1s rpcbind timeout, and richer netlink extack. The durable work Layton flags here — <strong>asynchronous rpcbind so it no longer runs under <code>nfsd_mutex</code></strong> — remains a follow-on, which he now says he hopes to post within a day.</p>
+<p>syzbot’s 128-entry cap is therefore both <strong>redundant with and stricter than</strong> patch 2 of that series (1024). The “break on first <code>svc_xprt_create_from_sa()</code> failure” change is not the same as the series’ “keep the first <code>svc_register()</code> error” work: one stops creating more sockets after a bind/module failure; the other is about rpcbind SET failing after some programs have already registered. Layton’s “similar fix” remark almost certainly refers to the cap / pre-mutex validation, not to the AI patch’s <code>request_module()</code> theory.</p>
+<h2>NFS client relevance</h2>
+<p>No NFS <strong>client</strong> code is patched here, but the hang is client-visible in two ways:</p>
+<ol>
+<li><strong>Control-plane stall.</strong> While <code>listener_set</code> holds <code>nfsd_mutex</code>, every other nfsd netlink and <code>/proc/fs/nfsd</code> write blocks — versions, threads, exports, cache flush. New clients cannot get a listener, and admin ops that clients depend on for mount (export refresh, thread count) sit in D state until the hung-task watchdog fires.</li>
+<li><strong>rpcbind is how NFSv2/v3 clients find the server.</strong> The slow path Layton names is the kernel registering <code>[program, version, proto, port]</code> with local rpcbind on behalf of those clients. Making that registration asynchronous and non-fatal (the follow-on he is promising) means a v2/v3 listener can come up even when rpcbind is down; clients then fail at mount/<code>getport</code> until the admin notices the printk/extack, rather than the whole nfsd control plane hanging.</li>
+</ol>
+<p>NFSv4 clients, which do not use rpcbind, still suffer the first failure mode: a wedged <code>nfsd_mutex</code> delays listener bring-up and any netlink-driven export or thread change.</p>
+<h2>Status</h2>
+<ul>
+<li><strong>Type:</strong> server-side hung-task / DoS hardening around <code>nfsd_nl_listener_set_doit()</code>.</li>
+<li><strong>This week’s outcome:</strong> the AI patch is <strong>not accepted as-is</strong>. Layton rejects the <code>request_module()</code> root cause, confirms a cap is already in his v2 series, and points the authors at that series plus a follow-on for async, non-fatal rpcbind.</li>
+<li><strong>No Fixes: applied, no Acked-by, no v2 of the syzbot patch.</strong> The merge path remains Layton’s nfsd-nl-hang series (v3 pending from the parallel thread) and the async-rpcbind follow-on he said he would try to post later the same day or the next.</li>
+</ul>
+<h2>Key messages</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/4601ffd5-c662-4ab1-ab2f-50a67a0a990e@mail.kernel.org/">syzbot / Slawomir Stepien — AI patch: cap listeners at 128, break on create failure</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/699bacb503758fbe2ebf01f3e8aca95e3eee4128.camel@kernel.org/">Jeff Layton — <code>request_module()</code> is not the stall; rpcbind is; series already posted</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/4601ffd5-c662-4ab1-ab2f-50a67a0a990e@mail.kernel.org/">2026-08-20 "syzbot" <a href="mailto:syzbot@kernel.org">syzbot@kernel.org</a> — [PATCH] nfsd: prevent hung task in nfsd_nl_listener_set_doit()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/699bacb503758fbe2ebf01f3e8aca95e3eee4128.camel@kernel.org/">2026-08-20 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH] nfsd: prevent hung task in nfsd_nl_listener_set_doit()</a></li>
+</ul>
+  </main>
+</body>
+</html>

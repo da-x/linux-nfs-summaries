@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD: Fail truncated pool_threads reads</title>
+  <meta name="description" content="This week Chuck Lever posted a one-patch NFSD bug fix for a silent truncation in the pool_threads nfsctl reply. There were no replies on this thread in the week ending 2026-08-20. The change is server-side (fs/nfsd/nfsctl.c); it is not an…">
+  <meta property="og:title" content="NFSD: Fail truncated pool_threads reads">
+  <meta property="og:description" content="This week Chuck Lever posted a one-patch NFSD bug fix for a silent truncation in the pool_threads nfsctl reply. There were no replies on this thread in the week ending 2026-08-20. The change is server-side (fs/nfsd/nfsctl.c); it is not an…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSD: Fail truncated pool_threads reads">
+  <meta name="twitter:description" content="This week Chuck Lever posted a one-patch NFSD bug fix for a silent truncation in the pool_threads nfsctl reply. There were no replies on this thread in the week ending 2026-08-20. The change is server-side (fs/nfsd/nfsctl.c); it is not an…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD: Fail truncated pool_threads reads</h1>
+<h2>Summary</h2>
+<h1>NFSD: Fail a pool_threads read whose reply does not fit</h1>
+<p>This week Chuck Lever posted a one-patch <a href="https://lore.kernel.org/linux-nfs/20260816174154.1442685-1-cel@kernel.org/">NFSD bug fix</a> for a silent truncation in the <code>pool_threads</code> nfsctl reply. There were no replies on this thread in the week ending 2026-08-20. The change is server-side (<code>fs/nfsd/nfsctl.c</code>); it is not an NFS client or protocol change.</p>
+<h2>The bug</h2>
+<p><code>write_pool_threads()</code> (the nfsctl handler that both writes and then reports per-pool thread counts) formats that list into a buffer capped at <code>SIMPLE_TRANSACTION_LIMIT</code> bytes. The existing code used <code>snprintf()</code> and then <code>strlen()</code> to size the reply. <a href="https://lore.kernel.org/linux-nfs/20260816174154.1442685-1-cel@kernel.org/">Lever</a> described the failure mode:</p>
+<blockquote>
+<p>"snprintf() truncates its last write and strlen() measures only what fit, so a reply too long for that buffer ends mid-number with no terminating newline. A pool running 4096 threads is reported as 40. Nothing marks the reply as incomplete, so an administrator reads a plausible but wrong count."</p>
+</blockquote>
+<p>That is the operational hazard: a truncated integer still looks like a valid thread count. An admin reading <code>/proc/fs/nfsd/pool_threads</code> (or the equivalent nfsctl transaction) can act on a number that is simply the leading digits of the real value.</p>
+<p>The patch tags <code>Fixes: eed2965af1ba ("[PATCH] knfsd: allow admin to set nthreads per node")</code>, the 2006 change that first allowed per-node/per-pool thread counts. Suggested-by credit goes to David Laight, with a link to his earlier overflow analysis.</p>
+<h2>The fix</h2>
+<p>Rather than trusting <code>strlen()</code> on the truncated buffer, Lever takes <code>snprintf()</code>'s return value, which reports how many bytes <em>would</em> have been written. If that exceeds remaining space, the read fails with <code>-ENAMETOOLONG</code>. He notes that this is already the errno <code>svc_one_xprt_name()</code> returns for the same "reply does not fit" condition, so the nfsctl interface stays consistent with other NFSD name/list formatters.</p>
+<p>The diff is small: 8 insertions, 4 deletions in <code>fs/nfsd/nfsctl.c</code>. Behavior on the success path is unchanged; only an oversized per-pool list becomes an explicit error instead of a quietly chopped number.</p>
+<h2>How this relates to the overflow thread</h2>
+<p>The week before, <a href="https://lore.kernel.org/linux-nfs/20260812193349.13347-1-david.laight.linux@gmail.com/">Laight posted</a> <code>[PATCH net-next] fs: nfsd: Fix buffer overflow in write_pool_threads()</code>, arguing that a failed overflow check could let the formatter write past the end of the almost-page-sized buffer. After reviewing that, Lever concluded the real user-visible defect was truncation, not a write past the buffer, and posted this v1 as the corrective patch. In the related thread he wrote that he had "convinced himself that the actual problem is the truncation" and that "the buffer overflow cannot occur."</p>
+<p>This thread itself did not pick up that debate. No Acked-by, Reviewed-by, or follow-up v2 appeared here before the week closed.</p>
+<h2>Classification and client impact</h2>
+<ul>
+<li><strong>Type:</strong> bug fix (silent truncation of an admin-visible NFSD control reply), not a new feature and not a protocol change.</li>
+<li><strong>Subsystem:</strong> NFSD nfsctl (<code>pool_threads</code>), server-side only.</li>
+<li><strong>NFS client:</strong> none. Client mount, I/O, and recovery paths are untouched. The only user-facing effect is that operators (and any tooling that reads <code>pool_threads</code>) will get <code>-ENAMETOOLONG</code> instead of a plausible but wrong thread count when the formatted list no longer fits in <code>SIMPLE_TRANSACTION_LIMIT</code>.</li>
+</ul>
+<p>Until reviewers comment, the open question is simply whether failing the read is the preferred policy versus enlarging or chunking the reply. Lever's rationale is that an incomplete number with no truncation marker is worse than an error, and that NFSD already uses <code>-ENAMETOOLONG</code> for the analogous case.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260816174154.1442685-1-cel@kernel.org/">2026-08-16 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v1] NFSD: Fail a pool_threads read whose reply does not fit</a></li>
+</ul>
+  </main>
+</body>
+</html>

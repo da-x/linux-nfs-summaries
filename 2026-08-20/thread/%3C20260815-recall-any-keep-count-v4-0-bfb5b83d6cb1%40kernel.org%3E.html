@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD v4 keep-count series draws a 5.10 backport request</title>
+  <meta name="description" content="Chuck Lever posted v4 of &quot;NFSD: CB_RECALL_ANY fixes and a meaningful keep count&quot; on 15 August, carrying Jeff Layton&#39;s Reviewed-by on all eight patches and a one-line v4 delta: avoid a divide-by-zero when max_delegations is zero. The series…">
+  <meta property="og:title" content="NFSD v4 keep-count series draws a 5.10 backport request">
+  <meta property="og:description" content="Chuck Lever posted v4 of &quot;NFSD: CB_RECALL_ANY fixes and a meaningful keep count&quot; on 15 August, carrying Jeff Layton&#39;s Reviewed-by on all eight patches and a one-line v4 delta: avoid a divide-by-zero when max_delegations is zero. The series…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSD v4 keep-count series draws a 5.10 backport request">
+  <meta name="twitter:description" content="Chuck Lever posted v4 of &quot;NFSD: CB_RECALL_ANY fixes and a meaningful keep count&quot; on 15 August, carrying Jeff Layton&#39;s Reviewed-by on all eight patches and a one-line v4 delta: avoid a divide-by-zero when max_delegations is zero. The series…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD v4 keep-count series draws a 5.10 backport request</h1>
+<h2>Summary</h2>
+<p>Chuck Lever posted <a href="https://lore.kernel.org/linux-nfs/20260815-recall-any-keep-count-v4-0-bfb5b83d6cb1@kernel.org/">v4 of "NFSD: CB_RECALL_ANY fixes and a meaningful keep count"</a> on 15 August, carrying Jeff Layton's <code>Reviewed-by</code> on all eight patches and a one-line v4 delta: avoid a divide-by-zero when <code>max_delegations</code> is zero. The series is a <strong>bug-fix plus protocol-usage correction</strong>, not a protocol change. Two <code>Fixes:</code> tags still point at <code>44df6f439a17</code> ("NFSD: add delegation reaper to react to low memory condition"). The only new debate this week is whether the keep-count fix belongs on stable kernels back to 5.10, and whether clients that dump every delegation on a zero keep count are conforming or defective.</p>
+<h2>Why the keep count matters to clients</h2>
+<p>The cover letter restates the problem that Linux-on-Linux testing has been hiding. NFSD currently sends every <code>CB_RECALL_ANY</code> with <code>craa_objects_to_keep</code> set to zero. RFC 8881 §20.6.3 defines that field as the number of recallable objects the client may retain, so zero is a request to return <em>every</em> delegation, including ones backing still-open files.</p>
+<blockquote>
+<p>"NFSD currently sends every CB_RECALL_ANY with craa_objects_to_keep set to zero, as RFC 8881 Section 20.6.3 does not mandate any particular way for a client to choose which delegations to return, if any."</p>
+</blockquote>
+<p>The Linux NFS client has been masking the bug. Lever notes that "only the Linux NFS client has been deeply tested against" NFSD's <code>CB_RECALL_ANY</code>, and that implementation "ignores the craa_objects_to_keep value and returns only one unused delegation of the named types." A zero keep count therefore never produced visible misbehavior in Linux-on-Linux testing. Non-Linux clients that honor the field would dump their working set on the first hint of server memory pressure:</p>
+<blockquote>
+<p>"a zero value can result in non-Linux clients giving back more delegations than is necessary to relieve temporary memory pressure on the server, which needlessly punctures the clients' delegation working set."</p>
+</blockquote>
+<p>The series therefore changes NFSD so each <code>CB_RECALL_ANY</code> asks a client to give up a sensible number of delegations instead of all of them at once. The shrinker split in patches 5–8 exists so that keep count can be a real fraction of each client's holdings rather than a constant.</p>
+<h2>Client-visible bug fixes (patches 1–4)</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260815-recall-any-keep-count-v4-1-bfb5b83d6cb1@kernel.org/">Patch 1</a> stops <code>deleg_reaper()</code> from sending <code>CB_RECALL_ANY</code> to NFSv4.0 clients. That operation is NFSv4.1-only; a v4.0 callback service accepts only <code>CB_GETATTR</code> and <code>CB_RECALL</code>, so it replies <code>OP_ILLEGAL</code>. The decoder maps the unexpected opnum to <code>-EIO</code>, <code>nfsd4_cb_done()</code> marks the callback channel down, and nothing brings it back — <code>nfsd4_run_cb_work()</code> only sets <code>NFSD4_CB_UP</code> for minor version &gt; 0, and the only <code>nfsd4_probe_callback()</code> a v4.0 client reaches is <code>nfsd4_setclientid_confirm()</code>. One visit from the reaper therefore leaves <code>RENEW</code> returning <code>NFS4ERR_CB_PATH_DOWN</code> for as long as the client holds delegations, and <code>nfsd4_cb_channel_good()</code> refuses to grant any more. Skip clients at minor version zero.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260815-recall-any-keep-count-v4-2-bfb5b83d6cb1@kernel.org/">Patch 2</a> adds <code>cl_deleg_count</code> on <code>struct nfs4_client</code>, maintained under <code>nn-&gt;deleg_lock</code> at the two sites that mutate <code>cl_delegations</code>. The reaper walks <code>nn-&gt;client_lru</code> under <code>nn-&gt;client_lock</code> and cannot take <code>nn-&gt;deleg_lock</code> to count the list; readers that hold only <code>client_lock</code> must treat the counter as a <code>data_race()</code>. No functional change on its own, but it is the input to the keep count.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260815-recall-any-keep-count-v4-3-bfb5b83d6cb1@kernel.org/">Patch 3</a> adds <code>RCA4_TYPE_MASK_DIR_DLG</code> to <code>craa_type_mask</code>. RFC 8881 §20.6.3 distinguishes servers that share one pool among all recallable-object classes from those that keep per-class pools; NFSD is the former. Directory delegations already go through <code>__alloc_init_deleg()</code>, count against <code>max_delegations</code>, and are reclaimed by the shrinker, but the type mask never named them. Clients that implement directory delegations would otherwise skip them when choosing what to return.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260815-recall-any-keep-count-v4-4-bfb5b83d6cb1@kernel.org/">Patch 4</a> is the keep-count change itself, also tagged against <code>44df6f439a17</code>. Instead of zero, <code>deleg_reaper()</code> derives <code>craa_objects_to_keep</code> from <code>cl_deleg_count</code> so each callback asks the client to give up one delegation. Both the shrinker and the laundromat re-arm while the condition lasts, so a client with more to spare is asked again on the next pass. Lever is explicit that this is a no-op for Linux:</p>
+<blockquote>
+<p>"The Linux client ignores craa_objects_to_keep and returns unused delegations selected from the type mask alone, so the count changes nothing for it."</p>
+</blockquote>
+<p>The audience is every other NFSv4.1 client that actually reads the field.</p>
+<h2>Shrinker accounting so the keep count is not a lie (patches 5–8)</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260815-recall-any-keep-count-v4-5-bfb5b83d6cb1@kernel.org/">Patch 5</a> counts delegations per network namespace. The state shrinker is allocated per netns, but <code>nfsd4_state_shrinker_count()</code> was reporting host-wide <code>num_delegations</code>, so reclaim saw the population multiplied by the number of namespaces and a namespace holding nothing still queued its reaper. <code>num_delegations</code> remains the host-wide admission/ceiling check against <code>max_delegations</code>.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260815-recall-any-keep-count-v4-6-bfb5b83d6cb1@kernel.org/">Patch 6</a> splits <code>nfsd_client_shrinker</code> into two. Courtesy-client reclaim is synchronous and deadlock-free; the shrinker can report a precise count of objects released. Delegation reclaim only sends <code>CB_RECALL_ANY</code> — clients are not obligated to return anything — so the callback cannot report progress. Worse, the combined shrinker fell back to delegation reaping only when no courtesy clients remained, so a single courtesy client kept a namespace's delegations out of the count.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260815-recall-any-keep-count-v4-7-bfb5b83d6cb1@kernel.org/">Patch 7</a> records scan requests instead of discarding them with <code>SHRINK_STOP</code>. Courtesy scans accumulate in <code>nfsd_shrink_backlog</code> and are subtracted from the count until <code>courtesy_client_reaper()</code> runs. Delegations use a time bound: they are reported only once <code>NFSD_RECALL_ANY_COOLDOWN_SECS</code> have passed since the last sweep, matching <code>deleg_reaper()</code>'s skip of any client recalled inside that window.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260815-recall-any-keep-count-v4-8-bfb5b83d6cb1@kernel.org/">Patch 8</a> is the client-facing payoff of that accounting. <code>deleg_reaper()</code> had been asking every eligible client for one delegation whenever it ran, "whether or not anything needs the memory." A delegation returned before it is needed costs the client an OPEN on the next touch. The scan callback now records <code>nr_to_scan</code> in <code>nfsd_deleg_backlog</code> and scales that total by each client's share of <code>nn-&gt;nfsd_delegations</code>. Nothing is recalled until a scan arrives, except <code>nfs4_laundromat()</code>, which has no scan request and instead computes what must go for <code>num_delegations</code> to fall below <code>max_delegations</code>, then passes only this namespace's share. The v4 changelog's divide-by-zero guard is for the case where <code>max_delegations</code> is zero in that apportionment.</p>
+<h2>Backport request, and a client-bug diagnosis</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/CALXu0Udh--HV_H-90PxVzGA8vuP-u54fkwsqkf0_gkDnEg_C6w@mail.gmail.com/">Cedric Blancher</a> added a <code>Reviewed-by</code> on patch 4 and asked for a deep stable backport:</p>
+<blockquote>
+<p>"Could you please backport this to the stable branches up to Linux 5.10, because conforming NFSv4.1 clients get robbed of all their delegations if craa_objects_to_keep=0."</p>
+</blockquote>
+<p><a href="https://lore.kernel.org/linux-nfs/f2745695-328f-45ab-88d9-eb1d102066cd@app.fastmail.com/">Lever declined</a> on two independent grounds. First, the series simply does not apply that far:</p>
+<blockquote>
+<p>"v6.18 is as far back as this series can apply with reasonable effort."</p>
+</blockquote>
+<p>Second, he rejected the premise that a zero keep count "robs" a conforming client. RFC 8881 §20.6.3 leaves the choice of <em>which</em> and <em>how many</em> delegations to return with the client:</p>
+<blockquote>
+<p>"What you are describing is a client bug. RFC 8881 Section 20.6.3 says clients get to choose which and how many delegations to return in response to a CB_RECALL_ANY request."</p>
+</blockquote>
+<p>And, more sharply:</p>
+<blockquote>
+<p>"clients that respond to CB_RECALL_ANY by returning all delegations unconditionally are not conformant, but are defective and should be fixed."</p>
+</blockquote>
+<p>That is the week's client-development takeaway. Linux already ignores <code>craa_objects_to_keep</code> and returns a single unused delegation of the named types, so the keep-count change is a no-op for it; the NFSv4.0 skip in patch 1 is the Linux-client-visible bug fix (callback channel no longer permanently marked down). Non-Linux clients that treat a zero keep count as "return everything" are, in Lever's reading, the ones that need to change. The series still stops advertising zero so those clients are not provoked, but the server will not paper over that behavior on kernels older than 6.18.</p>
+<p>v4 itself is already superseded: Lever posted v5 two days later (tracked separately) with further shrinker-accounting tweaks — exclude skipped clients from the apportionment divisor, skip clients whose <code>CB_RECALL_ANY</code> is still running, and discount the delegation shrinker's count by pending requests. This v4 thread ends on the stable-backport exchange.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260815-recall-any-keep-count-v4-0-bfb5b83d6cb1@kernel.org/">2026-08-15 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v4 0/8] NFSD: CB_RECALL_ANY fixes and a meaningful keep count</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260815-recall-any-keep-count-v4-1-bfb5b83d6cb1@kernel.org/">2026-08-15 Chuck Lever — [PATCH v4 1/8] NFSD: Do not send CB_RECALL_ANY to NFSv4.0 clients</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260815-recall-any-keep-count-v4-2-bfb5b83d6cb1@kernel.org/">2026-08-15 Chuck Lever — [PATCH v4 2/8] NFSD: Count the delegations held by each client</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260815-recall-any-keep-count-v4-3-bfb5b83d6cb1@kernel.org/">2026-08-15 Chuck Lever — [PATCH v4 3/8] NFSD: Name directory delegations in the CB_RECALL_ANY type mask</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260815-recall-any-keep-count-v4-4-bfb5b83d6cb1@kernel.org/">2026-08-15 Chuck Lever — [PATCH v4 4/8] NFSD: Send a meaningful CB_RECALL_ANY keep count</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260815-recall-any-keep-count-v4-5-bfb5b83d6cb1@kernel.org/">2026-08-15 Chuck Lever — [PATCH v4 5/8] NFSD: Count delegations per network namespace</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260815-recall-any-keep-count-v4-6-bfb5b83d6cb1@kernel.org/">2026-08-15 Chuck Lever — [PATCH v4 6/8] NFSD: Give delegations their own state shrinker</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260815-recall-any-keep-count-v4-7-bfb5b83d6cb1@kernel.org/">2026-08-15 Chuck Lever — [PATCH v4 7/8] NFSD: Pace the state shrinker's scan requests</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260815-recall-any-keep-count-v4-8-bfb5b83d6cb1@kernel.org/">2026-08-15 Chuck Lever — [PATCH v4 8/8] NFSD: Apportion CB_RECALL_ANY recalls among clients</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CALXu0Udh--HV_H-90PxVzGA8vuP-u54fkwsqkf0_gkDnEg_C6w@mail.gmail.com/">2026-08-16 Cedric Blancher <a href="mailto:cedric.blancher@gmail.com">cedric.blancher@gmail.com</a> — Re: [PATCH v4 4/8] NFSD: Send a meaningful CB_RECALL_ANY keep count</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/f2745695-328f-45ab-88d9-eb1d102066cd@app.fastmail.com/">2026-08-16 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v4 4/8] NFSD: Send a meaningful CB_RECALL_ANY keep count</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260815-recall-any-keep-count-v4-1-bfb5b83d6cb1@kernel.org/">2026-08-15 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v4 1/8] NFSD: Do not send CB_RECALL_ANY to NFSv4.0 clients</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260815-recall-any-keep-count-v4-0-bfb5b83d6cb1@kernel.org/">2026-08-15 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v4 0/8] NFSD: CB_RECALL_ANY fixes and a meaningful keep count</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260815-recall-any-keep-count-v4-2-bfb5b83d6cb1@kernel.org/">2026-08-15 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v4 2/8] NFSD: Count the delegations held by each client</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260815-recall-any-keep-count-v4-3-bfb5b83d6cb1@kernel.org/">2026-08-15 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v4 3/8] NFSD: Name directory delegations in the CB_RECALL_ANY type mask</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260815-recall-any-keep-count-v4-4-bfb5b83d6cb1@kernel.org/">2026-08-15 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v4 4/8] NFSD: Send a meaningful CB_RECALL_ANY keep count</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260815-recall-any-keep-count-v4-6-bfb5b83d6cb1@kernel.org/">2026-08-15 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v4 6/8] NFSD: Give delegations their own state shrinker</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260815-recall-any-keep-count-v4-5-bfb5b83d6cb1@kernel.org/">2026-08-15 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v4 5/8] NFSD: Count delegations per network namespace</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260815-recall-any-keep-count-v4-7-bfb5b83d6cb1@kernel.org/">2026-08-15 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v4 7/8] NFSD: Pace the state shrinker's scan requests</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260815-recall-any-keep-count-v4-8-bfb5b83d6cb1@kernel.org/">2026-08-15 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v4 8/8] NFSD: Apportion CB_RECALL_ANY recalls among clients</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CALXu0Udh--HV_H-90PxVzGA8vuP-u54fkwsqkf0_gkDnEg_C6w@mail.gmail.com/">2026-08-16 Cedric Blancher <a href="mailto:cedric.blancher@gmail.com">cedric.blancher@gmail.com</a> — Re: [PATCH v4 4/8] NFSD: Send a meaningful CB_RECALL_ANY keep count</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/f2745695-328f-45ab-88d9-eb1d102066cd@app.fastmail.com/">2026-08-16 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v4 4/8] NFSD: Send a meaningful CB_RECALL_ANY keep count</a></li>
+</ul>
+  </main>
+</body>
+</html>

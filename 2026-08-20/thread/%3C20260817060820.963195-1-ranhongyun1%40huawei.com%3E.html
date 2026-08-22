@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>lockd client NULL deref on lockowner allocation failure</title>
+  <meta name="description" content="This week’s linux-nfs traffic included a focused NFS client / lockd (NLM) bug-fix from Ran Hongyun, targeting a NULL pointer crash on the NLM client lock-release path after a lockowner allocation failure. The discussion is not a protocol…">
+  <meta property="og:title" content="lockd client NULL deref on lockowner allocation failure">
+  <meta property="og:description" content="This week’s linux-nfs traffic included a focused NFS client / lockd (NLM) bug-fix from Ran Hongyun, targeting a NULL pointer crash on the NLM client lock-release path after a lockowner allocation failure. The discussion is not a protocol…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="lockd client NULL deref on lockowner allocation failure">
+  <meta name="twitter:description" content="This week’s linux-nfs traffic included a focused NFS client / lockd (NLM) bug-fix from Ran Hongyun, targeting a NULL pointer crash on the NLM client lock-release path after a lockowner allocation failure. The discussion is not a protocol…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>lockd client NULL deref on lockowner allocation failure</h1>
+<h2>Summary</h2>
+<p>This week’s linux-nfs traffic included a focused <strong>NFS client / lockd (NLM) bug-fix</strong> from Ran Hongyun, targeting a NULL pointer crash on the NLM client lock-release path after a lockowner allocation failure. The discussion is not a protocol change and does not introduce a new feature; it is a follow-up correctness fix for the NLM client’s file-lock private-state setup, plus a review that immediately widened the scope to a related reference leak.</p>
+<h2>The crash: <code>fl_ops</code> set, owner still NULL</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260817060820.963195-1-ranhongyun1@huawei.com/">Ran Hongyun</a> posted a one-line patch against <code>fs/lockd/clntproc.c</code> titled <code>[PATCH] lockd: fix NULL pointer dereference in nlmclnt_locks_release_private</code>. The failure mode is specific to the <strong>NFS client NLM path</strong>: <code>nlmclnt_locks_init_private()</code> always installs <code>fl-&gt;fl_ops</code> even when <code>nlmclnt_find_lockowner()</code> returns NULL (allocation failure). <code>nlmclnt_proc()</code> then notices the missing owner and returns an error, but it leaves <code>fl_ops</code> populated. The VFS later tears the lock down through <code>locks_release_private()</code>, which treats a non-NULL <code>fl_ops</code> as a signal to call <code>fl_release_private</code>. That lands in <code>nlmclnt_locks_release_private()</code>, which dereferences <code>fl-&gt;fl_u.nfs_fl.owner</code> and crashes.</p>
+<p>Ran spelled the call chain out explicitly:</p>
+<blockquote>
+<p>"nlmclnt_locks_init_private() unconditionally sets fl-&gt;fl_ops even when nlmclnt_find_lockowner() returns NULL due to allocation failure. When locks_release_private() later sees a non-NULL fl_ops, it calls fl_release_private, which dereferences fl-&gt;fl_u.nfs_fl.owner."</p>
+</blockquote>
+<p>The proposed fix is deliberately small: in <code>nlmclnt_proc()</code>, if the owner is still NULL after <code>nlmclnt_locks_init_private()</code>, clear <code>fl-&gt;fl_ops</code> so <code>locks_release_private()</code> skips the NLM private-release callback. The patch is tagged:</p>
+<blockquote>
+<p>"Fixes: bf8848918d75 ("lockd: handle lockowner allocation failure in nlmclnt_proc()")"</p>
+</blockquote>
+<p>That <code>Fixes</code> tag is important for client maintainers. The earlier commit already tried to handle lockowner allocation failure in <code>nlmclnt_proc()</code>, but it only checked the owner pointer and returned <code>-ENOMEM</code>; it did not unwind the <code>fl_ops</code> assignment that <code>nlmclnt_locks_init_private()</code> had already made. Ran’s patch is therefore a residual hole in that error path rather than a brand-new class of bug.</p>
+<h2>Review: the one-liner is right, the structure is not</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/e7b2ae795a489a07f6f494b8f596f05db0ddc688.camel@kernel.org/">Jeff Layton</a> replied the same day. He accepted the diagnosis and the functional effect of the one-line <code>fl_ops</code> clear, but he objected to leaving the init/cleanup split as-is:</p>
+<blockquote>
+<p>"The fix looks correct, but I don't like the way that the initialization and cleanup is spread across multiple functions. I think it would be better to just get rid of nlmclnt_locks_init_private() altogether and open code what it does in the single caller (nlmclnt_proc()). Then you could just not initialize fl_ops if nlmclnt_find_lockowner() fails."</p>
+</blockquote>
+<p>That is a client-side maintainability argument as much as a correctness one. <code>nlmclnt_locks_init_private()</code> has a single caller. Setting <code>fl_ops</code> inside the helper and then trying to undo it in <code>nlmclnt_proc()</code> is exactly how the original hole appeared: the helper always “succeeds” at installing ops, and the caller only half-handles the allocation failure. Inlining the helper would make the success path (owner allocated → install ops) and the failure path (no owner → leave <code>fl_ops</code> alone) live in one place.</p>
+<p>Jeff also flagged a <strong>second, preexisting client bug</strong> on the same failure path:</p>
+<blockquote>
+<p>"There's also another preexisting bug here. If the lockowner allocation fails, this function also leaks the references taken in nlmclnt_alloc_call()."</p>
+</blockquote>
+<p>In other words, by the time <code>nlmclnt_find_lockowner()</code> fails, <code>nlmclnt_proc()</code> has already allocated an NLM RPC call structure and taken the associated references. Returning <code>-ENOMEM</code> without dropping those refs leaks the <code>nlm_rqst</code> (and whatever host/client state it holds). That leak is independent of the NULL deref: even a process that somehow survived the <code>fl_ops</code> crash would still leak on the allocation-failure path.</p>
+<p>He closed by asking Ran to expand the work rather than land the one-liner as-is:</p>
+<blockquote>
+<p>"Want to spin up a v2 that fixes all of this?"</p>
+</blockquote>
+<h2>Where the week left it</h2>
+<p>This thread itself contains only the original patch and Jeff’s review. There is no Acked-by, no merge decision, and no v2 posted as a reply here. The week’s conclusion is therefore a <strong>review-driven rewrite request</strong>, not a merged fix:</p>
+<ul>
+<li>The NULL dereference in <code>nlmclnt_locks_release_private()</code> is agreed to be real and the proposed <code>fl_ops</code> clear is agreed to be functionally correct.</li>
+<li>The preferred client-side fix is to delete <code>nlmclnt_locks_init_private()</code> and open-code it in <code>nlmclnt_proc()</code>, installing NLM lock ops only after a successful <code>nlmclnt_find_lockowner()</code>.</li>
+<li>The same error path must also drop the references taken by <code>nlmclnt_alloc_call()</code>, which the v1 patch does not address.</li>
+</ul>
+<p>A separate two-patch series addressing both issues was posted later in the week; that follow-up lives in its own thread and is outside the scope of this exchange. For this thread, the client-side takeaway is that lockowner allocation failure in <code>nlmclnt_proc()</code> is still incompletely unwound: ops are installed too early, the VFS release path assumes a valid <code>nfs_fl.owner</code>, and the NLM call allocation is not released on the <code>-ENOMEM</code> path. Jeff’s requested v2 is the intended vehicle for closing both holes together.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260817060820.963195-1-ranhongyun1@huawei.com/">2026-08-17 Ran Hongyun <a href="mailto:ranhongyun1@huawei.com">ranhongyun1@huawei.com</a> — [PATCH] lockd: fix NULL pointer dereference in nlmclnt_locks_release_private</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/e7b2ae795a489a07f6f494b8f596f05db0ddc688.camel@kernel.org/">2026-08-17 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH] lockd: fix NULL pointer dereference in nlmclnt_locks_release_private</a></li>
+</ul>
+  </main>
+</body>
+</html>

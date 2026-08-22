@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>pNFS EBUSY check in layout return path</title>
+  <meta name="description" content="A one-line client bug fix for pNFS layoutreturn scheduling drew an immediate maintainer veto this week, then a corrected follow-up that keeps the recall path alive on soft mounts.">
+  <meta property="og:title" content="pNFS EBUSY check in layout return path">
+  <meta property="og:description" content="A one-line client bug fix for pNFS layoutreturn scheduling drew an immediate maintainer veto this week, then a corrected follow-up that keeps the recall path alive on soft mounts.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="pNFS EBUSY check in layout return path">
+  <meta name="twitter:description" content="A one-line client bug fix for pNFS layoutreturn scheduling drew an immediate maintainer veto this week, then a corrected follow-up that keeps the recall path alive on soft mounts.">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>pNFS EBUSY check in layout return path</h1>
+<h2>Summary</h2>
+<p>A one-line client bug fix for pNFS layoutreturn scheduling drew an immediate maintainer veto this week, then a corrected follow-up that keeps the recall path alive on soft mounts.</p>
+<h2>What broke</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260817154044.1799634-1-tmenninger@purestorage.com/">Tim Menninger</a> posted a [PATCH] against <code>fs/nfs/pnfs.c</code> targeting <code>pnfs_layout_need_return()</code>. The regression is pinned to commit <code>41d0a8ead9720</code> ("NFSv4/pnfs: Add support for the PNFS_LAYOUT_FILE_BULK_RETURN flag"), which replaced <code>pnfs_layout_segments_returnable()</code> with a direct call to <code>pnfs_mark_layout_stateid_return()</code> and then compared that helper’s return value against <code>EBUSY</code> rather than <code>-EBUSY</code>.</p>
+<p>Because the helper returns negative errno values, the intended busy case is never seen. Menninger’s commit message is blunt about the sign error:</p>
+<blockquote>
+<p>"Since pnfs_mark_layout_stateid_return() returns negative errno values, the -EBUSY case is never detected."</p>
+</blockquote>
+<p>That is a client-side bug fix, not a protocol change: the pNFS layoutreturn decision on the Linux NFS client was silently ignoring the “segments still in use, defer the return” path after the bulk-return flag work landed.</p>
+<h2>The v1 mistake: treating “need return” as “must return 0”</h2>
+<p>v1 did not simply flip the sign. Menninger argued that <code>pnfs_mark_layout_stateid_return()</code> bottoms out in <code>pnfs_mark_matching_lsegs_return()</code>, which returns <code>0</code> when a layoutreturn should be scheduled, and therefore changed the comparison from <code>EBUSY</code> to <code>0</code>. In other words, <code>pnfs_layout_need_return()</code> would only proceed when the mark-for-return walk reported success, not when it reported <code>-ENOENT</code> (no matching segments) or <code>-EBUSY</code> (busy segments).</p>
+<p>That is a semantic change, not a sign fix. It collapses several historically distinct return codes into a single “only zero means return” test.</p>
+<h2>Maintainer pushback: recalls on soft mounts</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/ee8f174933d00fc58e2f54fd2fdd98d67919884b.camel@kernel.org/">Trond Myklebust</a> rejected that approach the next day. The Linux NFS client maintainer’s objection is about recall compliance, not about the original <code>EBUSY</code> typo:</p>
+<blockquote>
+<p>"This breaks the ability of the client to respond to layout recalls even when it does not think it holds a layout. That's a situation that can occur when using soft or softerr mounts."</p>
+</blockquote>
+<p>The important client invariant is that a layout recall can still arrive after the client has already dropped or timed out its local view of the layout—especially with <code>soft</code>/<code>softerr</code>, where I/O and state recovery can fail without a hard hang. The client must still be able to send a layoutreturn (or otherwise acknowledge the recall) even when the segment walk finds nothing to mark. Requiring a <code>0</code> return from <code>pnfs_mark_layout_stateid_return()</code> would skip that empty-layout recall response.</p>
+<p>That is a classic pNFS client correctness constraint: layout state on the wire and layout state in <code>pnfs_layout_hdr</code> are not always in lockstep, and the return path has to remain usable when they diverge.</p>
+<h2>v2: keep -ENOENT, defer only on -EBUSY</h2>
+<p>Menninger followed up on 19 August with <a href="https://lore.kernel.org/linux-nfs/20260819124121.1587969-1-tmenninger@purestorage.com/">PATCH v2</a> (posted in reply to Myklebust’s NAK). v2 drops the “check for 0” theory and does the minimal sign correction: compare against <code>-EBUSY</code>. The changelog is explicit about absorbing the review:</p>
+<blockquote>
+<p>"Preserve the -ENOENT path so the client can respond to recalls when it no longer holds matching layout segments, as pointed out by Trond."</p>
+</blockquote>
+<blockquote>
+<p>"Defer only on -EBUSY instead of requiring a zero return value."</p>
+</blockquote>
+<p>v2 also adds <code>Cc: stable@vger.kernel.org</code>, treating the <code>EBUSY</code> vs <code>-EBUSY</code> mix-up as a stable-worthy client regression from the bulk-return flag work rather than a behavioral redesign of layoutreturn.</p>
+<h2>Status</h2>
+<p>This remains a client bug-fix thread, not a feature or NFSv4.1/pNFS protocol discussion. The technical conclusion after two days is:</p>
+<ul>
+<li>The <code>EBUSY</code> comparison in <code>pnfs_layout_need_return()</code> is indeed wrong and never matches the negative errno from <code>pnfs_mark_layout_stateid_return()</code>.</li>
+<li>The correct fix is <code>-EBUSY</code>, not <code>== 0</code>.</li>
+<li>A zero-only check would break layout-recall replies when the client no longer believes it holds matching segments, a case Myklebust called out for <code>soft</code>/<code>softerr</code> mounts.</li>
+</ul>
+<p>No further review of v2 landed on this thread before the week closed. The outstanding question is whether the signed <code>-EBUSY</code> check plus the preserved <code>-ENOENT</code> recall path is accepted as the stable fix for commit <code>41d0a8ead9720</code>.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260817154044.1799634-1-tmenninger@purestorage.com/">2026-08-17 tmenninger@purestorage.com — [PATCH] pNFS: Fix EBUSY check in pnfs_layout_need_return</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ee8f174933d00fc58e2f54fd2fdd98d67919884b.camel@kernel.org/">2026-08-18 Trond Myklebust <a href="mailto:trondmy@kernel.org">trondmy@kernel.org</a> — Re: [PATCH] pNFS: Fix EBUSY check in pnfs_layout_need_return</a></li>
+</ul>
+  </main>
+</body>
+</html>

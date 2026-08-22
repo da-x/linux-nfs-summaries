@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS client: restore d_drop on failed nfs_mkdir()</title>
+  <meta name="description" content="Amazon’s Jimmy Zuber posted a two-line NFS client bug-fix that restores d_drop() on a failed nfs_mkdir(). The regression dates to 6.15, when NeilBrown’s “mkdir returns a dentry” conversion stopped unhashing the original negative dentry…">
+  <meta property="og:title" content="NFS client: restore d_drop on failed nfs_mkdir()">
+  <meta property="og:description" content="Amazon’s Jimmy Zuber posted a two-line NFS client bug-fix that restores d_drop() on a failed nfs_mkdir(). The regression dates to 6.15, when NeilBrown’s “mkdir returns a dentry” conversion stopped unhashing the original negative dentry…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS client: restore d_drop on failed nfs_mkdir()">
+  <meta name="twitter:description" content="Amazon’s Jimmy Zuber posted a two-line NFS client bug-fix that restores d_drop() on a failed nfs_mkdir(). The regression dates to 6.15, when NeilBrown’s “mkdir returns a dentry” conversion stopped unhashing the original negative dentry…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS client: restore d_drop on failed nfs_mkdir()</h1>
+<h2>Summary</h2>
+<h1>NFS client: restore d_drop on failed nfs_mkdir()</h1>
+<h2>Summary</h2>
+<p>Amazon’s Jimmy Zuber posted a two-line <a href="https://lore.kernel.org/linux-nfs/20260819015111.2743908-1-jamz@amazon.com/">NFS client bug-fix</a> that restores <code>d_drop()</code> on a failed <code>nfs_mkdir()</code>. The regression dates to 6.15, when NeilBrown’s “mkdir returns a dentry” conversion stopped unhashing the original negative dentry after an RPC error. No one has replied in-window; the patch is unreviewed and not queued.</p>
+<p>This is a <strong>client dcache correctness fix</strong>, not a protocol change and not a new feature. It is tagged <code>Fixes: 8376583b84a1</code> and <code>Cc: stable@vger.kernel.org # v6.15+</code>.</p>
+<h2>The regression</h2>
+<p>Since commit <code>8376583b84a1</code> (<code>nfs: change mkdir inode_operation to return alternate dentry if needed</code>), <code>nfs_mkdir()</code> no longer drops the dentry on RPC failure. <a href="https://lore.kernel.org/linux-nfs/20260819015111.2743908-1-jamz@amazon.com/">Zuber</a> writes:</p>
+<blockquote>
+<p>"A negative cache value can then result in spurious ENOENT results for further operations within that directory, such as open or stat."</p>
+</blockquote>
+<p>The user-visible failure is the classic “mkdir raced, then the loser cannot use the directory it just saw exist” pattern:</p>
+<blockquote>
+<p>"We observed this breaking some applications where an EEXIST on mkdir caused the application to assume the directory to exist, only to fail operations within that directory due to the retained negative cache entry."</p>
+</blockquote>
+<p>The sibling create paths were not converted the same way:</p>
+<blockquote>
+<p>"The other create paths, nfs_create() and nfs_mknod(), still drop the dentry on failure. This patch restores the previous behavior."</p>
+</blockquote>
+<p>The change itself is two insertions in <code>fs/nfs/dir.c</code> — restoring the drop that <code>nfs_mkdir()</code> used to do before the 6.15 inode-operation conversion. That conversion was <a href="https://lore.kernel.org/linux-nfs/20250227013949.536172-6-neilb@suse.de/">patch 5/6 of NeilBrown’s February 2025 series</a> that taught <code>-&gt;mkdir()</code> and <code>vfs_mkdir()</code> to return an alternate dentry so NFS (and fuse/ceph) could hand the VFS the hashed directory dentry when lookup-plus-create found an existing inode. The mkdir RPC op was switched to return a dentry (<code>NULL</code> meaning “use the original”), and <code>nfs4_do_mkdir()</code> was split out of <code>nfs4_do_create()</code>. In that rewrite the failure-path <code>d_drop()</code> disappeared, leaving a negative dentry hashed after <code>EEXIST</code> (and other RPC errors).</p>
+<h2>Reproduction</h2>
+<p>Zuber reproduced it against a local knfsd export over NFSv4.1. The export is mounted six times with <code>nosharecache</code> so each mount is an independent client with its own dcache, plus <code>acdirmin=30,acdirmax=60</code> so the seeded negatives stick around:</p>
+<pre><code>mount -t nfs4 -o vers=4.1,nosharecache,acdirmin=30,acdirmax=60 \
+    127.0.0.1:/ /mnt/nfs$i
+</code></pre>
+<p>For each of 40 new <code>cache/&lt;id&gt;</code> directories, every mount stats the name to seed a negative entry, then all mounts race <code>mkdir</code>. The winner writes a file and renames it; the losers that got <code>EEXIST</code> then read that file back. On vanilla v6.17:</p>
+<blockquote>
+<p>"unpatched:   read OK   0 / ENOENT 200"
+"patched:     read OK 200 / ENOENT   0"</p>
+</blockquote>
+<p>That is a complete miss: every loser still treats the directory as absent, even though the server created it and the application correctly treated <code>EEXIST</code> as success.</p>
+<p>The <code>nosharecache</code> setup is the right hammer for this class of bug. Shared <code>nfs_client</code> / <code>nfs_server</code> structures would otherwise collapse the six mounts onto one dcache and hide the “other client created it, this client still has a negative” race that production multi-client workloads hit.</p>
+<h2>Why it matters for NFS client development</h2>
+<p>Negative dentries are load-bearing on NFS: a hashed negative is how the client remembers “this name does not exist” across <code>acdirmin</code>/<code>acdirmax</code>. That is only correct while the name really is absent. After a failed <code>mkdir</code> that lost a create race (<code>EEXIST</code>), the name <em>does</em> exist on the server. Leaving the original dentry hashed means:</p>
+<ol>
+<li>subsequent <code>lookup</code> / <code>open</code> / <code>stat</code> of the directory itself return <code>ENOENT</code> from cache, and</li>
+<li>operations <em>inside</em> that directory, using a path that still walks the negative dentry, also fail with <code>ENOENT</code>.</li>
+</ol>
+<p>Applications that do <code>mkdir</code> + <code>open</code> (or <code>mkdir</code> + <code>stat</code> of a child) and treat <code>EEXIST</code> as “the directory is there” are then broken until the negative times out. Zuber’s numbers say the timeout is not a practical mitigation: with <code>acdirmin=30</code> every one of 200 loser reads failed.</p>
+<p>Restoring <code>d_drop()</code> on the mkdir failure path matches <code>nfs_create()</code> and <code>nfs_mknod()</code> and is the historical NFS answer: unhash the negative so the next lookup goes to the server. It does not try to instantiate the existing directory from the <code>EEXIST</code> reply; it only stops lying about absence. That is the conservative fix, and the one that belongs on stable (<code>v6.15+</code>).</p>
+<p>A more ambitious client could, on <code>EEXIST</code>, revalidate or splice in the hashed directory dentry that the 6.15 mkdir-returns-dentry work already knows how to return on the <em>success</em> path. Zuber does not propose that. Given that <code>nfs_create()</code>/<code>nfs_mknod()</code> still just drop, keeping mkdir in line with them is the right incremental repair.</p>
+<h2>Same-week context: negative dentries, different bug</h2>
+<p>The same week NeilBrown posted <a href="https://lore.kernel.org/linux-nfs/20260815042707.2535717-1-neilb@ownmail.net/">RFC/RFT v2 of “Fix easy bits of the negative dentry problem”</a>, a VFS series about parent <code>d_lockref</code> overflow and soft lockups walking huge <code>-&gt;d_children</code> lists of negatives. That work touches <code>nfs_clear_verifier_directory()</code> only so the NFS client can use a common, later-sleepable child iterator. It does <strong>not</strong> shrink the negative population and does <strong>not</strong> address stale negatives after a failed create.</p>
+<p>Zuber’s patch is the complementary client bug: not “too many negatives,” but “the wrong negative is still hashed.” The two threads should not be conflated. One is a VFS scalability RFC; this one is a two-line NFS mkdir correctness fix with a hard reproducer and a stable Cc.</p>
+<h2>Final conclusions (as of 20 August)</h2>
+<ul>
+<li><strong>Classification:</strong> NFS client bug fix (stale negative dentry after failed <code>nfs_mkdir()</code>). Regression from the 6.15 <code>-&gt;mkdir</code> dentry-return conversion. Not a protocol change.</li>
+<li><strong>Technical claim:</strong> after <code>8376583b84a1</code>, RPC failure (notably <code>EEXIST</code>) leaves the original negative hashed; later open/stat of that name or of children return spurious <code>ENOENT</code>. <code>nfs_create()</code> and <code>nfs_mknod()</code> still drop; mkdir should too.</li>
+<li><strong>Evidence:</strong> 200/200 loser reads fail unpatched on v6.17 knfsd/NFSv4.1 with <code>nosharecache</code>; 200/200 succeed patched.</li>
+<li><strong>Disposition:</strong> posted 19 August, no review, no ack, not merged in-window. The <code>Fixes:</code> / stable tag is appropriate; the patch is small enough to land independently of NeilBrown’s negative-dentry RFC.</li>
+<li><strong>Open question for reviewers:</strong> whether mkdir-on-<code>EEXIST</code> should go further and instantiate/return the existing directory dentry (the machinery the 6.15 series added for the success path) rather than only dropping. Zuber does not ask for that, and matching create/mknod is the safer stable fix.</li>
+</ul>
+<h2>Key messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260819015111.2743908-1-jamz@amazon.com/">Jimmy Zuber: restore d_drop on failed nfs_mkdir()</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260819015111.2743908-1-jamz@amazon.com/">2026-08-19 Jimmy Zuber <a href="mailto:jamz@amazon.com">jamz@amazon.com</a> — [PATCH] NFS: Fix stale negative cache on failed nfs_mkdir()</a></li>
+</ul>
+  </main>
+</body>
+</html>

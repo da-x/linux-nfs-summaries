@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Crash-region registry proposed as alternative to panic-path secret wipe</title>
+  <meta name="description" content="This week’s traffic on Jan Sebastian Götte’s v2 CRASH_WIPE_SECRETS series is a design debate, not an NFS client bug-fix thread. The four in-window messages all reply to patch 01/13 and converge on replacing panic-path wipe notifiers with a…">
+  <meta property="og:title" content="Crash-region registry proposed as alternative to panic-path secret wipe">
+  <meta property="og:description" content="This week’s traffic on Jan Sebastian Götte’s v2 CRASH_WIPE_SECRETS series is a design debate, not an NFS client bug-fix thread. The four in-window messages all reply to patch 01/13 and converge on replacing panic-path wipe notifiers with a…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Crash-region registry proposed as alternative to panic-path secret wipe">
+  <meta name="twitter:description" content="This week’s traffic on Jan Sebastian Götte’s v2 CRASH_WIPE_SECRETS series is a design debate, not an NFS client bug-fix thread. The four in-window messages all reply to patch 01/13 and converge on replacing panic-path wipe notifiers with a…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Crash-region registry proposed as alternative to panic-path secret wipe</h1>
+<h2>Summary</h2>
+<p>This week’s traffic on Jan Sebastian Götte’s v2 <code>CRASH_WIPE_SECRETS</code> series is a design debate, not an NFS client bug-fix thread. The four in-window messages all reply to patch 01/13 and converge on replacing panic-path wipe notifiers with a pre-populated crash-memory region table. No new patches landed; Götte committed to posting a registry prototype this or next week.</p>
+<h2>What this series is</h2>
+<p>This is a <strong>new opt-in kexec/kdump feature</strong>, not a protocol change and not an NFS client bug fix. Posted last week as <a href="https://lore.kernel.org/linux-nfs/20260811-crash-zeroize-rework-v2-0-9561d13c2340@jaseg.de/">PATCH v2 00/13</a>, it adds <code>CONFIG_CRASH_WIPE_SECRETS</code> so subsystems holding keys can erase them before <code>__crash_kexec()</code> jumps into the dump kernel. Götte’s use case is an HSM-like ARM64 embedded target: kdump is used as a tamper-response path that then memzeros DRAM, but a full linear wipe is “rather slow,” so he wants the “obviously sensitive stuff like keys gone as fast as possible.”</p>
+<p>The NFS client footprint in v2 is tiny. The series CCs linux-nfs because <code>fs/nfs/nfs4idmap.c</code> gains a two-line wipe hook on the NFSv4 idmap key type, and because <a href="https://lore.kernel.org/linux-nfs/20260811-crash-zeroize-rework-v2-10-9561d13c2340@jaseg.de/">patch 10/13</a> adds an rxrpc key wipe (session keys/tickets plus rxkad/rxgk server-key ops). Neither NFS nor rxrpc was discussed this week. There is no NFS client functional change, no pNFS/layout work, and no bug fix under review here.</p>
+<h2>Brief bridge from last week</h2>
+<p>v2’s core hook, <a href="https://lore.kernel.org/linux-nfs/20260811-crash-zeroize-rework-v2-1-9561d13c2340@jaseg.de/">patch 01/13</a>, registers an atomic notifier chain invoked late in <code>__crash_kexec()</code> after <code>machine_crash_shutdown()</code> has stopped other CPUs. Callbacks must not wait on locks. Götte called it “a best-effort, defence-in-depth measure, not a guarantee.”</p>
+<p>That approach drew immediate pushback. Eric Biggers argued the kernel already struggles to zeroize keys at normal end-of-life, so a second, panic-only, lock-free wipe path for every subsystem is unmaintainable: “If we can barely even do that, we aren't going to be able to correctly and completely implement and maintain separate zeroization code.” He asked Götte to “narrow the scope to one or two things,” noting even dm-crypt does not need a global crypto-tfm wipe list because “dm-crypt has its own copy of the key.” Götte offered to keep at least secretmem and dm-crypt.</p>
+<p>kexec maintainer Baoquan He separately objected to stuffing more work into the crash path, analogizing it to someone wanting Oracle to “do some transactions before juming into kdump kernel because the actions will save billions of dollar,” and asked whether this belonged in a vendor tree. Götte replied that a full DRAM wipe in the kdump kernel takes “several hundred milliseconds” against a 10 ms budget, and floated the alternative that now dominates this week: a registry of <code>(addr, len)</code> descriptors in crashkernel memory so the kdump kernel, not the dying kernel, does the memzero.</p>
+<p>Milan Broz also rejected the dm-crypt patch as a second wipe implementation beside <code>crypt_wipe_key()</code>, writing “Please no. It looks to me like you are trying to fix this on the wrong layer.” Götte agreed to drop per-driver <code>crash_wipe_memzero</code> helpers and flush caches in kexec instead.</p>
+<h2>This week: alternatives to panic-path handlers</h2>
+<p>On 16 August, <a href="https://lore.kernel.org/linux-nfs/aoGpcczo5GkBsPwt@wunner.de/">Lukas Wunner</a> replied to Götte’s registry sketch and offered a second model: isolate secrets in one allocator rather than tracking them after the fact.</p>
+<blockquote>
+<p>"Or create a dedicated mempool from which all sensitive data is allocated, then call mempool_free_bulk() on kexec to poison everything in that pool?"</p>
+</blockquote>
+<p>That idea was not taken up. The rest of the week stayed on the registry.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/aoK6jXA-tF9qfKOZ@MiWiFi-R3L-srv/">Baoquan He</a> first asked the CC’d security people a threat-model question that still has no reply:</p>
+<blockquote>
+<p>"Since there are a lot of security expert in CC, I am wondering what's the risk if we wipe secrets during dumping. System is located in user's place, and vmcore is dumped and collected in user's place. If we filter out secrets memory when we dumping, what could be leaked out?"</p>
+</blockquote>
+<p>He then followed up with a concrete API that generalizes Götte’s secrets-only table into a small crash-memory region table with a per-entry action (<a href="https://lore.kernel.org/linux-nfs/aoLFai0gzzH2bGgy@MiWiFi-R3L-srv/">message</a>):</p>
+<pre><code>enum crash_region_action {
+    CRASH_REG_WIPE,   /* memzero, then dump normally (leave zeros) */
+    CRASH_REG_SKIP,   /* do not include in the vmcore at all */
+};
+
+struct crash_region {
+    phys_addr_t addr;
+    size_t      len;
+    enum crash_region_action action;
+};
+
+void crash_reg_add(phys_addr_t addr, size_t len,
+                   enum crash_region_action action);
+void crash_reg_del(phys_addr_t addr, size_t len);
+</code></pre>
+<p>He split the two actions on purpose. <code>WIPE</code> is Götte’s secret-erasure case (zero the buffer, then still dump the zeros). <code>SKIP</code> is a vmcore-size play: omit regions entirely. He has been looking at shrinking dumps on large systems where “the vmcore size usually is several or tens of GB,” and suggested drivers could later register unused memory as <code>SKIP</code>. His sequencing advice was explicit: start the registry with wiping secrets, “we can add SKIP later and plus some driver used memory,” and “you can give it a shot to show what it looks like.”</p>
+<p>That is the week’s technical conclusion. The panic-path notifier in patch 01/13 is no longer the preferred direction if the work stays in mainline. Moving the memzero into the kdump kernel via a table populated ahead of time removes code from <code>__crash_kexec()</code>, avoids lock-free walking of live keyrings/tfms during panic, and gives kdump a hook that can later shrink dumps as well as sanitize them.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/9071e03b-a633-43e4-ac77-3b05291c1f66@jaseg.de/">Götte accepted</a> without caveats:</p>
+<blockquote>
+<p>"I think that's a good idea. I'll post a patch adding that registry this or next week."</p>
+</blockquote>
+<h2>Status and NFS client takeaway</h2>
+<p>The discussion is still design-only. Open questions: whether security reviewers will answer Baoquan’s “what leaks if we filter at dump time?” question; whether Wunner’s dedicated-mempool idea is worth a prototype; how <code>crash_reg_add</code>/<code>del</code> stay consistent if buffers move; and whether <code>SKIP</code> lands with wipe or later. No one this week revisited the NFS idmap or rxrpc wipe ops, and those hooks would likely be re-cast as region registrations if the registry replaces per-subsystem panic notifiers.</p>
+<p>For NFS client development this week: <strong>no client bug fix, no protocol change, and no functional NFS discussion.</strong> The only NFS-adjacent content remains last week’s two-line <code>nfs4idmap</code> wipe hook riding along on a kexec series whose architecture is now being rewritten.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/aoGpcczo5GkBsPwt@wunner.de/">2026-08-16 Lukas Wunner <a href="mailto:lukas@wunner.de">lukas@wunner.de</a> — Re: [PATCH v2 01/13] kexec: add CRASH_WIPE_SECRETS to wipe secrets before kdump</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aoK6jXA-tF9qfKOZ@MiWiFi-R3L-srv/">2026-08-17 Baoquan He <a href="mailto:baoquan.he@linux.dev">baoquan.he@linux.dev</a> — Re: [PATCH v2 01/13] kexec: add CRASH_WIPE_SECRETS to wipe secrets before kdump</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aoLFai0gzzH2bGgy@MiWiFi-R3L-srv/">2026-08-17 Baoquan He <a href="mailto:baoquan.he@linux.dev">baoquan.he@linux.dev</a> — Re: [PATCH v2 01/13] kexec: add CRASH_WIPE_SECRETS to wipe secrets before kdump</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/9071e03b-a633-43e4-ac77-3b05291c1f66@jaseg.de/">2026-08-18 Jan Sebastian Götte <a href="mailto:contact@jaseg.de">contact@jaseg.de</a> — Re: [PATCH v2 01/13] kexec: add CRASH_WIPE_SECRETS to wipe secrets before kdump</a></li>
+</ul>
+  </main>
+</body>
+</html>

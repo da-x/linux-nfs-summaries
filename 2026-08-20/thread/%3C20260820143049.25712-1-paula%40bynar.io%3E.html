@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SUNRPC OOB write in xdr_inline_pages()</title>
+  <meta name="description" content="A late-week bug-fix patch from Paula Moutafian targets a long-standing SUNRPC receive-path hole that can turn a legal NFSv3 AUTH_SYS reply into a peer-controlled slab write on the Linux NFS client.">
+  <meta property="og:title" content="SUNRPC OOB write in xdr_inline_pages()">
+  <meta property="og:description" content="A late-week bug-fix patch from Paula Moutafian targets a long-standing SUNRPC receive-path hole that can turn a legal NFSv3 AUTH_SYS reply into a peer-controlled slab write on the Linux NFS client.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="SUNRPC OOB write in xdr_inline_pages()">
+  <meta name="twitter:description" content="A late-week bug-fix patch from Paula Moutafian targets a long-standing SUNRPC receive-path hole that can turn a legal NFSv3 AUTH_SYS reply into a peer-controlled slab write on the Linux NFS client.">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>SUNRPC OOB write in xdr_inline_pages()</h1>
+<h2>Summary</h2>
+<p>A late-week <a href="https://lore.kernel.org/linux-nfs/20260820143049.25712-1-paula@bynar.io/">bug-fix patch</a> from Paula Moutafian targets a long-standing SUNRPC receive-path hole that can turn a legal NFSv3 AUTH_SYS reply into a peer-controlled slab write on the Linux NFS client.</p>
+<p>The defect sits in <code>xdr_inline_pages()</code>, which re-carves an existing receive buffer into head, page list and tail at a caller-supplied offset and computes the tail length as <code>buflen - offset</code>. Because <code>iov_len</code> is unsigned, an offset past the end wraps instead of failing:</p>
+<blockquote>
+<p>"It does not check that the offset lies within the buffer being carved, and iov_len is unsigned, so an offset past the end wraps the tail length instead of failing."</p>
+</blockquote>
+<p>That offset is not an internal constant. <a href="https://lore.kernel.org/linux-nfs/20260820143049.25712-1-paula@bynar.io/">Moutafian</a> traces it to wire data: <code>rpc_prepare_reply_pages()</code> derives it from the authentication flavour’s <code>au_ralign</code>, which is reread on every encode, while the receive buffer size is fixed once in <code>call_allocate()</code> from <code>au_rslack</code>. <code>unx_validate()</code> then raises <code>au_verfsize</code>, <code>au_rslack</code> and <code>au_ralign</code> from the reply verifier’s length <em>before</em> <code>rpc_decode_header()</code> inspects <code>accept_stat</code>. A <code>GARBAGE_ARGS</code> reply can therefore poison the alignment and only afterwards send the task back through <code>call_encode()</code>. <code>call_allocate()</code> short-circuits on the existing buffer, so <code>rq_rcvsize</code> is not recomputed and the retry carves a new offset against the old size. Compounding the geometry, <code>auth_unix</code> keeps those fields in a file-scope static <code>rpc_auth</code> shared by every AUTH_SYS client.</p>
+<p>For NFSv3 READ the design slack is a single XDR word, so the underflow needs only <code>au_ralign</code> at encode to exceed <code>au_rslack</code> at allocation by two — a five-byte verifier body. The observed case used eight: <code>rq_rcvsize</code> 132 with a 128-byte head and 4-byte tail, <code>au_ralign</code> raised from 2 to 4, and a retry carve at <code>(26 + 4 + 4) &lt;&lt; 2 = 136</code> against the unchanged 132-byte buffer. The in-tree <code>sunrpc:rpc_xdr_reply_pages</code> tracepoint captured the wrap on one task:</p>
+<blockquote>
+<p>"rpc_xdr_reply_pages: head=[..a18,128] tail=[..a98,4]
+rpc_xdr_reply_pages: head=[..a18,136] tail=[..aa0,4294967292]"</p>
+</blockquote>
+<p><code>xs_read_xdr_buf()</code> then fills the tail against that wrapped length. TCP record length is not capped against <code>rq_rcvsize</code>, so the reply to the retried call writes peer-controlled bytes past the <code>rpc_buffers</code> object. KASAN on an unmodified v7.2-rc7 arm64 kernel reported:</p>
+<blockquote>
+<p>"BUG: KASAN: slab-out-of-bounds in _copy_to_iter+0x7c8/0x1538
+Write of size 1664 at addr ffff0000c7640aa0 by task kworker/u8:0/12"</p>
+</blockquote>
+<p>The write landed 160 bytes past the object, with both length and payload chosen by the peer. Moutafian is careful about what KASAN actually proves: the interposed <code>__asan_memcpy()</code> returns without calling <code>__memcpy</code> once the range check fails, so the report establishes that the write is reachable and out of bounds, not that the copy executed. The enlarged head stays inside the same slab object and is not itself a violation.</p>
+<p>The trigger is an ordinary <code>read(2)</code> on an already mounted NFSv3 AUTH_SYS share over TCP and needs no client privilege; every byte the attacker supplies is a legal server reply. The blast radius is narrower than a generic SUNRPC issue: under RPCSEC_GSS the verifier is authenticated and cannot be forged; UDP is bounded by datagram length in <code>xs_udp_data_read_skb()</code>; NFSv4 does not take the retry path because <code>RPC_TASK_NO_RETRANS_TIMEOUT</code> suppresses the re-encode.</p>
+<p>Commit <code>53bc19f17f21</code> ("SUNRPC: receive buffer size estimation values almost never change") gated the equivalent slack update behind <code>RPCAUTH_AUTH_UPDATE_SLACK</code> in <code>gss_update_rslack()</code>, but <code>auth_unix</code> was never converted and still assigns unconditionally. Gating it the same way would only narrow the window:</p>
+<blockquote>
+<p>"the first update can still land between the allocation and the re-encode of an in-flight request, and it would leave the other caller of xdr_inline_pages() unguarded."</p>
+</blockquote>
+<p>The chosen fix is therefore at the carve itself: clamp the offset to the length of the buffer so the tail length cannot underflow. There is no <code>Fixes:</code> tag; the unbounded carve is original to <code>xdr_inline_pages()</code> (unchanged since the initial git import), and <code>unx_validate()</code> has written the shared <code>rpc_auth</code> slack from the reply verifier since at least v2.6.32.</p>
+<p>Reproduction is 2/2 on unmodified v7.2-rc7 with <code>CONFIG_NFS_V3=y</code>; the patched kernel has not been built or booted. A reproducer exists and can be shared privately. The posting is credited <code>Assisted-by: Bynario AI</code>. No in-week review replies landed before the window closed.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260820143049.25712-1-paula@bynar.io/">2026-08-20 Paula Moutafian <a href="mailto:paula@bynar.io">paula@bynar.io</a> — [PATCH] SUNRPC: fix out-of-bounds write in xdr_inline_pages()</a></li>
+</ul>
+  </main>
+</body>
+</html>

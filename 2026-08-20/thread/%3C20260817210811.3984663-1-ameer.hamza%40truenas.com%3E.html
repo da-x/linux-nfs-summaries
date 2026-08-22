@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SUNRPC reply-page recycling hits splice-path pushback</title>
+  <meta name="description" content="Ameer Hamza posted a two-patch NFSD/SUNRPC performance series aimed at a long-standing page-allocator collision on the NFS server, not the client. Review this week concentrated almost entirely on patch 1/2 (how NFSD chooses a READ path).…">
+  <meta property="og:title" content="SUNRPC reply-page recycling hits splice-path pushback">
+  <meta property="og:description" content="Ameer Hamza posted a two-patch NFSD/SUNRPC performance series aimed at a long-standing page-allocator collision on the NFS server, not the client. Review this week concentrated almost entirely on patch 1/2 (how NFSD chooses a READ path).…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="SUNRPC reply-page recycling hits splice-path pushback">
+  <meta name="twitter:description" content="Ameer Hamza posted a two-patch NFSD/SUNRPC performance series aimed at a long-standing page-allocator collision on the NFS server, not the client. Review this week concentrated almost entirely on patch 1/2 (how NFSD chooses a READ path).…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>SUNRPC reply-page recycling hits splice-path pushback</h1>
+<h2>Summary</h2>
+<p>Ameer Hamza posted a two-patch NFSD/SUNRPC performance series aimed at a long-standing page-allocator collision on the NFS <em>server</em>, not the client. Review this week concentrated almost entirely on patch 1/2 (how NFSD chooses a READ path). The actual recycling machinery in patch 2/2 was explicitly deferred. The series is a performance optimization, not a protocol change; it also surfaced two pre-existing NFSD iterator-READ accounting bugs, which Hamza immediately split out as a backportable fix series.</p>
+<h2>The problem: ACK-time frees versus <code>alloc_pages_bulk()</code></h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260817210811.3984663-1-ameer.hamza@truenas.com/">Hamza's cover letter</a> describes a contention pattern that only appears when an NFS READ Reply is built in pages the nfsd thread itself allocated, rather than spliced from the page cache. Those pages are freed from softirq when the peer's ACK arrives. Since commit <code>574907741599</code> ("mm/page_alloc: leave IRQs enabled for per-cpu page allocations"), that free collides with <code>alloc_pages_bulk()</code>'s IRQs-on per-cpu window and falls back to <code>free_one_page()</code> under <code>zone-&gt;lock</code>. On a single memory node every nfsd thread contends for the same lock:</p>
+<blockquote>
+<p>"On a single memory node this settles into a steady state with most CPU cycles in the queued-spinlock slowpath."</p>
+</blockquote>
+<p>Replies spliced from page-cache folios are immune, because the page cache still holds a reference. Everything else is not: gfs2, kernfs, cifs direct I/O and DAX files all go through <code>copy_splice_read()</code>, which allocates a fresh page for every page of payload; nfsd also allocates its own pages when splice is disabled (<code>nfsd_disable_splice_read</code>) and for <code>sec=krb5i</code> / <code>sec=krb5p</code>. Hamza notes ZFS is in the same boat (<code>-&gt;splice_read</code> is <code>copy_splice_read()</code>), though the posted measurements used ext4 DAX and tmpfs so they reproduce on a stock tree with a pmem device.</p>
+<p>On a 64-thread, single-node server serving 1 MiB sequential cached NFSv4.0 reads to eight local-namespace clients, the numbers are stark:</p>
+<table><thead><tr><th>workload</th><th><code>free_one_page</code> cycles</th><th>pages allocated per payload page</th></tr></thead><tbody>
+<tr><td>ext4 dax NFSv4</td><td>43% → 0%</td><td>2.97 → 0.05</td></tr>
+<tr><td>ext4 dax, splice disabled</td><td>32% → 0%</td><td>1.99 → 0.05</td></tr>
+<tr><td>tmpfs, splice disabled</td><td>33% → 0%</td><td>1.98 → 0.05</td></tr>
+</tbody></table>
+<p>The "knob" rows isolate patch 2. Hamza is careful about scope: "How much this is worth depends on contention: on the server below the ACK-time frees reach 43% of cycles, while on an uncontended machine the same change removes the allocations and leaves total CPU where it was." An ext4 export <em>without</em> DAX has no such free to collide, and is unchanged. The posted code was only run in a 20-CPU VM; the table is from a backport to 6.18.38. A build with the <code>folio_ref_count()</code> reuse gate deliberately removed still checksums cleanly on a fast link, but "Under a 40 ms ACK delay that build corrupts data and the series stays byte-identical."</p>
+<h2>Patch 1: stop double-allocating on copy-splice filesystems</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260817210811.3984663-2-ameer.hamza@truenas.com/">Patch 1/2</a> is the smaller, more controversial half. For filesystems whose <code>-&gt;splice_read</code> cannot avoid a copy, <code>copy_splice_read()</code> allocates a page, <code>nfsd_splice_actor()</code> then installs it in <code>rq_respages</code> (displacing pages the thread already owns), and both sets are freed. Routing those READs through <code>nfsd_iter_read()</code> does the same single copy into pages nfsd already holds. Hamza is explicit that this is not a throughput patch on its own:</p>
+<blockquote>
+<p>"On its own this is not expected to raise throughput; it changes which pages a Reply is built from so that the next patch can recycle them."</p>
+</blockquote>
+<p>The helper <code>nfsd_splice_read_is_zero_copy()</code> tests <code>f_op-&gt;splice_read</code> against known copy implementations. 9p and ceph, which fall back to <code>copy_splice_read()</code> <em>inside</em> their own methods, stay on the splice path. One visible side effect is already called out: an fsnotify watcher sees two access events per READ instead of one, the extra one from <code>vfs_iocb_iter_read()</code>.</p>
+<h2>Patch 2: park sent Reply pages and reuse them</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260817210811.3984663-3-ameer.hamza@truenas.com/">Patch 2/2</a> is the actual recycling work, and it received no review this week. After send, <code>svc_rqst_release_pages()</code> currently drops the thread's reference; the transport's <code>MSG_SPLICE_PAGES</code> hold is the last one, released from softirq at ACK time (~257 pages per 1 MiB READ on 4 KiB pages). The patch keeps the thread's reference, parks the page in a small per-thread array, and refills a free Call or Reply slot once <code>folio_ref_count()</code> reads 1 — "the gate the network stack has applied to its own ACK-timed references since 2012, today in <code>skb_page_frag_refill()</code>." Hamza points at 2021 discussions of releasing result pages as prior art.</p>
+<p>Reuse is opt-in per transport class; only <code>svc_udp_class</code> and <code>svc_tcp_class</code> set <code>XCL_FL_REPLY_PAGE_REUSE</code>. A page is reused only if it is order-0, unpoisoned, not <code>pfmemalloc</code>, node-local and not page-cache-backed; spliced-in folios are excluded. A thread holds at most four maximum-size Replies and never more than 4 MiB (512 MiB on a 128-thread server). The scan is unordered with a persistent cursor, so a page still held by one slow connection cannot block reuse of pages parked after it. <code>svc_reuse_scan()</code> costs 2.5% of cycles when it is busy, falling to 0.7% when late ACKs leave little to reuse.</p>
+<p>Chuck Lever set this patch aside on purpose: "I'm going to focus on patch 1/2 and set 2/2 aside for the moment. I promise we will come back to it."</p>
+<h2>Chuck Lever: fix the iterator-READ accounting first</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/2ed0ee16-c20e-44bd-9e7a-f5b71764f14f@app.fastmail.com/">Chuck Lever</a> thanked Hamza for posting the full series so the problem statement was visible, and acknowledged the underlying pain:</p>
+<blockquote>
+<p>"Contention in the page allocator is vexing, and is a problem we've been chasing for years."</p>
+</blockquote>
+<p>He then argued that expanding <code>nfsd_iter_read()</code> to more filesystems would expose two <em>pre-existing</em> bugs that already affect <code>sec=krb5i</code>/<code>sec=krb5p</code>, <code>nfsd_disable_splice_read</code>, and <code>NFSD_IO_DIRECT</code>:</p>
+<ol>
+<li><strong>fsnotify double-counting.</strong> <code>vfs_iocb_iter_read()</code> emits an access event, and <code>nfsd_finish_read()</code> emits a second. Splice emits none in the VFS helper, so <code>nfsd_finish_read()</code> is the only event on that path — correct for splice, one too many for iter.</li>
+<li><strong>atime not updated.</strong> <code>nfsd_splice_read()</code> picks up <code>file_accessed()</code> from <code>splice_direct_to_actor()</code>. <code>nfsd_iter_read()</code> leaves atime to <code>-&gt;read_iter</code>. That works for gfs2, cifs DIO, ext4 DAX and XFS DAX, but <code>fuse_dax_read_iter()</code> has an explicit <code>/* TODO file_accessed(iocb-&gt;f_filp) */</code> and never advances atime.</li>
+</ol>
+<p>Lever's ask was a backportable fix <em>before</em> the series, not a rewrite of 1/2 for stable:</p>
+<blockquote>
+<p>"So what I'd like you to do is provide a backportable fix that applies before your series to address the fsnotify and atime accounting issues. I'm not convinced that stable will want the bulk of the 1/2 changes as you have them here."</p>
+</blockquote>
+<p>Hamza <a href="https://lore.kernel.org/linux-nfs/aoTmC-jhOLD6F4gY@hamza-PC/">agreed both issues were real</a> and posted a separate two-patch series the same day:</p>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260818225715.572140-1-ameer.hamza@truenas.com/">NFSD: Fix duplicate fsnotify access events for iterator READs</a> — move <code>fsnotify_access()</code> out of <code>nfsd_finish_read()</code> and into <code>nfsd_splice_read()</code>, the one path whose VFS helper does not emit it. <code>Fixes: 507df40ebf316</code>, Cc: stable.</li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260818225715.572140-2-ameer.hamza@truenas.com/">NFSD: Update the atime for iterator READs</a> — call <code>file_accessed()</code> after each successful <code>vfs_iocb_iter_read()</code>, because "nfsd serves whatever filesystem is exported, so it cannot rely on every <code>-&gt;read_iter</code> keeping the convention." Same <code>Fixes:</code> tag, also Cc: stable.</li>
+</ul>
+<p>Those patches are a separate thread; they are the week's actual bug-fix fallout from this series.</p>
+<h2>Neil Brown: don't poke <code>f_op-&gt;splice_read</code> by function pointer</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/178709365192.2852630.5607658976022815566@noble.neil.brown.name/">NeilBrown</a> disliked the detection method, not necessarily the goal:</p>
+<blockquote>
+<p>"I really don't like the approach of explicitly testing whether <code>f_op-&gt;splice_read</code> is a particular value."</p>
+</blockquote>
+<p>His alternative: add <code>FMODE_DONT_COPY_FOR_SPLICE</code> so <code>copy_splice_read()</code> returns <code>-ENOTSUP</code> (or similar). nfsd would still <em>try</em> splice_read, and fall back to iter_read on that error. That would also catch 9p and ceph, which Hamza's helper cannot see. Hamza <a href="https://lore.kernel.org/linux-nfs/aoToQWzqZNqB4sIJ@hamza-PC/">accepted this for v2</a>:</p>
+<blockquote>
+<p>"Thanks, this indeed works better. I believe it also covers 9p and ceph falling back to <code>copy_splice_read()</code> internally, which the helper could not see. I will work it out this way for v2."</p>
+</blockquote>
+<h2>Christoph Hellwig: NACK on the premise</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/aoRvOZTxA1kxBO9x@infradead.org/">Christoph Hellwig</a> rejected patch 1 on more fundamental grounds:</p>
+<blockquote>
+<p>"No. None of the above are sensible use cases for NFSD exports. There is no good reason to add a barely maintained special code path thae pokes into internals for this."</p>
+</blockquote>
+<p>Hamza <a href="https://lore.kernel.org/linux-nfs/aoTuAnr4bBLg-BGf@hamza-PC/">conceded the internals point</a> and said he would rework v2 around Neil's FMODE flag "unless you have something else in mind." Hellwig's <a href="https://lore.kernel.org/linux-nfs/aoVGQ5a7ZhMmq2xY@infradead.org/">follow-up</a> made the "if" itself the issue, and was blunt about the DAX/tmpfs reproduction:</p>
+<blockquote>
+<p>"That's a big IFF. The splice fallback is a generate case. And no, we should not add flags and big blobs of NFSD code to work around it, there's simply no point in optimizing for some LLM generated ext4 on fake DAX bullshit."</p>
+</blockquote>
+<p>(Both of Hamza's patches, and the follow-up bug fixes, carry <code>Assisted-by: Claude:claude-fable-5</code>.)</p>
+<h2>Where things stand</h2>
+<p>This week did not produce a conclusion on merging either half of the series. Lever wants the fsnotify/atime bugs fixed first and is not convinced the splice-vs-iter reroute belongs in stable; Brown wants a generic FMODE handshake rather than function-pointer tests if the reroute happens at all; Hellwig does not want the reroute, or new flags to enable it, because he does not consider copy-splice filesystems (DAX, gfs2, kernfs, cifs DIO) first-class NFSD export targets. Patch 2 — the recycling design that actually removes the 43% <code>free_one_page()</code> tax, including for <code>nfsd_disable_splice_read</code> and krb5i/krb5p, which already use <code>nfsd_iter_read()</code> without patch 1 — has not been reviewed. Hamza is preparing a v2 around Brown's FMODE idea; whether that survives Hellwig's "big IFF" is the open question going into next week.</p>
+<p>There is no NFS <em>client</em> code in this series. The client-visible effects, if any, would be server-side: fewer allocator stalls under DAX/copy-splice/krb5 integrity READ load, plus (from the split-out fixes) correct atime and a single fsnotify access event on iterator READs that already take that path today.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260817210811.3984663-1-ameer.hamza@truenas.com/">2026-08-17 Ameer Hamza <a href="mailto:ameer.hamza@truenas.com">ameer.hamza@truenas.com</a> — [PATCH 0/2] SUNRPC: Recycle sent Reply pages instead of freeing them</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260817210811.3984663-2-ameer.hamza@truenas.com/">2026-08-17 Ameer Hamza <a href="mailto:ameer.hamza@truenas.com">ameer.hamza@truenas.com</a> — [PATCH 1/2] NFSD: Use nfsd_iter_read() when -&gt;splice_read is not zero-copy</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260817210811.3984663-3-ameer.hamza@truenas.com/">2026-08-17 Ameer Hamza <a href="mailto:ameer.hamza@truenas.com">ameer.hamza@truenas.com</a> — [PATCH 2/2] SUNRPC: Recycle sent Reply pages instead of freeing them</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/2ed0ee16-c20e-44bd-9e7a-f5b71764f14f@app.fastmail.com/">2026-08-18 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 1/2] NFSD: Use nfsd_iter_read() when -&gt;splice_read is not zero-copy</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aoRvOZTxA1kxBO9x@infradead.org/">2026-08-18 Christoph Hellwig <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [PATCH 1/2] NFSD: Use nfsd_iter_read() when -&gt;splice_read is not zero-copy</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178709365192.2852630.5607658976022815566@noble.neil.brown.name/">2026-08-18 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH 1/2] NFSD: Use nfsd_iter_read() when -&gt;splice_read is not zero-copy</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aoTmC-jhOLD6F4gY@hamza-PC/">2026-08-18 Ameer Hamza <a href="mailto:ameer.hamza@truenas.com">ameer.hamza@truenas.com</a> — Re: [PATCH 1/2] NFSD: Use nfsd_iter_read() when -&gt;splice_read is not zero-copy</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aoToQWzqZNqB4sIJ@hamza-PC/">2026-08-18 Ameer Hamza <a href="mailto:ameer.hamza@truenas.com">ameer.hamza@truenas.com</a> — Re: [PATCH 1/2] NFSD: Use nfsd_iter_read() when -&gt;splice_read is not zero-copy</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aoTuAnr4bBLg-BGf@hamza-PC/">2026-08-18 Ameer Hamza <a href="mailto:ameer.hamza@truenas.com">ameer.hamza@truenas.com</a> — Re: [PATCH 1/2] NFSD: Use nfsd_iter_read() when -&gt;splice_read is not zero-copy</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aoVGQ5a7ZhMmq2xY@infradead.org/">2026-08-19 Christoph Hellwig <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [PATCH 1/2] NFSD: Use nfsd_iter_read() when -&gt;splice_read is not zero-copy</a></li>
+</ul>
+  </main>
+</body>
+</html>

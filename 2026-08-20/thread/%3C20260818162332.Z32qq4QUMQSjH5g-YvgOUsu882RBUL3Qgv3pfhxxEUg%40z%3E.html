@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSv4 client OOB read in pNFS layout-type decode</title>
+  <meta name="description" content="This week’s linux-nfs traffic includes a standalone NFS client bug-fix from Alibaba’s Chuyf26: an integer-wrap out-of-bounds read in the NFSv4 XDR decoder for pNFS layout types. There were no replies in-window; the patch landed as a…">
+  <meta property="og:title" content="NFSv4 client OOB read in pNFS layout-type decode">
+  <meta property="og:description" content="This week’s linux-nfs traffic includes a standalone NFS client bug-fix from Alibaba’s Chuyf26: an integer-wrap out-of-bounds read in the NFSv4 XDR decoder for pNFS layout types. There were no replies in-window; the patch landed as a…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSv4 client OOB read in pNFS layout-type decode">
+  <meta name="twitter:description" content="This week’s linux-nfs traffic includes a standalone NFS client bug-fix from Alibaba’s Chuyf26: an integer-wrap out-of-bounds read in the NFSv4 XDR decoder for pNFS layout types. There were no replies in-window; the patch landed as a…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSv4 client OOB read in pNFS layout-type decode</h1>
+<h2>Summary</h2>
+<p>This week’s linux-nfs traffic includes a standalone NFS <strong>client bug-fix</strong> from Alibaba’s Chuyf26: an integer-wrap out-of-bounds read in the NFSv4 XDR decoder for pNFS layout types. There were no replies in-window; the patch landed as a single-message thread and has not yet been acked, nacked, or revised.</p>
+<h2>What broke</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260818162332.Z32qq4QUMQSjH5g-YvgOUsu882RBUL3Qgv3pfhxxEUg@z/">Chuyf26</a> reports that <code>decode_pnfs_layout_types()</code> in <code>fs/nfs/nfs4xdr.c</code> feeds a server-supplied count into a bulk <code>xdr_inline_decode()</code>:</p>
+<blockquote>
+<p>"decode_pnfs_layout_types() passes nlayouttypes * 4 to a single xdr_inline_decode() call. nlayouttypes comes from the server and the multiplication can wrap around to a small value, so the bounds check only covers a few bytes while the following loop reads up to NFS_MAX_LAYOUT_TYPES words from the resulting pointer."</p>
+</blockquote>
+<p>The attacker-controlled path is ordinary client FSINFO decoding — mount or <code>statfs</code> — via <code>nfs4_xdr_dec_fsinfo()</code> → <code>decode_fsinfo()</code> → <code>decode_pnfs_layout_types()</code>. After wrap, the pointer from <code>xdr_inline_decode()</code> sits at the end of the receive buffer, and the subsequent loop walks up to <code>NFS_MAX_LAYOUT_TYPES</code> words past it.</p>
+<p>The failure mode is quieter than a typical KASAN splat, which is why the reporter flags it as easy to miss in testing:</p>
+<blockquote>
+<p>"The XDR receive buffer is built from pages, not slab objects, so KASAN does not instrument these reads and the following memory is normally still mapped: the access silently produces garbage layout type values instead of failing the decode."</p>
+</blockquote>
+<p>A malicious NFS server can therefore inject bogus layout-type values into the client’s <code>fsinfo</code> state at mount time rather than forcing a clean decode error.</p>
+<p>The regression is attributed to <code>3132e49ecef9</code> ("pnfs: track multiple layout types in fsinfo structure") — the change that taught the client to keep more than one pNFS layout type. The report credits Abaci (<code>abaci@linux.alibaba.com</code>) and notes assistance from <code>abaci:qwen3.8-max</code>.</p>
+<h2>The proposed client fix</h2>
+<p>The patch is a 17-line change to <code>fs/nfs/nfs4xdr.c</code> (10 insertions, 7 deletions). The strategy is defensive decoding rather than a protocol change:</p>
+<blockquote>
+<p>"Cap the number of layout types before reading them and decode each layout type word individually so every read is bounds checked."</p>
+</blockquote>
+<p>That is the classic NFS client XDR hygiene: never multiply a server <code>u32</code> into a bulk inline decode, clamp against the client’s <code>NFS_MAX_LAYOUT_TYPES</code> limit first, then pull one XDR word at a time so <code>xdr_inline_decode()</code> can reject each access independently. The result should be a failed FSINFO decode instead of a silent walk off the end of the receive pages.</p>
+<h2>Status this week</h2>
+<p>This is <strong>not</strong> a new feature and <strong>not</strong> a wire-protocol change; it is a client-side bounds-check fix against a malicious or buggy pNFS server. No maintainer review, test reports, or v2 appeared before the week closed on 2026-08-20. Until someone on the list comments, the practical takeaway for NFS client development is that <code>decode_pnfs_layout_types()</code> still trusts a wrapped <code>nlayouttypes * 4</code> length, and this patch is the first proposed close of that hole.</p>
+<p>A same-day sibling from the same author (<a href="https://lore.kernel.org/linux-nfs/20260818162429.hRkBfHzaSOJtsemwF3XqknX_wBRwf6WfB8WnVDvY5Rg@z/">GETDEVICEINFO notification bitmap OOB</a>) uses the identical wrap-then-loop pattern in another <code>nfs4xdr.c</code> decoder, which suggests Abaci is sweeping bulk <code>xdr_inline_decode(4 * server_count)</code> sites rather than chasing an isolated layout-type bug. That GETDEVICEINFO thread is tracked separately.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260818162332.Z32qq4QUMQSjH5g-YvgOUsu882RBUL3Qgv3pfhxxEUg@z/">2026-08-18 Chuyf26 <a href="mailto:Chuyf26@linux.alibaba.com">Chuyf26@linux.alibaba.com</a> —  [PATCH] NFSv4: fix out-of-bounds read when decoding many pNFS layout types</a></li>
+</ul>
+  </main>
+</body>
+</html>

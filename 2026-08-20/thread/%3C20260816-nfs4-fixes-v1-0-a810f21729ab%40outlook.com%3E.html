@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Three independent pNFS client bug fixes: LAYOUTSTATS overflow, DS cache aliasing, lseg leak</title>
+  <meta name="description" content="This week Junrui Luo posted a three-patch NFSv4/pNFS client series targeting three independent bugs in paths that consume server-chosen data. There were no replies in the window; the series landed as a v1 drop on 16 August and still awaits…">
+  <meta property="og:title" content="Three independent pNFS client bug fixes: LAYOUTSTATS overflow, DS cache aliasing, lseg leak">
+  <meta property="og:description" content="This week Junrui Luo posted a three-patch NFSv4/pNFS client series targeting three independent bugs in paths that consume server-chosen data. There were no replies in the window; the series landed as a v1 drop on 16 August and still awaits…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Three independent pNFS client bug fixes: LAYOUTSTATS overflow, DS cache aliasing, lseg leak">
+  <meta name="twitter:description" content="This week Junrui Luo posted a three-patch NFSv4/pNFS client series targeting three independent bugs in paths that consume server-chosen data. There were no replies in the window; the series landed as a v1 drop on 16 August and still awaits…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Three independent pNFS client bug fixes: LAYOUTSTATS overflow, DS cache aliasing, lseg leak</h1>
+<h2>Summary</h2>
+<p>This week Junrui Luo posted a three-patch NFSv4/pNFS client series targeting three independent bugs in paths that consume server-chosen data. There were no replies in the window; the series landed as a v1 drop on 16 August and still awaits review.</p>
+<h2>Series overview</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260816-nfs4-fixes-v1-0-a810f21729ab@outlook.com/">Luo's cover letter</a> frames the work as three standalone client fixes rather than a protocol change or a new feature:</p>
+<blockquote>
+<p>"Three independent pNFS client fixes, all in paths that consume data the server gets to choose. They touch different files and can be applied in any order."</p>
+</blockquote>
+<p>The three problems are LAYOUTSTATS send-buffer exhaustion (flexfiles), data-server cache aliasing across NFS versions, and a layout-segment leak on the <code>pnfs_layout_process()</code> forget path. All three patches carry <code>Fixes:</code> tags, <code>Cc: stable@vger.kernel.org</code>, a <code>Reported-by: Yuhao Jiang</code>, and an <code>Assisted-by: Claude:claude-opus-5</code> credit. Base commit is <code>f5bbbfec59b4</code>.</p>
+<h2>Patch 1: LAYOUTSTATS send buffer exhaustion</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260816-nfs4-fixes-v1-1-a810f21729ab@outlook.com/">Patch 1</a> is a one-line NFSv4.2 client bug fix in <code>include/linux/nfs_xdr.h</code>: raise <code>PNFS_LAYOUTSTATS_MAXSIZE</code> from 256 to 384.</p>
+<p>Luo's analysis is that <code>encode_layoutstats_maxsz</code> budgets <code>XDR_QUADLEN(PNFS_LAYOUTSTATS_MAXSIZE)</code> — 256 bytes — for the <code>layoutupdate4</code> body written by the layout driver, but a flexfiles record can exceed that. <code>ff_layout_encode_ff_layoutupdate()</code> emits, per data server, a <code>netaddr4</code>, an <code>nfs_fh4</code>, two <code>ff_io_latency4</code>, an <code>nfstime4</code> and a bool. A data-server filehandle of <code>NFS_MAXFHSIZE</code> already accounts for 132 of those bytes; the two latency records (64 bytes each), the timestamp and the bool add another 144, so the body passes 256 bytes <em>before</em> the <code>netaddr4</code> is encoded. <code>encode_layoutstats()</code> additionally writes the <code>deviceid4</code> and the <code>layoutupdate4</code> <code>lou_type</code> word, neither of which the macro accounts for.</p>
+<p>The practical failure mode is worse than a truncated RPC. Both the filehandle and the address are server-chosen via LAYOUTGET and GETDEVICEINFO, so a server can drive the encoder past the end of the send buffer. Once that happens <code>xdr_reserve_space()</code> returns NULL, and the two <code>ff_layout_encode_io_latency()</code> calls run with <code>dss_info-&gt;mirror-&gt;lock</code> held:</p>
+<blockquote>
+<p>"a NULL return there leaves the lock permanently held."</p>
+</blockquote>
+<p>The proposed fix is simply to enlarge the reservation so the record fits. The patch fixes <code>27c430644369</code> ("pnfs/flexfiles: encode LAYOUTSTATS flexfiles specific data").</p>
+<h2>Patch 2: data-server cache keyed only on address</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260816-nfs4-fixes-v1-2-a810f21729ab@outlook.com/">Patch 2</a> is the more invasive of the three client changes. It keys the per-net pNFS data-server cache on NFS version as well as the multipath address set, touching <code>nfs4_pnfs_ds_add()</code>, <code>struct nfs4_pnfs_ds</code> / <code>pnfs.h</code>, and both the files and flexfiles layout device helpers.</p>
+<p>Today <code>nfs4_pnfs_ds_add()</code> matches on the multipath address set alone, and <code>struct nfs4_pnfs_ds</code> records no version. That is enough for the files layout driver, which always connects with version 4. Flexfiles, however, takes its version tuple from GETDEVICEINFO per device, and one address can legitimately serve both NFSv3 and NFSv4. Two deviceids on one address with different <code>ds_versions[0].version</code> therefore share a single <code>nfs4_pnfs_ds</code>, and whichever mirror connects first pins <code>ds_clp</code> to its own version. The other mirror is then handed that client anyway, so it selects <code>rpc_call_ops</code> for a version the connection does not speak:</p>
+<blockquote>
+<p>"the mismatched sequence-slot handling dereferences NULL."</p>
+</blockquote>
+<p>Luo's fix adds the version to the cache key so the two cannot alias, giving each version its own <code>nfs4_pnfs_ds</code> and connection while both mirrors stay usable. Only the major version is compared, because that is what selects <code>rpc_call_ops</code> and <code>rpc_ops</code>; v4.0 and v4.1 keep sharing a client. The files layout driver passes the 4 it already hardcodes at connect time.</p>
+<p>The patch fixes <code>d67ae825a59d</code> ("pnfs/flexfiles: Add the FlexFile Layout Driver") — a long-standing flexfiles client defect rather than a recent regression.</p>
+<h2>Patch 3: layout segment leak on the forget path</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260816-nfs4-fixes-v1-3-a810f21729ab@outlook.com/">Patch 3</a> restores a one-line drain that was lost in a later simplification of <code>pnfs_layout_process()</code>.</p>
+<p>When the server returns a new layout stateid while a valid one is still held, <code>pnfs_layout_process()</code> calls <code>pnfs_mark_matching_lsegs_return()</code> on the on-stack <code>free_me</code> list and jumps to <code>out_forget</code>. Segments whose reference count drops to zero are unlinked from <code>lo-&gt;plh_segs</code> and moved to <code>free_me</code> by <code>mark_lseg_invalid()</code>; for an idle cached segment the layout header holds the only reference, so this happens on the first decrement. The success path calls <code>pnfs_free_lseg_list()</code>, but <code>out_forget</code> never drains <code>free_me</code>.</p>
+<p>Luo reconstructs the regression as a three-commit sequence: <code>814b84971388</code> added the drain; <code>08bd8dbe8882</code> removed it while switching the destination to <code>lo-&gt;plh_return_segs</code> (which is drained elsewhere); <code>fb700ef02676</code> ("NFSv4.1: Simplify layout return in <code>pnfs_layout_process()</code>") switched the destination back to <code>free_me</code> without restoring the drain. The patch restores the <code>pnfs_free_lseg_list()</code> call and is tagged <code>Fixes: fb700ef02676</code>.</p>
+<h2>Status this week</h2>
+<p>This is a <strong>bug-fix</strong> series, not a protocol change. All three patches are NFS client / pNFS (flexfiles and files layout) work; two of them (LAYOUTSTATS overflow and DS cache aliasing) are specifically about flexfiles consuming server-chosen device and filehandle data, and the third is a layout-header lifetime leak on NFSv4.1 layout-stateid replacement.</p>
+<p>No reviewer, maintainer, or tester replied in the week ending 20 August. The series remains unacked, with stable CCs already in place and no follow-up revisions. The outstanding questions for review are whether 384 bytes is a durable LAYOUTSTATS budget (versus computing the reservation from the actual record), whether major-version-only DS cache keys are sufficient for mixed v4.0/v4.1 flexfiles devices, and whether restoring <code>pnfs_free_lseg_list()</code> on <code>out_forget</code> is complete relative to the <code>plh_return_segs</code> path that replaced it in <code>08bd8dbe8882</code>.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260816-nfs4-fixes-v1-3-a810f21729ab@outlook.com/">2026-08-16 Junrui Luo via B4 Relay <a href="mailto:devnull+moonafterrain.outlook.com@kernel.org">devnull+moonafterrain.outlook.com@kernel.org</a> — [PATCH 3/3] NFSv4.1: fix layout segment leak on the pnfs_layout_process() forget path</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260816-nfs4-fixes-v1-2-a810f21729ab@outlook.com/">2026-08-16 Junrui Luo via B4 Relay <a href="mailto:devnull+moonafterrain.outlook.com@kernel.org">devnull+moonafterrain.outlook.com@kernel.org</a> — [PATCH 2/3] NFSv4/pnfs: key the data server cache on the NFS version</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260816-nfs4-fixes-v1-0-a810f21729ab@outlook.com/">2026-08-16 Junrui Luo via B4 Relay <a href="mailto:devnull+moonafterrain.outlook.com@kernel.org">devnull+moonafterrain.outlook.com@kernel.org</a> — [PATCH 0/3] NFSv4/pnfs: LAYOUTSTATS overflow, DS cache aliasing, lseg leak</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260816-nfs4-fixes-v1-1-a810f21729ab@outlook.com/">2026-08-16 Junrui Luo via B4 Relay <a href="mailto:devnull+moonafterrain.outlook.com@kernel.org">devnull+moonafterrain.outlook.com@kernel.org</a> — [PATCH 1/3] NFSv4.2: fix LAYOUTSTATS send buffer exhaustion</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Flexfiles DS setup errors get a real opnum, not OP_ILLEGAL</title>
+  <meta name="description" content="This week’s linux-nfs traffic on this thread is a single, pointed client review of Benjamin Coddington’s NFSv4 flexfiles diagnostic fix, posted the previous day as patch 1 of 3 in the “pNFS/flexfiles: mirror instance error handling” series.">
+  <meta property="og:title" content="Flexfiles DS setup errors get a real opnum, not OP_ILLEGAL">
+  <meta property="og:description" content="This week’s linux-nfs traffic on this thread is a single, pointed client review of Benjamin Coddington’s NFSv4 flexfiles diagnostic fix, posted the previous day as patch 1 of 3 in the “pNFS/flexfiles: mirror instance error handling” series.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Flexfiles DS setup errors get a real opnum, not OP_ILLEGAL">
+  <meta name="twitter:description" content="This week’s linux-nfs traffic on this thread is a single, pointed client review of Benjamin Coddington’s NFSv4 flexfiles diagnostic fix, posted the previous day as patch 1 of 3 in the “pNFS/flexfiles: mirror instance error handling” series.">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Flexfiles DS setup errors get a real opnum, not OP_ILLEGAL</h1>
+<h2>Summary</h2>
+<p>This week’s linux-nfs traffic on this thread is a single, pointed client review of <a href="https://lore.kernel.org/linux-nfs/716acff789261dade8d1f530f2bac243e9c7791e.1786636529.git.bcodding@hammerspace.com/">Benjamin Coddington’s</a> NFSv4 flexfiles diagnostic fix, posted the previous day as patch 1 of 3 in the “pNFS/flexfiles: mirror instance error handling” series.</p>
+<p>The discussion is a <strong>bug-fix / error-reporting improvement</strong> on the NFS client’s pNFS flexfiles layout driver, not a protocol change. It sits in a larger client-side effort to stop the flexfiles driver from lying to the metadata server (and to operators) when a data-server (DS) path dies.</p>
+<h2>Prior week, in brief</h2>
+<p>On 13 August, Coddington sent a three-patch series whose cover letter described a real recovery hazard: when a flexfiles DS fails, the client marks the layout for return and cancels in-flight I/O for the whole layout segment. <code>ff_layout_cancel_io()</code> currently kills RPCs on every mirror, including healthy ones. Requests already on the wire cannot be un-sent, so writes can complete on a DS after <code>LAYOUTRETURN</code>, and the MDS then sees writes against a file that no longer has an outstanding write layout.</p>
+<p>Patch 1 is the diagnostic half of that story. When <code>nfs4_ff_layout_prepare_ds()</code> cannot even connect to a DS, the client records a device error with opnum <code>OP_ILLEGAL</code> because nothing ever went on the wire. Coddington argued that this is the wrong signal:</p>
+<blockquote>
+<p>"But servers can use the ff_ioerr4 opnum to distinguish failed read-class operations from write-class operations when deciding how to recover the affected mirror -- a mirror that may have missed writes needs to be brought back in sync, while one that merely failed to serve a read does not. OP_ILLEGAL gives the server nothing to act on."</p>
+</blockquote>
+<p>Every caller already knows which operation it was preparing (READ vs WRITE/COMMIT), and the existing <code>fail_return</code> boolean already splits along that same boundary (<code>false</code> for READ, <code>true</code> for WRITE and COMMIT). The patch replaces that boolean with the intended NFS opnum, derives the layout-return decision from it, and reports the real opnum in the tracked device error instead of <code>OP_ILLEGAL</code>. The change is confined to <code>flexfilelayout.c</code>, <code>flexfilelayout.h</code>, and <code>flexfilelayoutdev.c</code>.</p>
+<p>Patches 2 and 3 (not reviewed in this thread this week) then thread a device-ID argument through <code>-&gt;cancel_io()</code> so a failed mirror can be cancelled in isolation while I/O to remaining mirrors drains before <code>LAYOUTRETURN</code>, matching RFC 8881 §20.3.4’s advice to wait for in-flight READ/WRITE/COMMIT.</p>
+<h2>This week: Tigran Mkrtchyan’s review</h2>
+<p>On 14 August, <a href="https://lore.kernel.org/linux-nfs/EF00E0BC-B562-47DB-916D-F6BD6431A111@mail.desy.de/">Tigran Mkrtchyan</a> of DESY replied only to patch 1, with the tone of someone who has been staring at the current logs in production:</p>
+<blockquote>
+<p>"Our logs are full of those OP_ILLEGAL errors. Thanks for making them more useful."</p>
+</blockquote>
+<blockquote>
+<p>"The change makes sense and looks valid."</p>
+</blockquote>
+<p>He added <code>Reviewed-by: Tigran Mkrtchyan &lt;tigran.mkrtchyan@desy.de&gt;</code>. There was no request for a respin, no debate over the <code>fail_return</code> → opnum mapping, and no comment in this thread on patches 2/3.</p>
+<p>That is the entire in-window conversation: an Ack on the client’s flexfiles DS-setup error path, motivated by real operational noise. The review does not close the series — cancellation of I/O to a single failed mirror remains unreviewed here — but it does lock in the first, independently useful piece: when a flexfiles client cannot even reach a DS, the MDS (and the logs) will now see the operation that was <em>about</em> to be sent, rather than a synthetic <code>OP_ILLEGAL</code>.</p>
+<h2>Conclusions</h2>
+<ul>
+<li><strong>Type:</strong> NFS client bug-fix / error-reporting improvement in the pNFS flexfiles layout driver.</li>
+<li><strong>This week’s outcome:</strong> Patch 1 has a <code>Reviewed-by</code> from Mkrtchyan; no technical objections were raised.</li>
+<li><strong>Client impact:</strong> DS connection-setup failures will report the intended READ/WRITE/COMMIT opnum in <code>ff_ioerr4</code>, giving servers a usable recovery hint and operators a log line that is not a wall of <code>OP_ILLEGAL</code>.</li>
+<li><strong>Still open in the parent series:</strong> per-device <code>cancel_io</code> and “only cancel the failed mirror” have not been discussed on this thread this week.</li>
+</ul>
+<p>No further messages landed in-window after Mkrtchyan’s review.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/EF00E0BC-B562-47DB-916D-F6BD6431A111@mail.desy.de/">2026-08-14 "Mkrtchyan, Tigran" <a href="mailto:tigran@mail.desy.de">tigran@mail.desy.de</a> — Re: [PATCH 1/3] NFSv4/flexfiles: report the intended opnum when DS connection setup fails</a></li>
+</ul>
+  </main>
+</body>
+</html>

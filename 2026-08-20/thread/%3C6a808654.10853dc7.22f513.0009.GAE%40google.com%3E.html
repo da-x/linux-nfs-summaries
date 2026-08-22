@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>syzbot: stack overflow in nfsctl_transaction_write via recursive svc_write_space</title>
+  <meta name="description" content="This week’s linux-nfs traffic includes a fresh syzbot crash against upstream, tagged [net?] [nfs?]. The report is a bug, not a protocol change or a new feature: a TASK stack guard-page hit while writing NFSD control-plane ports through…">
+  <meta property="og:title" content="syzbot: stack overflow in nfsctl_transaction_write via recursive svc_write_space">
+  <meta property="og:description" content="This week’s linux-nfs traffic includes a fresh syzbot crash against upstream, tagged [net?] [nfs?]. The report is a bug, not a protocol change or a new feature: a TASK stack guard-page hit while writing NFSD control-plane ports through…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="syzbot: stack overflow in nfsctl_transaction_write via recursive svc_write_space">
+  <meta name="twitter:description" content="This week’s linux-nfs traffic includes a fresh syzbot crash against upstream, tagged [net?] [nfs?]. The report is a bug, not a protocol change or a new feature: a TASK stack guard-page hit while writing NFSD control-plane ports through…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>syzbot: stack overflow in nfsctl_transaction_write via recursive svc_write_space</h1>
+<h2>Summary</h2>
+<p>This week’s linux-nfs traffic includes a fresh syzbot crash against upstream, tagged <code>[net?] [nfs?]</code>. The report is a <strong>bug</strong>, not a protocol change or a new feature: a TASK stack guard-page hit while writing NFSD control-plane ports through <code>nfsctl_transaction_write</code>. No maintainer, reviewer, or patch has answered yet, so the thread remains an untriaged crash dump with a C reproducer.</p>
+<h2>What syzbot reported</h2>
+<p>On 15 August, <a href="https://lore.kernel.org/linux-nfs/6a808654.10853dc7.22f513.0009.GAE@google.com/">syzbot</a> filed:</p>
+<blockquote>
+<p>"syzbot found the following issue on:
+HEAD commit:    d58772d8520c Merge tag 'regmap-fix-v7.2-rc7' of git://git...
+git tree:       upstream"</p>
+</blockquote>
+<p>The bot asked that any fix carry:</p>
+<blockquote>
+<p>"Reported-by: syzbot+54cdc566f64abf51b7f1@syzkaller.appspotmail.com"</p>
+</blockquote>
+<p>The kernel is an upstream tree at <code>d58772d8520c</code> (around v7.2-rc7), built with gcc 14.2.0, KASAN, and <code>PREEMPT(full)</code>. Userspace is <strong>i386</strong> (<code>userspace arch: i386</code>), and the faulting task entered via a 32-bit compat write:</p>
+<pre><code>do_fast_syscall_32
+ksys_write
+vfs_write
+nfsctl_transaction_write
+</code></pre>
+<p>The oops itself is unambiguous:</p>
+<blockquote>
+<p>"BUG: TASK stack guard page was hit at ffffc900037d7ff8 (stack is ffffc900037d8000..ffffc900037e0000)
+Oops: stack guard page: 0000 [#1] SMP KASAN NOPTI"</p>
+</blockquote>
+<p>RIP is in <code>kasan_check_range()</code> (<code>mm/kasan/generic.c:199</code>), with CR2 pointing at the guard page. That is stack exhaustion, not a typical KASAN heap-use-after-free.</p>
+<p>Dashboard, console log, kernel config, syz repro, and C reproducer are all attached. Syzbot’s usual control commands (<code>#syz fix</code>, <code>#syz test</code>, <code>#syz dup</code>) are present; none have been used this week.</p>
+<h2>Call chain: NFSD control write into SUNRPC sockets</h2>
+<p>The outer path is NFSD’s <code>nfsctl</code> transaction interface, not an NFS client READ/WRITE. The truncated-but-complete tail of the trace is:</p>
+<ul>
+<li><code>nfsctl_transaction_write</code> (<code>fs/nfsd/nfsctl.c:112</code>)</li>
+<li><code>write_ports</code> / <code>__write_ports</code> / <code>__write_ports_addfd</code> (<code>fs/nfsd/nfsctl.c:861 / 805 / 742</code>)</li>
+<li><code>svc_addsock</code> (<code>net/sunrpc/svcsock.c:1547</code>)</li>
+<li><code>svc_setup_socket</code> (<code>net/sunrpc/svcsock.c:1498</code>)</li>
+<li><code>svc_udp_init</code> (<code>net/sunrpc/svcsock.c:854</code>)</li>
+<li><code>svc_sock_setbufsize</code> (<code>net/sunrpc/svcsock.c:386</code>)</li>
+<li>then unbounded recursion through <code>svc_write_space</code> (<code>net/sunrpc/svcsock.c:429–430</code>)</li>
+</ul>
+<p>In other words, a write to the NFSD ports file that <strong>adds a file descriptor</strong> (<code>__write_ports_addfd</code>) is enough to set up a UDP svc socket, resize its buffers, and then overflow the kernel stack.</p>
+<p>That matters for client-facing NFS as well as the server: <code>svc_write_space</code> lives in shared SUNRPC socket code (<code>net/sunrpc/svcsock.c</code>). A recursive <code>sk_write_space</code> callback on an svc socket can take down any kernel thread that happens to be in that path, not only nfsd workers. Here the victim is the syzkaller process itself (<code>Comm: syz.0.18</code>), PID 5932, running a compat <code>write(2)</code> against nfsctl.</p>
+<h2>The smoking gun: recursive <code>svc_write_space</code></h2>
+<p>The body of the oops is almost entirely one function calling itself. After the first frame:</p>
+<pre><code>svc_write_space+0x90/0x2b0 net/sunrpc/svcsock.c:429
+</code></pre>
+<p>the dump repeats, hundreds of times:</p>
+<pre><code>svc_write_space+0xe6/0x2b0 net/sunrpc/svcsock.c:430
+</code></pre>
+<p>The first frame is the tracepoint <code>trace_svcsock_write_space</code> (via <code>cpu_online</code> / <code>cpumask_test_cpu</code> / KASAN’s <code>_test_bit</code>). Every subsequent frame is the same function at offset <code>0xe6</code>, i.e. the recursive call site at <code>svcsock.c:430</code>.</p>
+<p>That pattern is the classic <strong>unbounded <code>sk-&gt;sk_write_space</code> recursion</strong>: <code>svc_write_space</code> is installed as the socket’s write-space callback; something in that callback (or in <code>svc_sock_setbufsize</code>, which the outer frames show calling into it) notifies write-space again on the same or a chained socket, and there is no recursion brake. Each call consumes stack; KASAN instrumentation on <code>cpu_online</code> inside the tracepoint makes the frames even fatter, so the 8K/16K kernel stack hits the guard page quickly.</p>
+<p>The disassembly note in the report matches that story:</p>
+<blockquote>
+<p>"* 2a:	55                   	push   %rbp &lt;-- trapping instruction"</p>
+</blockquote>
+<p><code>kasan_check_range</code> is trying to push a frame onto an already-exhausted stack.</p>
+<h2>NFS client angle, and why the subject is tagged <code>[nfs?]</code></h2>
+<p>Despite the <code>[nfs?]</code> tag, this is <strong>not an NFS client I/O bug</strong>. The trigger is NFSD’s user-facing control file (<code>nfsctl_transaction_write</code> → <code>write_ports</code>). Client developers still care, for two reasons:</p>
+<ol>
+<li><strong>Shared SUNRPC socket layer.</strong> <code>svc_write_space</code>, <code>svc_sock_setbufsize</code>, and <code>svc_setup_socket</code> are the same helpers used whenever a kernel RPC service binds a socket. A write-space recursion bug is a SUNRPC transport bug; it can in principle bite local RPC services that the NFS client stack also uses (lockd, rpc.statd-adjacent kernel bits, nfsdcld is userspace, but the svc socket code is common).</li>
+<li><strong>Compat / 32-bit entry.</strong> The repro runs as i386 userspace on a 64-bit kernel (<code>entry_SYSENTER_compat_after_hwframe</code>, <code>do_fast_syscall_32</code>). NFS client test matrices that exercise 32-on-64 nfsctl or mount helpers are exactly the kind of environment that would trip this if a similar fd-add path is used.</li>
+</ol>
+<p>There is no indication of a client-side <code>nfs_file_write</code> / sunrpc client transport issue in this dump. The <code>[net?]</code> tag is the more accurate of the two: the unbounded recursion is in <code>net/sunrpc/svcsock.c</code>.</p>
+<h2>Reproduction and environment</h2>
+<p>Syzbot shipped both a syz repro and a C reproducer, plus a non-bootable disk image, <code>vmlinux</code>, and <code>bzImage</code> for <code>d58772d8520c</code>. Hardware is QEMU Q35. The task is untainted (<code>Not tainted syzkaller #0</code>). No modules are loaded.</p>
+<p>The control-plane write is tiny: <code>write(fd=6, buf, 1)</code> in the compat registers (<code>RDX: 0000000000000001</code>), which is consistent with writing a single-byte / short ports record that still takes the <code>addfd</code> branch.</p>
+<h2>Status this week</h2>
+<p>This is a <strong>one-message thread</strong>. <code>ListThreadMessages</code> shows only the 15 August syzbot mail; there is no prior weekly summary file for this Message-ID, and no human reply in-window. Related-subject search did not turn up an existing linux-nfs discussion of this exact <code>nfsctl_transaction_write</code> stack-guard hit.</p>
+<p>Until someone replies, the technical conclusion from the dump alone is:</p>
+<ul>
+<li><strong>Class:</strong> kernel stack overflow / unbounded recursion (DoS, Oops).</li>
+<li><strong>Site:</strong> <code>svc_write_space()</code> in SUNRPC server sockets, entered from <code>svc_sock_setbufsize()</code> while adding a UDP svc socket via nfsctl <code>write_ports</code>.</li>
+<li><strong>Trigger surface:</strong> privileged write to NFSD’s ports transaction file (<code>__write_ports_addfd</code>), exercised here from 32-bit compat userspace.</li>
+<li><strong>Fix direction (not yet proposed):</strong> break the <code>sk_write_space</code> re-entry in <code>svc_write_space</code> / <code>svc_sock_setbufsize</code> (guard against calling the same callback on the socket whose write-space is already running; or defer buffer-size notification so it cannot recurse during init). Any such commit should include the syzbot <code>Reported-by</code> tag quoted above.</li>
+</ul>
+<p>No patch, no <code>#syz fix</code>, and no subsystem re-tag landed this week. The crash is still open on the syzbot dashboard.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/6a808654.10853dc7.22f513.0009.GAE@google.com/">2026-08-15 syzbot <a href="mailto:syzbot+54cdc566f64abf51b7f1@syzkaller.appspotmail.com">syzbot+54cdc566f64abf51b7f1@syzkaller.appspotmail.com</a> — [syzbot] [net?] [nfs?] BUG: stack guard page was hit in nfsctl_transaction_write</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Jeff Layton reviews NFSD CB_RECALL_ANY keep-count series</title>
+  <meta name="description" content="Chuck Lever&#39;s v3 series to stop NFSD from blasting CB_RECALL_ANY with a keep count of zero picked up its remaining review tags this week, with Jeff Layton signing off on the shrinker-accounting half of the work.">
+  <meta property="og:title" content="Jeff Layton reviews NFSD CB_RECALL_ANY keep-count series">
+  <meta property="og:description" content="Chuck Lever&#39;s v3 series to stop NFSD from blasting CB_RECALL_ANY with a keep count of zero picked up its remaining review tags this week, with Jeff Layton signing off on the shrinker-accounting half of the work.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Jeff Layton reviews NFSD CB_RECALL_ANY keep-count series">
+  <meta name="twitter:description" content="Chuck Lever&#39;s v3 series to stop NFSD from blasting CB_RECALL_ANY with a keep count of zero picked up its remaining review tags this week, with Jeff Layton signing off on the shrinker-accounting half of the work.">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Jeff Layton reviews NFSD CB_RECALL_ANY keep-count series</h1>
+<h2>Summary</h2>
+<p>Chuck Lever's v3 series to stop NFSD from blasting <code>CB_RECALL_ANY</code> with a keep count of zero picked up its remaining review tags this week, with <a href="https://lore.kernel.org/linux-nfs/36409b40bd92bbdc8f85661f58afaeac3fb3eeef.camel@kernel.org/">Jeff Layton</a> signing off on the shrinker-accounting half of the work.</p>
+<h2>Context from just before the window</h2>
+<p>On 13 August, <a href="https://lore.kernel.org/linux-nfs/20260813-recall-any-keep-count-v3-0-a96d243c0b13@kernel.org/">Chuck Lever posted v3</a> of "NFSD: CB_RECALL_ANY fixes and a meaningful keep count" — a mix of protocol-usage bug fixes and a server-side shrinker redesign. The cover letter is blunt about the current behavior:</p>
+<blockquote>
+<p>"NFSD currently sends every CB_RECALL_ANY with craa_objects_to_keep set to zero, as RFC 8881 Section 20.6.3 does not mandate any particular way for a client to choose which delegations to return, if any."</p>
+</blockquote>
+<p>That zero is not a no-op. RFC 8881 defines <code>craa_objects_to_keep</code> as the number of recallable objects the client may retain; zero therefore asks the client to return <em>every</em> delegation it holds, including ones backing files that are still open. Lever's rationale is performance, not pedantry:</p>
+<blockquote>
+<p>"a zero value can result in non-Linux clients giving back more delegations than is necessary to relieve temporary memory pressure on the server, which needlessly punctures the clients' delegation working set."</p>
+</blockquote>
+<p>The Linux NFS client has been masking the bug. Lever notes that "only the Linux NFS client has been deeply tested against" NFSD's <code>CB_RECALL_ANY</code>, and that implementation "ignores the craa_objects_to_keep value and returns only one unused delegation of the named types." The fixed zero therefore never showed up in Linux-on-Linux testing. Non-Linux clients that honor the field would dump their working set on the first hint of server memory pressure.</p>
+<p>v3 grew from a four-patch v1/v2 into eight patches after Lever split the state shrinker so the keep count can be apportioned. The first four patches already carried Layton's <code>Reviewed-by</code> from earlier rounds; this week's mail is the review of the new accounting work.</p>
+<h2>What the series actually changes</h2>
+<p>The eight patches, all in <code>fs/nfsd/</code>, fall into two buckets: client-visible protocol bugs, then the shrinker machinery needed to send a keep count that is not a lie.</p>
+<p><strong>Client-visible bug fixes (patches 1–4).</strong> <a href="https://lore.kernel.org/linux-nfs/20260813-recall-any-keep-count-v3-1-a96d243c0b13@kernel.org/">Patch 1</a> stops <code>deleg_reaper()</code> from sending <code>CB_RECALL_ANY</code> to NFSv4.0 clients. That operation is NFSv4.1-only; a v4.0 callback service accepts only <code>CB_GETATTR</code> and <code>CB_RECALL</code>, so it replies <code>OP_ILLEGAL</code>. The decoder maps the unexpected opnum to <code>-EIO</code>, <code>nfsd4_cb_done()</code> marks the callback channel down, and nothing brings it back — <code>nfsd4_run_cb_work()</code> only sets <code>NFSD4_CB_UP</code> for minor version &gt; 0, and the only <code>nfsd4_probe_callback()</code> a v4.0 client reaches is <code>nfsd4_setclientid_confirm()</code>. One visit from the reaper therefore leaves <code>RENEW</code> returning <code>NFS4ERR_CB_PATH_DOWN</code> for as long as the client holds delegations, and <code>nfsd4_cb_channel_good()</code> refuses to grant any more. Lever tags this <code>Fixes: 44df6f439a17 ("NFSD: add delegation reaper to react to low memory condition")</code>.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260813-recall-any-keep-count-v3-2-a96d243c0b13@kernel.org/">Patch 2</a> adds <code>cl_deleg_count</code> on <code>struct nfs4_client</code>, maintained under <code>nn-&gt;deleg_lock</code> at the two sites that mutate <code>cl_delegations</code>. The reaper walks <code>nn-&gt;client_lru</code> under <code>nn-&gt;client_lock</code> and cannot take <code>nn-&gt;deleg_lock</code> to count the list; readers that hold only <code>client_lock</code> must treat the counter as a <code>data_race()</code>. No functional change on its own, but it is the input to the keep count.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260813-recall-any-keep-count-v3-3-a96d243c0b13@kernel.org/">Patch 3</a> adds <code>RCA4_TYPE_MASK_DIR_DLG</code> to <code>craa_type_mask</code>. RFC 8881 §20.6.3 distinguishes servers that share one pool among all recallable-object classes from those that keep per-class pools; NFSD is the former. Directory delegations already go through <code>__alloc_init_deleg()</code>, count against <code>max_delegations</code>, and are reclaimed by the shrinker, but the type mask never named them. Clients that implement directory delegations would otherwise skip them when choosing what to return.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260813-recall-any-keep-count-v3-4-a96d243c0b13@kernel.org/">Patch 4</a> is the keep-count change itself, also tagged against <code>44df6f439a17</code>. Instead of zero, <code>deleg_reaper()</code> derives <code>craa_objects_to_keep</code> from <code>cl_deleg_count</code> so each callback asks the client to give up one delegation. Both the shrinker and the laundromat re-arm while the condition lasts, so a client with more to spare is asked again on the next pass. Lever is explicit that this is a no-op for Linux:</p>
+<blockquote>
+<p>"The Linux client ignores craa_objects_to_keep and returns unused delegations selected from the type mask alone, so the count changes nothing for it."</p>
+</blockquote>
+<p>The audience is every other NFSv4.1 client that actually reads the field.</p>
+<p><strong>Shrinker accounting (patches 5–8).</strong> These are the patches Layton reviewed this week. <a href="https://lore.kernel.org/linux-nfs/20260813-recall-any-keep-count-v3-5-a96d243c0b13@kernel.org/">Patch 5</a> counts delegations per network namespace. The state shrinker is allocated per netns, but <code>nfsd4_state_shrinker_count()</code> was reporting host-wide <code>num_delegations</code>, so reclaim saw the population multiplied by the number of namespaces and a namespace holding nothing still queued its reaper. <code>num_delegations</code> remains the host-wide admission/ceiling check against <code>max_delegations</code>.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260813-recall-any-keep-count-v3-6-a96d243c0b13@kernel.org/">Patch 6</a> splits <code>nfsd_client_shrinker</code> into two. Courtesy-client reclaim is synchronous and deadlock-free; the shrinker can report a precise count of objects released. Delegation reclaim only sends <code>CB_RECALL_ANY</code> — clients are not obligated to return anything — so the callback cannot report progress. Worse, the combined shrinker fell back to delegation reaping only when no courtesy clients remained, so a single courtesy client kept a namespace's delegations out of the count.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260813-recall-any-keep-count-v3-7-a96d243c0b13@kernel.org/">Patch 7</a> records scan requests instead of discarding them with <code>SHRINK_STOP</code>. Courtesy scans accumulate in <code>nfsd_shrink_backlog</code> and are subtracted from the count until <code>courtesy_client_reaper()</code> runs. Delegations use a time bound: they are reported only once <code>NFSD_RECALL_ANY_COOLDOWN_SECS</code> have passed since the last sweep, matching <code>deleg_reaper()</code>'s skip of any client recalled inside that window.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260813-recall-any-keep-count-v3-8-a96d243c0b13@kernel.org/">Patch 8</a> is the client-facing payoff of that accounting. <code>deleg_reaper()</code> had been asking every eligible client for one delegation whenever it ran, "whether or not anything needs the memory." A delegation returned before it is needed costs the client an OPEN on the next touch. The scan callback now records <code>nr_to_scan</code> in <code>nfsd_deleg_backlog</code> and scales that total by each client's share of <code>nn-&gt;nfsd_delegations</code>. Nothing is recalled until a scan arrives, except <code>nfs4_laundromat()</code>, which has no scan request and instead computes what must go for <code>num_delegations</code> to fall below <code>max_delegations</code>, then passes only this namespace's share.</p>
+<p>v3's changelog relative to v2 is exactly this accounting layer: per-namespace counts, separate shrinkers, scan-request discounting, and per-client scaling of the keep count.</p>
+<h2>This week's review</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/36409b40bd92bbdc8f85661f58afaeac3fb3eeef.camel@kernel.org/">Layton's 14 August reply</a> is short and conclusive. Patches 1–4 already carried his tag from the earlier rounds; for the new shrinker work he wrote:</p>
+<blockquote>
+<p>"You can add this to 5-8:"</p>
+<p>"Reviewed-by: Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a>"</p>
+</blockquote>
+<p>No technical objections, no requested respin, no discussion of the Linux client's decision to ignore <code>craa_objects_to_keep</code>. The client-side implication left on the table is that Linux will continue to return a single unused delegation per callback regardless of the newly meaningful keep count, while non-Linux clients should now see a proportional request instead of a demand to empty the working set.</p>
+<h2>Classification and status</h2>
+<p>This is a <strong>bug-fix series with a protocol-usage correction</strong>, not a protocol change and not a new feature. Two <code>Fixes:</code> tags point at the original delegation reaper (<code>44df6f439a17</code>): sending <code>CB_RECALL_ANY</code> to NFSv4.0 clients (callback channel permanently down, no further delegations) and advertising a keep count of zero (non-Linux clients over-returning). The rest is supporting machinery so the keep count can be a real fraction of each client's holdings under memory pressure.</p>
+<p>With Layton's tags on all eight patches, v3 is fully reviewed. Subsequent v4/v5 postings (tracked as separate threads) pick the series up from here; this thread itself ends on that <code>Reviewed-by</code>.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/36409b40bd92bbdc8f85661f58afaeac3fb3eeef.camel@kernel.org/">2026-08-14 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v3 0/8] NFSD: CB_RECALL_ANY fixes and a meaningful keep count</a></li>
+</ul>
+  </main>
+</body>
+</html>

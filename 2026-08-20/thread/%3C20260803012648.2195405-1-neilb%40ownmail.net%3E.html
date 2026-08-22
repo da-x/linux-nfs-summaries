@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>fsnotify patch 03: dnotify recalc must not walk d_children under mark-&gt;lock</title>
+  <meta name="description" content="This week the fsnotify maintainers finally catch up with patch 03/12 of NeilBrown’s negative-dentry RFC — the change that tried to drop mark-&gt;lock before fsnotify_recalc_mask() so a later cond_resched() can run while walking d_children.…">
+  <meta property="og:title" content="fsnotify patch 03: dnotify recalc must not walk d_children under mark-&gt;lock">
+  <meta property="og:description" content="This week the fsnotify maintainers finally catch up with patch 03/12 of NeilBrown’s negative-dentry RFC — the change that tried to drop mark-&gt;lock before fsnotify_recalc_mask() so a later cond_resched() can run while walking d_children.…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="fsnotify patch 03: dnotify recalc must not walk d_children under mark-&gt;lock">
+  <meta name="twitter:description" content="This week the fsnotify maintainers finally catch up with patch 03/12 of NeilBrown’s negative-dentry RFC — the change that tried to drop mark-&gt;lock before fsnotify_recalc_mask() so a later cond_resched() can run while walking d_children.…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>fsnotify patch 03: dnotify recalc must not walk d_children under mark-&gt;lock</h1>
+<h2>Summary</h2>
+<h1>fsnotify patch 03: dnotify recalc must not walk d_children under mark-&gt;lock</h1>
+<h2>Summary</h2>
+<p>This week the fsnotify maintainers finally catch up with <a href="https://lore.kernel.org/linux-nfs/20260803012648.2195405-4-neilb@ownmail.net/">patch 03/12</a> of NeilBrown’s negative-dentry RFC — the change that tried to drop <code>mark-&gt;lock</code> before <code>fsnotify_recalc_mask()</code> so a later <code>cond_resched()</code> can run while walking <code>d_children</code>. The discussion is a <strong>locking bug-fix</strong>, not a protocol change and not a new NFS feature. No NFS client code is touched in these six mails, but the patch is a prerequisite for the series’ NFS-facing iterator work: until fsnotify can drop its spinlocks, <code>d_for_each_positive_child()</code> cannot schedule, and the NFS client’s <code>nfs_clear_verifier_directory()</code> walk of a huge sibling list remains a soft-lockup hazard.</p>
+<p>The week ends with Jan Kara rejecting the original “just move the recalc outside the spinlock” approach, Amir Goldstein supplying a narrower <code>mark.c</code> patch, and Jan offering to take that patch immediately. Neil has not yet said whether he will fold it into v2.</p>
+<h2>Brief bridge from prior weeks</h2>
+<p>Brown posted the 12-patch RFC on 3 August. Patch 03 stops <code>dnotify_recalc_inode_mask()</code> from calling <code>fsnotify_recalc_mask()</code> under a spinlock, returning a “please recalc” flag instead, so callers can drop the lock first. Last week (outside this window) <a href="https://lore.kernel.org/linux-nfs/CAJfpegs-k3skRGiwZvQLzD7OrAK4KL8zwmpmJKyjRHSQ-rqX+Q@mail.gmail.com/">Miklos Szeredi</a> asked the obvious question of the new <code>dnotify_handle_event()</code> call site:</p>
+<blockquote>
+<p>"Is the fsnotify_group_lock() held in this case?   I don't see it."</p>
+</blockquote>
+<p><a href="https://lore.kernel.org/linux-nfs/178642552869.2852630.11443303758249822243@noble.neil.brown.name/">Neil’s 11 August reply</a> admitted it is not held and sketched extra SRCU-side safety. This week he comes back with a firmer conclusion — and then the fsnotify maintainers tell him the lifetime rules are subtler than that.</p>
+<h2>Neil concludes SRCU is enough</h2>
+<p>On 15 August <a href="https://lore.kernel.org/linux-nfs/178675372176.2852630.1305553887009521382@noble.neil.brown.name/">NeilBrown</a> reports that he dug into Miklos’s question and no longer wants the extra code:</p>
+<blockquote>
+<p>"I dug into this some more, and we do rely on srcu, but don't need the extra code below. inode_mark-&gt;lock doesn't protect inode_mark-&gt;connector, so moving the dereference out of the lock has no effect. srcu_read_lock is taken before we get the ref to the mark, so the mark and the connector cannot disappear underneath us. A race could result in inode_mark-&gt;connector reading as NULL, but fsnotify_recalc_mask() checks for NULL, so there is no risk for harm."</p>
+</blockquote>
+<p>That is the high-water mark of confidence in patch 03 as posted. Two days later Jan Kara, back from vacation, takes it apart.</p>
+<h2>Jan Kara: the comment is the contract</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/oh2lg2agqxwqopecacq6sfdnky5faxidwsybkvbwbq24r6tw6o@4swfog5ocwwb/">Jan</a> opens with the comment sitting above <code>fsnotify_recalc_mask()</code>:</p>
+<blockquote>
+<p>"Calculate mask of events for a list of marks. The caller must make sure connector and connector-&gt;obj cannot disappear under us. Callers achieve this by holding a mark-&gt;lock or mark-&gt;group-&gt;mark_mutex for a mark on this list."</p>
+</blockquote>
+<p>and the verdict:</p>
+<blockquote>
+<p>"and you very obviously start violating these rules with your changes."</p>
+</blockquote>
+<p>He then reconstructs why those rules exist. A connector lives as long as any mark remains on its list. Marks and connectors are SRCU-protected. <code>FSNOTIFY_MARK_FLAG_ATTACHED</code> is set if and only if <code>connector-&gt;obj</code> still points at a live inode/mount, and that flag changes only under <code>mark_mutex</code> — which is why most callers of <code>fsnotify_recalc_mask()</code> hold the mutex. dnotify is the odd one out: it has to tweak a mark mask from event handling, where <code>mark_mutex</code> is forbidden by lock ordering. The fallback is <code>mark-&gt;lock</code>, because that same lock is required to <em>clear</em> <code>FSNOTIFY_MARK_FLAG_ATTACHED</code>.</p>
+<p>Even the <em>existing</em> dnotify call is “somewhat racy”, because <code>dnotify_handle_event()</code> can run after <code>ATTACHED</code> has already been cleared. Moving the recalc outside <code>mark-&gt;lock</code> makes the race with <code>fcntl_dirnotify()</code> dropping the mark easier to hit. There is no direct UAF — the inode is pinned on the notification path and SRCU covers the rest — but:</p>
+<blockquote>
+<p>"fsnotify_recalc_mask() simply isn't prepared for the connector changing under it due to object getting detached and so we could end up doing weird things like NULL ptr derefs or similar stuff."</p>
+</blockquote>
+<blockquote>
+<p>"So this call to fsnotify_recalc_mask() from dnotify needs a more careful handling. Which is sad because I doubt anybody still uses dnotify..."</p>
+</blockquote>
+<p>That last line becomes the week’s escape hatch.</p>
+<h2>Amir’s way out: skip the optimization</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxgtKvKmPaK8rPAZDSwu0Hr9JAmqJi0a1VX_Rg7jDo8HrQ@mail.gmail.com/">Amir Goldstein</a> treats dnotify’s obscurity as a feature:</p>
+<blockquote>
+<p>"dnotify_recalc_inode_mask() can only remove bits from i_fsnotify_mask, so it is an optimization."</p>
+</blockquote>
+<blockquote>
+<p>"If we just remove fsnotify_recalc_mask() call from dnotify_recalc_inode_mask(), then i_fsnotify_mask will be updated when dnotify_mask gets removed eventually."</p>
+</blockquote>
+<blockquote>
+<p>"If nobody uses dnotify, noone is likely to notice the loss of the optimization."</p>
+</blockquote>
+<p>In other words: the event path never <em>adds</em> watch bits, so it does not need to walk children to set <code>DCACHE_FSNOTIFY_*</code> flags. Dropping the recalc entirely is safe; the mask catches up when the mark finally goes away.</p>
+<h2>Neil wants a smaller cut</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/178709583480.2852630.4575326968116183366@noble.neil.brown.name/">Neil</a> had been thinking along the same lines, but does not want to delete the whole recalc:</p>
+<blockquote>
+<p>"I don't think we need to drop all of fsnotify_recalc_mask(), only the fsnotify_conn_set_children_dentry_flags() part that walks the d_children list. And that only happens when we add to the mask, not when bits are cleared. So maybe the fsnotify_conn_set_children_dentry_flags() simply never happens in this context so it doesn't need fixing."</p>
+</blockquote>
+<p>He prefers to make that invariant visible in the code (a <code>dnotify.c</code> patch, omitted from ingest) and, importantly, still withholds agreement on Jan’s locking story:</p>
+<blockquote>
+<p>"Note that I'm not (yet) convinced by the locking argument, but maybe we don't need to pursue it."</p>
+</blockquote>
+<p>That is the NFS-relevant technical point: the <em>only</em> reason patch 03 exists is to get the <code>d_children</code> walk off a spinlock. If that walk never runs from dnotify’s event path, patch 03 as written is solving the wrong problem — and the later sleepable iterator can proceed without moving the recalc outside <code>mark-&gt;lock</code>.</p>
+<h2>Amir’s mark.c patch, and Jan’s ACK</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxj6O8Ukbn-vWU-o+zOAYyofokCTAGnSifSDh9-PACCTdg@mail.gmail.com/">Amir’s 19 August follow-up</a> (body truncated at ingest; reconstructed from Jan’s quotes) posts a <code>fs/notify/mark.c</code> patch (<code>73bbfcd1b21a0fc723999aee36af662f36ba4dd2</code>) that drops the <code>update_children</code> local and, from Jan’s reply, arranges that the child-dentry-flag walk is <em>not</em> the thing dnotify does under <code>mark-&gt;lock</code>. Amir also appears to have questioned whether the children-flag update is even needed from <code>fcntl_dirnotify()</code>.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/zos6dvjft7djeb7rox7zbeowaawfy3vl2ddp6o2iwnkfjnrjah@eu2lil7wihue/">Jan</a> agrees with the “walk never happens from this path” half of Neil’s argument, and interprets “doesn’t need fixing” as “leave the dnotify <code>fsnotify_recalc_mask()</code> call site alone”:</p>
+<blockquote>
+<p>"I agree with the "fsnotify_conn_set_children_dentry_flags() never happens from this path" part. I'm not sure I follow the "it doesn't need fixing" part - do you mean you will just not touch where dnotify calls fsnotify_recalc_mask()? In that case I agree."</p>
+</blockquote>
+<p>He wants Neil’s clarifying patch (“Definitely”), is still puzzled by Neil’s scepticism of the locking argument (“Not sure what you mean here…”), and corrects Amir on the add path:</p>
+<blockquote>
+<p>"Yes, it is not. Dnotify places mark on directory and sets FS_EVENT_ON_CHILD so it depends on dentry flags to be updated from fcntl_dirnotify()."</p>
+</blockquote>
+<p>That is the invariant the series actually needs: child dentry flags are installed when a watch is <em>added</em> (<code>fcntl_dirnotify()</code>), under locks that can sleep; the event path only clears bits and must not walk <code>d_children</code>. Amir’s <code>mark.c</code> change gets a clean ACK:</p>
+<blockquote>
+<p>"Looks good to me, Neil will you pick this into your series or should I pick the patch into my tree rightaway?"</p>
+</blockquote>
+<p>Jan also flags the documentation debt once Brown’s later patches let the iterator sleep:</p>
+<blockquote>
+<p>"As a side note once Neil allows the dentry iteration to sleep, we should document in the comment above that mark-&gt;lock can be used only for !update_children case and perhaps assert it in the function as well."</p>
+</blockquote>
+<p>No reply from Neil lands in-window. The merge question — fold Amir’s patch into v2 of the negative-dentry series, or let Jan take it now — is still open at the week’s close.</p>
+<h2>Why this matters for NFS client development</h2>
+<p>This sub-thread never mentions <code>fs/nfs/</code>. The NFS client still cares, for two reasons.</p>
+<p>First, <a href="https://lore.kernel.org/linux-nfs/20260803012648.2195405-3-neilb@ownmail.net/">patch 02 of the same series</a> converts <code>nfs_clear_verifier_directory()</code> onto <code>d_for_each_positive_child()</code> and already drops the parent <code>d_lock</code> between <code>nfs_unset_verifier_delegated()</code> on the parent and the same call on every child. That iterator is annotated <code>might_sleep()</code> only after patches 03–11 have stripped every spinlock from the walk. If patch 03 is wrong, the NFS verifier walk cannot schedule, and a directory with a pathological number of negative children remains a client-side soft lockup.</p>
+<p>Second, the resolution this week is exactly the kind of lock-constraint discovery Brown asked NFS and VFS reviewers for. The original patch 03 treated “don’t hold a spinlock across recalc” as sufficient. Jan’s reconstruction shows the real constraint is <em>which</em> recalc is allowed under <code>mark-&gt;lock</code>: mask-only, never the children-flag walk. That is the bug fix the series now has to absorb before the NFS client change is safe to merge.</p>
+<h2>Final conclusions (as of 20 August)</h2>
+<ul>
+<li><strong>Classification:</strong> VFS/fsnotify locking bug-fix inside a larger negative-dentry hardening RFC. Not a protocol change, not an NFS feature, but a merge blocker for the NFS client iterator conversion.</li>
+<li><strong>Patch 03 as posted is not acceptable.</strong> Moving <code>fsnotify_recalc_mask()</code> off <code>mark-&gt;lock</code> violates the documented connector/<code>connector-&gt;obj</code> lifetime rules and widens a pre-existing dnotify vs <code>fcntl_dirnotify()</code> race into possible NULL derefs, even though SRCU prevents a straight UAF.</li>
+<li><strong>The d_children walk is the only part that needed to move</strong>, and it does not run on the dnotify event path because that path only clears bits. Child dentry flags are the <code>fcntl_dirnotify()</code> add path’s job (<code>FS_EVENT_ON_CHILD</code>).</li>
+<li><strong>Disposition:</strong> Amir’s <code>mark.c</code> patch to stop treating children-flag update as part of the <code>mark-&gt;lock</code> recalc is ACKed by Jan, who is willing to take it immediately. Neil’s clarifying dnotify patch is also wanted. Neil has not yet answered, and has not conceded Jan’s locking argument.</li>
+<li><strong>NFS client impact this week:</strong> none in code. The practical effect is that v2 of the series will have to replace patch 03 with the narrower “don’t walk children under <code>mark-&gt;lock</code>” approach before the sleepable <code>d_for_each_positive_child()</code> used by <code>nfs_clear_verifier_directory()</code> can land.</li>
+</ul>
+<h2>Key messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/178675372176.2852630.1305553887009521382@noble.neil.brown.name/">NeilBrown: SRCU already pins the mark and connector</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/oh2lg2agqxwqopecacq6sfdnky5faxidwsybkvbwbq24r6tw6o@4swfog5ocwwb/">Jan Kara: patch 03 violates fsnotify_recalc_mask() locking comments</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxgtKvKmPaK8rPAZDSwu0Hr9JAmqJi0a1VX_Rg7jDo8HrQ@mail.gmail.com/">Amir Goldstein: drop the dnotify recalc, it is only an optimization</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178709583480.2852630.4575326968116183366@noble.neil.brown.name/">NeilBrown: only the children-flag walk needs to go, and it never runs here</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxj6O8Ukbn-vWU-o+zOAYyofokCTAGnSifSDh9-PACCTdg@mail.gmail.com/">Amir Goldstein: mark.c patch to split update_children off the locked recalc</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/zos6dvjft7djeb7rox7zbeowaawfy3vl2ddp6o2iwnkfjnrjah@eu2lil7wihue/">Jan Kara: ACK Amir’s patch; leave the dnotify call site; document !update_children</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/178675372176.2852630.1305553887009521382@noble.neil.brown.name/">2026-08-15 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v1 03/12] fsnotify: don't hold a spin_lock across fsnotify_recalc_mask() calls.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/oh2lg2agqxwqopecacq6sfdnky5faxidwsybkvbwbq24r6tw6o@4swfog5ocwwb/">2026-08-17 Jan Kara <a href="mailto:jack@suse.cz">jack@suse.cz</a> — Re: [PATCH v1 03/12] fsnotify: don't hold a spin_lock across fsnotify_recalc_mask() calls.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxgtKvKmPaK8rPAZDSwu0Hr9JAmqJi0a1VX_Rg7jDo8HrQ@mail.gmail.com/">2026-08-17 Amir Goldstein <a href="mailto:amir73il@gmail.com">amir73il@gmail.com</a> — Re: [PATCH v1 03/12] fsnotify: don't hold a spin_lock across fsnotify_recalc_mask() calls.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178709583480.2852630.4575326968116183366@noble.neil.brown.name/">2026-08-18 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v1 03/12] fsnotify: don't hold a spin_lock across fsnotify_recalc_mask() calls.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxj6O8Ukbn-vWU-o+zOAYyofokCTAGnSifSDh9-PACCTdg@mail.gmail.com/">2026-08-19 Amir Goldstein <a href="mailto:amir73il@gmail.com">amir73il@gmail.com</a> — Re: [PATCH v1 03/12] fsnotify: don't hold a spin_lock across fsnotify_recalc_mask() calls.</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/zos6dvjft7djeb7rox7zbeowaawfy3vl2ddp6o2iwnkfjnrjah@eu2lil7wihue/">2026-08-19 Jan Kara <a href="mailto:jack@suse.cz">jack@suse.cz</a> — Re: [PATCH v1 03/12] fsnotify: don't hold a spin_lock across fsnotify_recalc_mask() calls.</a></li>
+</ul>
+  </main>
+</body>
+</html>

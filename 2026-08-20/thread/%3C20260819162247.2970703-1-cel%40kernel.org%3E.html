@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>lockd: UAF in nlmsvc_retry_blocked during nfsd unmount</title>
+  <meta name="description" content="Chuck Lever posted a two-line lockd bug-fix for a KASAN slab use-after-free in nlmsvc_retry_blocked(). The race is between the lockd kthread retrying a blocked NLM grant and nfsd teardown walking the same block list. No one replied on this…">
+  <meta property="og:title" content="lockd: UAF in nlmsvc_retry_blocked during nfsd unmount">
+  <meta property="og:description" content="Chuck Lever posted a two-line lockd bug-fix for a KASAN slab use-after-free in nlmsvc_retry_blocked(). The race is between the lockd kthread retrying a blocked NLM grant and nfsd teardown walking the same block list. No one replied on this…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="lockd: UAF in nlmsvc_retry_blocked during nfsd unmount">
+  <meta name="twitter:description" content="Chuck Lever posted a two-line lockd bug-fix for a KASAN slab use-after-free in nlmsvc_retry_blocked(). The race is between the lockd kthread retrying a blocked NLM grant and nfsd teardown walking the same block list. No one replied on this…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>lockd: UAF in nlmsvc_retry_blocked during nfsd unmount</h1>
+<h2>Summary</h2>
+<h1>lockd: UAF in nlmsvc_retry_blocked during nfsd unmount</h1>
+<h2>Summary</h2>
+<p>Chuck Lever posted a two-line <a href="https://lore.kernel.org/linux-nfs/20260819162247.2970703-1-cel@kernel.org/">lockd bug-fix</a> for a KASAN slab use-after-free in <code>nlmsvc_retry_blocked()</code>. The race is between the lockd kthread retrying a blocked NLM grant and nfsd teardown walking the same block list. No one replied on this v1 thread in-window; Lever followed up the next day with a <a href="https://lore.kernel.org/linux-nfs/20260820150831.3291262-1-cel@kernel.org/">separate v2</a> after automated review found that the extra reference itself requeues a retired block.</p>
+<p>This is a <strong>lockd server (nlmsvc) memory-safety bug fix</strong>, not a protocol change and not a new feature. It is tagged <code>Fixes: 0e4ac9d93515</code> (<code>lockd: handle fl_grant callbacks</code>). The NLM service is the server half of NFS file locking: an NFS client’s <code>flock</code>/<code>fcntl</code> request lands here, so a UAF on the grant-retry path is a hard lockd crash under ordinary client lock traffic plus nfsd unmount.</p>
+<h2>The race</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260819162247.2970703-1-cel@kernel.org/">Lever</a> states the lifetime hole directly:</p>
+<blockquote>
+<p>"nlmsvc_retry_blocked() examines the block at the head of nlm_blocked under nlm_blocked_lock, then releases the lock before calling nlmsvc_grant_blocked() or retry_deferred_block(). It holds no reference of its own across that window, so the nlm_blocked list reference is all that keeps the block alive."</p>
+</blockquote>
+<p>Unmount of the nfsd filesystem while a lock request is still blocked reaches <code>nlmsvc_traverse_blocks()</code>, which drops that list reference. The grant path does take a reference, but too late:</p>
+<blockquote>
+<p>"nlmsvc_grant_blocked() does take a reference, but only after nlm_blocked_lock has been dropped, so the block and the nlm_rqst hanging off it can be freed before it runs."</p>
+</blockquote>
+<p>The KASAN report that <a href="https://lore.kernel.org/linux-nfs/20260818235808.3458075-1-shuangpeng.kernel@gmail.com/">Shuangpeng Bai filed the day before</a> matches that story exactly. The lockd kthread reads a freed <code>nlm_rqst</code> in <code>nlm_async_call()</code>:</p>
+<pre><code>BUG: KASAN: slab-use-after-free in nlm_async_call+0xd6/0x230
+Read of size 8 at addr ffff88811b04c808 by task lockd/8377
+  nlm_async_call+0xd6/0x230
+  nlmsvc_retry_blocked+0x61c/0x800
+  lockd+0x144/0x1c0
+Freed by task 8392:
+  nlmsvc_release_block+0x231/0x290
+  nlmsvc_traverse_blocks+0x139/0x1b0
+  nlm_traverse_files+0x1aa/0xa00
+  nlmsvc_free_host_resources+0x12/0x60
+  nlm_shutdown_hosts_net+0x127/0x280
+  lockd_down+0xd5/0x1c0
+</code></pre>
+<p>Bai hit it on <code>3aa1dcaa4f6f</code> (13 August) while testing current upstream, with a gist of reproducer and <code>.config</code>. The free path is nfsd unmount (<code>nfsd_umount</code> → <code>lockd_down</code> → <code>nlm_shutdown_hosts_net</code>), so the trigger is “NFS client lock still blocked, then the server filesystem is torn down.”</p>
+<p>The blamed commit, <code>0e4ac9d93515</code> (<code>lockd: handle fl_grant callbacks</code>), is the conversion that taught lockd to retry blocked grants via <code>fl_grant</code>. That is when <code>nlmsvc_retry_blocked()</code> started dropping <code>nlm_blocked_lock</code> and calling <code>nlmsvc_grant_blocked()</code> without pinning the block across the window.</p>
+<h2>The v1 fix</h2>
+<p>Two insertions in <code>fs/lockd/svclock.c</code>: take a reference on the head block <em>before</em> releasing <code>nlm_blocked_lock</code>, and drop it once the retry has run.</p>
+<blockquote>
+<p>"Take a reference before releasing nlm_blocked_lock and drop it once the retry has run. retry_deferred_block() borrows its caller's reference as well, so this covers both arms of the loop."</p>
+</blockquote>
+<p>That is the classic lockd lifetime pattern (<code>nlmsvc_get_block</code> / <code>nlmsvc_release_block</code>) applied to a path that had been living on the list’s implied ref. Both the grant arm and the deferred-retry arm are covered because the deferred helper does not take its own reference.</p>
+<p>No review, ack, or nack landed on this v1 posting. The patch is otherwise a textbook UAF close: pin the object for the unlocked call, then put it.</p>
+<h2>Why it matters for NFS clients</h2>
+<p>This is server-side lockd (<code>nlmsvc_*</code> in <code>fs/lockd/svclock.c</code>), not the NFS client’s <code>fs/nfs/</code> NLM caller. The user-visible effect is still on the client: NLM blocking locks (<code>LOCK</code> with <code>block=true</code>, BSD <code>flock</code>, POSIX <code>F_SETLKW</code>) wait on this retry loop. If nfsd is unmounted — container stop, <code>nfsd</code> thread shutdown, network-namespace teardown — while a client still has a blocked lock, lockd can UAF in <code>nlm_async_call</code> and take the lockd kthread with it. Remaining NLM clients then lose GRANT callbacks and blocking-lock service.</p>
+<p>The allocation side of Bai’s KASAN report is the client-facing lock path: <code>nlm_alloc_call</code> ← <code>nlmsvc_lock</code> ← <code>nlm4svc_do_lock</code> ← <code>nlmsvc_dispatch</code>. A blocked NFSv3/NLM lock from a client is exactly the object being freed out from under the retry.</p>
+<h2>Same-week follow-up (v2, separate thread)</h2>
+<p>The next day Lever posted <a href="https://lore.kernel.org/linux-nfs/20260820150831.3291262-1-cel@kernel.org/">PATCH v2</a> as a new thread, citing sashiko-bot on this v1. Holding the extra reference exposes a second teardown bug:</p>
+<blockquote>
+<p>"Holding that reference exposes a second problem. Both arms of the retry end in nlmsvc_insert_block(), which queues any block it finds unlisted, while nlmsvc_traverse_blocks() skips blocks that are already unlisted. A block unlinked during the window therefore returns to nlm_blocked after the teardown scan has passed it by."</p>
+</blockquote>
+<p>The resurrected block pins its file and host, so the host is never reaped, lockd warns that it could not shut down the host module, and the host outlives the network namespace that <code>host-&gt;net</code> points at. v2 keeps the get/put from v1 and adds a <code>B_DEAD</code> flag: mark a block dead before unlinking it on permanent retirement, and have <code>nlmsvc_insert_block_locked()</code> ignore a dead block. <code>nlmsvc_grant_blocked()</code> still calls <code>nlmsvc_unlink_block()</code> directly because unlink-and-requeue is a normal part of a grant attempt.</p>
+<p>That second issue is why v1 should not be merged as-is. Reviewers of this thread should look at v2.</p>
+<h2>Final conclusions (as of 20 August)</h2>
+<ul>
+<li><strong>Classification:</strong> lockd/NLM <em>server</em> use-after-free fix on the blocked-grant retry path. Regression from <code>0e4ac9d93515</code> (<code>lockd: handle fl_grant callbacks</code>). Not a protocol change.</li>
+<li><strong>Technical claim:</strong> <code>nlmsvc_retry_blocked()</code> drops <code>nlm_blocked_lock</code> with only the list reference holding the block; nfsd unmount’s <code>nlmsvc_traverse_blocks()</code> can free the block and its <code>nlm_rqst</code> before <code>nlmsvc_grant_blocked()</code> / <code>retry_deferred_block()</code> run. KASAN hits in <code>nlm_async_call</code>.</li>
+<li><strong>v1 repair:</strong> get the block before dropping the lock, put it after the retry. Two lines in <code>svclock.c</code>.</li>
+<li><strong>Disposition:</strong> posted 19 August, no human review on v1. Superseded in-week by v2 (20 August), which keeps the pin and adds <code>B_DEAD</code> so a retry cannot requeue a block that teardown already retired. Do not queue v1.</li>
+<li><strong>Client impact:</strong> blocking NLM locks from NFS clients plus nfsd unmount / netns teardown. The crash is in the lockd kthread, so GRANT callbacks and further blocking-lock service die with it.</li>
+</ul>
+<h2>Key messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260819162247.2970703-1-cel@kernel.org/">Chuck Lever: lockd UAF fix in nlmsvc_retry_blocked (v1)</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260819162247.2970703-1-cel@kernel.org/">2026-08-19 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH] lockd: fix use-after-free in nlmsvc_retry_blocked</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260819162247.2970703-1-cel@kernel.org/">2026-08-19 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH] lockd: fix use-after-free in nlmsvc_retry_blocked</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSv4 client: 4-line u32 wrap check for two xdr_inline_decode() sites</title>
+  <meta name="description" content="This week’s linux-nfs traffic includes a standalone NFS client bug-fix from Griffin Kroah-Hartman: a four-line addition to fs/nfs/nfs4xdr.c that inserts a size check before two xdr_inline_decode() calls whose length argument is a…">
+  <meta property="og:title" content="NFSv4 client: 4-line u32 wrap check for two xdr_inline_decode() sites">
+  <meta property="og:description" content="This week’s linux-nfs traffic includes a standalone NFS client bug-fix from Griffin Kroah-Hartman: a four-line addition to fs/nfs/nfs4xdr.c that inserts a size check before two xdr_inline_decode() calls whose length argument is a…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSv4 client: 4-line u32 wrap check for two xdr_inline_decode() sites">
+  <meta name="twitter:description" content="This week’s linux-nfs traffic includes a standalone NFS client bug-fix from Griffin Kroah-Hartman: a four-line addition to fs/nfs/nfs4xdr.c that inserts a size check before two xdr_inline_decode() calls whose length argument is a…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSv4 client: 4-line u32 wrap check for two xdr_inline_decode() sites</h1>
+<h2>Summary</h2>
+<h1>NFSv4 client: a 4-line size check against 32-bit wrap in two pNFS decoders</h1>
+<h2>Overview</h2>
+<p>This week’s linux-nfs traffic includes a standalone <strong>NFS client bug-fix</strong> from <a href="https://lore.kernel.org/linux-nfs/20260819-nfsv4_u32_size_patch-v1-1-d5eae3f6cce9@kroah.com/">Griffin Kroah-Hartman</a>: a four-line addition to <code>fs/nfs/nfs4xdr.c</code> that inserts a size check before two <code>xdr_inline_decode()</code> calls whose length argument is a server-supplied count multiplied by four. There were <strong>no replies</strong> in the week ending 2026-08-20. The patch has not been acked, nacked, or revised, and it carries neither a <code>Fixes:</code> tag nor a <code>Cc: stable@vger.kernel.org</code> trailer.</p>
+<p>This is <strong>not</strong> a new feature and <strong>not</strong> a wire-protocol change. It is a client-side robustness fix against 32-bit integer wrap in the NFSv4 pNFS XDR decoder, aimed at the same two functions that have already been the subject of two earlier hardening campaigns on this list.</p>
+<h2>The patch (August 19)</h2>
+<p>Kroah-Hartman’s <a href="https://lore.kernel.org/linux-nfs/20260819-nfsv4_u32_size_patch-v1-1-d5eae3f6cce9@kroah.com/">submission</a> is deliberately small — <code>fs/nfs/nfs4xdr.c | 4 ++++</code> — and names both sites in one change:</p>
+<blockquote>
+<p>"Add a size check before xdr_inline_decode() is called in decode_pnfs_layout_types() and decode_getdeviceinfo() where the length parameter is multiplied by 4."</p>
+</blockquote>
+<p>The stated goal is to keep the scaled length from wrapping a 32-bit variable before it is handed to the XDR helper:</p>
+<blockquote>
+<p>"This check ensures that the parameter passed will not overwrap when using 32 bit variables, avoiding incorrect size input to xdr_inline_decode()."</p>
+</blockquote>
+<p>The sign-off block credits an AI assistant (<code>Assisted-by: gkh_clanker_t1000</code>) and is signed <code>Griffin Kroah-Hartman &lt;griffin@kroah.com&gt;</code>. The ingest dropped the unified diff, so the exact predicate is not in the archived body; from the commit message the intent is a pre-multiply overflow guard at both call sites, not a rewrite of the subsequent decode loops.</p>
+<p>That shape matters. A four-line “don’t wrap the <code>* 4</code>” check is the most minimal of the three independent proposals now sitting on linux-nfs for this class of bug. It does <strong>not</strong>:</p>
+<ul>
+<li>clamp the count against <code>NFS_MAX_LAYOUT_TYPES</code> (or the GETDEVICEINFO notification-bitmap word limit) <em>before</em> the reservation;</li>
+<li>switch the bulk <code>xdr_inline_decode(count * 4)</code> into a word-at-a-time walk;</li>
+<li>call the existing <code>xdr_stream_decode_uint32_array()</code> helper.</li>
+</ul>
+<p>Those omissions are the whole story of this thread’s significance for NFS client development.</p>
+<h2>Why the two sites wrap</h2>
+<p>Both functions follow the same pattern: read a server-controlled <code>u32</code> count, multiply it by four in 32-bit arithmetic, and pass the product to a single <code>xdr_inline_decode()</code>. For any count <code>≥ 0x40000000</code> the multiply wraps to a small value, so the XDR bounds check only covers a few bytes while the following loop walks the original (huge) count from the resulting pointer.</p>
+<ul>
+<li><strong><code>decode_pnfs_layout_types()</code></strong> is on the ordinary FSINFO path (<code>nfs4_xdr_dec_fsinfo()</code> → <code>decode_fsinfo()</code> → <code>decode_pnfs_layout_types()</code>), so a hostile NFSv4.1+ server can hit it at mount or <code>statfs</code> time via a crafted <code>FATTR4_FS_LAYOUT_TYPES</code> attribute.</li>
+<li><strong><code>decode_getdeviceinfo()</code></strong> is on the pNFS layout-discovery path (<code>nfs4_xdr_dec_getdeviceinfo()</code> → <code>decode_getdeviceinfo()</code>). A huge notification-bitmap word count in a GETDEVICEINFO reply drives the same wrap, then a loop that can walk up to nearly a gigabyte of words past the receive buffer.</li>
+</ul>
+<p>The XDR receive buffer is assembled from pages, not slab objects, so KASAN typically does not instrument the over-read. Depending on what follows in memory, the client either consumes garbage layout-type / notification bits or faults on unmapped pages. That is a decoder-robustness hole against a malicious or compromised pNFS server (or a MITM on an unprotected mount), not a protocol defect.</p>
+<h2>Same-week siblings: Alibaba already proposed a stronger shape</h2>
+<p>Two days earlier, on 2026-08-18, Alibaba’s Chuyf26 posted <strong>two</strong> independent patches against the exact same functions, still unreplied as of this week’s close:</p>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260818162332.Z32qq4QUMQSjH5g-YvgOUsu882RBUL3Qgv3pfhxxEUg@z/"><code>[PATCH] NFSv4: fix out-of-bounds read when decoding many pNFS layout types</code></a> — cap <code>nlayouttypes</code> first, then decode each layout-type word individually so every <code>xdr_inline_decode()</code> is independently bounds-checked.</li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260818162429.hRkBfHzaSOJtsemwF3XqknX_wBRwf6WfB8WnVDvY5Rg@z/"><code>[PATCH] NFSv4.1: fix out-of-bounds read decoding GETDEVICEINFO notification bitmap</code></a> — stop the <code>4 * len</code> bulk reservation entirely and walk the notification bitmap one word at a time.</li>
+</ul>
+<p>Those submissions diagnose the same wrap, but they treat the bulk <code>xdr_inline_decode(count * 4)</code> itself as the bug, not merely the overflow of the multiply. Kroah-Hartman’s four-liner, posted the next day, does not reference either Alibaba patch and does not adopt their word-at-a-time strategy. Until a maintainer comments, linux-nfs now has <strong>three overlapping, unreviewed proposals</strong> for the same two call sites in a 48-hour window, with no discussion tying them together.</p>
+<h2>Bridge from June: Trond already rejected a hand-rolled guard</h2>
+<p>This is not a newly discovered hole. In June 2026 Michael Bommarito posted a KASAN-reproduced, <code>Cc: stable</code> campaign against the same XDR-wrap class:</p>
+<ul>
+<li>2026-06-14: bound the GETDEVICEINFO notification-bitmap length before scaling (<a href="https://lore.kernel.org/linux-nfs/20260614130814.2521819-1-michael.bommarito@gmail.com/">series</a>).</li>
+<li>2026-06-22: companion bound on <code>decode_pnfs_layout_types()</code> (<a href="https://lore.kernel.org/linux-nfs/20260622124836.1696330-1-michael.bommarito@gmail.com/">patch</a>).</li>
+</ul>
+<p>On the layout-types patch, Linux NFS client maintainer Trond Myklebust replied within about ninety minutes:</p>
+<blockquote>
+<p>"This is just open coding xdr_stream_decode_uint32_array(), and doing so incorrectly."</p>
+</blockquote>
+<p>Bommarito’s June analysis also flagged a subtlety that a bare pre-multiply size check does not obviously cover. The existing <code>NFS_MAX_LAYOUT</code> cap is applied <em>after</em> the reservation, so it cannot save a short <code>xdr_inline_decode()</code>. And <code>array_size()</code> is not a safe substitute, because <code>xdr_inline_decode()</code> runs its <code>nbytes</code> argument through <code>XDR_QUADLEN</code> (<code>((l) + 3) &gt;&gt; 2</code>), which wraps <code>SIZE_MAX</code> to a zero-word reservation instead of failing. A four-line “don’t let <code>count * 4</code> wrap a <code>u32</code>” guard addresses the multiply, but it does not automatically address the <code>XDR_QUADLEN</code> rounding edge, the post-reservation cap, or Myklebust’s instruction to use the helper.</p>
+<p>Kroah-Hartman’s patch does not mention that review, does not call <code>xdr_stream_decode_uint32_array()</code>, and does not explain why a hand-rolled size check is now the right shape. Given Myklebust’s June one-liner, the likely maintainer response — if and when it arrives — is to point all three current proposals at the existing uint32-array helper rather than to pick a favourite hand-rolled bound.</p>
+<h2>Significance for NFS client development</h2>
+<ul>
+<li><strong>The hole is still open.</strong> Three independent authors (Bommarito in June, Chuyf26 on August 18, Kroah-Hartman on August 19) have now found the same <code>u32 * 4</code> → <code>xdr_inline_decode()</code> wrap in <code>decode_pnfs_layout_types()</code> and <code>decode_getdeviceinfo()</code>. None of the proposals has an in-window ACK. The pNFS client still trusts a wrapped bulk reservation on FSINFO and GETDEVICEINFO.</li>
+<li><strong>Minimal vs. canonical.</strong> Kroah-Hartman’s four insertions are the smallest possible close of the wrap itself. Alibaba’s same-week pair is the classic XDR hygiene (never multiply a server <code>u32</code> into one bulk inline decode; pull one word at a time). Myklebust’s June review says the <em>canonical</em> close is <code>xdr_stream_decode_uint32_array()</code>. For future decoder work, that helper-first lesson is the one that will actually merge.</li>
+<li><strong>Testing gap.</strong> Because the receive buffer is page-backed, KASAN will not catch this in ordinary client fuzzing. Bommarito’s June KUnit/KASAN reproductions (UML for layout types, QEMU for GETDEVICEINFO) remain the only concrete oracles on the list; this week’s two new patch sets do not include tests.</li>
+<li><strong>Stable and provenance.</strong> Unlike Bommarito’s June series, this patch has no <code>Fixes:</code> tag and no stable Cc. If a maintainer takes a version of this, the historical <code>Fixes:</code> targets already identified on the list are <code>3132e49ecef9</code> (“pnfs: track multiple layout types in fsinfo structure”) for layout types and <code>4e59080397fa</code> (“NFSv4.1: Allow getdeviceinfo to return notification info back to caller”) for the notification bitmap — plus Bommarito’s earlier <code>ca440c383a58</code> / <code>b1f69b754ee3</code> tags for the original infrastructure. Someone will need to pick the right one before a backport.</li>
+</ul>
+<h2>Status and outlook</h2>
+<ul>
+<li><strong>Thread status:</strong> Open. One message, no review, no v2.</li>
+<li><strong>Likely next step:</strong> maintainer comparison of this 4-line wrap check against (a) Chuyf26’s word-at-a-time patches from August 18 and (b) Myklebust’s June direction to use <code>xdr_stream_decode_uint32_array()</code>. A v2 that calls the helper, covers both sites, and carries a proper <code>Fixes:</code> / stable trailer is the merge-shaped outcome; accepting the four-liner as-is would leave the “open coding … incorrectly” objection on the table.</li>
+<li><strong>Open items:</strong> (1) which of the three overlapping proposals (if any) becomes the vehicle; (2) whether GETDEVICEINFO’s notification bitmap should be bounded to the RFC 8881 two-bit / one-word limit rather than merely overflow-checked; (3) whether KUnit coverage from the June series should ride along.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260819-nfsv4_u32_size_patch-v1-1-d5eae3f6cce9@kroah.com/">2026-08-19 Griffin Kroah-Hartman — [PATCH] NFSv4: Add size check to avoid 32bit overwrap for xdr_inline_decode()</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260819-nfsv4_u32_size_patch-v1-1-d5eae3f6cce9@kroah.com/">2026-08-19 Griffin Kroah-Hartman <a href="mailto:griffin@kroah.com">griffin@kroah.com</a> — [PATCH] NFSv4: Add size check to avoid 32bit overwrap for xdr_inline_decode()</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS nfsroot: replacing deprecated strlcat() with snprintf()</title>
+  <meta name="description" content="This week’s discussion is a cleanup of deprecated string helpers in the NFS client’s nfsroot path, not a protocol change and not a functional NFS bug fix. Mariia Nikitash posted a one-file patch against fs/nfs/nfsroot.c that retires…">
+  <meta property="og:title" content="NFS nfsroot: replacing deprecated strlcat() with snprintf()">
+  <meta property="og:description" content="This week’s discussion is a cleanup of deprecated string helpers in the NFS client’s nfsroot path, not a protocol change and not a functional NFS bug fix. Mariia Nikitash posted a one-file patch against fs/nfs/nfsroot.c that retires…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS nfsroot: replacing deprecated strlcat() with snprintf()">
+  <meta name="twitter:description" content="This week’s discussion is a cleanup of deprecated string helpers in the NFS client’s nfsroot path, not a protocol change and not a functional NFS bug fix. Mariia Nikitash posted a one-file patch against fs/nfs/nfsroot.c that retires…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS nfsroot: replacing deprecated strlcat() with snprintf()</h1>
+<h2>Summary</h2>
+<p>This week’s discussion is a <strong>cleanup of deprecated string helpers</strong> in the NFS client’s nfsroot path, not a protocol change and not a functional NFS bug fix. <a href="https://lore.kernel.org/linux-nfs/27956255dde39f58d73a7b51cb53cbe3d7804f54.1786411026.git.mariianikitash@google.com/">Mariia Nikitash</a> posted a one-file patch against <code>fs/nfs/nfsroot.c</code> that retires <code>strlcat()</code> from <code>root_nfs_cat()</code> in favor of <code>snprintf()</code>, as part of the Kernel Self Protection Project’s campaign to remove the deprecated <code>strlcat()</code> API.</p>
+<p>The change is small: eight lines, four insertions and four deletions. <code>root_nfs_cat()</code> concatenates a comma separator and a source string onto a destination buffer used while assembling nfsroot mount options. Nikitash’s approach builds both pieces in a single <code>snprintf()</code> into the remaining space, then compares the return value (the length that <em>would</em> have been written, excluding the terminating NUL) against that remaining space so the existing truncation check is preserved:</p>
+<blockquote>
+<p>"Build the separator and source string in a single call using the remaining space in the destination buffer. snprintf() returns the length it would have written excluding the terminating NUL, so comparing the return value against the remaining buffer space preserves the existing truncation check."</p>
+</blockquote>
+<p>Google colleagues quickly lined up behind the patch. <a href="https://lore.kernel.org/linux-nfs/aoNuOD6CLopCgxtU@google.com/">Justin Stitt</a> supplied a <code>Reviewed-by</code>, and <a href="https://lore.kernel.org/linux-nfs/CAGG=3QXu=kioXx3dRB2GO=qGQ+SqSuenbqMrrLEFz8KcRbn35A@mail.gmail.com/">Bill Wendling</a> followed with an <code>Acked-by</code>.</p>
+<p>The technical debate opened when <a href="https://lore.kernel.org/linux-nfs/20260818095548.27e0edb2@pumpkin/">David Laight</a> sketched a different rewrite: compute <code>strlen(dest)</code>, optionally insert a comma in place, then <code>strscpy()</code> the source into the tail. He also argued the helper should really be an <code>add_option()</code> function, that <code>root_nfs_copy()</code> is “a pointless wrapper on strscpy()”, and that a more valuable target sits nearby:</p>
+<blockquote>
+<p>"I suspect the it used to be just strcat()."</p>
+<p>"Much more worth while would be fixing the sprintf() for NFS_ROOT."</p>
+</blockquote>
+<p><a href="https://lore.kernel.org/linux-nfs/202608181041.0619C92@keescook/">Kees Cook</a> accepted that Laight’s sketch was valid, but preferred Nikitash’s <code>%s%s</code> form on readability grounds. He noted that Laight’s version open-codes the first <code>%s</code> and that “the <code>++len</code>’s interaction between the logic and the argument to <code>strscpy</code> is subtle.” Because <code>root_nfs_cat()</code> is not a fast path, Cook argued for keeping the proposed <code>snprintf()</code>:</p>
+<blockquote>
+<p>"Since this isn't fast-path, let's use what Mariia has proposed."</p>
+</blockquote>
+<p>On the <code>add_option()</code> suggestion, Cook was similarly unmoved: the helper is used in too few places to justify a new abstraction. He added his own <code>Reviewed-by</code>.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/CAK=BGyKGPf+dvph30b4m=oPhA=cfAYEj2Sq0FY=Qsbpmb2XEQw@mail.gmail.com/">Nikitash</a> replied that she had considered an approach similar to Laight’s and was “open to any path forward based on what maintainers want,” leaving the choice with NFS maintainers rather than pushing a v2.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/CAFhGd8rGren7EwjASppcx2WW8d-ky-T7k6mTxK-MpHfZmFTtbg@mail.gmail.com/">Stitt</a> then flagged a potential size_t underflow in Laight’s counter-proposal: if <code>len == destlen</code>, the <code>++len</code> could make <code>strscpy()</code> see <code>destlen - (len + 1)</code> wrap to <code>SIZE_MAX</code>. <a href="https://lore.kernel.org/linux-nfs/20260819112254.3e7d2b9c@pumpkin/">Laight</a> dismissed the underflow — <code>len</code> can only be less than <code>destlen</code>, so <code>strscpy()</code> would at worst see a zero-length destination, which is fine — and then went further, arguing the whole helper could drop <code>strlen()</code> entirely. <code>root_nfs_cat()</code> is used only twice against a single static string; tweaking initialization would let <code>sizeof()</code> set the initial length, the comma is always needed, and the second call currently <code>snprintf()</code>s into a temporary buffer that could instead be written directly into the destination.</p>
+<p><strong>Status at week’s end:</strong> the patch has <code>Reviewed-by</code> from Stitt and Cook plus Wendling’s <code>Acked-by</code>. Cook’s preference for the <code>snprintf()</code> form is the clearest technical conclusion so far. No NFS maintainer Acked-by or merge decision appeared in-window, and Laight’s broader nfsroot string-handling rewrite (including the <code>sprintf()</code> for <code>NFS_ROOT</code>) remains an unaddressed follow-on rather than a blocking objection. The discussion is a <strong>hardening/cleanup</strong> of NFS client boot-time nfsroot option assembly, not a protocol change.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/27956255dde39f58d73a7b51cb53cbe3d7804f54.1786411026.git.mariianikitash@google.com/">2026-08-14 Mariia Nikitash <a href="mailto:mariianikitash@google.com">mariianikitash@google.com</a> — [PATCH] NFS: nfsroot: replace strlcat() with snprintf()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aoNuOD6CLopCgxtU@google.com/">2026-08-17 Justin Stitt <a href="mailto:justinstitt@google.com">justinstitt@google.com</a> — Re: [PATCH] NFS: nfsroot: replace strlcat() with snprintf()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAGG=3QXu=kioXx3dRB2GO=qGQ+SqSuenbqMrrLEFz8KcRbn35A@mail.gmail.com/">2026-08-17 Bill Wendling <a href="mailto:morbo@google.com">morbo@google.com</a> — Re: [PATCH] NFS: nfsroot: replace strlcat() with snprintf()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260818095548.27e0edb2@pumpkin/">2026-08-18 David Laight <a href="mailto:david.laight.linux@gmail.com">david.laight.linux@gmail.com</a> — Re: [PATCH] NFS: nfsroot: replace strlcat() with snprintf()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/202608181041.0619C92@keescook/">2026-08-18 Kees Cook <a href="mailto:kees@kernel.org">kees@kernel.org</a> — Re: [PATCH] NFS: nfsroot: replace strlcat() with snprintf()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAK=BGyKGPf+dvph30b4m=oPhA=cfAYEj2Sq0FY=Qsbpmb2XEQw@mail.gmail.com/">2026-08-18 Mariia Nikitash <a href="mailto:mariianikitash@google.com">mariianikitash@google.com</a> — Re: [PATCH] NFS: nfsroot: replace strlcat() with snprintf()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAFhGd8rGren7EwjASppcx2WW8d-ky-T7k6mTxK-MpHfZmFTtbg@mail.gmail.com/">2026-08-18 Justin Stitt <a href="mailto:justinstitt@google.com">justinstitt@google.com</a> — Re: [PATCH] NFS: nfsroot: replace strlcat() with snprintf()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260819112254.3e7d2b9c@pumpkin/">2026-08-19 David Laight <a href="mailto:david.laight.linux@gmail.com">david.laight.linux@gmail.com</a> — Re: [PATCH] NFS: nfsroot: replace strlcat() with snprintf()</a></li>
+</ul>
+  </main>
+</body>
+</html>

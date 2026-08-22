@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>pNFS layout-return validity check NACKed</title>
+  <meta name="description" content="This week’s linux-nfs traffic on Tim Menninger’s pNFS client patch is a short, decisive maintainer rejection rather than a design iteration. The original change, posted 13 August from Pure Storage, is a proposed bug fix in the Linux NFS…">
+  <meta property="og:title" content="pNFS layout-return validity check NACKed">
+  <meta property="og:description" content="This week’s linux-nfs traffic on Tim Menninger’s pNFS client patch is a short, decisive maintainer rejection rather than a design iteration. The original change, posted 13 August from Pure Storage, is a proposed bug fix in the Linux NFS…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="pNFS layout-return validity check NACKed">
+  <meta name="twitter:description" content="This week’s linux-nfs traffic on Tim Menninger’s pNFS client patch is a short, decisive maintainer rejection rather than a design iteration. The original change, posted 13 August from Pure Storage, is a proposed bug fix in the Linux NFS…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>pNFS layout-return validity check NACKed</h1>
+<h2>Summary</h2>
+<p>This week’s linux-nfs traffic on Tim Menninger’s pNFS client patch is a short, decisive maintainer rejection rather than a design iteration. The <a href="https://lore.kernel.org/linux-nfs/20260813135834.22278-1-tmenninger@purestorage.com/">original change</a>, posted 13 August from Pure Storage, is a proposed <strong>bug fix</strong> in the Linux NFS client’s pNFS error path: stop a stale layout segment from marking a <em>replacement</em> layout for return. Linux NFS client maintainer <a href="https://lore.kernel.org/linux-nfs/ee96bac85fec2cf59adfb3d4ff54182c8260f6cb.camel@kernel.org/">Trond Myklebust</a> answered on 18 August with a hard NACK, arguing that the proposed <code>NFS_LSEG_VALID</code> gate would violate the client’s obligation to report I/O errors on layoutreturn.</p>
+<h2>Prior week, in brief</h2>
+<p>Menninger’s patch targets <code>pnfs_error_mark_layout_for_return()</code>. That helper already receives the <code>lseg</code> tied to the failed I/O, but previously used only the segment’s I/O mode and then operated on the inode’s current layout header, without asking whether the <code>lseg</code> itself was still valid.</p>
+<p>The failure mode is a classic pNFS state-id race on the client:</p>
+<ul>
+<li>A layout stateid can be invalidated while RPCs still hold references to its layout segments.</li>
+<li><code>pnfs_mark_layout_stateid_invalid()</code> clears <code>NFS_LSEG_VALID</code> on those segments via <code>pnfs_clear_lseg_state()</code>.</li>
+<li>A later <code>LAYOUTGET</code> can install a replacement stateid on the same <code>pnfs_layout_hdr</code>.</li>
+<li>If an RPC that still holds an old <code>lseg</code> then reports an error, the existing code can mark the <em>new</em> layout for return.</li>
+</ul>
+<p>Menninger’s conclusion was that once <code>NFS_LSEG_VALID</code> is gone, the segment “is no longer eligible for selection for new I/O and must not initiate another error-driven return of the inode’s current layout.” The patch folded <code>pnfs_mark_layout_for_return()</code> into <code>pnfs_error_mark_layout_for_return()</code> and added a <code>pnfs_is_valid_lseg()</code> check alongside <code>pnfs_layout_is_valid()</code> before setting return info. It was also tagged <code>Cc: stable@vger.kernel.org</code>.</p>
+<p>The reproduction is operationally severe. Restarting a FlexFiles data server under a high-throughput read workload caused stale <code>lseg</code>s to repeatedly mark the replacement layout for return, which in turn cancelled I/O, forced RPC/RDMA reconnects, and produced sustained <code>inode-&gt;i_lock</code> contention. Menninger reported that the client did not recover on its own and burned about 94 CPU cores on a 96-CPU system; with the patch, I/O recovered in about 20 seconds and recovery load peaked around 15 cores.</p>
+<h2>This week: maintainer NACK on protocol grounds</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/ee96bac85fec2cf59adfb3d4ff54182c8260f6cb.camel@kernel.org/">Myklebust</a> did not contest the FlexFiles storm as an observed client failure. He rejected the <em>premise</em> of the fix: that <code>NFS_LSEG_VALID</code> is an appropriate gate for layout returns.</p>
+<blockquote>
+<p>"I strongly disagree with the above premise that NFS_LSEG_VALID should be used to gate layout returns. If the client tries to do I/O and fails, then it is required to report the error, the type of I/O, and the byte range to which it applies."</p>
+</blockquote>
+<p>That is a protocol-and-client-architecture argument, not a style nits. In the pNFS client, a failed I/O is supposed to feed a layoutreturn that describes <em>what</em> failed. The client then redrives that layoutreturn as outstanding I/O requests fail. Myklebust pointed at the existing <code>EBUSY</code> serialization as the intended collector, not a validity bit on the old segment:</p>
+<blockquote>
+<p>"We attempt to redrive that layoutreturn as the outstanding I/O requests fail. The EBUSY is there to ensure that we don't fire off the layoutreturn until all the errors have been collected."</p>
+</blockquote>
+<p>From that reading, Menninger’s extra <code>pnfs_is_valid_lseg()</code> check would drop error-driven returns for I/O that still belongs to an invalidated segment—exactly the I/O the server still needs to hear about—rather than waiting until every in-flight failure has been folded into one layoutreturn. The verdict was unambiguous:</p>
+<blockquote>
+<p>"So NACK to this patch."</p>
+</blockquote>
+<p>No alternative patch, no request for a v2 with a different predicate, and no follow-up from Menninger appeared in this window. The discussion therefore ends this week as an open client bug with a rejected approach: the FlexFiles recovery storm is still on the table, but gating layoutreturn on <code>NFS_LSEG_VALID</code> is not an accepted way to stop it.</p>
+<h2>What this means for NFS client development</h2>
+<p>This is <strong>not</strong> a protocol change and <strong>not</strong> a new feature. It is a proposed <strong>client bug fix</strong> in the pNFS layout-return error path, and it collides with a long-standing client invariant: layoutreturn is how the client reports failed I/O ranges, even after the layout stateid that originated those I/Os has been invalidated and replaced.</p>
+<p>The important client-side takeaway is the split between two recovery mechanisms that the patch tried to collapse:</p>
+<ol>
+<li><strong>Segment validity (<code>NFS_LSEG_VALID</code>)</strong> — used to stop <em>new</em> I/O from selecting a dead <code>lseg</code> after <code>pnfs_mark_layout_stateid_invalid()</code>.</li>
+<li><strong>Error-driven layoutreturn</strong> — used to report I/O that already ran (or tried to run) against that segment, with <code>EBUSY</code> holding the return until the error set is complete.</li>
+</ol>
+<p>Menninger treated (1) as a reason to suppress (2) against the inode’s current layout, on the theory that a stale <code>lseg</code> must not poison a replacement stateid. Myklebust treated (2) as mandatory regardless of (1), because the replacement layout and the failed byte range still have to be reconciled with the server. Until someone proposes a fix that preserves error collection—perhaps by tying the return to the <em>failed</em> layout’s identity rather than silencing the return entirely—the high-CPU FlexFiles restart path remains unfixed in-tree.</p>
+<p><strong>Status this week:</strong> patch NACKed; no merge, no v2, no alternative posted.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/ee96bac85fec2cf59adfb3d4ff54182c8260f6cb.camel@kernel.org/">2026-08-18 Trond Myklebust <a href="mailto:trondmy@kernel.org">trondmy@kernel.org</a> — Re: [PATCH] pNFS: Check lseg validity before marking a layout for return</a></li>
+</ul>
+  </main>
+</body>
+</html>

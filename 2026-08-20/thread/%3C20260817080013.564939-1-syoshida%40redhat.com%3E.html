@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SUNRPC pipefs_sb UAF on late rpc_pipefs mounts</title>
+  <meta name="description" content="A short but consequential NFS-client bug-fix thread landed this week: Shigeru Yoshida posted a one-file SUNRPC patch to close a use-after-free that surfaces when RPC clients are created before rpc_pipefs is mounted, and Jeff Layton signed…">
+  <meta property="og:title" content="SUNRPC pipefs_sb UAF on late rpc_pipefs mounts">
+  <meta property="og:description" content="A short but consequential NFS-client bug-fix thread landed this week: Shigeru Yoshida posted a one-file SUNRPC patch to close a use-after-free that surfaces when RPC clients are created before rpc_pipefs is mounted, and Jeff Layton signed…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="SUNRPC pipefs_sb UAF on late rpc_pipefs mounts">
+  <meta name="twitter:description" content="A short but consequential NFS-client bug-fix thread landed this week: Shigeru Yoshida posted a one-file SUNRPC patch to close a use-after-free that surfaces when RPC clients are created before rpc_pipefs is mounted, and Jeff Layton signed…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>SUNRPC pipefs_sb UAF on late rpc_pipefs mounts</h1>
+<h2>Summary</h2>
+<p>A short but consequential NFS-client bug-fix thread landed this week: <a href="https://lore.kernel.org/linux-nfs/20260817080013.564939-1-syoshida@redhat.com/">Shigeru Yoshida</a> posted a one-file SUNRPC patch to close a use-after-free that surfaces when RPC clients are created before <code>rpc_pipefs</code> is mounted, and <a href="https://lore.kernel.org/linux-nfs/4a3a7a0cd52e8fc571c967716756f49b8a0f95f2.camel@kernel.org/">Jeff Layton</a> signed off the same day.</p>
+<p>This is a <strong>bug fix</strong>, not a protocol change. It repairs a hole left by commit <code>bfca5fb4e97c</code> ("SUNRPC: Fix RPC client cleaned up the freed pipefs dentries"), which added <code>clnt-&gt;pipefs_sb</code> and a superblock-consistency check in <code>rpc_clnt_remove_pipedir()</code> so pipedir teardown is skipped when the live pipefs superblock no longer matches the one recorded on the client. Yoshida’s diagnosis is that the matching update was never wired into the pipefs notifier path:</p>
+<blockquote>
+<p>"<code>__rpc_clnt_handle_event()</code> never updates <code>clnt-&gt;pipefs_sb</code> when it creates or removes pipedirs in response to <code>RPC_PIPEFS_MOUNT</code> and <code>RPC_PIPEFS_UMOUNT</code> notifications."</p>
+</blockquote>
+<p>The practical NFS-client failure mode is clients that exist <em>before</em> pipefs comes up — during boot, or after an unmount. At registration, <code>rpc_get_sb_net()</code> returns NULL, so <code>clnt-&gt;pipefs_sb</code> stays NULL. A later <code>RPC_PIPEFS_MOUNT</code> event still creates the pipedir, but leaves that field NULL. When the client is destroyed, <code>rpc_clnt_remove_pipedir()</code> compares the now-live superblock against the NULL recorded pointer, skips cleanup, and leaves orphaned dentries whose <code>RPC_I(inode)-&gt;private</code> pointers still point at freed <code>rpc_clnt</code> memory. Opening those leftover info files then trips KASAN in <code>rpc_info_open()</code>.</p>
+<p>The KASAN report Yoshida included is squarely on the NFS client clone path, not a generic RPC-only workload. Allocation is:</p>
+<ul>
+<li><code>nfs_do_submount</code> → <code>nfs4_clone_server</code> → <code>nfs_clone_server</code> → <code>nfs_init_server_rpcclient</code> → <code>rpc_clone_client_set_auth</code> → <code>__rpc_clone_client</code> → <code>rpc_new_client</code></li>
+</ul>
+<p>The free is the usual deferred client teardown (<code>rpc_free_client_work</code> via the workqueue). The user-visible trigger is a later <code>cat</code> of the leftover pipefs info file.</p>
+<p>The fix is small and local: in <code>__rpc_clnt_handle_event()</code>, set <code>clnt-&gt;pipefs_sb</code> on MOUNT and clear it on UMOUNT, mirroring what <code>rpc_setup_pipedir()</code> already does at client registration. The patch is eight lines in <code>net/sunrpc/clnt.c</code> (<code>Fixes: bfca5fb4e97c</code>). Yoshida noted AI assistance (<code>Assisted-by: Claude:claude-opus-4-6</code>).</p>
+<p>Layton’s review was brief and affirmative:</p>
+<blockquote>
+<p>"Looks right."</p>
+<p><code>Reviewed-by: Jeff Layton &lt;jlayton@kernel.org&gt;</code></p>
+</blockquote>
+<p>No counter-proposals, no requested respin, and no further comments appeared in-window. As of 2026-08-17 the patch has a maintainer Reviewed-by and is waiting on merge; there is no in-thread indication yet that it has been applied. The client-side takeaway is that the earlier pipefs-dentry safety check was incomplete for NFS clones that race (or simply precede) <code>rpc_pipefs</code> mount, and this notifier-side <code>pipefs_sb</code> update is what actually lets <code>rpc_clnt_remove_pipedir()</code> clean up those dentries instead of leaking UAF-prone info files.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260817080013.564939-1-syoshida@redhat.com/">2026-08-17 Shigeru Yoshida <a href="mailto:syoshida@redhat.com">syoshida@redhat.com</a> — [PATCH] SUNRPC: update clnt-&gt;pipefs_sb on pipefs MOUNT/UMOUNT events</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/4a3a7a0cd52e8fc571c967716756f49b8a0f95f2.camel@kernel.org/">2026-08-17 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH] SUNRPC: update clnt-&gt;pipefs_sb on pipefs MOUNT/UMOUNT events</a></li>
+</ul>
+  </main>
+</body>
+</html>

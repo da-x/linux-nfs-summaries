@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD recall-any trace format eval maps land with dual reviews</title>
+  <meta name="description" content="Chuck Lever posted a one-file tracing bug fix this week so that trace-cmd and perf can actually decode the type mask on NFSD&#39;s nfsd_cb_recall_any event. Christoph Hellwig and Jeff Layton both reviewed it the next day. The patch is not a…">
+  <meta property="og:title" content="NFSD recall-any trace format eval maps land with dual reviews">
+  <meta property="og:description" content="Chuck Lever posted a one-file tracing bug fix this week so that trace-cmd and perf can actually decode the type mask on NFSD&#39;s nfsd_cb_recall_any event. Christoph Hellwig and Jeff Layton both reviewed it the next day. The patch is not a…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSD recall-any trace format eval maps land with dual reviews">
+  <meta name="twitter:description" content="Chuck Lever posted a one-file tracing bug fix this week so that trace-cmd and perf can actually decode the type mask on NFSD&#39;s nfsd_cb_recall_any event. Christoph Hellwig and Jeff Layton both reviewed it the next day. The patch is not a…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD recall-any trace format eval maps land with dual reviews</h1>
+<h2>Summary</h2>
+<h1>NFSD recall-any trace format eval maps land with dual reviews</h1>
+<p>Chuck Lever posted a one-file <a href="https://lore.kernel.org/linux-nfs/20260818184151.31180-1-cel@kernel.org/">tracing bug fix</a> this week so that <code>trace-cmd</code> and <code>perf</code> can actually decode the type mask on NFSD's <code>nfsd_cb_recall_any</code> event. Christoph Hellwig and Jeff Layton both reviewed it the next day. The patch is not a protocol change and not a new feature: it repairs observability of an existing CB_RECALL_ANY tracepoint, which matters for anyone watching how the server asks clients to return delegations.</p>
+<h2>The bug: enumerator names left in the format file</h2>
+<p>The <code>nfsd_cb_recall_any</code> event uses <code>show_rca_mask()</code> to pretty-print the <code>bmval0</code> field as named bits (<code>RDATA_DLG</code> and friends). Those names come from <code>RCA4_TYPE_MASK_*</code> enum constants. Lever's commit message explains why that never made it into a usable format string:</p>
+<blockquote>
+<p>"RCA4_TYPE_MASK_* are enum constants, so the preprocessor cannot fold them into the print format that show_rca_mask() builds for the nfsd_cb_recall_any event. Nothing declares an eval map for them either, so trace_event_eval_update() has no substitution to apply at module load, and the event's format file ships the enumerator names verbatim. trace-cmd and perf cannot decode the bmval0 field."</p>
+</blockquote>
+<p>In other words, the kernel's tracing machinery never got a numeric mapping for those bits. Userspace tools that parse <code>/sys/kernel/tracing/events/.../format</code> (or the equivalent from a recorded session) therefore saw the C enumerator identifiers instead of integer shift counts, and could not decode which recallable-object types the server had asked the client to give back.</p>
+<p>The fix is ten lines in <code>fs/nfsd/trace.h</code>: declare TRACE eval maps for the nine mask bits <code>show_rca_mask()</code> already decodes. After that, the event format carries the shift counts as integers, matching the shape SUNRPC already emits from its <code>BIT()</code> flag decoders. Lever tags it <code>Fixes: 638593be55c0 ("NFSD: add CB_RECALL_ANY tracepoints")</code>.</p>
+<h2>Why it matters for NFS client work</h2>
+<p>This is an NFSD-side change, but the field it repairs is exactly the mask a client sees on <code>CB_RECALL_ANY</code>. That callback is the server's way of asking a client to return some recallable state (delegations, layouts, and related objects) under memory pressure. Linux NFS client developers and operators using <code>perf</code> or <code>trace-cmd</code> against a live NFSD could not decode <code>bmval0</code>, so they could not tell from traces which object types the server had named.</p>
+<p>That gap is more than cosmetic this week. Lever's parallel <a href="https://lore.kernel.org/linux-nfs/20260817-recall-any-keep-count-v5-0-3b2cffce701e@kernel.org/">CB_RECALL_ANY keep-count series</a> is still landing: it stops NFSD from sending the operation to NFSv4.0 clients (which permanently takes the callback channel down) and stops advertising <code>craa_objects_to_keep == 0</code> (which non-Linux clients treat as "return everything"). The Linux NFS client has historically ignored the keep-count and returned only one unused delegation of the named types, which is why Linux-on-Linux testing never exposed the zero-keep-count bug. Being able to decode the type mask in traces is the other half of watching that path: without it, a client-side investigation of "which types did the server actually recall?" stops at an undecodable bitmap.</p>
+<h2>Reviews, no debate</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/aoVHuK-JPLvCEOuI@infradead.org/">Christoph Hellwig</a> replied the next morning with a one-line ack:</p>
+<blockquote>
+<p>"Looks good:"</p>
+</blockquote>
+<p>and a <code>Reviewed-by: Christoph Hellwig &lt;hch@lst.de&gt;</code>.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/f658b824d4d1a09119725a985e411ea2d28baefa.camel@kernel.org/">Jeff Layton</a> followed a few hours later with <code>Reviewed-by: Jeff Layton &lt;jlayton@kernel.org&gt;</code> after quoting the patch, including the <code>show_rca_mask()</code> table that maps <code>BIT(RCA4_TYPE_MASK_RDATA_DLG)</code> to <code>"RDATA_DLG"</code>. There was no technical pushback, no request for a v2, and no discussion of stable backporting on this thread.</p>
+<h2>Conclusion</h2>
+<p>This is a <strong>bug fix</strong> for NFSD tracing, not a protocol change. The original CB_RECALL_ANY tracepoints shipped enumerator names that userspace cannot resolve; declaring the nine eval maps makes <code>bmval0</code> decode the same way SUNRPC flag bits already do. With Hellwig and Layton's reviews in hand, the patch is ready to merge. For NFS client developers, the practical outcome is that traces of <code>nfsd_cb_recall_any</code> will finally name the object types the server asked the client to return — the missing decoder for a callback the keep-count series is simultaneously making less hazardous.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260818184151.31180-1-cel@kernel.org/">2026-08-18 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH] NFSD: Resolve the recall-any mask names in the trace format</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aoVHuK-JPLvCEOuI@infradead.org/">2026-08-19 Christoph Hellwig <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [PATCH] NFSD: Resolve the recall-any mask names in the trace format</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/f658b824d4d1a09119725a985e411ea2d28baefa.camel@kernel.org/">2026-08-19 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH] NFSD: Resolve the recall-any mask names in the trace format</a></li>
+</ul>
+  </main>
+</body>
+</html>

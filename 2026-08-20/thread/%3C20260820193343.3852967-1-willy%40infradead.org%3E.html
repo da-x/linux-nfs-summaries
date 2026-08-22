@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Wilcox series to drop aops-&gt;launder_folio, converting NFS to filemap_invalidate_pages()</title>
+  <meta name="description" content="Matthew Wilcox posted a seven-patch VFS/MM cleanup that would delete aops-&gt;launder_folio entirely, converting the remaining users—including the Linux NFS client—onto filemap_invalidate_pages(). The series is a page-cache invalidation…">
+  <meta property="og:title" content="Wilcox series to drop aops-&gt;launder_folio, converting NFS to filemap_invalidate_pages()">
+  <meta property="og:description" content="Matthew Wilcox posted a seven-patch VFS/MM cleanup that would delete aops-&gt;launder_folio entirely, converting the remaining users—including the Linux NFS client—onto filemap_invalidate_pages(). The series is a page-cache invalidation…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Wilcox series to drop aops-&gt;launder_folio, converting NFS to filemap_invalidate_pages()">
+  <meta name="twitter:description" content="Matthew Wilcox posted a seven-patch VFS/MM cleanup that would delete aops-&gt;launder_folio entirely, converting the remaining users—including the Linux NFS client—onto filemap_invalidate_pages(). The series is a page-cache invalidation…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Wilcox series to drop aops-&gt;launder_folio, converting NFS to filemap_invalidate_pages()</h1>
+<h2>Summary</h2>
+<p>Matthew Wilcox posted a seven-patch VFS/MM cleanup that would delete <code>aops-&gt;launder_folio</code> entirely, converting the remaining users—including the Linux NFS client—onto <code>filemap_invalidate_pages()</code>. The series is a page-cache invalidation refactor and efficiency fix, not an NFS protocol change. It landed on linux-nfs on 20 August with no NFS-maintainer review yet; the only in-week reply is a FUSE range-semantics objection from Bernd Schubert.</p>
+<h2>Why launder_folio is on the chopping block</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260820193343.3852967-1-willy@infradead.org/">Wilcox’s cover letter</a> is blunt about the address-space method:</p>
+<blockquote>
+<p>"There's really no reason to implement -&gt;launder_folio.  Most filesystems don't.  The only problem is that some filesystems rely on dirty folios being written back this way, so we need to make sure that folios are written back before invalidating them.  filemap_invalidate_pages() works well for that, once we remove the 'nowait' parameter."</p>
+</blockquote>
+<p>The series is 87 insertions / 174 deletions across 24 files. The plan is:</p>
+<ol>
+<li>Export a cleaned-up <code>filemap_invalidate_pages()</code> to modules.</li>
+<li>Convert FUSE, btrfs, NFS, and OrangeFS off <code>invalidate_inode_pages2[_range]()</code> so they no longer depend on <code>-&gt;launder_folio</code> for writeback-during-invalidate.</li>
+<li>Delete <code>folio_launder()</code> from the VFS and drop the method from the locking and VFS docs.</li>
+</ol>
+<h2>The VFS API change (and a small existing bug)</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260820193343.3852967-2-willy@infradead.org/">Patch 1</a> is the foundation the NFS conversion needs. Wilcox calls <code>filemap_invalidate_pages()</code> a better filesystem API than <code>invalidate_inode_pages2()</code> / <code>invalidate_inode_pages2_range()</code>, then strips the <code>nowait</code> argument as both unused by those callers and incorrectly implemented:</p>
+<blockquote>
+<p>"It's also wrongly implemented as it will call invalidate_inode_pages2_range() even after filemap_range_has_page() returns false."</p>
+</blockquote>
+<p>The <code>filemap_range_has_page()</code> check moves into the two existing in-tree callers (<code>block/ioctl.c</code>), kernel-doc is added, and the function is exported so NFS (and the other filesystems) can call it from modules.</p>
+<h2>NFS client: stop per-folio launder on invalidate</h2>
+<p>The NFS-facing change is <a href="https://lore.kernel.org/linux-nfs/20260820193343.3852967-5-willy@infradead.org/">patch 4/7</a>. Today the client depends on <code>invalidate_inode_pages2()</code> / <code>invalidate_inode_pages2_range()</code> to write dirty cache via <code>nfs_launder_folio()</code>. Wilcox’s diagnosis is that this is correct but slow:</p>
+<blockquote>
+<p>"nfs relies on invalidate_inode_pages2() / invalidate_inode_pages2_range() doing writeback by calling nfs_launder_folio().  While this works, it is inefficient as each folio is written back and waited for individually.  Far better to call filemap_invalidate_pages() which will do a bulk write first, then remove the page cache."</p>
+</blockquote>
+<blockquote>
+<p>"With this done, nfs_launder_folio() no longer needs to exist so delete it."</p>
+</blockquote>
+<p>The patch touches six NFS files (<code>fs/nfs/dir.c</code>, <code>direct.c</code>, <code>file.c</code>, <code>inode.c</code>, <code>nfs42proc.c</code>, <code>nfstrace.h</code>): 10 insertions, 35 deletions. The 24-line deletion in <code>fs/nfs/file.c</code> is <code>nfs_launder_folio()</code> itself; the trace header loses the corresponding event. Call sites that previously punched holes in the page cache through the old invalidate helpers—directory invalidation, direct I/O, inode-level cache drop, and NFSv4.2 procedures—switch to the bulk writeback-then-remove path.</p>
+<p>That is the important NFS client bug-fix/optimization in this thread: invalidation no longer serializes writeback and wait per folio. Dirty NFS pages in an invalidate range should be flushed as a batch, then dropped, which is the same contract the client already wanted from <code>nfs_launder_folio()</code> without the per-folio round trip.</p>
+<p>No NFS maintainer (Trond Myklebust, Anna Schumaker, Jeff Layton, Neil Brown, or others) has replied in-window. The conversion therefore remains unacked on the NFS side.</p>
+<h2>Same conversion for FUSE, btrfs, OrangeFS</h2>
+<p>The NFS change is one of a matching set:</p>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260820193343.3852967-3-willy@infradead.org/">FUSE</a> (<code>fs/fuse/{dax,dir,file,inode}.c</code>): drop <code>fuse_launder_folio()</code>, switch invalidate paths to <code>filemap_invalidate_pages()</code>. Wilcox repeats the same inefficiency argument—each page written back and waited for individually.</li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260820193343.3852967-4-willy@infradead.org/">btrfs</a>: same pattern, deleting <code>btrfs_launder_folio()</code> and updating direct-io, disk-io, free-space-cache, inode, and volumes.</li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260820193343.3852967-6-willy@infradead.org/">OrangeFS</a>: a pair of calls that already open-coded the bulk helper is collapsed to <code>filemap_invalidate_pages()</code>.</li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260820193343.3852967-7-willy@infradead.org/">OrangeFS follow-up</a>: unlink <code>-&gt;launder_folio</code> from the OrangeFS address-space ops. Wilcox leaves <code>orangefs_launder_folio()</code> in place because it is still used internally and “removing it entirely would be tricky.”</li>
+</ul>
+<h2>Closing the DIO vs. mmap redirty window</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260820193343.3852967-8-willy@infradead.org/">Patch 7</a> is the VFS endgame and matters for NFS direct I/O as much as for the other converted filesystems. Direct I/O first writes back overlapping dirty folios, then locks each folio and unmaps it from CPU page tables:</p>
+<blockquote>
+<p>"This leaves a wide window for userspace to re-dirty the folio by storing to a shared writable mmap."</p>
+</blockquote>
+<blockquote>
+<p>"Many filesystems respond to this situation by failing the call to release_folio(), but some try to writeback the dirty folio again, formerly in their release_folio() method and now in their launder_folio() method."</p>
+</blockquote>
+<p>Wilcox’s conclusion is to stop that filesystem-by-filesystem inconsistency:</p>
+<blockquote>
+<p>"Remove this inconsistency between filesystems by checking whether the folio is dirty in the VFS and failing the call to folio_unmap_invalidate().  Since we hold the folio locked and unmapped at this time, there is no way to dirty the folio after this point."</p>
+</blockquote>
+<p><code>folio_launder()</code> goes away from <code>mm/truncate.c</code>, <code>include/linux/fs.h</code>, and the VFS/locking documentation. After this, a redirtied folio during DIO invalidate fails in the VFS rather than being re-laundered by NFS (or anyone else).</p>
+<h2>Only review so far: FUSE range semantics, not NFS</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/075218ce-0c30-4f3a-b01d-6eb99094b7e8@bsbernd.com/">Bernd Schubert</a> replied to the FUSE conversion, not the NFS patch. He flags a possible behavior change in the invalidate-length handling:</p>
+<blockquote>
+<p>"Please correct me if I'm wrong, but doesn't that changes behavior for len &lt;= 0? The logic to invalidate till the file end is lost, at least if offset is != -1?  And incostent behavior for len &lt; 1? Note that the existing behavior is used by libfuse and heavily by some fuse daemons."</p>
+</blockquote>
+<p>Wilcox has not answered in this window. The objection is FUSE-userspace ABI, not NFS, but it is the only sign the series is under review and it may stall the common helper before the NFS conversion can land.</p>
+<h2>Status</h2>
+<p>This is a VFS cleanup plus NFS client invalidation efficiency fix. It is not a protocol change. As of 20 August the series is posted, the NFS client would lose <code>nfs_launder_folio()</code> and call <code>filemap_invalidate_pages()</code> from dir, DIO, inode, and NFSv4.2 paths, and the VFS would fail DIO invalidate on a redirtied folio instead of asking the filesystem to launder again. Nothing is merged or acked on linux-nfs this week; the open question is Schubert’s FUSE <code>len &lt;= 0</code> concern, with NFS review still outstanding.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260820193343.3852967-4-willy@infradead.org/">2026-08-20 "Matthew Wilcox (Oracle)" <a href="mailto:willy@infradead.org">willy@infradead.org</a> — [PATCH 3/7] btrfs: Use filemap_invalidate_pages()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260820193343.3852967-5-willy@infradead.org/">2026-08-20 "Matthew Wilcox (Oracle)" <a href="mailto:willy@infradead.org">willy@infradead.org</a> — [PATCH 4/7] nfs: Use filemap_invalidate_pages()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260820193343.3852967-6-willy@infradead.org/">2026-08-20 "Matthew Wilcox (Oracle)" <a href="mailto:willy@infradead.org">willy@infradead.org</a> — [PATCH 5/7] orangefs: Use filemap_invalidate_pages()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260820193343.3852967-1-willy@infradead.org/">2026-08-20 "Matthew Wilcox (Oracle)" <a href="mailto:willy@infradead.org">willy@infradead.org</a> — [PATCH 0/7] Remove aops-&gt;launder_folio</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260820193343.3852967-3-willy@infradead.org/">2026-08-20 "Matthew Wilcox (Oracle)" <a href="mailto:willy@infradead.org">willy@infradead.org</a> — [PATCH 2/7] fuse: Use filemap_invalidate_pages()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260820193343.3852967-8-willy@infradead.org/">2026-08-20 "Matthew Wilcox (Oracle)" <a href="mailto:willy@infradead.org">willy@infradead.org</a> — [PATCH 7/7] Remove folio_launder()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260820193343.3852967-2-willy@infradead.org/">2026-08-20 "Matthew Wilcox (Oracle)" <a href="mailto:willy@infradead.org">willy@infradead.org</a> — [PATCH 1/7] filemap: Export filemap_invalidate_pages() to modules</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260820193343.3852967-7-willy@infradead.org/">2026-08-20 "Matthew Wilcox (Oracle)" <a href="mailto:willy@infradead.org">willy@infradead.org</a> — [PATCH 6/7] orangefs: Remove launder_folio implementation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/075218ce-0c30-4f3a-b01d-6eb99094b7e8@bsbernd.com/">2026-08-20 Bernd Schubert <a href="mailto:bernd@bsbernd.com">bernd@bsbernd.com</a> — Re: [PATCH 2/7] fuse: Use filemap_invalidate_pages()</a></li>
+</ul>
+  </main>
+</body>
+</html>

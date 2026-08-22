@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS DIO modernization: v6 after Sashiko unpin bugs</title>
+  <meta name="description" content="This week’s traffic on Pranjal Shrivastava’s NFS client Direct I/O modernization series is a short status note, not a design debate: the Google engineer announced v6 after static analysis turned up double-unpin bugs in the v5 pin-aware…">
+  <meta property="og:title" content="NFS DIO modernization: v6 after Sashiko unpin bugs">
+  <meta property="og:description" content="This week’s traffic on Pranjal Shrivastava’s NFS client Direct I/O modernization series is a short status note, not a design debate: the Google engineer announced v6 after static analysis turned up double-unpin bugs in the v5 pin-aware…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS DIO modernization: v6 after Sashiko unpin bugs">
+  <meta name="twitter:description" content="This week’s traffic on Pranjal Shrivastava’s NFS client Direct I/O modernization series is a short status note, not a design debate: the Google engineer announced v6 after static analysis turned up double-unpin bugs in the v5 pin-aware…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS DIO modernization: v6 after Sashiko unpin bugs</h1>
+<h2>Summary</h2>
+<p>This week’s traffic on Pranjal Shrivastava’s NFS client Direct I/O modernization series is a short status note, not a design debate: the Google engineer <a href="https://lore.kernel.org/linux-nfs/an8oIS2WA5CdQGVQ@google.com/">announced v6</a> after static analysis turned up double-unpin bugs in the v5 pin-aware <code>nfs_page</code> path.</p>
+<p>The work remains a <strong>client feature / preparatory refactor</strong>, not a protocol change. It replaces the legacy <code>iov_iter_get_pages_alloc2()</code> O_DIRECT extraction path with <code>iov_iter_extract_pages()</code> so NFS can later pass <code>ITER_ALLOW_P2PDMA</code>. That API shift is also a <strong>lifecycle bug-fix</strong>: pins must be held until I/O completes, and <code>nfs_page</code> has to distinguish a GUP pin from a normal page reference.</p>
+<h2>Prior context (posted 10 Aug, just before this window)</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260810195040.2877784-1-praan@google.com/">v5</a> kept the five-patch split agreed after the April P2PDMA RFC and the v2/v3 reviews (folio conversion and actual P2PDMA enablement stay in later series):</p>
+<ol>
+<li>Make <code>nfs_page</code> pin-aware (<code>PG_PINNED</code>; <code>unpin_user_page()</code> / <code>unpin_user_folio()</code> in <code>nfs_clear_request()</code> and <code>nfs_direct_release_pages()</code>).</li>
+<li>Track <code>wb_nr_pinned</code> so only the primary request unpins.</li>
+<li>Centralize list teardown in <code>nfs_release_request_list()</code>.</li>
+<li>Switch Direct I/O to <code>iov_iter_extract_pages()</code>.</li>
+<li>Factor <code>nfs_direct_extract_pages()</code> for read and write scheduling.</li>
+</ol>
+<p>Shrivastava’s cover letter stated the motivation bluntly:</p>
+<blockquote>
+<p>"Currently, NFS O_DIRECT relies on the legacy iov_iter_get_pages_alloc2() API which does not support the pinning requirements for P2P memory."</p>
+</blockquote>
+<p>The v5 changelog already carried two client-side correctness fixes: an <code>iov_iter_revert</code> oops in <code>nfs_direct_extract_pages()</code>, and a swap-over-NFS refcount underflow because <code>nfs_direct_release_pages()</code> called <code>put_page()</code> on unpinned memory. Patch 4 also documents an older DIO-loop bug:</p>
+<blockquote>
+<p>"The migration fixes a bug in the Direct I/O loop where pages were being unpinned immediately after request creation. With the new extraction model, pins are held until the I/O is complete."</p>
+</blockquote>
+<p>Hours after posting, <a href="https://lore.kernel.org/linux-nfs/ano2R8fAeGmsNt9f@google.com/">Shrivastava flagged process mistakes</a>: the cover subject still said “v4”, and Christoph Hellwig’s <code>Reviewed-by</code> tags on patches 1–3 had been dropped in the rebase. He asked whether to resend.</p>
+<h2>This week: Sashiko unpin bugs drive v6</h2>
+<p>On 14 Aug, Shrivastava answered his own etiquette question by resending. The <a href="https://lore.kernel.org/linux-nfs/an8oIS2WA5CdQGVQ@google.com/">in-thread note</a> is the only linux-nfs message in this window:</p>
+<blockquote>
+<p>"Quick update: I've posted a v6 [1] with fixes for unpin bugs reported by Sashiko [2] and with R-bs from Christoph that were dropped mistakenly in v5."</p>
+</blockquote>
+<p>The <a href="https://lore.kernel.org/linux-nfs/20260814143255.861084-1-praan@google.com/">v6 cover</a> (separate thread root, posted minutes earlier) repeats the same design and xfstests matrix (quick group on RDMA/TCP × NFSv3/4.0/4.1/4.2, no regressions vs. pre-series) and adds:</p>
+<blockquote>
+<p>"Fixed double unpin bugs pointed out by Sashiko"</p>
+</blockquote>
+<p>Those fixes land in the pin-tracking core, not in the VFS extraction helper. v6 patch 1 (<code>nfs: make nfs_page pin-aware</code>) grows from 40 to 44 lines in <code>pagelist.c</code> and restores Hellwig’s <code>Reviewed-by</code>. v6 patch 2 (<code>wb_nr_pinned</code>) grows from 9 to 13 lines in the same file. The Direct I/O extraction patches also pick up a few extra lines (patch 4: 34 → 37 in <code>direct.c</code>; patch 5: 127 → 130), consistent with tighter failed-page cleanup so a request is not unpinned twice—once in the scheduling loop and again when the <code>nfs_page</code> is cleared.</p>
+<p>Hellwig’s reviews are restored across the pin-aware and helper patches; Shivaji Kant’s tags remain on patches 3–5. Folio aggregation and <code>ITER_ALLOW_P2PDMA</code> / transport P2P negotiation are still explicitly out of scope.</p>
+<h2>Conclusion</h2>
+<p>No maintainer ack or merge decision appeared on this thread this week. The series is still in flight: v5’s pin model is the right direction, but Sashiko’s double-unpin findings were serious enough that Shrivastava did not wait for list review of v5. Follow-up coverage belongs on the <a href="https://lore.kernel.org/linux-nfs/20260814143255.861084-1-praan@google.com/">v6 series</a>.</p>
+<p><strong>Key message-IDs:</strong> <a href="https://lore.kernel.org/linux-nfs/20260810195040.2877784-1-praan@google.com/">v5 cover</a>, <a href="https://lore.kernel.org/linux-nfs/ano2R8fAeGmsNt9f@google.com/">v5 process note</a>, <a href="https://lore.kernel.org/linux-nfs/an8oIS2WA5CdQGVQ@google.com/">this week’s v6 pointer</a>, <a href="https://lore.kernel.org/linux-nfs/20260814143255.861084-1-praan@google.com/">v6 cover</a>.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/an8oIS2WA5CdQGVQ@google.com/">2026-08-14 Pranjal Shrivastava <a href="mailto:praan@google.com">praan@google.com</a> — Re: [PATCH v4 0/5] nfs: modernize direct I/O path</a></li>
+</ul>
+  </main>
+</body>
+</html>

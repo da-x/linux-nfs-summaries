@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD iterator-READ fsnotify/atime fixes meet VFS pushback</title>
+  <meta name="description" content="Ameer Hamza posted a two-patch bug-fix series for NFSD&#39;s iterator READ path, split out of his larger SUNRPC reply-page recycling work at Chuck Lever&#39;s request. Both patches target fs/nfsd/vfs.c, carry Fixes: 507df40ebf316 (&quot;NFSD: Hoist…">
+  <meta property="og:title" content="NFSD iterator-READ fsnotify/atime fixes meet VFS pushback">
+  <meta property="og:description" content="Ameer Hamza posted a two-patch bug-fix series for NFSD&#39;s iterator READ path, split out of his larger SUNRPC reply-page recycling work at Chuck Lever&#39;s request. Both patches target fs/nfsd/vfs.c, carry Fixes: 507df40ebf316 (&quot;NFSD: Hoist…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSD iterator-READ fsnotify/atime fixes meet VFS pushback">
+  <meta name="twitter:description" content="Ameer Hamza posted a two-patch bug-fix series for NFSD&#39;s iterator READ path, split out of his larger SUNRPC reply-page recycling work at Chuck Lever&#39;s request. Both patches target fs/nfsd/vfs.c, carry Fixes: 507df40ebf316 (&quot;NFSD: Hoist…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD iterator-READ fsnotify/atime fixes meet VFS pushback</h1>
+<h2>Summary</h2>
+<h2>Summary</h2>
+<p>Ameer Hamza posted a two-patch <strong>bug-fix</strong> series for NFSD's iterator READ path, split out of his larger SUNRPC reply-page recycling work at <a href="https://lore.kernel.org/linux-nfs/2ed0ee16-c20e-44bd-9e7a-f5b71764f14f@app.fastmail.com//">Chuck Lever's request</a>. Both patches target <code>fs/nfsd/vfs.c</code>, carry <code>Fixes: 507df40ebf316</code> ("NFSD: Hoist rq_vec preparation into nfsd_read()") and <code>Cc: stable@vger.kernel.org</code>, and are tagged <code>Assisted-by: Claude:claude-fable-5</code>. This is not a protocol change and it does not touch the NFS <strong>client</strong>; the client-visible effect, if any, is on the server: inotify watchers of exported files currently see iterator READs twice, and some exported filesystems never advance atime on that path.</p>
+<p>By week's end, patch 2/2 (the atime update) is withdrawn. Patch 1/2 (the duplicate fsnotify event) is acknowledged as a real bug but is not yet accepted as an NFSD workaround; Lever has asked VFS/fsnotify maintainers whether the splice helpers should emit the event instead.</p>
+<h2>The bugs, as they stand today</h2>
+<p>Iterator READs already run without Hamza's recycling series. They are the path for <code>sec=krb5i</code> / <code>sec=krb5p</code>, <code>nfsd_disable_splice_read</code>, and the <code>NFSD_IO_DONTCACHE</code> / <code>NFSD_IO_DIRECT</code> modes. Spliced READs are a different helper stack, and that mismatch is the whole story.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260818225715.572140-1-ameer.hamza@truenas.com//">Patch 1/2</a> documents the fsnotify double-count:</p>
+<blockquote>
+<p>"A READ served without splice emits two fsnotify access events; a local read of the same file emits one. <code>vfs_iocb_iter_read()</code> emits an access event when the read succeeds, and <code>nfsd_finish_read()</code> emits a second one for the same READ."</p>
+</blockquote>
+<p>Spliced READs are not affected, because <code>splice_direct_to_actor()</code> emits nothing and <code>nfsd_finish_read()</code> supplies their only event. Hamza's proposed fix is to move <code>fsnotify_access()</code> out of the common <code>nfsd_finish_read()</code> and into <code>nfsd_splice_read()</code>, "the one path whose VFS helper does not emit it." Measured with an inotify watch: iterator drops from two events per READ to one; splice stays at one.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260818225715.572140-2-ameer.hamza@truenas.com//">Patch 2/2</a> is the atime counterpart. <code>nfsd_iter_read()</code> and <code>nfsd_direct_read()</code> leave atime to the filesystem's <code>-&gt;read_iter</code>. Hamza argues that is not a contract NFSD can rely on:</p>
+<blockquote>
+<p>"fuse_dax_read_iter() carries a TODO for it, and kernfs_fop_read_iter() does not touch the atime at all. On a fuse DAX export, READs never advance the atime, no matter how often clients read the file. ... nfsd serves whatever filesystem is exported, so it cannot rely on every <code>-&gt;read_iter</code> keeping the convention."</p>
+</blockquote>
+<p>The proposed fix is <code>file_accessed()</code> after each successful <code>vfs_iocb_iter_read()</code>. Spliced READs already pick this up from <code>splice_direct_to_actor()</code>.</p>
+<h2>Hellwig: do not paper over VFS gaps in NFSD</h2>
+<p>Christoph Hellwig rejected both patches on architectural grounds, not on whether the symptoms exist.</p>
+<p>On <a href="https://lore.kernel.org/linux-nfs/aoVF8l3E6SjXOVlD@infradead.org//">patch 2/2</a> he drew a hard line at <code>file_accessed()</code>:</p>
+<blockquote>
+<p>"Code outside of file systems and library code has absolutely no business ever calling file_accessed."</p>
+</blockquote>
+<p>He also objected to the LLM-assisted style of the series, and to the broader pattern of treating filesystem corner cases as something core code should paper over:</p>
+<blockquote>
+<p>"And please stop this LLM garbage. Your patches seem to have a pattern of finding some unusual corner case that is broken in a file system and than work around it in core code. That's not how it works."</p>
+</blockquote>
+<p>On <a href="https://lore.kernel.org/linux-nfs/aoVHBkmPNSRakbYW@infradead.org//">patch 1/2</a> he located the bug in splice, not in nfsd:</p>
+<blockquote>
+<p>"Well, that is the underlying bug here. <code>-&gt;splice_read</code> should not skip fsnotify events and nfsd should not work around this as fsnotify is not the business of the users of VFS APIs."</p>
+</blockquote>
+<p>That is the same theme as his NACK on the parent recycling series: NFSD should not grow special cases to compensate for VFS helper inconsistencies.</p>
+<h2>Lever: drop the atime patch; ask fsnotify about the event site</h2>
+<p>Chuck Lever, who had asked Hamza to split these out as a backportable fix, walked both conclusions back after Hellwig's review.</p>
+<p>On <a href="https://lore.kernel.org/linux-nfs/9ad95194-983d-427d-9a07-c9eb0891d1a0@app.fastmail.com//">the fsnotify patch</a> he still wants the duplicate event fixed, but no longer claims NFSD is the right layer:</p>
+<blockquote>
+<p>"I asked for the duplicate event to be split out of Ameer's larger series as a backportable fix because there is clearly a bug here. But NFSD might not be the correct place to address it."</p>
+</blockquote>
+<p>He then mapped the current call sites. Today the fsnotify access event comes from the <em>system call</em> implementations, not from the splice helpers: <code>do_sendfile()</code> calls <code>fsnotify_access()</code> after <code>do_splice_direct()</code> returns, and <code>do_splice()</code> does the same for <code>splice(2)</code>, while <code>vfs_splice_read()</code> and <code>splice_direct_to_actor()</code> emit nothing. <code>vfs_iocb_iter_read()</code> is the outlier, emitting from inside the helper. NFSD calls <code>splice_direct_to_actor()</code> directly, so on that path it behaves like <code>do_sendfile()</code> and emits the event itself — which is why the two NFSD READ paths disagree. Moving the call site down into <code>-&gt;splice_read</code> would double sendfile events unless the syscall implementations stop emitting it at the same time. Lever pinged Jan Kara and Amir Goldstein for a VFS-level ruling.</p>
+<p>On <a href="https://lore.kernel.org/linux-nfs/40f94c59-32e5-458e-bc48-80585beea7ff@app.fastmail.com//">the atime patch</a> he conceded Hellwig's point outright. Every existing <code>file_accessed()</code> call site in the kernel is a filesystem; NFSD would have been the first outsider. More importantly, he had misread FUSE:</p>
+<blockquote>
+<p>"I see now that FUSE does not maintain atime in the kernel. <code>file_accessed()</code> from NFSD would have stamped a kernel-side atime on an inode whose atime the user space filesystem manages."</p>
+</blockquote>
+<p>He had assumed FamFS would hit the same hole, then doubted that. The <code>TODO</code> in <code>fuse_dax_read_iter()</code> remains confusing — "Implementing that should be a one-liner, or it should be replaced with a comment that explains why that callback is missing an explicit atime update" — but it is a FUSE problem, not an NFSD one.</p>
+<blockquote>
+<p>"So we can drop 2/2. Sorry for the noise."</p>
+</blockquote>
+<h2>Where things stand</h2>
+<p>This week's conclusion is split:</p>
+<ul>
+<li><strong>Patch 2/2 is dead.</strong> NFSD will not call <code>file_accessed()</code>. If fuse DAX (or kernfs) fails to update atime on <code>-&gt;read_iter</code>, that belongs in those filesystems.</li>
+<li><strong>Patch 1/2 is a real bug with no agreed home.</strong> Iterator READs still emit two fsnotify access events; splice READs emit one. Hellwig wants splice to emit the event. Lever showed why a naive move into <code>-&gt;splice_read</code> would break <code>sendfile(2)</code> / <code>splice(2)</code> unless those syscalls are changed in lockstep. The question is now with the fsnotify maintainers; Amir Goldstein's reply arrived after this week's window.</li>
+</ul>
+<p>There is still no NFS client code in this thread. The server-side fallout that <em>does</em> matter to clients is limited to inotify/fanotify watches on exported files (double access counts for krb5i/krb5p, <code>nfsd_disable_splice_read</code>, and direct/dontcache READs) and, until patch 2 was dropped, a mistaken kernel atime stamp on FUSE exports. The parent recycling series remains blocked on a separate splice-vs-iter debate; these two patches were meant to clear the accounting issues before that series expanded the iterator path further. After this week, only the fsnotify half is still live, and only as a VFS placement question.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260818225715.572140-1-ameer.hamza@truenas.com/">2026-08-18 Ameer Hamza <a href="mailto:ameer.hamza@truenas.com">ameer.hamza@truenas.com</a> — [PATCH 1/2] NFSD: Fix duplicate fsnotify access events for iterator READs</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260818225715.572140-2-ameer.hamza@truenas.com/">2026-08-18 Ameer Hamza <a href="mailto:ameer.hamza@truenas.com">ameer.hamza@truenas.com</a> — [PATCH 2/2] NFSD: Update the atime for iterator READs</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aoVF8l3E6SjXOVlD@infradead.org/">2026-08-19 Christoph Hellwig <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [PATCH 2/2] NFSD: Update the atime for iterator READs</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aoVHBkmPNSRakbYW@infradead.org/">2026-08-19 Christoph Hellwig <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [PATCH 1/2] NFSD: Fix duplicate fsnotify access events for iterator READs</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/9ad95194-983d-427d-9a07-c9eb0891d1a0@app.fastmail.com/">2026-08-19 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 1/2] NFSD: Fix duplicate fsnotify access events for iterator READs</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/40f94c59-32e5-458e-bc48-80585beea7ff@app.fastmail.com/">2026-08-19 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 2/2] NFSD: Update the atime for iterator READs</a></li>
+</ul>
+  </main>
+</body>
+</html>

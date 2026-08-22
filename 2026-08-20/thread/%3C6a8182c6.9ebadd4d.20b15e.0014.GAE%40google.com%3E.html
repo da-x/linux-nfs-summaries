@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>syzbot hung-task in write_versions: nfsd_mutex pile-up</title>
+  <meta name="description" content="This week’s traffic is a single, unreplied bug report: a syzbot hung-task splat tagged [nfs?] against the in-kernel NFS server control plane, not the NFS client. On 16 August, syzbot reported INFO: task hung in write_versions on upstream…">
+  <meta property="og:title" content="syzbot hung-task in write_versions: nfsd_mutex pile-up">
+  <meta property="og:description" content="This week’s traffic is a single, unreplied bug report: a syzbot hung-task splat tagged [nfs?] against the in-kernel NFS server control plane, not the NFS client. On 16 August, syzbot reported INFO: task hung in write_versions on upstream…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="syzbot hung-task in write_versions: nfsd_mutex pile-up">
+  <meta name="twitter:description" content="This week’s traffic is a single, unreplied bug report: a syzbot hung-task splat tagged [nfs?] against the in-kernel NFS server control plane, not the NFS client. On 16 August, syzbot reported INFO: task hung in write_versions on upstream…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>syzbot hung-task in write_versions: nfsd_mutex pile-up</h1>
+<h2>Summary</h2>
+<h1>syzbot hung-task in write_versions: nfsd_mutex pile-up</h1>
+<h2>Summary</h2>
+<p>This week’s traffic is a single, unreplied <strong>bug report</strong>: a syzbot hung-task splat tagged <code>[nfs?]</code> against the in-kernel NFS <em>server</em> control plane, not the NFS client. On 16 August, <a href="https://lore.kernel.org/linux-nfs/6a8182c6.9ebadd4d.20b15e.0014.GAE@google.com/">syzbot</a> reported <code>INFO: task hung in write_versions</code> on upstream HEAD <code>3d6d817622b0</code> (<code>Merge tag 'scsi-fixes'</code>), with <strong>no reproducer</strong> and no human follow-up before week close.</p>
+<p>This is not a protocol change and not an NFS client patch. The stack never leaves <code>fs/nfsd/nfsctl.c</code>. The <code>[nfs?]</code> tag is syzbot’s uncertain subsystem guess; the traces implicate NFSD’s global <code>nfsd_mutex</code>, the same choke point that has produced a string of sibling hung-task reports on <code>write_ports</code>, <code>write_threads</code>, netlink listeners, and <code>nfsd_umount</code>.</p>
+<h2>What hung</h2>
+<p>A syzkaller worker (<code>syz.2.2321</code>, PID 12662) sat in uninterruptible sleep (<code>state:D</code>) for more than 144 seconds while taking <code>nfsd_mutex</code> from the <code>/proc/fs/nfsd/versions</code> write path:</p>
+<blockquote>
+<p>"INFO: task syz.2.2321:12662 blocked for more than 144 seconds."</p>
+</blockquote>
+<p>The stack is:</p>
+<pre><code>__mutex_lock
+  write_versions+0x95/0xe30 fs/nfsd/nfsctl.c:701
+    nfsctl_transaction_write+0x10f/0x160 fs/nfsd/nfsctl.c:112
+      vfs_write / ksys_write
+</code></pre>
+<p><code>write_versions()</code> is the nfsd control-file handler that enables or disables NFS protocol versions (v2/v3/v4). Like every other <code>nfsctl_transaction_write()</code> path, it serializes on the global <code>nfsd_mutex</code> before touching per-netns service state. The hung worker already held <code>sb_writers#27</code> from <code>vfs_write()</code> and a <code>f_pos_lock</code>, then blocked on that mutex.</p>
+<p>syzbot is explicit about the missing reproducer:</p>
+<blockquote>
+<p>"Unfortunately, I don't have any reproducer for this issue yet."</p>
+</blockquote>
+<p>A later fix is asked to carry:</p>
+<blockquote>
+<p>"Reported-by: syzbot+1c807916bc4bb0c1c340@syzkaller.appspotmail.com"</p>
+</blockquote>
+<p>Dashboard: https://syzkaller.appspot.com/bug?extid=1c807916bc4bb0c1c340. Disk image, <code>vmlinux</code>, and <code>bzImage</code> are attached.</p>
+<h2>The lock dump: three-way contention, not a classic deadlock</h2>
+<p>The interesting part of the report is the lock inventory, not the hung stack itself. Three tasks of two syzkaller processes are piled up on the same <code>nfsd_mutex</code>:</p>
+<ul>
+<li><strong>Holder (same process, sibling thread):</strong> <code>syz.2.2321/12657</code> holds <code>nfsd_mutex</code> in <code>write_ports+0xb5/0xd10 fs/nfsd/nfsctl.c:860</code> — the <code>/proc/fs/nfsd/portlist</code> writer that adds or removes nfsd listeners. It also holds <code>sb_writers#27</code> and a <code>f_pos_lock</code>.</li>
+<li><strong>Hung waiter:</strong> <code>syz.2.2321/12662</code> is the reported task, waiting on the same mutex in <code>write_versions</code>.</li>
+<li><strong>Second waiter (different process):</strong> <code>syz.3.2488/13375</code> holds generic-netlink <code>cb_lock</code> and is waiting on <code>nfsd_mutex</code> in <code>nfsd_nl_unlock_filesystem_doit+0x2af/0x400 fs/nfsd/nfsctl.c:2345</code>.</li>
+</ul>
+<p>That is the classic nfsdctl pattern: every write through <code>nfsctl_transaction_write()</code> takes <code>nfsd_mutex</code>, so a slow or stuck <code>write_ports</code> (socket bind, listener start, rpcbind registration, or teardown) makes every other nfsd control write — versions, threads, exports — sit in D state until the hung-task watchdog fires. The netlink <code>unlock_filesystem</code> path joins the same queue, which is why a procfs versions write can stall a genetlink admin command and vice versa.</p>
+<p>This is <strong>not</strong> a proven circular deadlock. Lockdep lists no AB-BA cycle; <code>write_ports</code> is simply still holding <code>nfsd_mutex</code> after 144 seconds. The kernel is tainted <code>G L</code> (<code>SOFTLOCKUP</code>). The NMI all-CPU backtraces that follow are unhelpful: <code>khungtaskd</code> dumping stacks, and <code>swapper/0</code> sitting in <code>pv_native_safe_halt</code>. There is no smoking-gun stack of a CPU spinning inside nfsd, and the dump does not capture the <em>holder’s</em> wait chain — only that <code>write_ports</code> still owns the mutex.</p>
+<p>Whether <code>write_ports</code> is itself blocked behind rpcbind, RTNL, or transport teardown while holding <code>nfsd_mutex</code> is not proven by this splat. That missing owner stack is the same gap Jeff Layton called out on the older <code>nfsd_umount</code> hang.</p>
+<h2>Continuity with earlier hung-task reports</h2>
+<p>This is not a new class of bug. It is the versions-file instance of a family of NFSD control-plane hangs that have been landing all summer:</p>
+<ul>
+<li>On 1 August, syzbot filed <code>[syzbot] [nfs?] INFO: task hung in write_ports</code> against 7.2-rc5, <em>with</em> a C reproducer. That dump showed <code>nfsd_mutex</code> held by <code>nfsd_shutdown_threads</code> on the <code>deactivate_super</code> path while a crowd of writers waited in <code>write_ports</code>.</li>
+<li>Thirty-four minutes later, <code>[syzbot] [nfs?] INFO: task hung in write_threads</code> showed the inverse: <code>write_ports</code> holding the mutex, <code>write_threads</code> waiting. No reproducer.</li>
+<li>The same day as this <code>write_versions</code> report (16 August), syzbot posted a follow-up on the long-running <code>nfsd_umount</code> hang, now with a C reproducer; that dump again has <code>write_ports</code> waiters stacked behind <code>nfsd_shutdown_threads</code>.</li>
+<li>Earlier in July, the netlink <code>listener_set</code> / <code>cache_flush</code> hang was diagnosed as <strong>synchronous rpcbind registration under <code>nfsd_mutex</code></strong>: a down or unresponsive local rpcbind can stall each <code>RPC ping</code> for ~60 seconds, and <code>listener_set</code> can batch many sockets. Jeff Layton’s v2 hardening series (transport-name validation, 1024-entry cap, 1s local rpcbind timeout, non-fatal v2/v3 registration) is the in-flight mitigation; the durable fix — asynchronous rpcbind so it no longer runs under the mutex — remains later work.</li>
+</ul>
+<p>This week’s <code>write_versions</code> splat fits the same picture: a procfs versions write blocked behind a concurrent <code>write_ports</code> that still holds <code>nfsd_mutex</code>, with a netlink <code>unlock_filesystem</code> waiter in the same queue. Nobody has <code>#syz dup</code>’d these reports together on-list.</p>
+<h2>NFS client angle</h2>
+<p>There is none in this thread. No client maintainer replied, and the stack never leaves <code>fs/nfsd/nfsctl.c</code>. Nothing touches <code>fs/nfs/</code>, <code>xprtsock.c</code>, or any NFS client I/O path.</p>
+<p>The client-visible fallout is still real, even though the defect is server-side:</p>
+<ul>
+<li><code>/proc/fs/nfsd/versions</code> is how rpc.nfsd enables NFSv3/v4. A hung <code>write_versions</code> means the server cannot change the advertised protocol set; clients that need a version that is still disabled cannot mount.</li>
+<li>The mutex owner is <code>write_ports</code>. If that path never finishes, listeners cannot be added or dropped, so clients cannot connect or reconnect while the control fs is wedged.</li>
+<li>The waiters also pin <code>sb_writers</code> on the nfsd control superblock, so further writes (threads, exports, unlock_filesystem) serialize behind the same bottleneck.</li>
+</ul>
+<p>For client developers, there is nothing to change in <code>fs/nfs/</code> this week. The actionable work is on the nfsd side: <code>nfsd_mutex</code> remaining a global serialization point for unmount, listener configuration, version/thread writes, and genetlink admin commands.</p>
+<h2>Status</h2>
+<p>Open. One message, no maintainer comment, no <code>#syz fix</code> / <code>#syz dup</code> / <code>#syz test</code>. Until someone captures the <code>write_ports</code> holder’s wait chain — or lands the in-flight listener/rpcbind hardening so portlist updates cannot hold <code>nfsd_mutex</code> for a hung-task timeout — syzkaller will keep finding this as a hung task on whichever nfsctl file happens to be the waiter.</p>
+<p>syzbot’s usual closing boilerplate still applies: reply with <code>#syz fix: exact-commit-title</code> if a fix lands, or <code>#syz dup:</code> if this is folded into the <code>write_ports</code> or <code>nfsd_umount</code> bugs.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/6a8182c6.9ebadd4d.20b15e.0014.GAE@google.com/">2026-08-16 syzbot <a href="mailto:syzbot+1c807916bc4bb0c1c340@syzkaller.appspotmail.com">syzbot+1c807916bc4bb0c1c340@syzkaller.appspotmail.com</a> — [syzbot] [nfs?] INFO: task hung in write_versions</a></li>
+</ul>
+  </main>
+</body>
+</html>

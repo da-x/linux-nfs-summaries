@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd write_pool_threads overflow vs truncation</title>
+  <meta name="description" content="This week the write_pool_threads() debate shifted from “can nfsd walk off the end of its reply buffer?” to “does the real bug silently truncate a pool-thread count?” It is a server-side bug fix in fs/nfsd/nfsctl.c, not a protocol change…">
+  <meta property="og:title" content="nfsd write_pool_threads overflow vs truncation">
+  <meta property="og:description" content="This week the write_pool_threads() debate shifted from “can nfsd walk off the end of its reply buffer?” to “does the real bug silently truncate a pool-thread count?” It is a server-side bug fix in fs/nfsd/nfsctl.c, not a protocol change…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-20T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd write_pool_threads overflow vs truncation">
+  <meta name="twitter:description" content="This week the write_pool_threads() debate shifted from “can nfsd walk off the end of its reply buffer?” to “does the real bug silently truncate a pool-thread count?” It is a server-side bug fix in fs/nfsd/nfsctl.c, not a protocol change…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-20</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd write_pool_threads overflow vs truncation</h1>
+<h2>Summary</h2>
+<p>This week the <code>write_pool_threads()</code> debate shifted from “can nfsd walk off the end of its reply buffer?” to “does the real bug silently truncate a pool-thread count?” It is a <strong>server-side bug fix</strong> in <code>fs/nfsd/nfsctl.c</code>, not a protocol change and not NFS client work. The practical impact is on the <code>pool_threads</code> control-file reply that administrators (and tooling) use to inspect per-pool nfsd thread counts.</p>
+<h2>Prior week, in brief</h2>
+<p>On 12 August, <a href="https://lore.kernel.org/linux-nfs/20260812193349.13347-1-david.laight.linux@gmail.com/">David Laight</a> posted <code>[PATCH net-next] fs: nfsd: Fix buffer overflow in write_pool_threads()</code>, targeting <code>eed2965af1ba</code> (“knfsd: allow admin to set nthreads per node”). The write path dumps each pool’s thread count into a caller-supplied “almost PAGE_SIZE” buffer; Laight argued that if there are enough pools, the existing overflow check fails and the loop keeps writing past the end. He already framed it as hard to hit:</p>
+<blockquote>
+<p>"I'm pretty sure this is 'root only' code. So you'd have to try very hard to actually get the overflow."</p>
+</blockquote>
+<p><a href="https://lore.kernel.org/linux-nfs/35a12022-518b-4c66-b3d5-c850376bfca7@app.fastmail.com/">Chuck Lever</a> immediately spotted a compile-breaking typo (<code>msg[-1]</code> vs <code>mesg[-1]</code>). <a href="https://lore.kernel.org/linux-nfs/20260812220457.6dc4d5ec@pumpkin/">Laight</a> conceded it (“Yes - and I thought I'd compiled it ...”) and waved off a missing trailing newline when the output “just fits,” noting you would need “over 1300 pools with 10 threads to get to 4k” and “I'd bet something else dies first.”</p>
+<h2>This week: overflow recast as truncation</h2>
+<p>On 16 August, <a href="https://lore.kernel.org/linux-nfs/9e99253f-99d9-4ecd-8911-2844621a6ae6@app.fastmail.com/">Lever</a> closed the original diagnosis and pointed at a different failure mode:</p>
+<blockquote>
+<p>"I've convinced myself that the actual problem is the truncation. The buffer overflow cannot occur. I've posted a patch to address that."</p>
+</blockquote>
+<p>That companion patch is <a href="https://lore.kernel.org/linux-nfs/20260816174154.1442685-1-cel@kernel.org/">NFSD: Fail a pool_threads read whose reply does not fit</a>, posted minutes earlier and marked <code>Suggested-by: David Laight</code>. Lever’s changelog is the clearest statement of the user-visible bug: <code>snprintf()</code> truncates its last write and <code>strlen()</code> only measures what fit, so an over-long reply ends mid-number with no newline. “A pool running 4096 threads is reported as 40.” Nothing marks the reply incomplete, so an administrator can read a plausible but wrong count. The proposed fix takes <code>snprintf()</code>’s return value (which reports truncation <code>strlen()</code> cannot see) and fails the read with <code>-ENAMETOOLONG</code>, matching <code>svc_one_xprt_name()</code>.</p>
+<h2>Laight’s unsigned-size analysis</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260817090641.082489a5@pumpkin/">Laight</a> did not withdraw the overflow theory so much as explain why it looked real and why it may still be latent. His analysis:</p>
+<blockquote>
+<p>"size is size_t so unsigned. So after snprintf() truncates the 'size -= len' is going to generate a big number, so the 'size &gt; 0' check doesn't terminate the loop. Which would mean that the next iteration would write beyond the buffer."</p>
+</blockquote>
+<p>He then qualified that <code>snprintf()</code> may refuse “silly” lengths, which “may stop the overwrite,” but that does <strong>not</strong> stop the length returned to the caller being longer than the buffer. At the call site the buffer is copied back to user space; if the user supplied a long enough destination, that copy “might read beyond the end of the page.” He still treated the whole scenario as practically unreachable:</p>
+<blockquote>
+<p>"Of course this is all likely impossible for other reasons. (and root only)."</p>
+</blockquote>
+<h2>Where it stands</h2>
+<p>The discussion is a <strong>bug-fix</strong> thread, not a feature or protocol change. Two related defects were on the table:</p>
+<ol>
+<li><strong>Loop / length accounting</strong> around <code>snprintf()</code> and an unsigned <code>size_t</code> remaining-space counter — Laight’s original overflow claim, still theoretically interesting if truncation wraps <code>size</code> and the caller trusts the returned length.</li>
+<li><strong>Silent truncation of a pool-thread count</strong> — Lever’s conclusion, and the defect his <code>-ENAMETOOLONG</code> patch actually addresses.</li>
+</ol>
+<p>This week’s consensus, as stated by Lever, is that a true buffer overflow “cannot occur,” while a truncated, unterminated <code>pool_threads</code> reply <em>can</em> and should fail the read instead of returning a plausible wrong number. Laight’s reply leaves a residual concern: even if <code>snprintf()</code> itself will not smash the page, a too-large returned length could still over-read when copying back to userspace. No client-side NFS code is involved; the only operational exposure is the nfsd <code>pool_threads</code> control interface.</p>
+<p>The thread ends without an ack of Lever’s v1 on this list and without a respin of Laight’s original overflow patch. The live proposed fix is Lever’s fail-the-read change, with Laight’s unsigned-wrap analysis still on the record as the reason the old loop looked broken.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/9e99253f-99d9-4ecd-8911-2844621a6ae6@app.fastmail.com/">2026-08-16 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH net-next] fs: nfsd: Fix buffer overflow in write_pool_threads()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260817090641.082489a5@pumpkin/">2026-08-17 David Laight <a href="mailto:david.laight.linux@gmail.com">david.laight.linux@gmail.com</a> — Re: [PATCH net-next] fs: nfsd: Fix buffer overflow in write_pool_threads()</a></li>
+</ul>
+  </main>
+</body>
+</html>
