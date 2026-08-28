@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>xprtrdma hang: Lever nits v2 unmap/disconnect serialization</title>
+  <meta name="description" content="This week’s linux-nfs traffic on Tim Menninger’s xprtrdma hang fix is a single review: Chuck Lever signs off on the correctness of v2 and asks for comment and layering cleanups rather than another redesign. The thread remains a bug fix for…">
+  <meta property="og:title" content="xprtrdma hang: Lever nits v2 unmap/disconnect serialization">
+  <meta property="og:description" content="This week’s linux-nfs traffic on Tim Menninger’s xprtrdma hang fix is a single review: Chuck Lever signs off on the correctness of v2 and asks for comment and layering cleanups rather than another redesign. The thread remains a bug fix for…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-27T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="xprtrdma hang: Lever nits v2 unmap/disconnect serialization">
+  <meta name="twitter:description" content="This week’s linux-nfs traffic on Tim Menninger’s xprtrdma hang fix is a single review: Chuck Lever signs off on the correctness of v2 and asks for comment and layering cleanups rather than another redesign. The thread remains a bug fix for…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-27</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>xprtrdma hang: Lever nits v2 unmap/disconnect serialization</h1>
+<h2>Summary</h2>
+<h1>xprtrdma hang: Lever nits v2 unmap/disconnect serialization</h1>
+<h2>Summary</h2>
+<p>This week’s linux-nfs traffic on Tim Menninger’s xprtrdma hang fix is a single review: <a href="https://lore.kernel.org/linux-nfs/aa454838-8574-404e-94c8-cca6b15a796c@app.fastmail.com/">Chuck Lever</a> signs off on the <strong>correctness</strong> of <a href="https://lore.kernel.org/linux-nfs/20260820211700.318824-1-tmenninger@everpuredata.com/">v2</a> and asks for comment and layering cleanups rather than another redesign. The thread remains a <strong>bug fix</strong> for a client-side FRWR race, not a protocol change.</p>
+<p>Last week established the hang: <code>frwr_unmap_sync()</code> can post <code>LOCAL_INV</code> work after <code>rpcrdma_xprt_disconnect()</code> has already drained the QP, then sleep forever on a CQE that will never arrive. v1’s extra inflight counter was dropped; v2 serializes the post-after-drain window with <code>rx_unmap_rwsem</code>, reuses <code>rpcrdma_ep_get()</code>/<code>rpcrdma_ep_put()</code> for endpoint lifetime across the wait, and moves the completion onto <code>struct rpcrdma_req</code>.</p>
+<h2>Correctness is in; comments are not</h2>
+<p>Lever’s opening line is the news of the week:</p>
+<blockquote>
+<p>"I didn't find any correctness issues in this one."</p>
+</blockquote>
+<p>The rest of the mail is titled as nits: stale kernel-doc and a layering change around CM ID teardown.</p>
+<h3>Kernel-doc for <code>frwr_unmap_sync()</code></h3>
+<p>The rewritten function comment drops the old sleeping contract:</p>
+<blockquote>
+<p>"Sleeps until it is safe for the host CPU to access the previously mapped memory regions."</p>
+</blockquote>
+<p>v2 also takes and releases a transport-wide rwsem. Lever wants both facts in a Context section:</p>
+<blockquote>
+<p>"Context: Process context. Takes and releases @r_xprt-&gt;rx_unmap_rwsem for read. May sleep."</p>
+</blockquote>
+<h3>Disconnect no longer fully tears down hardware</h3>
+<p><code>rpcrdma_xprt_disconnect()</code> now holds <code>rx_unmap_rwsem</code> for write across the QP drain and resource teardown, but its kernel-doc still records only the caller-side rule:</p>
+<blockquote>
+<p>"Caller serializes. Either the transport send lock is held, or we're being called to destroy the transport."</p>
+</blockquote>
+<p>The rwsem belongs there as well. More importantly, the old “completely divested” claim is now false:</p>
+<blockquote>
+<p>"On return, @r_xprt is completely divested of all hardware resources and prepared for the next -&gt;connect operation."</p>
+</blockquote>
+<p>A concurrent <code>frwr_unmap_sync()</code> holds an endpoint reference across its completion wait, so <code>rpcrdma_ep_put()</code> returns 0. The QP, both completion queues, the PD, and the CM ID then outlive disconnect’s return.</p>
+<h3><code>rx_unmap_rwsem</code> overclaims what it covers</h3>
+<p>The new lock comment on <code>struct rpcrdma_xprt</code> claims more than the lock delivers. <code>rx_ep</code> is still sampled without this rwsem in <code>frwr_mr_init()</code>, <code>frwr_map()</code>, <code>frwr_send()</code>, <code>frwr_unmap_async()</code>, <code>frwr_wp_create()</code>, <code>rpcrdma_xprt_drain()</code>, <code>rpcrdma_mrs_create()</code>, <code>rpcrdma_mrs_refresh()</code>, <code>rpcrdma_rep_create()</code>, <code>rpcrdma_rep_resize()</code>, and <code>rpcrdma_post_recvs()</code>. Lever wants the comment narrowed to the actual ordering:</p>
+<blockquote>
+<p>"Orders frwr_unmap_sync()'s LOCAL_INV submission ahead of the QP drain. Disconnect holds the write side across the drain and resource teardown."</p>
+</blockquote>
+<h2>Layering: don’t destroy CM IDs from <code>frwr_ops.c</code></h2>
+<p>v2’s error path in <code>frwr_unmap_sync()</code> open-codes <code>rdma_destroy_id()</code> after <code>rpcrdma_ep_put()</code> returns 1. Lever flags this as not a defect, but a layering break:</p>
+<blockquote>
+<p>"This is not a defect, but it makes frwr_ops.c the only file outside verbs.c that destroys a CM ID."</p>
+</blockquote>
+<p>The other three teardowns already live in <code>verbs.c</code> (<code>rpcrdma_create_id()</code> and <code>rpcrdma_ep_create()</code> error paths, plus <code>rpcrdma_xprt_disconnect()</code>). The rule that a nonzero <code>rpcrdma_ep_put()</code> return leaves the CM ID for the caller to destroy is only documented above that helper. Lever wants a small <code>verbs.c</code> wrapper to carry the rule instead of duplicating the idiom:</p>
+<pre><code>void rpcrdma_ep_release(struct rpcrdma_ep *ep)
+{
+        struct rdma_cm_id *id = ep-&gt;re_id;
+
+        if (rpcrdma_ep_put(ep))
+                rdma_destroy_id(id);
+}
+</code></pre>
+<p>That would export <code>rpcrdma_ep_get()</code> / <code>rpcrdma_ep_release()</code> rather than the get/put pair. The local <code>id</code> snapshot in <code>frwr_unmap_sync()</code> then goes away, because <code>ib_post_send()</code> can read <code>ep-&gt;re_id-&gt;qp</code> directly while the read side is still held. The new <code>rpcrdma_ep_put()</code> prototype in <code>xprt_rdma.h</code> also needs to document that a return of 1 leaves the CM ID for the caller.</p>
+<h2>Status</h2>
+<p>No v3 landed this week. The discussion has moved from “is this the right lifetime model?” to “the hang is closed; tidy the comments and keep CM ID destruction in <code>verbs.c</code>.” The client-side FRWR unmap/disconnect race remains the bug under fix; merge still waits on those nits.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/aa454838-8574-404e-94c8-cca6b15a796c@app.fastmail.com/">2026-08-21 Chuck Lever — Re: [PATCH v2] xprtrdma: serialize unmap_sync with xprt_disconnect</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/aa454838-8574-404e-94c8-cca6b15a796c@app.fastmail.com/">2026-08-21 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v2] xprtrdma: serialize unmap_sync with xprt_disconnect</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Syzkaller hits stack-queued rpc_pipe_msg in nfsd cld upcall</title>
+  <meta name="description" content="This week’s linux-nfs traffic closed with a bug report, not a patch, a protocol change, or a new feature. Farhad Alemi of ASU’s SEFCOM lab mailed Chuck Lever and Jeff Layton a syzkaller crash on Linux 7.1-rc5 whose subject already states…">
+  <meta property="og:title" content="Syzkaller hits stack-queued rpc_pipe_msg in nfsd cld upcall">
+  <meta property="og:description" content="This week’s linux-nfs traffic closed with a bug report, not a patch, a protocol change, or a new feature. Farhad Alemi of ASU’s SEFCOM lab mailed Chuck Lever and Jeff Layton a syzkaller crash on Linux 7.1-rc5 whose subject already states…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-27T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Syzkaller hits stack-queued rpc_pipe_msg in nfsd cld upcall">
+  <meta name="twitter:description" content="This week’s linux-nfs traffic closed with a bug report, not a patch, a protocol change, or a new feature. Farhad Alemi of ASU’s SEFCOM lab mailed Chuck Lever and Jeff Layton a syzkaller crash on Linux 7.1-rc5 whose subject already states…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-27</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Syzkaller hits stack-queued rpc_pipe_msg in nfsd cld upcall</h1>
+<h2>Summary</h2>
+<p>This week’s linux-nfs traffic closed with a <strong>bug report</strong>, not a patch, a protocol change, or a new feature. <a href="https://lore.kernel.org/linux-nfs/CA+0ovCjVF58WLeen2ctdzHyWUASAAW3Y=Yjihyq0pFApYawtDg@mail.gmail.com/">Farhad Alemi</a> of ASU’s SEFCOM lab mailed Chuck Lever and Jeff Layton a syzkaller crash on Linux 7.1-rc5 whose subject already states the diagnosis: <code>[BUG] sunrpc: rpc_pipe_msg left queued on a stack frame (nfsd cld upcall)</code>. There are no replies in-window. The thread therefore ends as an unacked, unreproduced-by-maintainers KASAN finding against the NFSD client-tracking (cld) upcall and the shared SUNRPC <code>rpc_pipefs</code> queue.</p>
+<p>That matters to <strong>NFS client</strong> work this week even though the crashing caller is nfsd. <code>rpc_queue_upcall()</code> and <code>struct rpc_pipe_msg</code> are the same pipefs machinery the client uses for idmap, gssd, and pNFS blocklayout device maps. Two days earlier, FAN YE’s blocklayout lost-wakeup series treated <code>__cld_pipe_upcall()</code> in <code>fs/nfsd/nfs4recover.c</code> as the <em>safe</em> waiter — the completion-based pattern v2 copied. Alemi’s report says that model path can still leave a stack-allocated <code>rpc_pipe_msg</code> on the pipe’s list after the waiter’s frame is gone.</p>
+<h2>What landed on the list</h2>
+<p>Alemi wrote that the crash came out of syzkaller, not a production nfsd workload:</p>
+<blockquote>
+<p>"While fuzzing Linux 7.1-rc5 with syzkaller, as part of research at ASU's SEFCOM lab, we hit the crash below."</p>
+</blockquote>
+<p>The in-list splat is a KASAN vmalloc OOB while validating a list insert, which is the signature of walking a <code>list_head</code> that still points into a returned kernel stack (KASAN-instrumented stacks live in vmalloc space; <code>ffffc900…</code> is that range):</p>
+<blockquote>
+<p>"BUG: KASAN: vmalloc-out-of-bounds in __list_add_valid_or_report+0x6a/0x130 lib/list_debug.c:32"</p>
+<p>"Read of size 8 at addr ffffc90007027950 by task syz.0.96/13066"</p>
+</blockquote>
+<p>The ingested body cuts off after <code>print_address_description()</code>. Alemi pointed maintainers at the full reports rather than pasting the rest of the trace:</p>
+<blockquote>
+<p>https://github.com/farhad-alemi/public_bug_reports/tree/main/118-nfsd-cld-stack-rpc_pipe_msg-left-queued/</p>
+</blockquote>
+<p>and offered to close the loop:</p>
+<blockquote>
+<p>"Our reproducer.c is available upon request."</p>
+<p>"Happy to test a patch if that would help."</p>
+</blockquote>
+<p>No one asked for the reproducer, and no patch was posted.</p>
+<h2>The bug class, as named in the subject</h2>
+<p>The subject is the technical claim. NFSD’s NFSv4 client-tracking upcall (<code>__cld_pipe_upcall()</code> / friends in <code>fs/nfsd/nfs4recover.c</code>) builds a <code>struct rpc_pipe_msg</code> on the stack, queues it with <code>rpc_queue_upcall()</code>, and waits on a completion for <code>nfsdcld</code> (or the legacy <code>nfsdcltrack</code> helper) to read the pipe and write a downcall. That is legal only if every path that returns from the upcall also unlinks the message. If the waiter is interrupted, the pipe is closed, or an error path returns while <code>msg</code> is still on <code>pipe-&gt;in_upcall</code> / <code>pipe-&gt;pipe</code>, the next <code>rpc_queue_upcall()</code> or pipe-release list walk dereferences <code>msg-&gt;list</code> after the stack frame is dead. <code>__list_add_valid_or_report()</code> is exactly where <code>CONFIG_DEBUG_LIST</code> / KASAN notices that.</p>
+<p>This is a <strong>use-after-return of a stack list node</strong>, not an NFS protocol issue and not a new upcall feature. The user-visible server impact, if the race is hit outside the fuzzer, is a kernel oops or memory corruption on the nfsd cld pipe during client-id tracking (reboot recovery, <code>nfsdcld</code> restarts, pipe close). The client-visible impact is indirect: the same SUNRPC pipefs queue is what idmapd, rpc.gssd, and <code>blkmapd</code> sit on.</p>
+<h2>Same-week client context: cld was the “good” waiter</h2>
+<p>The report did not mention the blocklayout series, but the two threads now sit next to each other on the list and they share the upcall primitive.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260821-rpc-pipefs-blwake-v1-1-3e70ec9b0537@gmail.com/">FAN YE’s RFC</a> argued that of the four in-tree <code>rpc_queue_upcall()</code> callers, <code>bl_resolve_deviceid()</code> was the only open-coded wait-queue waiter, and that <code>__cld_pipe_upcall()</code> “waits on a completion and cannot lose the wakeup this way.” <a href="https://lore.kernel.org/linux-nfs/20260823-rpc-pipefs-blwake-v2-1-68d73e3393ef@gmail.com/">v2</a> then <em>replaced</em> the blocklayout wait with a completion, explicitly “the way <code>__cld_pipe_upcall()</code> waits,” after v1’s <code>set_current_state()</code> reorder proved unsafe because <code>rpc_queue_upcall()</code> can sleep in <code>dput()</code>.</p>
+<p>Alemi’s KASAN report does not contradict that wakeup analysis. Completions still do not make a stack <code>rpc_pipe_msg</code> safe if the function can return with the message linked. The client takeaway from this week is therefore sharper than either thread stated alone:</p>
+<ul>
+<li>Blocklayout’s hang was a lost wakeup plus a stale <code>bl_mount_reply</code>; v2’s completion rewrite is the right wait style, and it still needs the message lifetime to match the wait.</li>
+<li>NFSD cld, the pattern v2 copied, is now accused of the complementary pipefs bug: the <code>rpc_pipe_msg</code> itself is stack-backed and can remain queued.</li>
+<li>Any other <code>rpc_queue_upcall()</code> caller that embeds <code>rpc_pipe_msg</code> on the stack (idmap, gssd, blocklayout) should be checked for the same unlink-on-all-return-paths rule. A heap-allocated message, or an explicit <code>rpc_purge_list()</code> / <code>list_del_init()</code> on every abort, is the usual fix for this class.</li>
+</ul>
+<p>No one on the list has yet connected those two threads.</p>
+<h2>Where things stand</h2>
+<ul>
+<li><strong>Kind of change:</strong> bug report against SUNRPC <code>rpc_pipefs</code> and the NFSD cld upcall. Not a feature. Not a protocol change. No patch.</li>
+<li><strong>NFS client angle:</strong> shared <code>rpc_queue_upcall()</code> infrastructure; this week’s pNFS blocklayout fix treated cld as the reference waiter. Client idmap/gssd/blocklayout paths that stack-allocate <code>rpc_pipe_msg</code> are in the same blast radius until the lifetime rule is audited.</li>
+<li><strong>Evidence:</strong> syzkaller on 7.1-rc5, KASAN vmalloc-OOB in <code>__list_add_valid_or_report</code>, full traces off-list on GitHub, reproducer offered but not posted.</li>
+<li><strong>Maintainer response:</strong> none from Lever, Layton, or anyone else before the week closed. The report landed late on 2026-08-27.</li>
+</ul>
+<p>Until someone asks for the reproducer or posts a pipefs unlink/<code>rpc_pipe_msg</code> lifetime fix, the cld upcall remains a fuzzer-crashing stack-use-after-return on the shared SUNRPC pipe queue, and the client-side blocklayout series is still modeling its wait on that same path.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/CA+0ovCjVF58WLeen2ctdzHyWUASAAW3Y=Yjihyq0pFApYawtDg@mail.gmail.com/">2026-08-27 Farhad Alemi — [BUG] sunrpc: rpc_pipe_msg left queued on a stack frame (nfsd cld upcall)</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/CA+0ovCjVF58WLeen2ctdzHyWUASAAW3Y=Yjihyq0pFApYawtDg@mail.gmail.com/">2026-08-27 Farhad Alemi <a href="mailto:farhad.alemi@berkeley.edu">farhad.alemi@berkeley.edu</a> — [BUG] sunrpc: rpc_pipe_msg left queued on a stack frame (nfsd cld upcall)</a></li>
+</ul>
+  </main>
+</body>
+</html>

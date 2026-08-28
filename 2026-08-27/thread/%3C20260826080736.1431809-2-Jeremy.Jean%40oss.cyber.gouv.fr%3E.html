@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Client pNFS SCSI layout rejects oversized designators to stop a GETDEVICEINFO OOB read</title>
+  <meta name="description" content="This week’s linux-nfs traffic includes a client security bug fix, not a protocol change and not a new feature: Jérémy Jean posted a one-patch hardening of the pNFS SCSI layout decoder so a malicious GETDEVICEINFO cannot turn a 32-bit…">
+  <meta property="og:title" content="Client pNFS SCSI layout rejects oversized designators to stop a GETDEVICEINFO OOB read">
+  <meta property="og:description" content="This week’s linux-nfs traffic includes a client security bug fix, not a protocol change and not a new feature: Jérémy Jean posted a one-patch hardening of the pNFS SCSI layout decoder so a malicious GETDEVICEINFO cannot turn a 32-bit…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-27T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Client pNFS SCSI layout rejects oversized designators to stop a GETDEVICEINFO OOB read">
+  <meta name="twitter:description" content="This week’s linux-nfs traffic includes a client security bug fix, not a protocol change and not a new feature: Jérémy Jean posted a one-patch hardening of the pNFS SCSI layout decoder so a malicious GETDEVICEINFO cannot turn a 32-bit…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-27</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Client pNFS SCSI layout rejects oversized designators to stop a GETDEVICEINFO OOB read</h1>
+<h2>Summary</h2>
+<p>This week’s linux-nfs traffic includes a <strong>client security bug fix</strong>, not a protocol change and not a new feature: <a href="https://lore.kernel.org/linux-nfs/20260826080736.1431809-2-Jeremy.Jean@oss.cyber.gouv.fr/">Jérémy Jean</a> posted a one-patch hardening of the pNFS SCSI layout decoder so a malicious <code>GETDEVICEINFO</code> cannot turn a 32-bit length into a <code>SIZE_MAX</code> memcpy. There are no replies in the window. Maintainers have not acked, nacked, or queued it.</p>
+<h2>The hole: a signed SCSI designator length that can wrap to −1</h2>
+<p>The bug lives in the NFS <strong>client</strong> pNFS blocklayout path that implements RFC 8154 SCSI layouts (<code>fs/nfs/blocklayout/</code>). When the client processes a layout and needs the backing device, <code>pnfs_layout_process()</code> → <code>bl_alloc_lseg()</code> → <code>nfs4_find_get_deviceid()</code> → <code>bl_alloc_deviceid_node()</code> decodes the SCSI designator from the device-info XDR.</p>
+<p>Jean’s diagnosis is a classic signedness bypass on that length:</p>
+<blockquote>
+<p>"A SCSI GETDEVICEINFO reply can encode designator_len as 0xffffffff. The current signed field turns that into -1, so the size check is bypassed and the value is converted to SIZE_MAX for xdr_inline_decode() and memcpy()."</p>
+</blockquote>
+<p><code>0xffffffff</code> is a legal on-the-wire <code>u32</code>. Stored in a signed C field it becomes <code>-1</code>. The existing “is this designator too big?” test treats that as in-range, then the length is widened to <code>size_t</code> and becomes <code>SIZE_MAX</code> (<code>18446744073709551615</code> on 64-bit). Both <code>xdr_inline_decode()</code> and the subsequent <code>memcpy()</code> are then asked to consume that many bytes.</p>
+<p>KASAN on a file read against a layout that pulls in the poisoned device id reports exactly that:</p>
+<blockquote>
+<p>"BUG: KASAN: out-of-bounds in bl_alloc_deviceid_node+0x616/0x1110"</p>
+<p>"Read of size 18446744073709551615"</p>
+</blockquote>
+<p>The stack in the report is the client layoutget path: <code>__asan_memcpy</code> ← <code>bl_alloc_deviceid_node</code> ← <code>nfs4_find_get_deviceid</code> ← <code>bl_alloc_lseg</code> ← <code>pnfs_layout_process</code> ← <code>nfs4_proc_layoutget</code>. This is not a server crash and not a local unprivileged ioctl; it is the mounted NFSv4.1+ client trusting device-info XDR from the MDS.</p>
+<h2>Attacker model: a mounted client, a hostile NFSv4.1+ server</h2>
+<p>Jean is explicit about who can hit this:</p>
+<blockquote>
+<p>"The attacker model considers a controlled NFSv4.1+ server and a client already mounted to that server. An OOB read can be triggered in the client on a file read."</p>
+</blockquote>
+<p>That is the standard pNFS “malicious MDS” model: the client has already accepted the export and is using SCSI layouts. A file read that causes layoutget/deviceid resolution is enough. There is no claim of unauthenticated remote attack, and no claim of a write primitive — KASAN shows an <strong>out-of-bounds read</strong> of essentially unbounded size. For a production client that still means kernel memory disclosure or an oops, which is why the patch is <code>Cc: stable@vger.kernel.org</code>.</p>
+<p>The regression tag goes all the way back to the original SCSI layout code:</p>
+<p><code>Fixes: d9186c039765 ("nfs/blocklayout: add SCSI layout support")</code></p>
+<p>That is the 2016 client work that added pNFS SCSI. Every kernel with <code>CONFIG_PNFS_BLOCK</code> SCSI layout support is in the backport set.</p>
+<h2>The fix: <code>u32</code> length, reject before <code>xdr_inline_decode()</code></h2>
+<p>The patch is five lines across two files (<code>blocklayout.h</code>, <code>dev.c</code>):</p>
+<ul>
+<li><code>pnfs_block_dev_scsi.designator_len</code> (or the local length used while decoding) is stored as <strong><code>u32</code></strong>, matching the XDR type, instead of a signed integer that can go negative.</li>
+<li>Oversized values are <strong>rejected</strong> rather than clamped after the fact.</li>
+<li>The bounds check is <strong>moved up</strong>, so it runs <strong>before</strong> <code>xdr_inline_decode()</code> rather than after a decode that already used the wrapped length.</li>
+</ul>
+<p>Jean’s one-sentence summary of the code change:</p>
+<blockquote>
+<p>"The fix stores the length as u32 and reject oversized values before decoding. The check is moved up before the call to xdr_inline_decode()."</p>
+</blockquote>
+<p>That ordering matters. Checking after <code>xdr_inline_decode(xdr, designator_len)</code> is too late once <code>designator_len</code> has become <code>SIZE_MAX</code>: the decoder has already tried to pull an impossible span out of the XDR buffer. Rejecting first means a hostile <code>0xffffffff</code> becomes <code>-EIO</code> / a failed deviceid node, not a KASAN splat in memcpy.</p>
+<p>This is the same <em>class</em> of client XDR hygiene as other “reject oversized length” work on linux-nfs (callback bitmap lengths and similar), applied here to the SCSI designator in GETDEVICEINFO. It is <strong>not</strong> a wire-protocol change: RFC 8154 designators were never allowed to be 4 GiB; the client is finally refusing the illegal encoding instead of wrapping.</p>
+<p>The commit trailer also carries <code>Assisted-by: Codex:gpt-5</code>. That is disclosure of LLM assistance on a security fix, not a technical argument; nobody on-list commented on it this week.</p>
+<h2>Client impact, and what did not happen this week</h2>
+<ul>
+<li><strong>Kind of change:</strong> NFS <strong>client</strong> bug fix / hardening in pNFS SCSI layout device-id decoding. No NFSD change, no new layout type, no protocol extension.</li>
+<li><strong>Who is exposed:</strong> any client that mounts an NFSv4.1+ pNFS SCSI export (<code>pnfs=scsi</code> / blocklayout SCSI). Trigger is a READ (or any operation that forces layoutget + GETDEVICEINFO) against a server that returns <code>designator_len = 0xffffffff</code>.</li>
+<li><strong>What the user would see today:</strong> KASAN OOB, or a hard crash / memory over-read in <code>bl_alloc_deviceid_node</code> on non-KASAN kernels. After the patch: the device id is rejected and the layout path fails closed.</li>
+<li><strong>Stable:</strong> requested. The <code>Fixes:</code> tag implies every SCSI-layout-capable stable tree.</li>
+<li><strong>Review status:</strong> <strong>none in this window.</strong> The Message-ID is numbered <code>-2-</code> (typical of a git-send-email series), but only this standalone <code>[PATCH]</code> landed on linux-nfs; there is no cover letter, no patch 1, and no reply from Trond, Anna, Chuck, Christoph, or the blocklayout regulars.</li>
+</ul>
+<p>Until someone reviews the <code>u32</code> conversion and the new max-designator constant, this remains an unacked client security patch sitting on the list. The technical claim is straightforward — do not feed a wrapped SCSI designator length to <code>xdr_inline_decode()</code> / <code>memcpy()</code> — and the KASAN trace backs it up. What is missing this week is an ack that the new limit matches the SCSI designator sizes the client actually accepts (NAA, EUI-64, T10 vendor ID) and that failing the device node is the right recovery for a hostile MDS.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260826080736.1431809-2-Jeremy.Jean@oss.cyber.gouv.fr/">2026-08-26 Jérémy Jean — [PATCH] NFS: blocklayout: reject oversized SCSI designators</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260826080736.1431809-2-Jeremy.Jean@oss.cyber.gouv.fr/">2026-08-26 Jérémy Jean <a href="mailto:Jeremy.Jean@oss.cyber.gouv.fr">Jeremy.Jean@oss.cyber.gouv.fr</a> — [PATCH] NFS: blocklayout: reject oversized SCSI designators</a></li>
+</ul>
+  </main>
+</body>
+</html>

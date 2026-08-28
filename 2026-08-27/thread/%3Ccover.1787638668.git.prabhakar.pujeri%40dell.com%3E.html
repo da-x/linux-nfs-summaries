@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd Netlink client-state dump and grace reporting</title>
+  <meta name="description" content="Dell’s Prabhakar Pujeri opened a new nfsd observability series this week, proposing to expose NFSv4 client state over the existing Generic Netlink family rather than forcing monitoring tools to walk /proc/fs/nfsd/clients. The work is a new…">
+  <meta property="og:title" content="nfsd Netlink client-state dump and grace reporting">
+  <meta property="og:description" content="Dell’s Prabhakar Pujeri opened a new nfsd observability series this week, proposing to expose NFSv4 client state over the existing Generic Netlink family rather than forcing monitoring tools to walk /proc/fs/nfsd/clients. The work is a new…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-27T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd Netlink client-state dump and grace reporting">
+  <meta name="twitter:description" content="Dell’s Prabhakar Pujeri opened a new nfsd observability series this week, proposing to expose NFSv4 client state over the existing Generic Netlink family rather than forcing monitoring tools to walk /proc/fs/nfsd/clients. The work is a new…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-27</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd Netlink client-state dump and grace reporting</h1>
+<h2>Summary</h2>
+<p>Dell’s Prabhakar Pujeri opened a new nfsd observability series this week, proposing to expose NFSv4 client state over the existing Generic Netlink family rather than forcing monitoring tools to walk <code>/proc/fs/nfsd/clients</code>. The work is a <strong>new userspace ABI / admin feature</strong>, not a wire-protocol change and not a bug fix. Jeff Layton immediately challenged the grace-period semantics in patch 1/3; Pujeri accepted the critique and sketched a v2 that reports the union of NLM and NFSv4 grace via <code>locks_in_grace()</code>. Chuck Lever then asked that any new API leave room for future per-export grace. Patches 2/3 and 3/3 (the client dump and stateid counters) had not yet drawn review by week’s end.</p>
+<h2>Why Netlink, and what the series actually adds</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/cover.1787638668.git.prabhakar.pujeri@dell.com/">Pujeri’s cover letter</a> frames the problem as operational, not functional: administrators can already inspect NFSv4 clients through the nfsd filesystem, “but collecting a server-wide view requires walking a directory and opening multiple files for every client. That is useful for detailed inspection, but awkward for monitoring and automation.” The series therefore adds a compact query interface to the existing nfsd Generic Netlink family, in three deliberately split steps:</p>
+<ol>
+<li>Extend <code>threads-get</code> with an explicit NFSv4 recovery-grace value.</li>
+<li>Add a privileged <code>client-get</code> dump with basic identity, lease, confirmation, reclaim, and callback information.</li>
+<li>Extend each client reply with session and stateid record counts.</li>
+</ol>
+<p>The split is ABI-conscious. Pujeri wrote that it “keeps the grace query independent, establishes the minimum useful client ABI before adding the more expensive state traversal, and permits older user space to ignore the count extension.” The existing nfsd filesystem files and their output are left unchanged; a companion nfs-utils series (not posted on linux-nfs this week) would add <code>nfsdctl clients</code> and surface the grace value from <code>nfsdctl threads</code>.</p>
+<p>Two implementation details in the cover letter matter for anyone consuming the dump:</p>
+<ul>
+<li><strong>Best-effort snapshot.</strong> <code>client-get</code> emits one bounded message per client. The dump pins each client, uses the existing client and state locks for mutable fields, and serializes against server shutdown. “Client churn can still make a multi-message dump a best-effort snapshot; the interface documentation states this explicitly.”</li>
+<li><strong>Client ID encoding.</strong> The Netlink client ID places <code>cl_boot</code> in the upper 32 bits and <code>cl_id</code> in the lower 32 bits — “an architecture-independent representation matching NFSD’s logical and tracepoint representation, rather than the legacy procfs rendering of the in-memory bytes.”</li>
+</ul>
+<p>Validation listed in the cover includes checkpatch, YNL regeneration, Sphinx <code>-W</code> docs, <code>W=1</code> builds with <code>CONFIG_NFSD_V4</code> both on and off, a two-vCPU QEMU loopback NFSv4.2 mount, grace yes/no transitions through both raw Netlink and nfsdctl, and a live client carrying one session plus open, lock, and delegation stateids (zero layouts). The series is based on <code>nfsd-testing</code> at <code>46ff234c7129c7c10ed493413d4f60d0cf4dd1f1</code>.</p>
+<h2>Patch 1/3: grace on <code>threads-get</code></h2>
+<p><a href="https://lore.kernel.org/linux-nfs/3fd25e2178458fbb44f57f1b0e068c12a6503d17.1787638668.git.prabhakar.pujeri@dell.com/">Patch 1/3</a> adds an in-grace value to the <code>threads-get</code> reply. The stated goal is to let operational tooling “distinguish a server that is accepting normal NFSv4 state operations from one that is still accepting only recovery requests.” Recovery state is currently available only through the nfsd filesystem. The attribute is returned in every reply so userspace can tell a server that is <em>not</em> in grace from an older kernel that simply does not provide the attribute.</p>
+<h2>Patch 2/3: privileged NFSv4 client dump</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/6b42a390ce3ea9a5930e2704137fd435c6f7d27e.1787638668.git.prabhakar.pujeri@dell.com/">Patch 2/3</a> is the core of the series: a privileged <code>client-get</code> dump that emits one bounded message per confirmed or unconfirmed client, carrying server-generated client ID, peer address, minor version, client and callback states, signed lease time remaining, and <code>RECLAIM_COMPLETE</code> status.</p>
+<p>Concurrency is conservative rather than lock-free. Each client is pinned while a snapshot is taken; mutable lease and confirmation fields are protected with the per-net client lock; server shutdown is serialized with <code>nfsd_mutex</code>. Netlink dump cursors track table, bucket, and position. Pujeri is explicit that client churn can still produce a best-effort snapshot, and that the nfsd filesystem interface is left as the detailed-inspection path.</p>
+<h2>Patch 3/3: per-client state usage counters</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/245a1ee42d054e280629c9640c8d8225b45639d0.1787638668.git.prabhakar.pujeri@dell.com/">Patch 3/3</a> extends those replies with compact totals, because “a client can retain substantial server-side state even when its lease and callback channel look healthy.” Counts are separate for sessions and for open, lock, delegation, and layout <strong>stateid records</strong>. The lock count is intentionally not a byte-range or LOCK-operation count: “A lock stateid represents a lock-owner/file pair and can cover multiple byte-range locks.”</p>
+<p>The walk is done under <code>cl_lock</code> for both the session list and the stateid IDR. Pujeri notes that <code>free_client()</code> already detaches its session list under that lock, “so a client pinned by the dump cannot race this traversal with session teardown.”</p>
+<h2>Review: Jeff Layton on what “in grace” actually means</h2>
+<p>The only technical review this week landed on patch 1/3. <a href="https://lore.kernel.org/linux-nfs/1046756851d9d7d688ac612a7f175e48745d2b84.camel@kernel.org/">Jeff Layton asked</a> the design question first:</p>
+<blockquote>
+<p>"What's your interest in reporting this info?"</p>
+</blockquote>
+<p>and then pointed out that the v1 attribute answers the wrong operational question:</p>
+<blockquote>
+<p>"Just because the v4 recovery is done does not mean that you will be able to access files. The overall system grace period is a union of both the NLM and v4 grace periods."</p>
+</blockquote>
+<blockquote>
+<p>"This patch is reporting just the v4 one. If the goal is for the admin to reliably tell when the grace period has been lifted, then this won't tell us that."</p>
+</blockquote>
+<p>Layton offered two ways forward: return <code>locks_in_grace()</code> from nfsd, or add similar reporting to lockd and let userspace compute the union.</p>
+<h2>Pujeri’s reply: restart/failover harness, and a v2 semantic switch</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260827045139.4353-1-prabhakar.pujeri@dell.com/">Two days later Pujeri answered</a> with the use case behind the series. He is building “a validation harness for NFS server restart and failover behaviour: bounce the server, drive reclaim from a set of clients, and check that state comes back the way it should.” That harness has to know when grace has actually lifted before it can advance. Polling <code>/proc/fs/nfsd/v4_end_grace</code> works, “but it is a text interface, it only answers for nfsd’s v4 lock manager, and new nfsd control and observability interfaces are going to the netlink family instead.” He would “rather frame this as parity than as new information.”</p>
+<p>He then conceded Layton’s semantic point in full:</p>
+<blockquote>
+<p>"Agreed, and "has the grace period lifted" is the question I actually care about. I mirrored the semantics of /proc/fs/nfsd/v4_end_grace without stopping to ask whether those were the useful semantics to expose in a new interface. They aren't."</p>
+</blockquote>
+<p>For v2 he plans to report <code>locks_in_grace()</code> — “which answers ‘can this server hand out normal locks and opens yet’ rather than ‘is nfsd’s v4 lock manager done’.” He does not think lockd needs a new interface: <code>fs/nfs_common/grace.c</code> already exposes both halves. <code>locks_in_grace()</code> is the union; <code>opens_in_grace()</code> is true only while a manager with <code>-&gt;block_opens</code> is in grace (NFSv4-and-up; NLM does not set it). A second attribute for <code>opens_in_grace()</code> could be added later without touching lockd, letting userspace derive the NLM-only case as <code>(locks &amp;&amp; !opens)</code>, but he would rather not add that speculatively.</p>
+<p>Two implementation cleanups fall out of the switch, both improvements in his view: the <code>#ifdef CONFIG_NFSD_V4</code> and the open-coded <code>nfsd_vers()</code> / <code>NFSD_NET_UP</code> / <code>NFSD_NET_GRACE_ENDED</code> test all go away (NFSD selects LOCKD which selects <code>GRACE_PERIOD</code>, so the helper is always available), and the answer “stops being a v4-specific answer that just happens to be served out of the nfsd netlink family.” He will rename the attribute and fix the YAML and RST wording so the union semantics are explicit.</p>
+<p>He also floated a design question that is still open at week’s end: <code>threads-get</code> otherwise reports configuration, while grace is dynamic state, so it could live in its own operation. His inclination is to keep just this boolean on <code>threads-get</code> for nfsdfs parity, and grow richer recovery detail — elapsed time, expected vs completed reclaims, whether grace was extended or force-ended — as a separate operation later. He offered to start that separate op now if reviewers prefer.</p>
+<h2>Chuck Lever: do not freeze grace as a server-wide boolean</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/1c53950d-66ba-490a-872f-b2318c584d3c@app.fastmail.com/">Chuck Lever’s reply</a> did not object to reporting grace, but asked that the new API not paint nfsd into a corner:</p>
+<blockquote>
+<p>"Although NFSD does not yet support putting individual exports in grace, that is an open possibility for handling things like the reboot of a backend NFS server for a re-exported NFS client. I'd like any new API to avoid foreclosing the ability to move exports in and out of grace individually rather than as a single unit."</p>
+</blockquote>
+<p>That is a forward-looking constraint on the Netlink schema: a single server-wide boolean is fine as a v2 starting point only if it does not become the only shape the ABI can ever express.</p>
+<h2>Status at week’s end</h2>
+<p>The series is <strong>v1, under review, not merged</strong>. Consensus so far:</p>
+<ul>
+<li>There is appetite for a Netlink replacement of nfsdfs client enumeration for monitoring and automation; patches 2/3 and 3/3 (the dump itself and the stateid counters) have not been technically disputed this week.</li>
+<li>The v1 grace attribute, which mirrored <code>/proc/fs/nfsd/v4_end_grace</code>, is <strong>not</strong> the right answer. v2 is expected to report <code>locks_in_grace()</code> (NLM ∪ NFSv4) and to rename the attribute so those union semantics are explicit.</li>
+<li>Whether grace stays on <code>threads-get</code> or becomes its own operation is still an open design question from the author.</li>
+<li>Any ABI must not preclude future per-export grace, a concern Lever tied to NFS re-export / backend reboot.</li>
+</ul>
+<p>No NFS <em>client</em> code is touched. The client-visible impact, if the series lands, is indirect: better server-side observability of leases, reclaim, callbacks, and per-client stateid load, which is exactly the data a restart/failover test harness — or an operator watching a busy NFSv4 server — needs before deciding that recovery is finished.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/cover.1787638668.git.prabhakar.pujeri@dell.com/">2026-08-25 Prabhakar Pujeri <a href="mailto:prabhakar.pujeri@dell.com">prabhakar.pujeri@dell.com</a> — [PATCH v1 0/3] nfsd: expose NFSv4 client state through Netlink</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/3fd25e2178458fbb44f57f1b0e068c12a6503d17.1787638668.git.prabhakar.pujeri@dell.com/">2026-08-25 Prabhakar Pujeri <a href="mailto:prabhakar.pujeri@dell.com">prabhakar.pujeri@dell.com</a> — [PATCH v1 1/3] nfsd: report NFSv4 grace state through Netlink</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/6b42a390ce3ea9a5930e2704137fd435c6f7d27e.1787638668.git.prabhakar.pujeri@dell.com/">2026-08-25 Prabhakar Pujeri <a href="mailto:prabhakar.pujeri@dell.com">prabhakar.pujeri@dell.com</a> — [PATCH v1 2/3] nfsd: add a Netlink dump of NFSv4 clients</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/245a1ee42d054e280629c9640c8d8225b45639d0.1787638668.git.prabhakar.pujeri@dell.com/">2026-08-25 Prabhakar Pujeri <a href="mailto:prabhakar.pujeri@dell.com">prabhakar.pujeri@dell.com</a> — [PATCH v1 3/3] nfsd: report per-client NFSv4 state usage through Netlink</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/1046756851d9d7d688ac612a7f175e48745d2b84.camel@kernel.org/">2026-08-25 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v1 1/3] nfsd: report NFSv4 grace state through Netlink</a></li>
+</ul>
+  </main>
+</body>
+</html>

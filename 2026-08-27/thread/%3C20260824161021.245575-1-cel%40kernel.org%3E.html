@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Chuck Lever posts the VFS splice wrapper for NFSD’s duplicate fsnotify ACCESS bug</title>
+  <meta name="description" content="This is a bug-fix thread, not a protocol change and not NFS client work. It is the follow-through on Ameer Hamza’s earlier NFSD series: iterator READs still fire two fsnotify_access() events, splice READs fire one, and VFS maintainers had…">
+  <meta property="og:title" content="Chuck Lever posts the VFS splice wrapper for NFSD’s duplicate fsnotify ACCESS bug">
+  <meta property="og:description" content="This is a bug-fix thread, not a protocol change and not NFS client work. It is the follow-through on Ameer Hamza’s earlier NFSD series: iterator READs still fire two fsnotify_access() events, splice READs fire one, and VFS maintainers had…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-27T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Chuck Lever posts the VFS splice wrapper for NFSD’s duplicate fsnotify ACCESS bug">
+  <meta name="twitter:description" content="This is a bug-fix thread, not a protocol change and not NFS client work. It is the follow-through on Ameer Hamza’s earlier NFSD series: iterator READs still fire two fsnotify_access() events, splice READs fire one, and VFS maintainers had…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-27</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Chuck Lever posts the VFS splice wrapper for NFSD’s duplicate fsnotify ACCESS bug</h1>
+<h2>Summary</h2>
+<h1>Chuck Lever posts the VFS splice wrapper for NFSD’s duplicate fsnotify ACCESS bug</h1>
+<h2>Summary</h2>
+<p>This is a <strong>bug-fix</strong> thread, not a protocol change and not NFS <strong>client</strong> work. It is the follow-through on <a href="https://lore.kernel.org/linux-nfs/20260818225715.572140-1-ameer.hamza@truenas.com/">Ameer Hamza’s earlier NFSD series</a>: iterator READs still fire two <code>fsnotify_access()</code> events, splice READs fire one, and VFS maintainers had already ruled that NFSD must not paper over that mismatch itself. <a href="https://lore.kernel.org/linux-nfs/20260824161021.245575-1-cel@kernel.org/">Chuck Lever</a> now posts the agreed VFS helper. <a href="https://lore.kernel.org/linux-nfs/CAOQ4uxgCrwDCX88uC=cDr16hQVHOkaPJBppLk740vmGpA4Ya8w@mail.gmail.com/">Amir Goldstein</a> reviews it on the spot. <a href="https://lore.kernel.org/linux-nfs/ao00KJYNtQqHQGhl@infradead.org/">Christoph Hellwig</a> does not NACK the layering, but he wants the new public API renamed and slimmed before it lands.</p>
+<p>The client-visible symptom is unchanged until a v2 ships: an inotify/fanotify watch on an exported file sees a READ twice when NFSD takes the iterator path (<code>sec=krb5i</code>/<code>sec=krb5p</code>, splice disabled, <code>NFSD_IO_DONTCACHE</code>/<code>NFSD_IO_DIRECT</code>) and once when it splices.</p>
+<h2>Brief recap of the placement fight</h2>
+<p>Hamza’s original 1/2 moved <code>fsnotify_access()</code> into <code>nfsd_splice_read()</code> so both NFSD READ helpers would emit from one place. Hellwig rejected that as an NFSD workaround of a VFS hole. Goldstein then proposed exporting <code>vfs_splice_direct_to_actor()</code>: wrap <code>splice_direct_to_actor()</code> with the permission hook and a single access event, keep those hooks <em>outside</em> freeze protection (the 2023 “Tidy up file permission hooks” rule), and let NFSD call the wrapper. Hellwig called that “the right thing to do.” Lever volunteered to write it.</p>
+<h2>Lever’s v1: one ACCESS per NFSD READ, emitted by VFS</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260824161021.245575-1-cel@kernel.org/">Lever’s patch</a> is a three-file change (<code>fs/nfsd/vfs.c</code>, <code>fs/splice.c</code>, <code>include/linux/splice.h</code>) that does exactly that. The commit message restates the double-count:</p>
+<blockquote>
+<p>"nfsd_finish_read() calls fsnotify_access() on both NFSD read paths, because splice_direct_to_actor() does not emit the event itself. The iterator path reaches nfsd_finish_read() from vfs_iocb_iter_read(), which has already emitted one. A READ served without splice therefore emits two access events."</p>
+</blockquote>
+<p>And the GSS-specific reason it shows up in the field:</p>
+<blockquote>
+<p>"NFSD does not use splice for the GSS integrity and privacy services, so a READ on a sec=krb5i or sec=krb5p mount takes the iterator. An inotify watch on that file sees the READ twice."</p>
+</blockquote>
+<p>The VFS side introduces <code>vfs_splice_direct_to_actor()</code>, which runs <code>rw_verify_area()</code>, calls the existing <code>splice_direct_to_actor()</code>, and then emits <code>fsnotify_access()</code> once for the whole READ. NFSD’s splice READ helper switches to that wrapper, and <code>nfsd_finish_read()</code> stops calling <code>fsnotify_access()</code> so the iterator path (already covered by <code>vfs_iocb_iter_read()</code>) no longer double-fires. That is the important server-side accounting fix: both NFSD READ flavors now produce one ACCESS event, and the event is generated by the VFS API rather than by nfsd special-casing.</p>
+<p>Credits on the patch: Reported-by Hamza, Suggested-by Goldstein, Closes the Hamza 1/2 thread.</p>
+<h2>Goldstein: Reviewed-by, no further comments</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxgCrwDCX88uC=cDr16hQVHOkaPJBppLk740vmGpA4Ya8w@mail.gmail.com//">Goldstein</a> replied the same afternoon with a bare:</p>
+<blockquote>
+<p>"Reviewed-by: Amir Goldstein <a href="mailto:amir73il@gmail.com">amir73il@gmail.com</a>"</p>
+</blockquote>
+<p>That is the fsnotify maintainer signing off on the layering he sketched days earlier. He did not ask for a rename, a kerneldoc rewrite, or a change to the <code>splice_desc</code> argument list.</p>
+<h2>Hellwig: keep the wrapper, retire “direct”, maybe hide <code>splice_desc</code></h2>
+<p><a href="https://lore.kernel.org/linux-nfs/ao00KJYNtQqHQGhl@infradead.org/">Hellwig</a> reviewed the new helper as API, not as an nfsd workaround. First he wants the historically confusing “direct” terminology gone from the new public name:</p>
+<blockquote>
+<p>"Can we use this to start retiring the really weird direct terminology here that is confusing? I.e. name this vfs_splice_to_actor? With that we'll only need to fix up do_splice_direct (which is an event worse name) to fix the public API."</p>
+</blockquote>
+<p>Then the kerneldoc. The <code>@</code> lines dump too much of the <code>splice_desc</code> contract; the <code>Description:</code> heading is “accepted by te parset, but redundant.” He supplied a rewritten comment that describes the helper as “call an actor on data read from a file,” notes that it “Ensures the read is allowed using rw_verify_area() and emits fsnotify access events,” and keeps the seekable (<code>FMODE_LSEEK</code>) requirement.</p>
+<p>He then floated a deeper cleanup of the “weird semantics of the splice_desc”: build the descriptor <em>inside</em> the helper and pass <code>pos</code>, <code>count</code>, <code>actor</code>, and <code>private</code> instead of making every caller fill in <code>sd</code>. That would turn NFSD into a caller of something closer to:</p>
+<pre><code>vfs_splice_to_actor(in, pos, count, actor, private)
+</code></pre>
+<p>rather than a <code>splice_desc</code> assembler. He left both options on the table; the second is “maybe an even better idea,” not a hard requirement.</p>
+<p>Hellwig did not dispute the fsnotify placement, the removal of <code>fsnotify_access()</code> from <code>nfsd_finish_read()</code>, or the fact that this is the right layer for the bug. The review is a request for a v2 of the VFS surface, not a return to Hamza’s nfsd-only patch.</p>
+<h2>Where things stand</h2>
+<ul>
+<li><strong>Kind of change:</strong> bug fix in VFS splice plus a small NFSD call-site update. No NFS protocol change. No NFS <strong>client</strong> code.</li>
+<li><strong>The double ACCESS event is still unfixed in-tree.</strong> v1 is posted and Goldstein-acked; Hellwig wants <code>vfs_splice_to_actor</code> (and possibly no public <code>splice_desc</code>) before it is the public API.</li>
+<li><strong>NFSD remains a consumer, not the emitter.</strong> That was the point of last week’s VFS ruling, and Lever’s patch follows it.</li>
+<li><strong>No v2 this window.</strong> Lever has not yet answered Hellwig’s naming and signature nits.</li>
+<li><strong>Why it still matters to NFS:</strong> GSS integrity/privacy READs, and any other iterator-READ work (including Hamza’s SUNRPC reply-page recycling series), inherit the duplicate inotify ACCESS until this wrapper lands. Watchers of exported files are the users who see it.</li>
+</ul>
+<p>Until Lever respins, the splice and iterator READ helpers remain inconsistent, and the “one ACCESS per user READ” contract Goldstein asked for is agreed in principle but not merged.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260824161021.245575-1-cel@kernel.org/">2026-08-24 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v1] splice: emit a single fsnotify access event per NFSD READ</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxgCrwDCX88uC=cDr16hQVHOkaPJBppLk740vmGpA4Ya8w@mail.gmail.com/">2026-08-24 Amir Goldstein <a href="mailto:amir73il@gmail.com">amir73il@gmail.com</a> — Re: [PATCH v1] splice: emit a single fsnotify access event per NFSD READ</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ao00KJYNtQqHQGhl@infradead.org/">2026-08-25 Christoph Hellwig <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [PATCH v1] splice: emit a single fsnotify access event per NFSD READ</a></li>
+</ul>
+  </main>
+</body>
+</html>

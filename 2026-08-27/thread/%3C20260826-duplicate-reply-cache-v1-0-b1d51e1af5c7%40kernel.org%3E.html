@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Chuck Lever posts implied-ACK eviction for NFSD’s duplicate reply cache</title>
+  <meta name="description" content="This is a server-side performance feature, not an NFS client change and not a protocol revision. Chuck Lever posted a seven-patch series that lets NFSD drop completed duplicate-reply-cache (DRC) entries as soon as the next request arrives…">
+  <meta property="og:title" content="Chuck Lever posts implied-ACK eviction for NFSD’s duplicate reply cache">
+  <meta property="og:description" content="This is a server-side performance feature, not an NFS client change and not a protocol revision. Chuck Lever posted a seven-patch series that lets NFSD drop completed duplicate-reply-cache (DRC) entries as soon as the next request arrives…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-27T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Chuck Lever posts implied-ACK eviction for NFSD’s duplicate reply cache">
+  <meta name="twitter:description" content="This is a server-side performance feature, not an NFS client change and not a protocol revision. Chuck Lever posted a seven-patch series that lets NFSD drop completed duplicate-reply-cache (DRC) entries as soon as the next request arrives…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-27</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Chuck Lever posts implied-ACK eviction for NFSD’s duplicate reply cache</h1>
+<h2>Summary</h2>
+<p>This is a <strong>server-side performance feature</strong>, not an NFS <strong>client</strong> change and not a protocol revision. <a href="https://lore.kernel.org/linux-nfs/20260826-duplicate-reply-cache-v1-0-b1d51e1af5c7@kernel.org/">Chuck Lever</a> posted a seven-patch series that lets NFSD drop completed duplicate-reply-cache (DRC) entries as soon as the next request arrives on the same TCP or RDMA connection, instead of parking them until the 120-second <code>RC_EXPIRE</code> timeout. No reviews, Acked-bys, or follow-ups landed in this window; the thread is the v1 posting only.</p>
+<p>The work sits on the server lookup hot path that NFSv3 (and NFSv2) clients hit on every non-idempotent RPC. Shorter-lived DRC entries keep the per-bucket rb-trees small, which is the actual win: fewer LLC misses on <code>rb_erase</code>/<code>rb_insert_color</code> while the client is streaming writes. There is no corresponding client patch; Linux NFS client retransmission and session-slot DRC are untouched.</p>
+<h2>Why the 120-second hold is expensive</h2>
+<p>A completed DRC entry currently lives until <code>RC_EXPIRE</code> or until the cache exceeds <code>max_drc_entries</code>. Entries whose replies the client already holds still occupy a bucket and slow every later lookup that hashes there. Lever’s cover letter reports numbers from <code>perf record -e cycles -e cpu-clock -e LLC-load-misses -e branch-misses</code> on an NFSv3/RDMA 4KB random-write workload:</p>
+<blockquote>
+<p>"nfsd_cache_lookup overhead dropped from 1.53% to 0.76% of CPU cycles. The rb-tree operations (rb_erase, rb_insert_color) that dominated LLC cache misses fell from a combined 13.2% to 1.1% of all LLC-load-misses, because shorter-lived entries keep the per-bucket trees small."</p>
+</blockquote>
+<p>That is the entire motivation. The series does not change the DRC key, the checksum, or the RC_INPROG/RC_DONE state machine; it only shortens how long a <code>RC_DONE</code> entry is allowed to linger when the transport can prove the reply was delivered.</p>
+<h2>The implied-ACK rule</h2>
+<p>Connection-oriented transports (TCP, RDMA) deliver in order. Arrival of a later request on the same <code>svc_xprt</code> is treated as evidence that every prior reply on that connection has been received. Lever cites RFC 1813 §4.5 for the protocol reading: on a live connection-oriented transport, a duplicate request comes from reconnection, not from inside an established stream. <a href="https://lore.kernel.org/linux-nfs/20260826-duplicate-reply-cache-v1-5-b1d51e1af5c7@kernel.org/">Patch 5</a> is explicit that the signal is still only advisory:</p>
+<blockquote>
+<p>"Even there the evidence is not conclusive, since a client with several requests outstanding sends the next before the previous reply arrives. The cache is advisory: a premature eviction costs a miss and re-execution, the same outcome memory pressure and RC_EXPIRE already produce."</p>
+</blockquote>
+<p>UDP is excluded. A UDP <code>svc_xprt</code> is shared by every peer and carries retransmits on timeout, so a later datagram is not an ACK of an earlier reply. Eviction is therefore confined to transports marked <code>XPT_ORDERED</code>.</p>
+<p>During bucket pruning, <code>nfsd_prune_bucket_locked()</code> compares each <code>RC_DONE</code> entry’s <code>c_timestamp</code> against <code>xpt_last_recv</code> on the transport the <em>current</em> request arrived on. A newer timestamp on the same transport means the reply was delivered and the entry is dropped immediately. Only that transport is consulted, because it is the one the pruning thread holds a reference to; entries recorded on other transports wait for a later lookup or a shrinker pass.</p>
+<p>Implied ACK does not evict in age order, so the prune loop can no longer stop at the first non-evictable entry. Lever bounds the walk because a client controls its XIDs and the bucket is chosen by an XID hash:</p>
+<blockquote>
+<p>"an unbounded scan lets it pack one bucket and turn every miss into a walk of the whole bucket under cache_lock. Bound the work per call to four times the eviction limit."</p>
+</blockquote>
+<p>That bound is the closest thing in the series to a <strong>bug-class hardening</strong>: without it, implied-ACK eviction would turn a dense XID hash into a lock-held linear scan.</p>
+<h2>Plumbing: stable xprt IDs, last-recv, XPT_ORDERED</h2>
+<p>The eviction policy needs three pieces of SUNRPC state that the DRC did not previously have.</p>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260826-duplicate-reply-cache-v1-1-b1d51e1af5c7@kernel.org/">Patch 1</a></strong> assigns each <code>svc_xprt</code> a per-netns identifier from a cyclic IDR. A consumer that associates state with a transport without holding a reference cannot detect ABA collisions: once a transport is freed, SLUB may hand out a new <code>svc_xprt</code> at the same address. The cyclic IDR delays reuse. <code>svc_xprt_init()</code> now returns a boolean, and its callers in <code>svcsock.c</code> and <code>svc_rdma_transport.c</code> unwind on allocation failure. The DRC is the first consumer.</p>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260826-duplicate-reply-cache-v1-2-b1d51e1af5c7@kernel.org/">Patch 2</a></strong> records that xprt id in each DRC entry. No behavior change on its own.</p>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260826-duplicate-reply-cache-v1-3-b1d51e1af5c7@kernel.org/">Patch 3</a></strong> adds <code>xpt_last_recv</code> on <code>svc_xprt</code> and updates it in <code>svc_handle_xprt()</code> after each successful <code>xpo_recvfrom()</code>. A revisited deferred request leaves the stamp alone, because that request arrived before the deferral and is not fresh client activity.</p>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260826-duplicate-reply-cache-v1-4-b1d51e1af5c7@kernel.org/">Patch 4</a></strong> adds <code>XPT_ORDERED</code>, set by the TCP and RDMA init paths and left clear for UDP. The commit message flags a real semantic cost on svcrdma: <code>handle_connect_req()</code> zeroes the remote port in the DRC key so a cached reply survives a reconnect, and implied-ACK eviction can retire such an entry while the original connection is still up. Lever treats that as consistent with TCP, which already loses the same association whenever a client re-binds its reserved port:</p>
+<blockquote>
+<p>"TCP gives up the same thing whenever a client re-binds its reserved port, so this follows from the eviction policy rather than from RDMA."</p>
+</blockquote>
+<p>That is the one place the series can change client-visible replay behavior: a reconnecting RDMA (or rebound TCP) client that retransmits an in-flight non-idempotent RPC after the next request has already arrived may now miss the DRC and re-execute, the same outcome <code>RC_EXPIRE</code> already produces under memory pressure.</p>
+<h2>Observability</h2>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260826-duplicate-reply-cache-v1-6-b1d51e1af5c7@kernel.org/">Patch 6</a></strong> adds tracepoints for each eviction reason — memory pressure, expiry, implied ACK — plus one for the transport-mismatch case that keeps an otherwise eligible entry in the cache. Without those events there is no way to confirm implied-ACK eviction actually fires or to compare its rate with the other prune paths.</p>
+<p><strong><a href="https://lore.kernel.org/linux-nfs/20260826-duplicate-reply-cache-v1-7-b1d51e1af5c7@kernel.org/">Patch 7</a></strong> adds an <code>entries=</code> field to <code>nfsd_drc_found</code> so a trace can show whether a miss happened under pressure. The count is passed as an explicit argument rather than read from <code>nn-&gt;num_drc_entries</code> in <code>TP_fast_assign</code>, “so that per-connection lookup paths can later supply their own depth without changing the tracepoint format.” That last clause is a hint that Lever is already thinking about per-connection DRC accounting; it is not implemented here.</p>
+<h2>Client impact, and what this is not</h2>
+<p>This series does <strong>not</strong> touch the Linux NFS client. Client-side DRC, NFSv4.1 session slots, retransmission timers, and <code>nconnect</code> are out of scope. The client-visible effect, if any, is on the server’s ability to absorb a replay of a non-idempotent NFSv3 RPC after the next request on the same TCP/RDMA connection has already arrived: a premature eviction is a cache miss and a re-execution, which Lever argues is already an accepted outcome of shrinker pressure and <code>RC_EXPIRE</code>. UDP clients keep the 120-second hold.</p>
+<p>It is also not a protocol change. RFC 1813 §4.5 is used as justification for a local eviction heuristic, not as a wire-format or interoperability update.</p>
+<h2>Where things stand</h2>
+<ul>
+<li><strong>Kind of change:</strong> NFSD/SUNRPC performance feature (implied-ACK DRC eviction) with supporting xprt identity and tracing. Not a bug fix, not a protocol change, not NFS client code.</li>
+<li><strong>No review this window.</strong> The eight messages are the cover letter plus patches 1–7, all dated 2026-08-26, all from Lever. Nothing is merged on the strength of this thread.</li>
+<li><strong>Risk surface to watch in review:</strong> ABA-safe xprt IDs (patch 1), the RDMA reconnect / TCP rebind interaction with <code>XPT_ORDERED</code> (patch 4), the four-times-eviction-limit bound on the prune walk (patch 5), and whether implied ACK is too aggressive for pipelined clients with many requests outstanding.</li>
+<li><strong>Why it still matters to NFS clients:</strong> NFSv3/RDMA and NFSv3/TCP write-heavy workloads spend less server CPU in <code>nfsd_cache_lookup</code> and take fewer LLC misses in the DRC rb-trees. That is a server efficiency win that shows up as client throughput, not as a client code change.</li>
+</ul>
+<p>Until reviewers weigh in, the 120-second <code>RC_EXPIRE</code> hold remains the in-tree policy, and implied-ACK eviction is a v1 proposal backed by the RDMA random-write profile above.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260826-duplicate-reply-cache-v1-0-b1d51e1af5c7@kernel.org/">2026-08-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 0/7] Implied-ACK eviction for NFSD's duplicate reply cache</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260826-duplicate-reply-cache-v1-1-b1d51e1af5c7@kernel.org/">2026-08-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 1/7] SUNRPC: Assign a unique identifier to each svc_xprt</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260826-duplicate-reply-cache-v1-2-b1d51e1af5c7@kernel.org/">2026-08-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 2/7] NFSD: Track transport in DRC entries</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260826-duplicate-reply-cache-v1-3-b1d51e1af5c7@kernel.org/">2026-08-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 3/7] SUNRPC: Record last-request timestamp on svc_xprt</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260826-duplicate-reply-cache-v1-4-b1d51e1af5c7@kernel.org/">2026-08-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 4/7] SUNRPC: Mark connection-oriented transports on svc_xprt</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260826-duplicate-reply-cache-v1-6-b1d51e1af5c7@kernel.org/">2026-08-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 6/7] NFSD: Add tracepoints for DRC entry eviction</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260826-duplicate-reply-cache-v1-5-b1d51e1af5c7@kernel.org/">2026-08-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 5/7] NFSD: Evict completed DRC entries via implied ACK</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260826-duplicate-reply-cache-v1-7-b1d51e1af5c7@kernel.org/">2026-08-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 7/7] NFSD: Record DRC population in lookup tracepoints</a></li>
+</ul>
+  </main>
+</body>
+</html>

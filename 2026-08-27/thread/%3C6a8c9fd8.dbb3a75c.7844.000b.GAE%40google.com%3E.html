@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>syzbot: recursive svc_tcp_state_change overflows the stack during inet_stream_connect</title>
+  <meta name="description" content="This is a bug report, not a protocol change and not a new feature. syzbot filed a TASK stack-guard hit against upstream, tagged [net?] [nfs?]. The overflowing function is the SUNRPC server TCP state-change callback, entered from a 32-bit…">
+  <meta property="og:title" content="syzbot: recursive svc_tcp_state_change overflows the stack during inet_stream_connect">
+  <meta property="og:description" content="This is a bug report, not a protocol change and not a new feature. syzbot filed a TASK stack-guard hit against upstream, tagged [net?] [nfs?]. The overflowing function is the SUNRPC server TCP state-change callback, entered from a 32-bit…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-27T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="syzbot: recursive svc_tcp_state_change overflows the stack during inet_stream_connect">
+  <meta name="twitter:description" content="This is a bug report, not a protocol change and not a new feature. syzbot filed a TASK stack-guard hit against upstream, tagged [net?] [nfs?]. The overflowing function is the SUNRPC server TCP state-change callback, entered from a 32-bit…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-27</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>syzbot: recursive svc_tcp_state_change overflows the stack during inet_stream_connect</h1>
+<h2>Summary</h2>
+<p>This is a <strong>bug report</strong>, not a protocol change and not a new feature. <a href="https://lore.kernel.org/linux-nfs/6a8c9fd8.dbb3a75c.7844.000b.GAE@google.com/">syzbot</a> filed a TASK stack-guard hit against upstream, tagged <code>[net?] [nfs?]</code>. The overflowing function is the SUNRPC <strong>server</strong> TCP state-change callback, entered from a 32-bit compat <code>connect(2)</code>. There is <strong>no NFS client code</strong> in the dump, and no human reply this week.</p>
+<p>The report is the TCP sibling of last week’s UDP <code>svc_write_space</code> overflow on <code>/proc/fs/nfsd/portlist</code>. Chuck Lever already posted a three-line <code>sk_user_data</code> ownership check for that class of bug; it has not landed, and syzbot has now reproduced the same double-attach recursion on the TCP <code>sk_state_change</code> path.</p>
+<h2>What syzbot reported</h2>
+<p>On 24 August, <a href="https://lore.kernel.org/linux-nfs/6a8c9fd8.dbb3a75c.7844.000b.GAE@google.com/">syzbot</a> wrote:</p>
+<blockquote>
+<p>"syzbot found the following issue on:
+HEAD commit:    d58772d8520c Merge tag 'regmap-fix-v7.2-rc7' of git://git...
+git tree:       upstream"</p>
+</blockquote>
+<p>That is the same <code>d58772d8520c</code> tree as the 15 August <code>nfsctl_transaction_write</code> stack-guard report. The kernel is gcc 14.2.0, KASAN, <code>PREEMPT(full)</code>. Userspace is <strong>i386</strong>. Dashboard, console log, kernel config, syz repro, and C reproducer are attached. Any fix is asked to carry:</p>
+<blockquote>
+<p>"Reported-by: syzbot+c9834a0c0215e6d8697a@syzkaller.appspotmail.com"</p>
+</blockquote>
+<p>The oops itself:</p>
+<blockquote>
+<p>"BUG: TASK stack guard page was hit at ffffc900062a7ff8 (stack is ffffc900062a8000..ffffc900062b0000)
+Oops: stack guard page: 0000 [#1] SMP KASAN NOPTI"</p>
+</blockquote>
+<p>RIP is the function prologue of <code>svc_tcp_state_change()</code> at <code>net/sunrpc/svcsock.c:911</code>. The trapping instruction is a <code>push %r12</code> — the callback is trying to open a new frame on an already-exhausted kernel stack. The task is <code>syz.0.18</code>, PID 5926, untainted.</p>
+<h2>The smoking gun: unbounded <code>svc_tcp_state_change</code> recursion</h2>
+<p>The call trace is almost entirely one function calling itself. After the first frame at offset <code>+0x8</code> (the prologue that hit the guard page), the dump repeats, hundreds of times:</p>
+<pre><code>svc_tcp_state_change+0x81/0x350 net/sunrpc/svcsock.c:917
+</code></pre>
+<p>Offset <code>+0x81</code> / line 917 is the recursive call site: <code>svc_tcp_state_change</code> invoking the <em>saved</em> <code>sk_state_change</code> callback. That saved callback is itself <code>svc_tcp_state_change</code>. Each re-entry consumes stack; KASAN instrumentation makes the frames fat enough that an 8K/16K kernel stack hits the guard page quickly.</p>
+<p>The frames <em>under</em> the recursion show how the callback was entered:</p>
+<pre><code>tcp_done
+tcp_done_with_error
+tcp_reset
+tcp_rcv_synsent_state_process / tcp_rcv_state_process
+tcp_v4_do_rcv
+sk_backlog_rcv / __release_sock / release_sock
+inet_wait_for_connect / __inet_stream_connect
+inet_stream_connect
+__sys_connect / __ia32_sys_connect
+do_fast_syscall_32
+</code></pre>
+<p>In other words: a 32-bit <code>connect(2)</code> is waiting in <code>inet_wait_for_connect</code> for a SYN-SENT handshake. A TCP RST arrives, <code>tcp_reset</code> → <code>tcp_done</code> fires <code>sk-&gt;sk_state_change</code>, and that pointer is the SUNRPC server callback, chained to itself.</p>
+<p>The subject names <code>inet_stream_connect</code> because that is the syscall that was on the stack when the guard page was hit. The defect is not in <code>af_inet.c</code>.</p>
+<h2>How this relates to last week’s portlist double-attach</h2>
+<p>Last week’s <a href="https://lore.kernel.org/linux-nfs/6a808654.10853dc7.22f513.0009.GAE@google.com/">syzbot UDP report</a> overflowed in <code>svc_write_space</code> while <code>write_ports</code> added a UDP descriptor. <a href="https://lore.kernel.org/linux-nfs/20260815162844.8219-1-cel@kernel.org/">Chuck Lever’s v1</a> explained the mechanism: writing the same socket to <code>/proc/fs/nfsd/portlist</code> twice attaches a second <code>svc_sock</code>. <code>svc_setup_socket()</code> saves the existing callbacks, then installs SUNRPC’s own. On the second attach those “old” callbacks are already SUNRPC’s, so the new <code>svc_sock</code> records <code>svc_write_space</code> / <code>svc_tcp_state_change</code> as the previous handlers. The next invocation chains into itself until the stack dies.</p>
+<p>Lever already named the TCP half of that story:</p>
+<blockquote>
+<p>"the same chaining exists on TCP via saved data_ready / state_change callbacks, so a TCP descriptor added twice recurses on the next incoming segment rather than during setup."</p>
+</blockquote>
+<p>This week’s dump is that TCP half, observed from <code>connect()</code> rather than from <code>write_ports</code>. A socket whose <code>sk_state_change</code> is <code>svc_tcp_state_change</code>, and whose <em>saved</em> callback is <em>also</em> <code>svc_tcp_state_change</code>, is the double-attach signature. A RST on a SYN-SENT socket is enough to detonate it.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/9223c486ff90585a56556d810901c2cbcec85bae.camel@kernel.org/">Jeff Layton’s review</a> of Lever’s patch is the right decoder ring for <em>which</em> TCP callback recurses. For a listening socket, <code>svc_tcp_init()</code> only replaces <code>sk_data_ready</code> with <code>svc_tcp_listen_data_ready</code>; <code>sk_state_change</code> is left alone. The <strong>non-listen</strong> branch <em>does</em> install <code>svc_tcp_state_change()</code>. <code>svc_addsock()</code> reaches that branch for a descriptor that is not listening, then deferred-closes the transport unless the socket is already <code>TCP_SYN_RECV</code> or <code>TCP_ESTABLISHED</code>. This crash is in SYN-SENT (<code>tcp_rcv_synsent_state_process</code>), so it is that non-listen / connecting-socket path, not the listener <code>svc_tcp_listen_data_ready</code> path Layton asked Lever to name in the changelog.</p>
+<p>Lever’s proposed fix still covers it: refuse a socket that already carries <code>sk_user_data</code> before <code>svc_setup_socket()</code> overwrites the callbacks. That patch was Reviewed-by Layton on 17 August; no v2 and no merge ack appeared this window. syzbot is still fuzzing the unfixed tree.</p>
+<h2>NFS client angle — why the <code>[nfs?]</code> tag is a red herring</h2>
+<p>Despite the subject and the <code>[nfs?]</code> tag, this is <strong>not an NFS client I/O or client-transport bug</strong>.</p>
+<ul>
+<li>The overflowing function is <code>svc_tcp_state_change</code> in <code>net/sunrpc/svcsock.c</code>. The NFS <strong>client</strong> TCP state machine is <code>xs_tcp_state_change</code> in <code>net/sunrpc/xprtsock.c</code>. They are not the same callback.</li>
+<li>The trigger is a raw <code>connect(2)</code> on a socket that already has SUNRPC <em>server</em> callbacks installed. That is the NFSD <code>portlist</code> / <code>svc_addsock</code> injection surface, not <code>nfs_file_write</code> and not an RPC client reconnect.</li>
+<li>Shared SUNRPC still matters to client developers: <code>svc_setup_socket</code> is the same helper lockd and other in-kernel RPC services use. A recursive <code>sk_state_change</code> on an svc socket can take down whatever thread happens to be in <code>release_sock</code> / <code>tcp_done</code>, which here is the connecting task itself.</li>
+</ul>
+<p>Client test matrices that mix 32-on-64 compat syscalls with nfsctl socket passing are exactly the environment that would trip this. Ordinary NFSv4 client mounts do not.</p>
+<h2>Reproduction and environment</h2>
+<p>Syzbot shipped both a syz repro and a C reproducer, plus a non-bootable disk image, <code>vmlinux</code>, and <code>bzImage</code> for <code>d58772d8520c</code>. Hardware is QEMU Q35. The connect is a compat syscall (<code>entry_SYSENTER_compat_after_hwframe</code>, <code>__ia32_sys_connect</code>) with <code>AF_INET</code> address length 16 (<code>RDX: 0x10</code>). No modules are loaded.</p>
+<p>Syzbot’s usual control commands (<code>#syz fix</code>, <code>#syz test</code>, <code>#syz dup</code>) are present; none have been used this week.</p>
+<h2>Status this week</h2>
+<p>This is a <strong>one-message thread</strong>. <code>ListThreadMessages</code> shows only the 24 August syzbot mail. There is no prior weekly summary for this Message-ID, and no maintainer, reviewer, or patch has answered in-window.</p>
+<p>Until someone replies, the technical conclusion from the dump — read against last week’s Lever/Layton thread — is:</p>
+<ul>
+<li><strong>Class:</strong> kernel stack overflow / unbounded recursion (Oops / DoS).</li>
+<li><strong>Site:</strong> <code>svc_tcp_state_change()</code> in SUNRPC server sockets, entered from <code>tcp_done</code> while a compat <code>connect(2)</code> waits in SYN-SENT.</li>
+<li><strong>Root cause (inferred, not yet confirmed on-list):</strong> the same non-idempotent <code>svc_setup_socket()</code> callback-save that last week overflowed <code>svc_write_space</code> on UDP. A second attach records <code>svc_tcp_state_change</code> as the previous <code>sk_state_change</code>; the next RST/state-change chains into itself.</li>
+<li><strong>Fix already posted, not merged:</strong> Lever’s “reject a socket that already has <code>sk_user_data</code>” patch. It should close this TCP path as well as the UDP one. It needs a v2 changelog that names both <code>svc_tcp_listen_data_ready</code> (listener) and <code>svc_tcp_state_change</code> (non-listen / connecting), plus this report’s <code>Reported-by</code> tag.</li>
+<li><strong>Not an NFS client bug.</strong> Client RPC uses <code>xs_tcp_state_change</code>. The <code>[net?]</code> tag is the accurate one; <code>[nfs?]</code> is NFSD’s <code>portlist</code> socket-injection surface.</li>
+</ul>
+<p>No <code>#syz fix</code>, no <code>#syz dup</code> against the 15 August UDP report, and no subsystem re-tag landed this week. The crash is still open on the syzbot dashboard.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/6a8c9fd8.dbb3a75c.7844.000b.GAE@google.com/">2026-08-24 syzbot <a href="mailto:syzbot+c9834a0c0215e6d8697a@syzkaller.appspotmail.com">syzbot+c9834a0c0215e6d8697a@syzkaller.appspotmail.com</a> — [syzbot] [net?] [nfs?] BUG: stack guard page was hit in inet_stream_connect</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/6a8c9fd8.dbb3a75c.7844.000b.GAE@google.com/">2026-08-24 syzbot <a href="mailto:syzbot+c9834a0c0215e6d8697a@syzkaller.appspotmail.com">syzbot+c9834a0c0215e6d8697a@syzkaller.appspotmail.com</a> — [syzbot] [net?] [nfs?] BUG: stack guard page was hit in inet_stream_connect</a></li>
+</ul>
+  </main>
+</body>
+</html>

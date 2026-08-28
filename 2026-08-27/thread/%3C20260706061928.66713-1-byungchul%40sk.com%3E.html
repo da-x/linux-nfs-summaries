@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DEPT v19: Lockdep Retrofit vs. Sibling Detector, Folio Handoff</title>
+  <meta name="description" content="This remains a new kernel feature under review: Byungchul Park&#39;s 40-patch DEPT (DEPendency Tracker) series, still at v19. Nothing this week is an NFS protocol change or an NFS client bug fix. The debate is architectural — whether DEPT…">
+  <meta property="og:title" content="DEPT v19: Lockdep Retrofit vs. Sibling Detector, Folio Handoff">
+  <meta property="og:description" content="This remains a new kernel feature under review: Byungchul Park&#39;s 40-patch DEPT (DEPendency Tracker) series, still at v19. Nothing this week is an NFS protocol change or an NFS client bug fix. The debate is architectural — whether DEPT…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-27T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="DEPT v19: Lockdep Retrofit vs. Sibling Detector, Folio Handoff">
+  <meta name="twitter:description" content="This remains a new kernel feature under review: Byungchul Park&#39;s 40-patch DEPT (DEPendency Tracker) series, still at v19. Nothing this week is an NFS protocol change or an NFS client bug fix. The debate is architectural — whether DEPT…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-27</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>DEPT v19: Lockdep Retrofit vs. Sibling Detector, Folio Handoff</h1>
+<h2>Summary</h2>
+<h1>DEPT v19: Lockdep Retrofit vs. Sibling Detector, Folio Handoff</h1>
+<h2>Classification</h2>
+<p>This remains a <strong>new kernel feature</strong> under review: Byungchul Park's 40-patch <strong>DEPT (DEPendency Tracker)</strong> series, still at v19. Nothing this week is an NFS protocol change or an NFS client bug fix. The debate is architectural — whether DEPT should ship as a sibling of Lockdep, and how (or whether) folio <code>PG_lock</code> / <code>PG_writeback</code> waits can be modeled with existing Lockdep primitives. That question is nevertheless NFS-shaped: the client’s readahead, writeback, and RPC-completion paths are exactly the “lock in task context, unlock from interrupt or workqueue” pattern under discussion.</p>
+<h2>Bridging Prior Weeks (Briefly)</h2>
+<p>v19 landed on 6 July. Matthew Wilcox challenged per-page <code>PG_locked</code> tracking; Gary Guo flagged a Rust <code>dept_key</code> collision; Park confirmed an <code>init_completion_dkey()</code> plan and agreed to merge two Rust hygiene patches. The series then went quiet for five weeks. On 20 August, <a href="https://lore.kernel.org/linux-nfs/359ea967-9b97-4584-88e6-bddb4044de2e@kernel.org/">David Hildenbrand</a> reopened the cover letter — asking why DEPT cannot be a <code>CONFIG_LOCKDEP_*</code> extension, and proposing a debug <code>lockdep_map</code> in <code>struct folio</code> — and <a href="https://lore.kernel.org/linux-nfs/aoc-jJ10op62jXFK@casper.infradead.org/">Wilcox</a> restated three reasons <code>PG_lock</code> is not a Lockdep-shaped object (page lifetime vs. lock semantics, owner-based hierarchy, task-acquire / IRQ-release with an I/O-submit hole). Park’s replies, and the subsequent Lockdep-vs-DEPT design debate, fall in this window. The only NFS-tree patch in the series remains the SUNRPC <code>rcu_head</code> relocation (patch 37/40, Reviewed-by Jeff Layton).</p>
+<h2>This Week's Activity (21–25 August)</h2>
+<p>Fifteen messages, clustered on 21 August and 24–25 August. The cover letter, not any individual patch, is the battlefield.</p>
+<h3>1. Park answers Hildenbrand: classification, timestamps, unofficial support</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260821042143.GA40890@system.software.com/">Park</a> opened the week by agreeing that folio locking rules belong to mappings, not pages, and that DEPT already uses lock-class style classification rather than a full map in every page:</p>
+<blockquote>
+<p>"DEPT doesn't use a full map in each page but uses a minimum space for a timestamp in each to track when each starts to wait so as to use the recorded timestamp when the event occurs e.g. folio_unlock()."</p>
+</blockquote>
+<p>He accepted Hildenbrand’s future <code>struct folio</code> allocation as “good news for lockdep. (And even for DEPT :)” but held the line on independence. Lockdep, he argued, tracks <strong>acquisition order</strong>; folio lock is special because it can be released from a context other than the acquirer. Retrofitting that into Lockdep is not a small extension:</p>
+<blockquote>
+<p>"Focusing on only the dependency checking, the most parts of lockdep are for the tricky things, so the reusable parts are not that big."</p>
+</blockquote>
+<p>His two reasons for a separate engine were (1) similar or less effort than a retrofit, and (2) stability risk — the argument Hildenbrand had already rejected. On maintainer buy-in he offered only an unofficial LPC hallway conversation:</p>
+<blockquote>
+<p>"One of locking maintainers who I met in an LPC told me that he agrees with the direction of DEPT and supports DEPT, not officially tho."</p>
+</blockquote>
+<blockquote>
+<p>"What he and other people are concerning w.r.t DEPT the most is, false positives, which is the most important issue for now."</p>
+</blockquote>
+<p>His near-term plan is operational, not architectural: share DEPT’s true reports periodically on LKML, especially around folio locks.</p>
+<h3>2. Park answers Wilcox: three folio classes, annotate I/O submit</h3>
+<p>Thirty minutes later <a href="https://lore.kernel.org/linux-nfs/20260821045132.GB40890@system.software.com/">Park</a> told Wilcox that the three properties Wilcox listed <em>are</em> classification, and that DEPT currently buckets folios into three global maps:</p>
+<blockquote>
+<p>"1. folios in mm paths
+2. folios in block device buffer (meta data)
+3. folios in regular file cache"</p>
+</blockquote>
+<p>He agreed Wilcox’s finer cut — “this folio belongs to this xfs file inode” rather than merely “this inode” — would be better, and called the current split “still a good start.” On the I/O-submit hole (locked folio never submitted, so it will never unlock), he proposed treating submit as the <em>event</em> that will eventually release <code>folio_lock()</code>:</p>
+<blockquote>
+<p>"Annotate the point submitting IO as an event for the folio_lock() to be released. That way, the issue above can be detected by DEPT."</p>
+</blockquote>
+<blockquote>
+<p>"Again, DEPT can do every thing we need w.r.t. deadlock."</p>
+</blockquote>
+<p>That last claim is the one the rest of the week spends dismantling.</p>
+<h3>3. Hildenbrand: lifetime is well-defined; four merge options</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/f1657724-e7a9-45f6-9aef-af69d3c64a7d@kernel.org/">Hildenbrand</a> pushed back on Wilcox’s lifetime argument: until folios are dynamically allocated, <code>PG_locked</code> still has a well-defined life between allocator hand-out and return, and debug kernels already spend memory on <code>page_ext</code>. He conceded the cross-context release is hard to squeeze into Lockdep, and that “Dept might be a more natural fit for this scenario.”</p>
+<p>His second mail the same morning, <a href="https://lore.kernel.org/linux-nfs/825134a8-ceae-430c-b2fc-d1d0c7240f39@kernel.org/">to Park</a>, asked the questions the series has not answered in public:</p>
+<ul>
+<li>Where does DEPT store the per-page timestamp?</li>
+<li>Is Lockdep <em>impossible</em> to extend for release in a different context, or merely expensive?</li>
+<li>Can DEPT and Lockdep run at the same time?</li>
+<li>Are false positives conceptual, or missing edge-case annotations?</li>
+</ul>
+<p>He then laid out four paths and picked one:</p>
+<blockquote>
+<p>"(1) Don't merge it and carry it OOT. Shame if it delivers real value.
+(2) Merge it … keeping it entirely separate from lockdep.
+(3) Integrate it with lockdep on a high level, giving us a single locking dependency checker, but mostly letting dept have a separate implementation.
+(4) Retrofit and extend lockdep to really have one mechanism."</p>
+</blockquote>
+<blockquote>
+<p>"As the saying goes, it's hard to teach old dogs new tricks, but in the end taking care of two dogs is likely harder than only a single dog? :)"</p>
+</blockquote>
+<blockquote>
+<p>"I tend to favor (4) (or 3 with possible future work to achieve 4), but I am not a locking maintainer, so really they have to voice what to do."</p>
+</blockquote>
+<blockquote>
+<p>"I do see value in DEPT (even if the folio lock might be handled differently)."</p>
+</blockquote>
+<h3>4. NeilBrown: Lockdep already has a hand-off API</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/178730572084.2852630.7732425311008244683@noble.neil.brown.name/">NeilBrown</a> — the voice on this list who actually ships NFS locking — argued that neither Lockdep nor DEPT needs per-page maps. Lockdep needs one <code>lockdep_map</code> per <em>class</em>; all folio locks could share a global one. Cross-thread hand-off is already expressible:</p>
+<blockquote>
+<p>"If you have some code that takes a lock and then hands it off to another thread, at the hand-off point you call <code>lock_map_release(&amp;the_lock_map)</code> … Somewhere else some other task takes responsibility … That code then calls <code>lock_map_acquire_try(&amp;the_lock_map)</code>."</p>
+</blockquote>
+<blockquote>
+<p>"So you definitely <em>can</em> send lock dependency information between tasks with lockdep. I have only tried it in extremely simple cases … There may be — and probably are — more complexities involved with locking folios and passing them around. Maybe it is so complex that you need all the support that DEPT provides. But I'd like to see a coherent explanation of how the functionality offered by DEPT is clearly better."</p>
+</blockquote>
+<p>That request — a coherent superiority argument, not a stability argument — becomes the week’s refrain.</p>
+<h3>5. Readahead, bios, and two page flags (24 August)</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/3d58eb3c-7a9d-4183-907b-46172664631c@kernel.org/">Hildenbrand</a> mapped Neil’s hand-off onto the actual I/O path: readahead submits I/O and unlocks from interrupt via <code>folio_wake_bit(folio, PG_locked)</code> in <code>folio_end_read()</code>; writeback never unlocks on the I/O path and uses a dedicated flag instead. He repeated:</p>
+<blockquote>
+<p>"Stating that lockdep is stable and should not be destabilized is not really a good argument."</p>
+</blockquote>
+<p><a href="https://lore.kernel.org/linux-nfs/178761465493.3510150.12380729360578969391@noble.neil.brown.name/">Neil</a> then gave the most concrete Lockdep-shaped design of the week. <code>rhashtable</code> bucket bit-spinlocks already share a single <code>lockdep_map</code> — existence proof that one map per lock is unnecessary. A <code>lockdep_map</code> in each <code>struct address_space</code> would be enough for file folios. “Submit the I/O” <em>is</em> a queue (folio → bio → device transmit queue). The hard part is cardinality:</p>
+<blockquote>
+<p>"A small difficulty here is that a bio has multiple folios and they are all locked. I cannot see that lockdep has a concept of holding an arbitrarily large set of related locks.
+We could just tell lockdep 'I have some folios locked' or maybe enhance lockdep to allow 'I have N folios in address-space A with the highest offset being O'."</p>
+</blockquote>
+<p>That last form would let Lockdep accept a later folio lock only if it is the same address space and a higher offset — the writeback/readahead ordering rule Wilcox has been asking for since July. Neil also split the two bits:</p>
+<blockquote>
+<p>"PG_locked and PG_writeback are two different lock-bits with two different meanings. … So these are two separate, though related, lock bits that would both need to be tracked."</p>
+</blockquote>
+<p>And he stated the process doctrine that hanging over v19:</p>
+<blockquote>
+<p>"Replacing one big thing with another big thing is almost always rejected. Incremental development is the preferred approach. So developing something like DEPT to explore and learn and demonstrate a cool idea is great. … But the path from there to upstream acceptance is to take the lessons learned and to apply them one by one to the existing tools."</p>
+</blockquote>
+<h3>6. Wilcox and Neil on what Lockdep should actually be told</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/ao0AieB7zg5FKD39@casper.infradead.org/">Wilcox</a> said Neil’s bio/offset sketch is still too simple, and floated a callback (“I hold this lock, is that lock OK to acquire”), plus the history of the writeback split: before <code>PG_writeback</code>, the kernel held <code>PG_locked</code> throughout writeback; it was split so a page could be mapped into an address space while dirty data was in flight.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/178762929532.3510150.18274428053274599221@noble.neil.brown.name/">Neil</a> declined arbitrary callbacks. Lockdep does not prove locking is correct; it proves the <em>annotations</em> are consistent. The right abstraction is not “this folio” at all:</p>
+<blockquote>
+<p>"We don't want to tell lockdep that we are locking a 'folio'. The particular folio is irrelevant. Rather we want to tell lockdep that we are locking something at a particular offset of some array of folios."</p>
+</blockquote>
+<p><code>vfs_lock_two_folios()</code> is the same pattern as <code>lock_two_nondirectories()</code>: subclasses, plus a white lie when needed. His <code>d_walk()</code> example — drop a subclass, <code>try_lock</code> the primary on the same dentry, walk down the tree — is the NFS-adjacent lesson:</p>
+<blockquote>
+<p>"This example highlights the idea that lockdep doesn't need to know exactly what is going on, it just needs to know about the stuff we want it to check."</p>
+</blockquote>
+<p><a href="https://lore.kernel.org/linux-nfs/7db786d5-5665-44b4-9c1f-a88596be0560@kernel.org/">Hildenbrand</a> endorsed that incremental path as “likely the direction DEPT should take … unless there is something so fundamental different that it cannot possibly be integrated into lockdep.” A side note on readahead (<a href="https://lore.kernel.org/linux-nfs/6bc50779-1daa-4d1f-9374-ef784cd6fc0d@kernel.org/">Hildenbrand</a>) wondered whether a <code>PG_locked</code> → something-else downgrade analogous to writeback’s <code>PG_writeback</code> could exist; he immediately marked it as not a proposal.</p>
+<h3>7. Park’s Friday replies: simultaneous, timestamps, hunting dog</h3>
+<p><a href="https://lore.kernel.org/linux-nfs/20260825121322.GA23086@system.software.com/">Park</a> finally answered Hildenbrand’s configuration question: <strong>DEPT and Lockdep can run at the same time.</strong> False positives are not a conceptual hole:</p>
+<blockquote>
+<p>"It's because of lack of annotations for proper classification. As Willy mentioned, different call paths for various usages should be annotated with different classes throughout the kernel."</p>
+</blockquote>
+<p>On the four options he reached for a counter-metaphor:</p>
+<blockquote>
+<p>"Or it's better to train a unmatured hunting dog than to teach a pet dog, how to hunt, for better hunting, even though the pet dog might eventually become able to."</p>
+</blockquote>
+<p><a href="https://lore.kernel.org/linux-nfs/e0c589d0-d17b-48c2-8e1b-d41b69ecaadc@kernel.org/">Hildenbrand</a> declined the analogy (“I'm not sure whether 'pet dog' is the right analogy to lockdep”), and <a href="https://lore.kernel.org/linux-nfs/20260825131906.GC23086@system.software.com/">Park</a> walked it back:</p>
+<blockquote>
+<p>"Ah. Okay. I will be careful in using terms. I wanted to tell DEPT has its strength, lockdep has its own, and they are different."</p>
+</blockquote>
+<p>To Neil’s hand-off sketch, <a href="https://lore.kernel.org/linux-nfs/20260825130843.GB23086@system.software.com/">Park</a> granted the class-map point and then restated DEPT’s core claim: classes can be global, but DEPT still needs a per-page timestamp so <code>folio_unlock()</code> can be matched to the wait that started on that page. Ownership tracking is not the essence:</p>
+<blockquote>
+<p>"It's certainly useful to track who owns the lock, but the essence, when it comes to deadlock detection, lies elsewhere. DEPT is based on the essence, that is, a deadlock comes from waits that are never awakened."</p>
+</blockquote>
+<blockquote>
+<p>"It's an interesting approach if your goal is to track the owenership, but if the goal is for tracking dependencies.. well.. I'm not sure."</p>
+</blockquote>
+<p>The week ends there: two models of what a deadlock <em>is</em> (never-awakened wait vs. inconsistent annotated acquisition order), no locking-maintainer Ack, no v20.</p>
+<h2>Evolution of the Discussion</h2>
+<p>The arc is <strong>revival → concrete Lockdep design → unresolved dual-engine stance</strong>:</p>
+<ol>
+<li><strong>21 August:</strong> Park answers last week’s two mails, defends a separate wait/event engine, lists three folio classes, and offers I/O-submit-as-event. Hildenbrand enumerates four merge options and prefers a Lockdep retrofit. Neil shows <code>lock_map_release</code> / <code>lock_map_acquire_try</code> as an existing cross-context path.</li>
+<li><strong>24 August:</strong> The discussion leaves the cover-letter FAQ and lands on real I/O: readahead unlock-from-IRQ, bio-sized sets of folio locks, <code>PG_locked</code> vs <code>PG_writeback</code>, and Neil’s process doctrine that big-for-big replacements are rejected.</li>
+<li><strong>25 August:</strong> Wilcox and Neil converge on <em>what to tell Lockdep</em> (address-space + offset, not per-folio objects; subclasses and white lies rather than callbacks). Park confirms simultaneous operation, attributes false positives to missing annotations, and refuses the ownership-hand-off model because DEPT’s essence is waits that never wake.</li>
+</ol>
+<p>No code changed. No locking maintainer spoke on-list. Hildenbrand’s option (4) is the reviewer’s preference; Park’s preference remains a mature separate engine that eventually supersedes only Lockdep’s dependency-checking logic.</p>
+<h2>Significance for NFS Client Development</h2>
+<p>No NFS client patch moved this week. The design fight is still the one that will decide whether DEPT (or a Lockdep extension) is usable on the NFS client:</p>
+<ul>
+<li><strong>Readahead and writeback are the motivating I/O path.</strong> NFS client reads lock folios, submit READ RPCs, and unlock from RPC completion (softirq / workqueue) — Wilcox’s task-acquire / async-release pattern, Hildenbrand’s <code>folio_end_read()</code> path, Neil’s bio-as-queue. A detector that cannot mark the submit point will either scream about every NFS read or miss the “locked but never submitted” hang <code>f2c817bed58d</code> was written to contain.</li>
+<li><strong>Owner-based, range-based classification is the NFS-shaped design.</strong> Wilcox’s “all folios of this inode share locking rules” and Neil’s “N folios in address-space A with highest offset O” both map onto <code>nfsi-&gt;vfs_inode.i_mapping</code>. Park’s current three global classes (mm / block-buffer / regular file cache) are coarser than that; until DEPT (or Lockdep) tracks folio waits at the <code>address_space</code> / filesystem-type / offset level, NFS writeback and readahead reports will mix stale-wgen false positives with same-mapping false negatives.</li>
+<li><strong><code>PG_locked</code> and <code>PG_writeback</code> are two locks.</strong> NFS writeback already lives in the split-flag world Wilcox recounted. Any detector that treats “the folio lock” as one object will mis-model the downgrade.</li>
+<li><strong>The SUNRPC <code>rcu_head</code> relocation is still the only in-tree NFS change</strong>, a compile-time <code>kfree_rcu()</code> accommodation for <code>CONFIG_DEPT</code>, not a runtime client fix. Nothing this week revisits it.</li>
+</ul>
+<h2>Final Conclusions (as of window close)</h2>
+<ul>
+<li>The series is still <strong>v19, still experimental, still without a locking-maintainer Ack</strong>.</li>
+<li>Hildenbrand’s position: four options, prefer retrofit (4) or high-level integration then merge (3→4); dual similar mechanisms will confuse people; the stability argument is not accepted. He does “see value in DEPT.”</li>
+<li>NeilBrown’s position: Lockdep already has class maps, subclasses, and a cross-task hand-off API; folio locks should be described as ranges of an address space, not as per-page objects; the upstream path is incremental lessons applied to Lockdep, not a sibling detector.</li>
+<li>Wilcox’s position: <code>PG_lock</code> hierarchy is an owner property; I/O submit must be annotated; writeback’s <code>PG_locked</code>→<code>PG_writeback</code> split is historical evidence that these are wait/event bits, not mutexes. He did not bless DEPT’s current per-page <code>wgen</code>.</li>
+<li>Park’s position: DEPT and Lockdep can run together; false positives are missing classification annotations, not a conceptual flaw; DEPT still needs a per-page timestamp; deadlock <em>is</em> a wait that is never awakened, which ownership-hand-off Lockdep does not capture; he will publish true reports and work folio classification in follow-ups.</li>
+<li><strong>No merge path, no code change, no NFS client bug fix this week.</strong> The open question is sharper than in July: either DEPT’s wait/event model is taught to Lockdep in pieces (the room’s preference), or Park demonstrates — with real folio-lock reports, not cover-letter FAQs — that the two engines are different enough that a sibling is justified.</li>
+</ul>
+<h2>Key Messages This Week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260821042143.GA40890@system.software.com/">Park: timestamps not full maps; unofficial LPC support; false positives are the issue</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260821045132.GB40890@system.software.com/">Park: three folio classes; annotate I/O submit as the unlock event</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/825134a8-ceae-430c-b2fc-d1d0c7240f39@kernel.org/">Hildenbrand: four merge options, prefer Lockdep retrofit</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178730572084.2852630.7732425311008244683@noble.neil.brown.name/">NeilBrown: <code>lock_map_release</code> / <code>lock_map_acquire_try</code> already express hand-off</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178761465493.3510150.12380729360578969391@noble.neil.brown.name/">NeilBrown: address-space + offset; incremental path; two page flags</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178762929532.3510150.18274428053274599221@noble.neil.brown.name/">NeilBrown: tell Lockdep about ranges, not folios; <code>d_walk()</code> white lie</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260825121322.GA23086@system.software.com/">Park: DEPT and Lockdep can run simultaneously; waits that never wake</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260825130843.GB23086@system.software.com/">Park: per-page timestamp is required; ownership tracking is not the essence</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260821042143.GA40890@system.software.com/">2026-08-21 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — Re: [PATCH v19 00/40] DEPT(DEPendency Tracker)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260821045132.GB40890@system.software.com/">2026-08-21 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — Re: [PATCH v19 00/40] DEPT(DEPendency Tracker)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/f1657724-e7a9-45f6-9aef-af69d3c64a7d@kernel.org/">2026-08-21 "David Hildenbrand (Arm)" <a href="mailto:david@kernel.org">david@kernel.org</a> — Re: [PATCH v19 00/40] DEPT(DEPendency Tracker)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/825134a8-ceae-430c-b2fc-d1d0c7240f39@kernel.org/">2026-08-21 "David Hildenbrand (Arm)" <a href="mailto:david@kernel.org">david@kernel.org</a> — Re: [PATCH v19 00/40] DEPT(DEPendency Tracker)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178730572084.2852630.7732425311008244683@noble.neil.brown.name/">2026-08-21 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v19 00/40] DEPT(DEPendency Tracker)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/3d58eb3c-7a9d-4183-907b-46172664631c@kernel.org/">2026-08-24 "David Hildenbrand (Arm)" <a href="mailto:david@kernel.org">david@kernel.org</a> — Re: [PATCH v19 00/40] DEPT(DEPendency Tracker)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178761465493.3510150.12380729360578969391@noble.neil.brown.name/">2026-08-24 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v19 00/40] DEPT(DEPendency Tracker)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ao0AieB7zg5FKD39@casper.infradead.org/">2026-08-25 Matthew Wilcox <a href="mailto:willy@infradead.org">willy@infradead.org</a> — Re: [PATCH v19 00/40] DEPT(DEPendency Tracker)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178762929532.3510150.18274428053274599221@noble.neil.brown.name/">2026-08-25 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v19 00/40] DEPT(DEPendency Tracker)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/6bc50779-1daa-4d1f-9374-ef784cd6fc0d@kernel.org/">2026-08-25 "David Hildenbrand (Arm)" <a href="mailto:david@kernel.org">david@kernel.org</a> — Re: [PATCH v19 00/40] DEPT(DEPendency Tracker)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/7db786d5-5665-44b4-9c1f-a88596be0560@kernel.org/">2026-08-25 "David Hildenbrand (Arm)" <a href="mailto:david@kernel.org">david@kernel.org</a> — Re: [PATCH v19 00/40] DEPT(DEPendency Tracker)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260825121322.GA23086@system.software.com/">2026-08-25 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — Re: [PATCH v19 00/40] DEPT(DEPendency Tracker)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260825130843.GB23086@system.software.com/">2026-08-25 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — Re: [PATCH v19 00/40] DEPT(DEPendency Tracker)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/e0c589d0-d17b-48c2-8e1b-d41b69ecaadc@kernel.org/">2026-08-25 "David Hildenbrand (Arm)" <a href="mailto:david@kernel.org">david@kernel.org</a> — Re: [PATCH v19 00/40] DEPT(DEPendency Tracker)</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260825131906.GC23086@system.software.com/">2026-08-25 Byungchul Park <a href="mailto:byungchul@sk.com">byungchul@sk.com</a> — Re: [PATCH v19 00/40] DEPT(DEPendency Tracker)</a></li>
+</ul>
+  </main>
+</body>
+</html>

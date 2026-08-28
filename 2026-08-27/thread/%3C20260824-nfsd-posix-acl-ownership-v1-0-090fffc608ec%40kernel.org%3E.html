@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Chuck Lever splits two NFSD COMPOUND teardown bugs for different LTS paths</title>
+  <meta name="description" content="This is a bug-fix series, not a protocol change and not NFS client code. On 24 August, Chuck Lever posted two NFSD patches that repair COMPOUND argument teardown: an unprivileged out-of-bounds read in the rpc_status netlink dump, and a…">
+  <meta property="og:title" content="Chuck Lever splits two NFSD COMPOUND teardown bugs for different LTS paths">
+  <meta property="og:description" content="This is a bug-fix series, not a protocol change and not NFS client code. On 24 August, Chuck Lever posted two NFSD patches that repair COMPOUND argument teardown: an unprivileged out-of-bounds read in the rpc_status netlink dump, and a…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-27T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Chuck Lever splits two NFSD COMPOUND teardown bugs for different LTS paths">
+  <meta name="twitter:description" content="This is a bug-fix series, not a protocol change and not NFS client code. On 24 August, Chuck Lever posted two NFSD patches that repair COMPOUND argument teardown: an unprivileged out-of-bounds read in the rpc_status netlink dump, and a…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-27</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Chuck Lever splits two NFSD COMPOUND teardown bugs for different LTS paths</h1>
+<h2>Summary</h2>
+<h2>Summary</h2>
+<p>This is a <strong>bug-fix</strong> series, not a protocol change and not NFS <strong>client</strong> code. On 24 August, <a href="https://lore.kernel.org/linux-nfs/20260824-nfsd-posix-acl-ownership-v1-0-090fffc608ec@kernel.org/">Chuck Lever</a> posted two NFSD patches that repair COMPOUND argument teardown: an unprivileged out-of-bounds read in the <code>rpc_status</code> netlink dump, and a POSIX ACL leak when a decoded NFSv4 operation never runs. Both defects were originally reported by Prabhakar Pujeri of Dell in a single combined patch; Lever split them because they need different stable routing. There were no replies in this window.</p>
+<p>The client-visible angle is indirect but real. A remote NFSv4 client can force the ACL leak by repeating an aborting COMPOUND, and a local unprivileged user can race the netlink dump against a busy server. Neither patch touches <code>fs/nfs/</code>; both sit in <code>fs/nfsd/</code>.</p>
+<h2>Why they were split</h2>
+<p>Lever’s cover letter is explicit about LTS policy:</p>
+<blockquote>
+<p>"They are split here because they need different LTS routing. The rpc_status dump requires no privilege and is present in a default build. NFSv4 POSIX ACL support is experimental and disabled by default, so the ACL-related fix is mainline-only."</p>
+</blockquote>
+<p>He also rejected two pieces of Pujeri’s original approach after review. On the leak:</p>
+<blockquote>
+<p>"In the original proposed fix, the decoder leaves the only reference to a decoded ACL in the operation's argument structure, and the executing operation transfers that reference to struct nfsd_attrs. This is the root cause of leak, so my proposal is to address that instead."</p>
+</blockquote>
+<p>On the OOB:</p>
+<blockquote>
+<p>"After close review, I determined that the argp-&gt;opcnt assignments address a problem that is currently unreachable. Instead, my fix is to block the OOB buffer read during the rpc_status dump."</p>
+</blockquote>
+<p>That is the whole discussion this week: a maintainer rewrite of a reporter’s combined patch, with no Acked-by or review comments yet.</p>
+<h2>Patch 1/2: unprivileged OOB in <code>rpc_status</code> dump</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260824-nfsd-posix-acl-ownership-v1-1-090fffc608ec@kernel.org/">Patch 1</a> is the one that wants stable. <code>nfsd_nl_rpc_status_get_dumpit()</code> loads <code>args-&gt;opcnt</code> and <code>args-&gt;ops</code> separately, then walks <code>ops[]</code> <em>before</em> rechecking <code>rq_status_counter</code>. If a COMPOUND finishes between those two loads, <code>nfsd4_release_compoundargs()</code> zeroes <code>opcnt</code> and points <code>ops</code> back at the eight-entry inline array. A dump that already sampled an <code>opcnt</code> of 200 clamps it to the sixteen slots in <code>rq_opnum</code> and then indexes <code>iops[0..15]</code>. Because <code>iops</code> is the last member of <code>struct nfsd4_compoundargs</code> and <code>rq_argp</code> is allocated at exactly that size, the walk runs off the end of the allocation. The trailing counter recheck discards the sampled data, but the read has already happened.</p>
+<p>The security note is the reason this is not mainline-only:</p>
+<blockquote>
+<p>"NFSD_CMD_RPC_STATUS_GET carries no GENL_ADMIN_PERM, so an unprivileged local user can repeat the dump against a busy server until it lands in the window."</p>
+</blockquote>
+<p>Lever’s fix samples <code>opcnt</code> and <code>ops</code> into locals, then finishes the counter recheck <em>before</em> dereferencing <code>ops</code>. An unchanged counter means both values came from the same COMPOUND, where <code>opcnt</code> cannot exceed what <code>ops</code> holds. That is a TOCTOU close, not a change to how COMPOUNDs are decoded. Fixes <code>bd9d6a3efa97</code> ("NFSD: add rpc_status netlink support"). One file: <code>fs/nfsd/nfsctl.c</code>.</p>
+<h2>Patch 2/2: POSIX ACL leak on unexecuted COMPOUND ops</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260824-nfsd-posix-acl-ownership-v1-2-090fffc608ec@kernel.org/">Patch 2</a> is the experimental-feature leak. <code>nfsd4_decode_fattr4()</code> allocates POSIX ACLs while decoding <code>OP_OPEN</code>, <code>OP_CREATE</code>, and <code>OP_SETATTR</code>, and leaves the only reference in the operation’s argument structure. Execution hands that reference to <code>struct nfsd_attrs</code>, which drops it. If the op is decoded but never executed, the ACLs leak. Lever’s commit message states the client-triggered DoS plainly:</p>
+<blockquote>
+<p>"A client can repeat an aborting compound to force the server to leak memory."</p>
+</blockquote>
+<p>His ownership model is the opposite of “transfer the only pointer”:</p>
+<blockquote>
+<p>"Give struct nfsd_attrs its own reference with posix_acl_dup() so nfsd_attrs_free() still balances the reference the operation took."</p>
+</blockquote>
+<p>The decoder now records each ACL on the compound’s temporary allocation chain, and each chained item gets an optional release callback. The chain holds a reference for the life of the compound, so <code>OP_OPEN</code> no longer needs an <code>op_release</code> method. Fixes <code>5fc51dfc2eb1</code> ("NFSD: Add support for XDR decoding POSIX draft ACLs"). Tagged <code>Cc: stable+noautosel@kernel.org</code> with the comment “experimental, disabled by default.” Files: <code>fs/nfsd/nfs4proc.c</code>, <code>fs/nfsd/nfs4xdr.c</code>, <code>fs/nfsd/xdr4.h</code>.</p>
+<h2>Client impact, without client patches</h2>
+<p>There is no NFS client development in this thread. The client still matters as the attacker and as the party that sees the fallout:</p>
+<ul>
+<li>A malicious or buggy NFSv4 client that aborts COMPOUNDs after XDR decode (OPEN/CREATE/SETATTR with POSIX draft ACLs) can grow server memory until the export is unusable. That path is off unless the experimental NFSv4 POSIX ACL decoder is enabled.</li>
+<li>A local unprivileged process on the server can spray <code>NFSD_CMD_RPC_STATUS_GET</code> against a busy nfsd and hit the OOB window. That path is on in a default build and needs no CAP_SYS_ADMIN.</li>
+<li>Ordinary NFS mounts do not change protocol, mount options, or client recovery. The client-side takeaway is “do not expect a client workaround”; the server must own teardown.</li>
+</ul>
+<h2>Where things stand</h2>
+<ul>
+<li><strong>Kind of change:</strong> two NFSD bug fixes for COMPOUND argument teardown. No protocol change. No <code>fs/nfs/</code> patches.</li>
+<li><strong>No review this window.</strong> Lever posted the cover letter and both patches; nobody replied.</li>
+<li><strong>Routing is already decided by the author:</strong> patch 1 is the LTS candidate (unprivileged, default-on netlink dump); patch 2 is mainline-only because POSIX draft ACL decode is experimental and off by default.</li>
+<li><strong>Pujeri’s combined patch is superseded, not merged.</strong> Lever kept the reports (<code>Reported-by</code> / <code>Closes</code>) and replaced both proposed fixes with root-cause changes: snapshot-then-recheck for the dump, and a compound-lifetime ACL chain plus <code>posix_acl_dup()</code> for the leak.</li>
+<li><strong>Until this lands,</strong> a busy nfsd remains theoretically OOB-readable via <code>rpc_status</code>, and an aborting client can leak POSIX ACLs on servers that enabled the experimental decoder.</li>
+</ul>
+<p>Until reviewers show up, this is a maintainer-posted split of a reporter’s findings, not a concluded merge.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260824-nfsd-posix-acl-ownership-v1-0-090fffc608ec@kernel.org/">2026-08-24 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 0/2] NFSD: Fixes for NFSv4 COMPOUND argument teardown</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260824-nfsd-posix-acl-ownership-v1-1-090fffc608ec@kernel.org/">2026-08-24 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 1/2] NFSD: Fix out-of-bounds read in the rpc_status dump</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260824-nfsd-posix-acl-ownership-v1-2-090fffc608ec@kernel.org/">2026-08-24 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 2/2] NFSD: Fix POSIX ACL leak in unexecuted NFSv4 COMPOUND operations</a></li>
+</ul>
+  </main>
+</body>
+</html>

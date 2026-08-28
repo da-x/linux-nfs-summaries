@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD POSIX ACL leak in unexecuted compounds</title>
+  <meta name="description" content="This week’s discussion is a server-side memory-leak bug fix in NFSD’s NFSv4 COMPOUND teardown, not a protocol change and not NFS client work. Dell’s Prabhakar Pujeri reported that a remote client can force the server to leak POSIX ACL…">
+  <meta property="og:title" content="NFSD POSIX ACL leak in unexecuted compounds">
+  <meta property="og:description" content="This week’s discussion is a server-side memory-leak bug fix in NFSD’s NFSv4 COMPOUND teardown, not a protocol change and not NFS client work. Dell’s Prabhakar Pujeri reported that a remote client can force the server to leak POSIX ACL…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-27T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSD POSIX ACL leak in unexecuted compounds">
+  <meta name="twitter:description" content="This week’s discussion is a server-side memory-leak bug fix in NFSD’s NFSv4 COMPOUND teardown, not a protocol change and not NFS client work. Dell’s Prabhakar Pujeri reported that a remote client can force the server to leak POSIX ACL…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-27</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD POSIX ACL leak in unexecuted compounds</h1>
+<h2>Summary</h2>
+<p>This week’s discussion is a <strong>server-side memory-leak bug fix</strong> in NFSD’s NFSv4 COMPOUND teardown, not a protocol change and not NFS client work. Dell’s Prabhakar Pujeri reported that a remote client can force the server to leak POSIX ACL objects by sending compounds that decode ACL-bearing operations and then abort before those operations run.</p>
+<h2>The leak</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260823113255.3417-1-prabhakar.pujeri@dell.com/">Pujeri’s patch</a> traces the leak to <code>nfsd4_decode_fattr4()</code>, which allocates POSIX ACLs while decoding <code>OP_OPEN</code>, <code>OP_CREATE</code>, and <code>OP_SETATTR</code>. In the happy path, a processed OPEN drops them from its <code>op_release</code> callback, while CREATE and SETATTR hand ownership to <code>struct nfsd_attrs</code> and clear the pointers. If compound processing stops first, <code>nfsd4_release_compoundargs()</code> frees the operation array without dropping those ACL references.</p>
+<blockquote>
+<p>"If compound processing stops before a decoded ACL-bearing operation, nfsd4_release_compoundargs() frees the operation array without dropping those ACL references. A client can repeat an aborting compound to leak server memory."</p>
+</blockquote>
+<p>The same patch also tightens <code>opcnt</code> handling so the procedure-release callback never walks stale inline entries after a hard XDR decode failure: keep <code>opcnt</code> limited to fully initialized entries on a truncated operation number, and clear it when the dynamic operation array cannot be allocated.</p>
+<p>Pujeri tagged it <code>Fixes: 5fc51dfc2eb1 ("NFSD: Add support for XDR decoding POSIX draft ACLs")</code> and backed the diagnosis with kmemleak:</p>
+<blockquote>
+<p>"An A/B kmemleak test with 512 crafted NFSv4.2 compounds found 347--349 leaked 64-byte ACL objects without this change and none with it. On the rebased kernel, 512 runtime-abort and 512 hard-decode compounds completed without a kmemleak or KASAN report."</p>
+</blockquote>
+<p>The proposed fix was a teardown sweep: release ACLs still attached to decoded operations when compound arguments are destroyed, and clear OPEN’s pointers in its release callback so the final sweep stays idempotent.</p>
+<h2>Maintainer review: two bugs, two patches</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/2805508b-99b1-4bfd-bdd5-cd07ba0789f5@app.fastmail.com/">Chuck Lever</a> accepted the diagnosis and the remote-triggerability, then declined to take the combined patch as-is.</p>
+<blockquote>
+<p>"Thanks for the report. I agree with the diagnosis and its status as triggerable by a remote. After careful review, I have decided to split the work into two patches."</p>
+</blockquote>
+<p>He treated the two <code>opcnt</code> assignments as a separate defect that needs a stable backport, and argued that the ACL leak’s real root cause is pointer ownership, not missing teardown:</p>
+<blockquote>
+<p>"For the ACL half, the underlying issue is that -&gt;set_acl() borrows the caller's reference rather than consuming it. That makes pointer ownership the true root cause, which IMHO needs a different approach than your proposed fix. And, since POSIX ACLs in NFSv4 are experimental and disabled by default, it's something that can be treated as mainline-only; no backport."</p>
+</blockquote>
+<p>He asked for the 512-compound test and said he would post a two-patch series for review.</p>
+<h2>Reporter agrees, then publishes the reproducer</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260827045920.4737-1-prabhakar.pujeri@dell.com/">Pujeri agreed</a> with the split and with treating the ACL half as mainline-only.</p>
+<blockquote>
+<p>"Thanks, the split makes sense, and separating the opcnt fix so it can go to stable on its own is clearly the right call -- it stands independent of the ACL question and is the part with the wider blast radius."</p>
+</blockquote>
+<p>On the ownership question he deferred:</p>
+<blockquote>
+<p>"My sweep in nfsd4_release_compoundargs() cleans up the symptom at teardown; putting the fix at the ownership boundary is the more durable answer, and it makes the release path idempotent by construction rather than by careful pointer-clearing."</p>
+</blockquote>
+<p>He offered a Tested-by against his harness and sketched the attack: decode an ACL-bearing op, then stop the compound before that op executes so the ACL is allocated during decode but never reaches <code>-&gt;set_acl()</code> or <code>op_release()</code>. Unpatched, one ACL leaks per iteration; patched, the slab stays flat.</p>
+<p>Minutes later he <a href="https://lore.kernel.org/linux-nfs/20260827051412.5079-1-prabhakar.pujeri@dell.com/">corrected the runtime-abort shape</a>: the invalid PUTFH comes <em>before</em> the ACL-bearing SETATTR, not after.</p>
+<blockquote>
+<p>"The invalid PUTFH comes before the ACL-bearing SETATTR. The server decodes both operations, allocating the POSIX ACL while decoding SETATTR, then execution stops on the earlier PUTFH before SETATTR runs. Thus the decoded ACL remains owned by compound-argument cleanup."</p>
+</blockquote>
+<p>The exact NFSv4.2 runtime compound is:</p>
+<pre><code>PUTFH(invalid one-byte filehandle)
+SETATTR(FATTR4_WORD2_POSIX_ACCESS_ACL)
+</code></pre>
+<p>The hard-decode case decodes SETATTR, advertises a second operation, and truncates the request before that second operation number. He posted a raw-XDR Python client (default 512 iterations of each mode; <code>--mode runtime</code> or <code>--mode hard-decode</code>) rather than a pynfs case, and offered to convert it if maintainers prefer it live with the existing NFSv4 tests.</p>
+<h2>Where it stands</h2>
+<p>No code from this thread was merged this week. Pujeri is holding his patch and waiting to review Lever’s rewrite. Lever did post that rewrite the next day as a separate series, <code>[PATCH 0/2] NFSD: Fixes for NFSv4 COMPOUND argument teardown</code>, which is outside this thread but is the direct follow-through:</p>
+<ul>
+<li>He split the original report because the two defects need different LTS routing.</li>
+<li>After closer review he decided Pujeri’s <code>argp-&gt;opcnt</code> assignments actually address an <em>unreachable</em> problem; the stable-worthy half is instead an unprivileged out-of-bounds read in <code>nfsd_nl_rpc_status_get_dumpit()</code> (NFSD_CMD_RPC_STATUS_GET has no <code>GENL_ADMIN_PERM</code>).</li>
+<li>For the ACL leak he keeps a compound-lifetime reference by chaining decoded ACLs on the temporary allocation list with an optional release callback, and gives <code>struct nfsd_attrs</code> its own <code>posix_acl_dup()</code> so <code>nfsd_attrs_free()</code> still balances. That removes OPEN’s <code>op_release</code> method. The ACL patch is marked experimental / no autosel for stable.</li>
+</ul>
+<p>Client impact is only as the attacker: a crafted NFSv4.1/4.2 COMPOUND is enough. There is no client-side code change in this thread.</p>
+<p><strong>Conclusion this week:</strong> remote-triggerable NFSD leak confirmed; original combined patch withdrawn in favor of a maintainer rewrite that separates a stable-bound rpc_status OOB from a mainline-only POSIX ACL ownership fix. The reporter’s Python harness is now on-list for that follow-up series.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260823113255.3417-1-prabhakar.pujeri@dell.com/">2026-08-23 prabhakar.pujeri@dell.com — [PATCH] nfsd: release POSIX ACLs of unexecuted compound ops</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/2805508b-99b1-4bfd-bdd5-cd07ba0789f5@app.fastmail.com/">2026-08-23 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH] nfsd: release POSIX ACLs of unexecuted compound ops</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260827045920.4737-1-prabhakar.pujeri@dell.com/">2026-08-27 Prabhakar Pujeri <a href="mailto:prabhakar.pujeri@dell.com">prabhakar.pujeri@dell.com</a> — Re: [PATCH] nfsd: release POSIX ACLs of unexecuted compound ops</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260827051412.5079-1-prabhakar.pujeri@dell.com/">2026-08-27 Prabhakar Pujeri <a href="mailto:prabhakar.pujeri@dell.com">prabhakar.pujeri@dell.com</a> — Re: [PATCH] nfsd: release POSIX ACLs of unexecuted compound ops</a></li>
+</ul>
+  </main>
+</body>
+</html>

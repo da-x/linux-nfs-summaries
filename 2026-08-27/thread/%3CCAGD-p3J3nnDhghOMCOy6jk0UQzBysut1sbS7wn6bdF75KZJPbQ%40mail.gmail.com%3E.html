@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Client sunrpc receive UAF wedges NFS after leaking TCP socket lock</title>
+  <meta name="description" content="This week brought a bug report, not a patch and not a protocol change: Kris Globtrotter described a Linux NFS client crash in the SUNRPC TCP receive path that is fatal rather than merely noisy. An xprtiod worker oopses inside…">
+  <meta property="og:title" content="Client sunrpc receive UAF wedges NFS after leaking TCP socket lock">
+  <meta property="og:description" content="This week brought a bug report, not a patch and not a protocol change: Kris Globtrotter described a Linux NFS client crash in the SUNRPC TCP receive path that is fatal rather than merely noisy. An xprtiod worker oopses inside…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-27T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Client sunrpc receive UAF wedges NFS after leaking TCP socket lock">
+  <meta name="twitter:description" content="This week brought a bug report, not a patch and not a protocol change: Kris Globtrotter described a Linux NFS client crash in the SUNRPC TCP receive path that is fatal rather than merely noisy. An xprtiod worker oopses inside…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-27</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Client sunrpc receive UAF wedges NFS after leaking TCP socket lock</h1>
+<h2>Summary</h2>
+<h1>Client sunrpc receive UAF wedges NFS after leaking TCP socket lock</h1>
+<h2>Summary</h2>
+<p>This week brought a <strong>bug report</strong>, not a patch and not a protocol change: <a href="https://lore.kernel.org/linux-nfs/CAGD-p3J3nnDhghOMCOy6jk0UQzBysut1sbS7wn6bdF75KZJPbQ@mail.gmail.com/">Kris Globtrotter</a> described a Linux NFS <strong>client</strong> crash in the SUNRPC TCP receive path that is fatal rather than merely noisy. An <code>xprtiod</code> worker oopses inside <code>xs_read_stream_request()</code> while copying a reply, then exits still holding the TCP socket lock. Every later RPC piles up on that lock, the client starts logging <code>nfs: server not responding</code> against a live server, and only a reboot restores I/O. There were no replies on the list this week, so the report is still untriaged.</p>
+<h2>What failed</h2>
+<p>The host is a Proxmox VE kernel (<code>7.0.14-12-pve</code>, Ubuntu-7.0.0-31.31 plus later CVE cherry-picks) mounting NFSv4.2 <code>hard</code> from a TrueNAS SCALE in-kernel <code>nfsd</code> guest on the same machine, over a virtio bridge. <code>nconnect</code> is currently off. The workload is a high rate of small RPCs (~1100 concurrent torrents plus media scanners). Five crashes since 8 August, with MTBF now around two days:</p>
+<blockquote>
+<p>"I'm hitting a crash in the sunrpc receive path that leaves the machine permanently unable to do any NFS I/O. Five occurrences since Aug 8, MTBF now around two days."</p>
+</blockquote>
+<p>The oops is a supervisor instruction fetch at address <code>0x8</code> on workqueue <code>xprtiod</code> / <code>xs_stream_data_receive_workfn</code>. The call chain is the stream receive path into the socket:</p>
+<p><code>xs_stream_data_receive_workfn</code> → <code>xs_read_stream</code> → <code>xs_read_stream_request</code> → <code>xs_sock_recvmsg</code> → <code>sock_recvmsg</code> → <code>inet_recvmsg</code> → <code>tcp_recvmsg</code> → <code>tcp_recvmsg_locked</code> → <code>skb_copy_datagram_iter</code> → <code>simple_copy_to_iter</code>, with RIP <code>0x8</code>.</p>
+<p>Globtrotter’s reading is a use-after-free of the <code>rpc_rqst</code> while the reply is copied into the request receive buffer (an indirect call through a NULL struct at offset 8). There is no reproducer beyond “it happens every couple of days under this load.” The same two functions (<code>xs_read_stream</code> and <code>xs_stream_data_receive_workfn</code>) appear in both traces captured so far. The worker also exited with IRQs disabled.</p>
+<h2>Why the crash wedges all NFS traffic</h2>
+<p>The more important client-side consequence is not the oops itself but the lock that dies with the worker. <code>tcp_recvmsg()</code> takes <code>lock_sock()</code> before <code>tcp_recvmsg_locked()</code>, so the dead <code>xprtiod</code> thread still owns the socket. Hours later another <code>rpciod</code> worker is stuck in:</p>
+<p><code>rpc_async_schedule</code> → <code>__rpc_execute</code> → <code>call_transmit</code> → <code>xprt_transmit</code> → <code>xs_tcp_send_request</code> → <code>tcp_sock_set_cork</code> → <code>lock_sock_nested</code> → <code>__lock_sock</code></p>
+<p>Globtrotter’s diagnosis of that hang:</p>
+<blockquote>
+<p>"Waiting on a lock whose owner no longer exists. Every subsequent RPC queues behind it, load climbs past 65, and "nfs: server not responding" appears even though the server is idle and responsive throughout (verified independently on every occurrence). umount -f, remount and service restarts are all futile since the state is in the socket. Only a reboot recovers."</p>
+</blockquote>
+<p>That is a classic client transport-lock leak: the NFS mount’s TCP xprt is permanently unusable because the sock lock is not released on the oops path, and userspace recovery (<code>umount -f</code>, remount, service restart) cannot break a kernel socket lock whose owner is gone.</p>
+<h2>What was ruled out</h2>
+<p>The reporter already tried the usual red herrings:</p>
+<ul>
+<li>Hardware: six hours of <code>stressapptest</code> over 103GB with zero errors and zero corrected ECC.</li>
+<li><code>nconnect</code>: the first occurrence was on a single transport, with the same <code>__lock_sock</code> signature, before <code>nconnect</code> was enabled.</li>
+<li>The server: idle and independently responsive on every occurrence (same-host TrueNAS SCALE VM).</li>
+<li>Taint: <code>P O</code> from ZFS used for <em>local</em> storage. ZFS is not on the crash path (sunrpc + TCP receive only); there is no proprietary GPU driver. Globtrotter acknowledged that taint may still limit how seriously the report is taken and cannot easily run a vanilla kernel, but offered to test patches because the machine reproduces on its own every couple of days.</li>
+</ul>
+<p>First mitigation attempted this week: NFSv4 directory delegations were disabled, with a promise to report back. Full dmesg, mountstats, and <code>sysrq-t</code> were offered for the next occurrence.</p>
+<h2>Where things stand</h2>
+<p>This is an <strong>NFS client / SUNRPC bug report</strong> against the TCP stream receive worker. No maintainer has yet confirmed a use-after-free of <code>rpc_rqst</code>, named a commit, or posted a fix. The operational takeaway for client developers is the combination of:</p>
+<ol>
+<li>a NULL indirect call in <code>xs_read_stream_request()</code> while <code>skb_copy_datagram_iter()</code> fills the request buffer, and</li>
+<li>an <code>xprtiod</code> oops that leaks <code>lock_sock()</code>, after which <code>xs_tcp_send_request()</code> cannot proceed and the whole mount is wedged until reboot.</li>
+</ol>
+<p>Until someone on linux-nfs maps the RIP-at-0x8 to a specific freed object (likely <code>rpc_rqst</code> or its receive <code>xdr_buf</code>/<code>iov_iter</code> ops) and makes the receive worker drop the sock lock on the failure path, this remains an unreproduced-but-repeating production hang for hard NFSv4.2 clients under a high rate of small RPCs.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/CAGD-p3J3nnDhghOMCOy6jk0UQzBysut1sbS7wn6bdF75KZJPbQ@mail.gmail.com/">2026-08-27 Kris Globtrotter — NULL indirect call in xs_read_stream_request, leaked socket lock wedges all NFS traffic</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/CAGD-p3J3nnDhghOMCOy6jk0UQzBysut1sbS7wn6bdF75KZJPbQ@mail.gmail.com/">2026-08-27 Kris Globtrotter <a href="mailto:kris.globtrotter@gmail.com">kris.globtrotter@gmail.com</a> — NULL indirect call in xs_read_stream_request, leaked socket lock wedges all NFS traffic</a></li>
+</ul>
+  </main>
+</body>
+</html>

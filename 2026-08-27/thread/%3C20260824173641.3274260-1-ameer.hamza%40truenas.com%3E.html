@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD session-slot replay race lands in nfsd-testing</title>
+  <meta name="description" content="This week Ameer Hamza posted a server-side bug fix for a regression in NFSD’s NFSv4.1 session reply cache, and Chuck Lever applied it to nfsd-testing the next day. The discussion is not a protocol change and not NFS client code, but the…">
+  <meta property="og:title" content="NFSD session-slot replay race lands in nfsd-testing">
+  <meta property="og:description" content="This week Ameer Hamza posted a server-side bug fix for a regression in NFSD’s NFSv4.1 session reply cache, and Chuck Lever applied it to nfsd-testing the next day. The discussion is not a protocol change and not NFS client code, but the…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-27T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSD session-slot replay race lands in nfsd-testing">
+  <meta name="twitter:description" content="This week Ameer Hamza posted a server-side bug fix for a regression in NFSD’s NFSv4.1 session reply cache, and Chuck Lever applied it to nfsd-testing the next day. The discussion is not a protocol change and not NFS client code, but the…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-27</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD session-slot replay race lands in nfsd-testing</h1>
+<h2>Summary</h2>
+<h1>NFSD session-slot replay race lands in nfsd-testing</h1>
+<h2>Summary</h2>
+<p>This week Ameer Hamza posted a <strong>server-side bug fix</strong> for a regression in NFSD’s NFSv4.1 session reply cache, and Chuck Lever applied it to <code>nfsd-testing</code> the next day. The discussion is not a protocol change and not NFS <strong>client</strong> code, but the crash is triggered by a perfectly legal client behavior: pipelining two copies of a cached SEQUENCE request before reading either reply. That is exactly the retry/replay path NFSv4.1 sessions were designed to support, so the server-side interlock around <code>NFSD4_SLOT_INUSE</code> is the piece that has to hold.</p>
+<p>The thread is short and conclusive. Hamza’s <a href="https://lore.kernel.org/linux-nfs/20260824173641.3274260-1-ameer.hamza@truenas.com/">patch</a> diagnoses a production NULL-pointer panic on 6.12.91, traces it to commit <code>cc028a10a48c</code> (“NFSD: Hoist status code encoding into XDR encoder functions”), and restores the missing “did this request actually claim the slot?” distinction with a new <code>cstate-&gt;slot_owned</code> flag. <a href="https://lore.kernel.org/linux-nfs/178766510748.80442.7476523533813098527.b4-ty@b4/">Chuck Lever</a> accepted it without further review comments:</p>
+<blockquote>
+<p>"Applied to nfsd-testing, thanks!"</p>
+</blockquote>
+<h2>What broke</h2>
+<p><code>nfsd4_sequence()</code> claims a session slot by setting <code>NFSD4_SLOT_INUSE</code> under <code>nn-&gt;client_lock</code>. A reply served from the slot’s DRC does <strong>not</strong> claim it. That distinction used to live only in <code>cstate-&gt;status</code>, which <code>nfsd4_sequence()</code> set to <code>nfserr_replay_cache</code>. Hamza’s commit message is explicit about the subsequent landmine:</p>
+<blockquote>
+<p>"Commit cc028a10a48c ("NFSD: Hoist status code encoding into XDR encoder functions") moved nfsd4_proc_compound()'s cstate-&gt;status assignment below the out: label, and the replay path's goto out was the one path that relied on skipping it. The test in nfsd4_sequence_done() therefore no longer identifies a replay, and every replay now stores its reply and clears NFSD4_SLOT_INUSE as though it owned the slot."</p>
+</blockquote>
+<p><code>NFSD4_SLOT_INUSE</code> is the interlock. <code>check_slot_seqid()</code> rejects every sequence id for a slot that is in use, <strong>before</strong> <code>replay_matches_cache()</code> runs. A replay never sets the flag, so two replays can be in flight on the same slot at once. One thread can then read <code>slot-&gt;sl_cred</code> under <code>nn-&gt;client_lock</code> while the other’s completion frees and rebuilds that credential from the XDR encoder without the lock. Two completions can also collide and <code>put</code> the same <code>group_info</code> twice. <code>free_svc_cred()</code> leaves <code>cr_uid</code>, <code>cr_gid</code>, and <code>cr_flavor</code> intact, so the racing reader sails through every earlier test in <code>same_creds()</code> and then dereferences a NULL <code>cr_group_info</code>.</p>
+<p>Hamza captured the resulting panic from a 6.12.91 production server:</p>
+<blockquote>
+<p>"BUG: kernel NULL pointer dereference, address: 0000000000000004
+CPU: 63 UID: 0 PID: 39015 Comm: nfsd
+RIP: 0010:same_creds+0x38/0xa0 [nfsd]
+[...]
+Kernel panic - not syncing: Fatal exception"</p>
+</blockquote>
+<p>The stack is the classic nfsd compound path: <code>same_creds</code> ← <code>nfsd4_sequence</code> ← <code>nfsd4_proc_compound</code> ← <code>nfsd_dispatch</code>.</p>
+<p>There is a second, newer failure mode. Since v6.14 a live session’s slot table can shrink. <code>nfsd4_sequence()</code> defers that shrink while a slot is in use, but it tests <code>NFSD4_SLOT_INUSE</code>, which a replay does not set. <code>free_session_slots()</code> can therefore <code>kfree()</code> the slot the replay still holds in <code>cstate-&gt;slot</code>. The unowned store of the cached reply then becomes a use-after-free write.</p>
+<p>Hamza reproduced the race on an unmodified tree:</p>
+<blockquote>
+<p>"Reproduced on an unmodified tree with a client that pipelines two copies of a cached request before reading either reply."</p>
+</blockquote>
+<p>That is the NFS <strong>client</strong> angle that matters here. The Linux NFS client (and any other NFSv4.1 client) is allowed to have more than one copy of a SEQUENCE-tagged request in flight when it has not yet seen the reply. The server’s DRC is supposed to serve the cached reply without claiming the slot. After <code>cc028a10a48c</code>, that “serve but do not own” path was indistinguishable from a first-time execution, so the cache itself became racy under client retry.</p>
+<h2>The fix</h2>
+<p>The patch is small: seven insertions in <code>fs/nfsd/nfs4state.c</code> and one new field in <code>fs/nfsd/xdr4.h</code>. Hamza records the claim in <code>cstate-&gt;slot_owned</code> when <code>nfsd4_sequence()</code> accepts a request, and tests that flag in <code>nfsd4_sequence_done()</code>. Only the request that actually claimed the slot updates the cached reply and clears <code>NFSD4_SLOT_INUSE</code>. <code>svc_generic_init_request()</code> zeroes the compound response before each request, so the flag starts clear and does not leak across RPCs.</p>
+<p>The patch is tagged:</p>
+<ul>
+<li><code>Fixes: cc028a10a48c ("NFSD: Hoist status code encoding into XDR encoder functions")</code></li>
+<li><code>Assisted-by: Claude:claude-opus-5</code></li>
+<li><code>Signed-off-by: Ameer Hamza &lt;ameer.hamza@truenas.com&gt;</code></li>
+</ul>
+<p>This is a <strong>bug fix</strong>, not a new feature. It restores the original slot-ownership contract that the XDR-encoder hoist accidentally dropped, rather than changing how NFSv4.1 sessions or the DRC are specified.</p>
+<h2>Outcome this week</h2>
+<p>No design debate, no v2, no NAK. <a href="https://lore.kernel.org/linux-nfs/178766510748.80442.7476523533813098527.b4-ty@b4/">Lever’s b4-ty note</a> on 25 August is the entire follow-up: the patch is in <code>nfsd-testing</code>. There is no SHA in the applied-mail (“no commit info”), so the exact testing-branch commit is not recorded on-list.</p>
+<p>For operators, the practical takeaway is that any 6.12-era (and later) nfsd that inherited the XDR-encoder hoist can panic or UAF when a client retries a cached SEQUENCE while another replay is still completing. The client does not have to be buggy; pipelined retries of a cached request are enough. The server-side <code>slot_owned</code> flag is the intended back-port candidate.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260824173641.3274260-1-ameer.hamza@truenas.com/">2026-08-24 Ameer Hamza — [PATCH] nfsd: don't modify a session slot when replaying its cached reply</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178766510748.80442.7476523533813098527.b4-ty@b4/">2026-08-25 Chuck Lever — Re: [PATCH] nfsd: don't modify a session slot when replaying its cached reply</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260824173641.3274260-1-ameer.hamza@truenas.com/">2026-08-24 Ameer Hamza <a href="mailto:ameer.hamza@truenas.com">ameer.hamza@truenas.com</a> — [PATCH] nfsd: don't modify a session slot when replaying its cached reply</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178766510748.80442.7476523533813098527.b4-ty@b4/">2026-08-25 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH] nfsd: don't modify a session slot when replaying its cached reply</a></li>
+</ul>
+  </main>
+</body>
+</html>

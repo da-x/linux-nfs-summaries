@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd Netlink grace reporting shifts to locks_in_grace()</title>
+  <meta name="description" content="This week’s traffic is a design review of a new nfsd observability feature, not an NFS client bug fix and not a wire-protocol change. Prabhakar Pujeri had posted v1 of “report NFSv4 grace state through Netlink” as patch 1/3 of a series…">
+  <meta property="og:title" content="nfsd Netlink grace reporting shifts to locks_in_grace()">
+  <meta property="og:description" content="This week’s traffic is a design review of a new nfsd observability feature, not an NFS client bug fix and not a wire-protocol change. Prabhakar Pujeri had posted v1 of “report NFSv4 grace state through Netlink” as patch 1/3 of a series…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-27T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd Netlink grace reporting shifts to locks_in_grace()">
+  <meta name="twitter:description" content="This week’s traffic is a design review of a new nfsd observability feature, not an NFS client bug fix and not a wire-protocol change. Prabhakar Pujeri had posted v1 of “report NFSv4 grace state through Netlink” as patch 1/3 of a series…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-27</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd Netlink grace reporting shifts to locks_in_grace()</h1>
+<h2>Summary</h2>
+<p>This week’s traffic is a design review of a <strong>new nfsd observability feature</strong>, not an NFS client bug fix and not a wire-protocol change. <a href="https://lore.kernel.org/linux-nfs/3fd25e2178458fbb44f57f1b0e068c12a6503d17.1787638668.git.prabhakar.pujeri@dell.com/">Prabhakar Pujeri</a> had posted v1 of “report NFSv4 grace state through Netlink” as patch 1/3 of a series that also dumps NFSv4 clients and per-client state usage. The patch adds an in-grace boolean to the existing Generic Netlink <code>threads-get</code> reply so user space can tell a live server that is still in recovery from one that is handing out normal NFSv4 state, without walking nfsdfs. Jeff Layton’s 25 August review (quoted in this week’s follow-up) objected that the v1 attribute only mirrored <code>/proc/fs/nfsd/v4_end_grace</code> and therefore reported <strong>nfsd’s v4 lock manager</strong>, not the system-wide grace period that actually gates file access.</p>
+<h2>Why the attribute exists</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260827045139.4353-1-prabhakar.pujeri@dell.com/">Pujeri’s 27 August reply</a> answered Layton’s “what’s your interest?” with a concrete operational story: a validation harness that bounces the server, drives reclaim from a set of clients, and must know when grace has actually lifted before the next phase. Polling <code>v4_end_grace</code> works, but it is a text interface, it only answers for nfsd’s v4 lock manager, and new nfsd control is moving to netlink. He framed the work as <strong>parity with a retiring interface</strong>, not as new information:</p>
+<blockquote>
+<p>"My interest is in making nfsd's operational state observable to monitoring and validation tooling without parsing nfsdfs."</p>
+</blockquote>
+<p>He then conceded Layton’s semantic critique in full:</p>
+<blockquote>
+<p>"Agreed, and "has the grace period lifted" is the question I actually care about. I mirrored the semantics of /proc/fs/nfsd/v4_end_grace without stopping to ask whether those were the useful semantics to expose in a new interface. They aren't."</p>
+</blockquote>
+<p>Layton had written that “just because the v4 recovery is done does not mean that you will be able to access files,” because overall grace is the <strong>union of NLM and NFSv4</strong> grace periods, and had suggested either returning <code>locks_in_grace()</code> or adding a lockd counterpart so userland could union the two.</p>
+<h2>v2 plan: report the union, not the v4-only flag</h2>
+<p>Pujeri rejected growing lockd. <code>fs/nfs_common/grace.c</code> already exports both halves, and nfsd already calls both helpers:</p>
+<ul>
+<li><code>locks_in_grace()</code> is true while <strong>any</strong> lock manager in the netns is still in grace (the union Layton described).</li>
+<li><code>opens_in_grace()</code> is true only while a manager with <code>-&gt;block_opens</code> is in grace — the NFSv4-and-up case; NLM does not set that flag.</li>
+</ul>
+<p>For v2 he will report <code>locks_in_grace()</code>, which answers “can this server hand out normal locks and opens yet” rather than “is nfsd’s v4 lock manager done.” A second attribute for <code>opens_in_grace()</code> could be added later without touching lockd; userland could then derive the NLM-only case as <code>(locks &amp;&amp; !opens)</code>. He would rather not add that speculatively.</p>
+<p>Two implementation cleanups fall out of the switch, both improvements over v1:</p>
+<ul>
+<li>The <code>#ifdef CONFIG_NFSD_V4</code> and the open-coded <code>nfsd_vers()</code> / <code>NFSD_NET_UP</code> / <code>NFSD_NET_GRACE_ENDED</code> test go away. NFSD selects LOCKD which selects <code>GRACE_PERIOD</code>, so the helper is always available, and a lock manager that is not running simply is not on the grace list.</li>
+<li>The answer stops being a v4-specific value that merely happens to be served from the nfsd netlink family.</li>
+</ul>
+<p>He will rename the attribute and fix the YAML and RST wording so the union semantics are explicit.</p>
+<h2>Where the boolean should live</h2>
+<p>Pujeri also asked whether grace belongs on <code>threads-get</code> at all. That operation otherwise reports configuration; grace is dynamic state. His inclination is to keep <strong>just this boolean</strong> on <code>threads-get</code> for nfsdfs parity, and to grow richer recovery detail — elapsed time, expected vs completed reclaims, whether grace was extended or force-ended — as a <strong>separate operation later</strong> rather than widening <code>threads-get</code>. He offered to start that separate op now if reviewers prefer grace not ride on <code>threads-get</code>.</p>
+<h2>Chuck Lever: do not freeze a server-wide-only ABI</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/1c53950d-66ba-490a-872f-b2318c584d3c@app.fastmail.com/">Chuck Lever</a> did not object to exposing grace, but set a forward-looking constraint on the new API:</p>
+<blockquote>
+<p>"Although NFSD does not yet support putting individual exports in grace, that is an open possibility for handling things like the reboot of a backend NFS server for a re-exported NFS client. I'd like any new API to avoid foreclosing the ability to move exports in and out of grace individually rather than as a single unit."</p>
+</blockquote>
+<p>That is the only in-week maintainer direction beyond Layton’s semantic review. A boolean on <code>threads-get</code> that is documented as <strong>server-wide / netns-wide</strong> is compatible with a later per-export operation; a user-visible contract that “the server is in or out of grace as a single unit” would not be.</p>
+<h2>Client angle and status</h2>
+<p>There is <strong>no NFS client code change</strong> in this thread. The client relevance is operational: the intended consumers are monitoring and a restart/failover harness that drives <strong>client reclaim</strong> and must wait until the server is actually out of grace before asserting that locks and opens succeed. The v1 attribute would have been the wrong signal for that (v4 lock manager done, NLM possibly still blocking). v2’s <code>locks_in_grace()</code> is the value those clients and tests actually need.</p>
+<p><strong>Conclusion this week:</strong> Pujeri accepted the review, will respin v2 around <code>locks_in_grace()</code>, will make the union semantics explicit in the spec, and left open whether the boolean stays on <code>threads-get</code> or becomes its own operation. Lever’s per-export grace warning is unresolved in-thread; no v2 patch landed in this window.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260827045139.4353-1-prabhakar.pujeri@dell.com/">2026-08-27 Prabhakar Pujeri <a href="mailto:prabhakar.pujeri@dell.com">prabhakar.pujeri@dell.com</a> — Re: [PATCH v1 1/3] nfsd: report NFSv4 grace state through Netlink</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/1c53950d-66ba-490a-872f-b2318c584d3c@app.fastmail.com/">2026-08-27 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v1 1/3] nfsd: report NFSv4 grace state through Netlink</a></li>
+</ul>
+  </main>
+</body>
+</html>

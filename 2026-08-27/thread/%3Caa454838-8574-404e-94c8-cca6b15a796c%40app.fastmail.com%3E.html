@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>xprtrdma hang: v3 serializes unmap_sync, Lever R-b</title>
+  <meta name="description" content="This week’s linux-nfs traffic on Tim Menninger’s xprtrdma hang fix is the v3 respin and Chuck Lever’s review-with-nits. The thread remains a bug fix for a client-side FRWR race, not a protocol change: frwr_unmap_sync() can post LOCAL_INV…">
+  <meta property="og:title" content="xprtrdma hang: v3 serializes unmap_sync, Lever R-b">
+  <meta property="og:description" content="This week’s linux-nfs traffic on Tim Menninger’s xprtrdma hang fix is the v3 respin and Chuck Lever’s review-with-nits. The thread remains a bug fix for a client-side FRWR race, not a protocol change: frwr_unmap_sync() can post LOCAL_INV…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-27T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="xprtrdma hang: v3 serializes unmap_sync, Lever R-b">
+  <meta name="twitter:description" content="This week’s linux-nfs traffic on Tim Menninger’s xprtrdma hang fix is the v3 respin and Chuck Lever’s review-with-nits. The thread remains a bug fix for a client-side FRWR race, not a protocol change: frwr_unmap_sync() can post LOCAL_INV…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-27</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>xprtrdma hang: v3 serializes unmap_sync, Lever R-b</h1>
+<h2>Summary</h2>
+<h2>Summary</h2>
+<p>This week’s linux-nfs traffic on Tim Menninger’s xprtrdma hang fix is the v3 respin and Chuck Lever’s review-with-nits. The thread remains a <strong>bug fix</strong> for a client-side FRWR race, not a protocol change: <code>frwr_unmap_sync()</code> can post <code>LOCAL_INV</code> work after <code>rpcrdma_xprt_disconnect()</code> has already drained the QP, then sleep forever on a CQE that never arrives.</p>
+<p>Prior weeks established the hang and the lifetime model. v1 added an inflight counter that Lever rejected as technical debt; v2 dropped that counter, moved the completion onto <code>struct rpcrdma_req</code>, and reused endpoint krefs. Lever then signed off on correctness but asked for comment and layering cleanups. <a href="https://lore.kernel.org/linux-nfs/20260821234827.1560856-1-tmenninger@purestorage.com/">v3</a> is that cleanup series. <a href="https://lore.kernel.org/linux-nfs/9b573eb8-ea13-47bb-a06a-db70d57fc20e@app.fastmail.com/">Lever</a> still wants two small follow-ups, but the hang fix itself now has a <code>Reviewed-by</code>.</p>
+<h2>The race, restated</h2>
+<p>Menninger’s changelog still walks the four-step window that stalls <code>rpciod</code>:</p>
+<ol>
+<li><code>frwr_unmap_sync()</code> samples <code>r_xprt-&gt;rx_ep</code></li>
+<li><code>rpcrdma_xprt_disconnect()</code> drains the QP</li>
+<li><code>frwr_unmap_sync()</code> posts <code>LOCAL_INV</code> WRs after the drain</li>
+<li>No CQE arrives, so <code>wait_for_completion()</code> blocks indefinitely</li>
+</ol>
+<p>The hung task remains:</p>
+<blockquote>
+<p>"Workqueue: rpciod rpc_async_schedule [sunrpc]
+wait_for_completion()
+frwr_unmap_sync()
+xprt_rdma_free()
+xprt_release()"</p>
+</blockquote>
+<p>The same pNFS restart loop is the reproduction: v7.2-rc6 under load with repeated data-server restarts. Without the fix, the hang hit twice in six attempts; with it, 200 cycles stayed clean. The stall has also been seen on v6.8 and v6.18.34. The <code>Fixes:</code> tag stays on <code>e28ce90083f0</code> ("xprtrdma: kmalloc rpcrdma_ep separate from rpcrdma_xprt"), which made <code>rx_ep</code> a separately allocated, kref-managed pointer.</p>
+<p>v3 keeps the v2 mechanics: <code>rx_unmap_rwsem</code> serializes the post-after-drain window; the reader drops the lock before waiting so disconnect can drain submitted work; <code>rl_registered</code> is rechecked after acquiring the rwsem in case disconnect already reset the request; the completion lives on the request, not the MR; the sampled endpoint is held across the wait so disconnect can destroy MRs without a separate active-unmap counter. The async path still needs no extra lock, because Receive-before-Send Queue drain already orders <code>frwr_unmap_async()</code>.</p>
+<h2>v3: comments, encapsulation, and a verbs.c helper</h2>
+<p>The changelog lists the nits Lever asked for after v2:</p>
+<blockquote>
+<p>"Document the sleepable rx_unmap_rwsem locking context in frwr_unmap_sync() and rpcrdma_xprt_disconnect().
+Add rpcrdma_ep_release() so CM ID destruction remains encapsulated in verbs.c; export the endpoint get/release pair instead of get/put.
+Use ep-&gt;re_id-&gt;qp directly while frwr_unmap_sync() holds the rwsem read side.
+Correct rpcrdma_xprt_disconnect() documentation to account for endpoint resources that can outlive the disconnect operation.
+Narrow the rx_unmap_rwsem comment to describe the LOCAL_INV versus QP-drain ordering it provides."</p>
+</blockquote>
+<p>That last point is the lock-comment overclaim from last week: <code>rx_ep</code> is still sampled without this rwsem in a long list of other FRWR and verbs helpers, so the comment now describes only the LOCAL_INV versus QP-drain ordering. Disconnect’s kernel-doc no longer claims the transport is “completely divested of all hardware resources” on return, because a concurrent unmap can keep the endpoint (QP, CQs, PD, CM ID) alive past disconnect. CM ID teardown is no longer open-coded from <code>frwr_ops.c</code>; <code>rpcrdma_ep_release()</code> in <code>verbs.c</code> carries the rule that a last <code>rpcrdma_ep_put()</code> leaves the ID for the caller to destroy.</p>
+<h2>Lever: Reviewed-by, two leftover nits</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/9b573eb8-ea13-47bb-a06a-db70d57fc20e@app.fastmail.com/">Chuck Lever</a> does not reopen the race or the lifetime model. The remaining comments are documentation and one missed call site.</p>
+<p>The new exported helpers still lack kernel-doc, and <code>rpcrdma_ep_put()</code> is now static:</p>
+<blockquote>
+<p>"Nit: The new externally-visible functions need kdoc comments. rpcrdma_ep_put() is now static, so the kdoc comment there can be converted to non-kdoc-style."</p>
+</blockquote>
+<p>Disconnect still open-codes the put-then-destroy idiom that <code>rpcrdma_ep_release()</code> was added to encapsulate:</p>
+<blockquote>
+<p>"Nit: rpcrdma_xprt_disconnect() retains</p>
+<pre><code>if (rpcrdma_ep_put(ep))
+    rdma_destroy_id(id);
+</code></pre>
+<p>but should call the new rpcrdma_ep_release() helper."</p>
+</blockquote>
+<p>He also notes the new block comments are wordy. None of that is a merge blocker:</p>
+<blockquote>
+<p>"The new block comments are wordy, and could be tightened. But no show-stoppers here:</p>
+<p>Reviewed-by: Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a>"</p>
+</blockquote>
+<h2>Status</h2>
+<p>The client-side FRWR unmap/disconnect race is closed on the design Lever asked for: one transport-wide rwsem, existing request and endpoint objects for lifetime, no inflight counter. v3 absorbed last week’s comment and layering nits; this week’s leftover work is kdoc on the new <code>rpcrdma_ep_get()</code> / <code>rpcrdma_ep_release()</code> pair, converting the now-static <code>rpcrdma_ep_put()</code> comment, and routing disconnect through that helper. With Lever’s <code>Reviewed-by</code> on the hang fix itself, the remaining items look like a v4 polish pass rather than another redesign.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260821234827.1560856-1-tmenninger@purestorage.com/">2026-08-21 tmenninger@purestorage.com — [PATCH v3] xprtrdma: serialize unmap_sync with xprt_disconnect</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/9b573eb8-ea13-47bb-a06a-db70d57fc20e@app.fastmail.com/">2026-08-22 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v3] xprtrdma: serialize unmap_sync with xprt_disconnect</a></li>
+</ul>
+  </main>
+</body>
+</html>

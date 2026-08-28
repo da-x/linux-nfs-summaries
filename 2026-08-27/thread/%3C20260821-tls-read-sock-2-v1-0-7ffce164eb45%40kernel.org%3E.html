@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Chuck Lever rewrites svcsock TCP receive around -&gt;read_sock after netdev rejects read_sock_rectype</title>
+  <meta name="description" content="This is a bug-fix plus receive-path rewrite, not an NFS protocol change. Chuck Lever posted a five-patch SUNRPC series that stops using recvmsg() to ingest NFSD TCP records and instead parses the RPC stream with the existing -&gt;read_sock…">
+  <meta property="og:title" content="Chuck Lever rewrites svcsock TCP receive around -&gt;read_sock after netdev rejects read_sock_rectype">
+  <meta property="og:description" content="This is a bug-fix plus receive-path rewrite, not an NFS protocol change. Chuck Lever posted a five-patch SUNRPC series that stops using recvmsg() to ingest NFSD TCP records and instead parses the RPC stream with the existing -&gt;read_sock…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-27T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Chuck Lever rewrites svcsock TCP receive around -&gt;read_sock after netdev rejects read_sock_rectype">
+  <meta name="twitter:description" content="This is a bug-fix plus receive-path rewrite, not an NFS protocol change. Chuck Lever posted a five-patch SUNRPC series that stops using recvmsg() to ingest NFSD TCP records and instead parses the RPC stream with the existing -&gt;read_sock…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-27</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Chuck Lever rewrites svcsock TCP receive around -&gt;read_sock after netdev rejects read_sock_rectype</h1>
+<h2>Summary</h2>
+<p>This is a <strong>bug-fix plus receive-path rewrite</strong>, not an NFS protocol change. <a href="https://lore.kernel.org/linux-nfs/20260821-tls-read-sock-2-v1-0-7ffce164eb45@kernel.org/">Chuck Lever</a> posted a five-patch SUNRPC series that stops using <code>recvmsg()</code> to ingest NFSD TCP records and instead parses the RPC stream with the existing <code>-&gt;read_sock</code> actor. The work is confined to <code>net/sunrpc/svcsock.c</code> (555 lines, +295/−260). There were <strong>no replies this week</strong>.</p>
+<p>The series is the svcsock-only fallback after netdev rejected the generic <code>read_sock_rectype</code> proto op from Lever’s <a href="https://lore.kernel.org/linux-nfs/20260720-tcp-read-sock-v2-0-29545d034f3c@kernel.org/">July net-next v2</a>. That earlier series tried to make TLS control-record delivery unrepresentable as a mixed data/cmsg receive for every in-kernel consumer. This week Lever scopes the same idea to NFSD alone and leaves the NFS <strong>client</strong> (<code>xprtsock</code>), <code>nvmet-tcp</code>, and <code>nvme-tcp</code> for later.</p>
+<h2>Why the rewrite exists</h2>
+<p>kTLS splits a TLS control record across two destinations: the record type arrives in a control-message buffer, while an alert’s level and description land in the caller’s application-data buffer. Every in-kernel consumer therefore builds the same <code>recvmsg()</code> dance: install a cmsg buffer, discover a control record mid-call, take the body from the data buffer, re-issue the receive with a kvec, and rewind the iterator the first copy advanced. Lever’s cover letter is unsparing:</p>
+<blockquote>
+<p>"No consumer has gotten that sequence quite right."</p>
+</blockquote>
+<p>He lists the fallout: <code>tls_alert_recv()</code> read a kvec holding no valid data on the <strong>server</strong> (<code>bee47cb026e7</code>) and, independently, on the <strong>client</strong> (<code>cc5d59081fa2</code>); xprtsock processed only the first cmsg and dropped every record type behind it (<code>9559d2fffd4f</code>); nvmet-tcp and nvme-tcp were built on the same split and never took the corresponding repair. The server-side repair itself left two more defects that stood for a year (<code>dbabcbc9cf46</code>, <code>b6c603a2415f</code>).</p>
+<p>netdev would not take the proto op that would have made that class of bug unrepresentable. Lever therefore:</p>
+<blockquote>
+<p>"Instead, this series fixes the svcsock instance alone. Data records and control records now arrive through separate calls with separate buffers, and no buffer carries both application data and record metadata. The MSG_CTRUNC recovery that bee47cb026e7 installed is removed with the old path. xprtsock, nvmet-tcp, and nvme-tcp are left for future work."</p>
+</blockquote>
+<p>That last sentence is the client-development takeaway for this week: the NFS client still lives on the broken mixed-buffer path. The svcsock conversion is the template, not the client fix.</p>
+<p>Two receive outcomes that used to keep a connection running now close it:</p>
+<ul>
+<li>A handshake record during an established TLS session was drained and the receive retried; svcsock has no handler for a post-handshake handshake record.</li>
+<li><code>-&gt;read_sock</code> stops at an urgent octet and consumes none of it. <code>recvmsg()</code> walked past that octet and cleared the condition, so an RPC stream that carries urgent data can no longer advance once ingested via <code>read_sock</code>.</li>
+</ul>
+<h2>Patch 1: classify without acting</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260821-tls-read-sock-2-v1-1-7ffce164eb45@kernel.org/">Patch 1</a> splits <code>svc_tcp_sock_recv_cmsg()</code> into a receive helper and a policy helper. The old function both received the record at the head of the kTLS queue <strong>and</strong> decided what its content type meant for the transport, so a later caller could not learn a record’s type without also acting on it. The conversion needs a <code>MSG_PEEK</code> classify-before-consume step.</p>
+<p><code>svc_tcp_recv_cmsg()</code> now takes <code>recvmsg()</code> flags and reports octet count, record type, and message flags. Alert policy stays in <code>svc_tcp_sock_recv_cmsg()</code>. A zeroed control buffer replaces the <code>msg_controllen</code> check: an unfilled buffer reports record type zero, so a positive octet count with no record type now returns <code>-EBADMSG</code> instead of a count. The alert parse runs on a second <code>msghdr</code> over the alert buffer, so the copy and the parse share no iterator state. The hand-written rewind from <code>bee47cb026e7</code> ("sunrpc: fix handling of server side tls alerts") is no longer needed.</p>
+<h2>Patch 2: unhandled TLS record types close the transport</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260821-tls-read-sock-2-v1-2-7ffce164eb45@kernel.org/">Patch 2</a> is the first behavioral <strong>bug fix</strong>. The old helper drained a TLS record that was neither an alert nor application data, then returned <code>-EAGAIN</code> so the receive loop retried. That path only runs on an established TLS session. A handshake record there is a post-handshake message, and the server has no handler for one. Draining a KeyUpdate only delays the close: kTLS sets <code>key_update_pending</code> when it decrypts that record, and a later receive returns <code>-EKEYEXPIRED</code>. kTLS flags only a KeyUpdate, so any other post-handshake message disappeared and the connection kept running.</p>
+<p>The new policy returns <code>-EPROTO</code> for an unhandled record type. Any error but <code>-EAGAIN</code> closes the transport. Application data still returns <code>-EAGAIN</code>. Lever notes, with a client-side implication:</p>
+<blockquote>
+<p>"No NFS client is known to send a handshake record on an established connection."</p>
+</blockquote>
+<p>That is a statement of observed client behavior, not a client code change. A future xprtsock conversion will have to decide the same close-vs-drain policy for post-handshake records.</p>
+<h2>Patch 3: flush pages once per complete record</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260821-tls-read-sock-2-v1-3-7ffce164eb45@kernel.org/">Patch 3</a> is a small correctness/performance cleanup that the <code>read_sock</code> conversion needs. <code>svc_tcp_read_msg()</code> flushed destination pages after every receive, so a record that arrived in several pieces was flushed once per piece, and a page spanning two pieces was flushed twice. Nothing reads the message body before the record is complete, so no reader needed the intermediate flushes.</p>
+<p>The flush now happens once from <code>svc_tcp_recvfrom()</code>, after the last fragment has arrived. <code>svc_flush_bvec()</code> and its <code>ARCH_IMPLEMENTS_FLUSH_DCACHE_PAGE</code> guard go away; a plain walk of <code>rq_pages</code> compiles away where <code>flush_dcache_page()</code> is an empty inline.</p>
+<h2>Patch 4: RPC records via -&gt;read_sock</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260821-tls-read-sock-2-v1-4-7ffce164eb45@kernel.org/">Patch 4</a> is the heart of the series. <code>svc_tcp_recvfrom()</code> used to read an RPC record with two <code>recvmsg()</code> calls — four-octet fragment marker, then body. Neither supplied a control-message buffer, so kTLS reported a TLS control record on either one by raising <code>MSG_CTRUNC</code> and delivering nothing. Both receives had to recognize that outcome and hand off to the recovery path <code>bee47cb026e7</code> built. That recovery stays on both receives for as long as one <code>recvmsg()</code> serves data and control alike.</p>
+<p>The new path parses the record stream in a <code>-&gt;read_sock</code> actor. The data path carries no control-message buffer at all. A control record at the head stops <code>-&gt;read_sock</code> short, so <code>svc_tcp_recv_ctrl_record()</code> classifies the head of the receive queue with <code>MSG_PEEK</code> before consuming anything.</p>
+<p>Copying is rewritten to avoid walking a large GRO or kTLS skb once per page:</p>
+<blockquote>
+<p>"skb_copy_bits() walks an skb from its head to reach the copy offset, so an actor that copies a page at a time rewalks a large GRO or kTLS skb once per page. Copy each callback's share of the record into rq_bvec with one skb_copy_datagram_iter() instead."</p>
+</blockquote>
+<p>Fragment accounting is tightened. A non-final fragment carries four octets of marker and may carry no payload. <code>sk_datalen</code> advances only by the payload, so neither a run of empty fragments nor a run of one-octet fragments trips the <code>sv_max_mesg</code> check before <code>desc-&gt;count</code> runs out. Only <code>desc-&gt;count</code> bounded such a run, four or five octets at a time. The patch caps the fragments per socket-lock hold.</p>
+<p>Urgent data becomes a hard close. <code>recvmsg()</code> skipped an urgent octet and cleared the condition, so the old path advanced past it. <code>-&gt;read_sock</code> consumes what precedes the urgent octet and then stops there for good. With no <code>recvmsg()</code> left on the data path, the record stream cannot advance again. Lever’s conclusion:</p>
+<blockquote>
+<p>"An RPC stream carries no urgent data, so close the connection. The read that first reaches the mark returns a positive count, so a zero-length read does not mark the stop. Key the close on an incomplete record."</p>
+</blockquote>
+<p>That is a server-side transport close, not a client bug, but it is the kind of stream-framing edge the xprtsock conversion will have to re-decide when the client moves off <code>recvmsg()</code>.</p>
+<h2>Patch 5: one receive path, no partial LSM coverage</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260821-tls-read-sock-2-v1-5-7ffce164eb45@kernel.org/">Patch 5</a> is a small but sharp <strong>security-observation fix</strong>. After patch 4, <code>svc_tcp_recvfrom()</code> parses the RPC record stream with <code>-&gt;read_sock</code>, which calls neither <code>security_socket_recvmsg()</code> nor the <code>sock:sock_recv_length</code> tracepoint. <code>svc_tcp_recv_cmsg()</code> still went through <code>sock_recvmsg()</code>, so an LSM mediated only the TLS control records on a server socket, and <code>sock:sock_recv_length</code> reported only those. Lever’s verdict:</p>
+<blockquote>
+<p>"Partial coverage is worse than none. It makes the RPC stream look mediated and observed when it is not."</p>
+</blockquote>
+<p>Until the record stream moved to <code>-&gt;read_sock</code>, an LSM saw every octet NFSD read from a TCP socket. An SELinux policy that denies <code>SOCKET__READ</code> to NFSD blocked the receive. After this change no call on the server’s TCP receive path consults an LSM, so that denial has no effect. The patch dispatches <code>-&gt;recvmsg</code> directly (<code>sock_recvmsg_nosec()</code> / <code>INDIRECT_CALL_INET()</code>) so the whole receive path behaves one way. Control records are rare on an established connection, so the extra indirect call on a retpoline build is accepted.</p>
+<p>This is an NFSD-side LSM coverage change, not an NFS client change. A later xprtsock conversion that also switches to <code>-&gt;read_sock</code> will hit the same LSM/tracepoint question on the client socket.</p>
+<h2>NFS client implications</h2>
+<p>No NFS <strong>client</strong> code moves this week. The cover letter is explicit that xprtsock is unfinished work, and the historical client bugs Lever cites (<code>cc5d59081fa2</code> for <code>tls_alert_recv()</code>, <code>9559d2fffd4f</code> for dropped extra cmsgs) remain the reason that conversion still matters. Until xprtsock gets the same split — data records through <code>-&gt;read_sock</code>, control records through a separate buffer, no mixed iterator — a kTLS NFS client still has to get the <code>recvmsg()</code> / cmsg sequence right, and Lever’s position is that no consumer has.</p>
+<p>What this series does give client developers is a working svcsock template after the generic netdev API was rejected:</p>
+<ul>
+<li>Classify a TLS record with <code>MSG_PEEK</code> before consuming it.</li>
+<li>Never put application data and record metadata in the same buffer.</li>
+<li>Close on unhandled post-handshake record types rather than draining them.</li>
+<li>Treat urgent data as a stream that cannot advance under <code>-&gt;read_sock</code>.</li>
+<li>Do not leave an LSM or a tracepoint covering only the control-record side path.</li>
+</ul>
+<h2>Status</h2>
+<p>Posted 2026-08-21, <strong>no review, Acked-by, or merge this window</strong>. The discussion has not evolved past Lever’s own commit messages. The series is the first concrete SUNRPC follow-through after netdev rejected <code>read_sock_rectype</code>; whether reviewers accept closing on handshake records and urgent octets, and whether the LSM bypass in patch 5 needs a wider audit, are open questions for next week. The NFS client conversion is named, not started.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260821-tls-read-sock-2-v1-0-7ffce164eb45@kernel.org/">2026-08-21 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 0/5] SUNRPC: Receive svcsock TCP records with -&gt;read_sock</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260821-tls-read-sock-2-v1-1-7ffce164eb45@kernel.org/">2026-08-21 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 1/5] SUNRPC: Separate the TLS control-record receive from its policy</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260821-tls-read-sock-2-v1-2-7ffce164eb45@kernel.org/">2026-08-21 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 2/5] SUNRPC: Close the transport on an unhandled TLS record type</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260821-tls-read-sock-2-v1-3-7ffce164eb45@kernel.org/">2026-08-21 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 3/5] SUNRPC: Flush a received record's pages once it is complete</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260821-tls-read-sock-2-v1-4-7ffce164eb45@kernel.org/">2026-08-21 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 4/5] SUNRPC: Receive RPC records with -&gt;read_sock</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260821-tls-read-sock-2-v1-5-7ffce164eb45@kernel.org/">2026-08-21 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 5/5] SUNRPC: Bypass sock_recvmsg() for the TLS control-record receive</a></li>
+</ul>
+  </main>
+</body>
+</html>

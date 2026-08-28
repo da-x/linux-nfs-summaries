@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD drops shared NFS trace helpers to unblock xdrgen nfserr.h</title>
+  <meta name="description" content="This is a header-hygiene / preparatory refactor, not a protocol change and not a runtime bug fix. Chuck Lever posted a one-patch series on 27 August that stops NFSD tracing from including include/trace/misc/nfs.h. The goal is to keep…">
+  <meta property="og:title" content="NFSD drops shared NFS trace helpers to unblock xdrgen nfserr.h">
+  <meta property="og:description" content="This is a header-hygiene / preparatory refactor, not a protocol change and not a runtime bug fix. Chuck Lever posted a one-patch series on 27 August that stops NFSD tracing from including include/trace/misc/nfs.h. The goal is to keep…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-27T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSD drops shared NFS trace helpers to unblock xdrgen nfserr.h">
+  <meta name="twitter:description" content="This is a header-hygiene / preparatory refactor, not a protocol change and not a runtime bug fix. Chuck Lever posted a one-patch series on 27 August that stops NFSD tracing from including include/trace/misc/nfs.h. The goal is to keep…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-27</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD drops shared NFS trace helpers to unblock xdrgen nfserr.h</h1>
+<h2>Summary</h2>
+<p>This is a <strong>header-hygiene / preparatory refactor</strong>, not a protocol change and not a runtime bug fix. <a href="https://lore.kernel.org/linux-nfs/20260827185134.197322-1-cel@kernel.org/">Chuck Lever</a> posted a one-patch series on 27 August that stops NFSD tracing from including <code>include/trace/misc/nfs.h</code>. The goal is to keep upcoming xdrgen-generated NFSD status headers from colliding with the client-oriented NFS enumerators that header currently drags in. There were <strong>no replies</strong> in this window.</p>
+<h2>Why the shared trace header is a problem</h2>
+<p>Today <code>fs/nfsd/trace.h</code> pulls in <code>include/trace/misc/nfs.h</code> only because it wants two TRACE_DEFINE_ENUM helpers: <code>show_nfs4_seq4_status()</code> and <code>show_rca_mask()</code>. Lever’s cover letter is blunt about the collateral damage:</p>
+<blockquote>
+<p>"That header pulls in linux/nfs.h, so every NFSD translation unit that reads trace.h also sees the NFS_OK, NFSERR_*, and file-type enumerators."</p>
+</blockquote>
+<p>Those names live in the mixed UAPI <code>enum nfs_stat</code> / file-type tables that both the in-kernel NFS <strong>client</strong> and server have historically treated as a convenient soup of on-the-wire constants. That is the client-development angle this week: the shared tracing helper is a client-side header (<code>include/trace/misc/nfs.h</code>) that NFSD has been using as a shortcut, and that shortcut leaks client UAPI enumerators into every NFSD C file that includes tracing.</p>
+<p>The leak is about to become a hard compile failure. Lever is staging an xdrgen conversion of <code>fs/nfsd/nfserr.h</code>:</p>
+<blockquote>
+<p>"I'm about to switch fs/nfsd/nfserr.h to an xdrgen-generated header, which defines enum nfsstat and enum ftype with those same names. Any translation unit that includes both headers then fails to build with enumerator redefinition errors."</p>
+</blockquote>
+<p>That conversion is the next step after <a href="https://lore.kernel.org/linux-nfs/20260826194444.148243-1-cel@kernel.org/">yesterday’s nfserr respell</a>, which already stopped wrapping version-agnostic <code>NFSERR_*</code> names and imported a dedicated <code>NFS3ERR_*</code> table into the shared <code>linux/nfs3.h</code>. This patch is the tracing counterpart: isolate NFSD’s TRACE_DEFINE_ENUM helpers so the generated <code>enum nfsstat</code> / <code>enum ftype</code> can land without fighting <code>linux/nfs.h</code>.</p>
+<h2>What the patch actually does</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260827185134.197322-1-cel@kernel.org/">NFSD: Replace the use of include/trace/misc/nfs.h</a> is a 67-line diff with a concentrated footprint:</p>
+<ul>
+<li><code>fs/nfsd/trace.h</code>: +44 lines. The two helpers that used to come from the shared header are copied into the NFSD-private tracing header, so server TUs no longer need <code>trace/misc/nfs.h</code> at all.</li>
+<li><code>include/trace/misc/nfs.h</code>: −22 lines. The NFSD-only <code>show_nfs4_seq4_status()</code> and <code>show_rca_mask()</code> definitions are removed from the shared file.</li>
+</ul>
+<p>Lever’s operational conclusion is a one-liner:</p>
+<blockquote>
+<p>"To address this, stop including trace/misc/nfs.h in fs/nfsd/trace.h."</p>
+</blockquote>
+<p>There is no change to NFS wire format, no change to NFSD’s on-the-wire status numbers, and no change to client I/O paths. The TRACE_DEFINE_ENUM pretty-printers that ftrace/perf already use for NFSv4 sequence status bits and recallable-state masks stay available; they just live next to the NFSD events that consume them instead of in a client-shared header that also <code>#include</code>s <code>linux/nfs.h</code>.</p>
+<h2>Client vs. server, and what is <em>not</em> in this patch</h2>
+<ul>
+<li><strong>Kind of change:</strong> preparatory compile-time isolation for xdrgen. No NFS protocol change. No functional bug fix. No client or server I/O path change.</li>
+<li><strong>Client impact this week:</strong> indirect but real. <code>include/trace/misc/nfs.h</code> is a <strong>client-facing</strong> tracing helper. Removing the two NFSD-only macros from it shrinks the shared surface and, more importantly, stops NFSD from transitively including <code>linux/nfs.h</code> via tracing. Client TUs that still include <code>trace/misc/nfs.h</code> for their own events are unaffected; they already wanted those UAPI enumerators. What goes away is the accidental coupling that made every NFSD file that enabled tracing also see <code>NFS_OK</code> / <code>NFSERR_*</code> / file-type names.</li>
+<li><strong>Server impact:</strong> <code>fs/nfsd/trace.h</code> becomes self-contained for the two pretty-printers. After this lands, NFSD tracing no longer depends on the client UAPI header, which is the prerequisite for swapping <code>nfserr.h</code> onto an xdrgen-generated <code>enum nfsstat</code> / <code>enum ftype</code> without enumerator-redefinition build breaks.</li>
+<li><strong>Not included:</strong> the actual xdrgen-generated <code>nfserr.h</code>. Lever only announces that conversion (“I’m about to switch…”). This patch is the tracing unblocker, not the generator change itself.</li>
+<li><strong>Review status:</strong> Lever is the only participant. No Reviewed-by, Acked-by, or nits this window.</li>
+</ul>
+<p>Until reviewers weigh in, the patch sits as unacked infrastructure on the same xdrgen runway as the 26 August nfserr respell: peel NFSD off the mixed <code>linux/nfs.h</code> namespace so generated, spec-based status and file-type enums can replace it without colliding with client tracing helpers.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260827185134.197322-1-cel@kernel.org/">2026-08-27 Chuck Lever — [PATCH] NFSD: Replace the use of include/trace/misc/nfs.h</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260827185134.197322-1-cel@kernel.org/">2026-08-27 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH] NFSD: Replace the use of include/trace/misc/nfs.h</a></li>
+</ul>
+  </main>
+</body>
+</html>

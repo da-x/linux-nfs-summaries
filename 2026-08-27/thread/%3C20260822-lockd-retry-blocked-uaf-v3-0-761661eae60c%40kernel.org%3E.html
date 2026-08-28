@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Chuck Lever splits lockd retry-loop UAF and host-leak races after B_DEAD backfires</title>
+  <meta name="description" content="This is a bug-fix series, not a protocol change and not NFS client work. The defects live in lockd’s NLM server retry loop (nlmsvc_retry_blocked() in fs/lockd/svclock.c): unmounting nfsd while a lock is still blocked can either free a…">
+  <meta property="og:title" content="Chuck Lever splits lockd retry-loop UAF and host-leak races after B_DEAD backfires">
+  <meta property="og:description" content="This is a bug-fix series, not a protocol change and not NFS client work. The defects live in lockd’s NLM server retry loop (nlmsvc_retry_blocked() in fs/lockd/svclock.c): unmounting nfsd while a lock is still blocked can either free a…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-27T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Chuck Lever splits lockd retry-loop UAF and host-leak races after B_DEAD backfires">
+  <meta name="twitter:description" content="This is a bug-fix series, not a protocol change and not NFS client work. The defects live in lockd’s NLM server retry loop (nlmsvc_retry_blocked() in fs/lockd/svclock.c): unmounting nfsd while a lock is still blocked can either free a…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-27</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Chuck Lever splits lockd retry-loop UAF and host-leak races after B_DEAD backfires</h1>
+<h2>Summary</h2>
+<p>This is a <strong>bug-fix</strong> series, not a protocol change and not NFS <strong>client</strong> work. The defects live in lockd’s NLM <em>server</em> retry loop (<code>nlmsvc_retry_blocked()</code> in <code>fs/lockd/svclock.c</code>): unmounting nfsd while a lock is still blocked can either free a block the retry is still using, or let a retry re-queue a block the teardown scan already skipped, pinning an NLM host past namespace destruction. <a href="https://lore.kernel.org/linux-nfs/20260822-lockd-retry-blocked-uaf-v3-0-761661eae60c@kernel.org/">Chuck Lever</a> posted v3 this week after two earlier attempts (v1 on 19 Aug, v2 on 20 Aug) and <a href="https://lore.kernel.org/linux-nfs/40a5b6327dff9aaebb1cf07f75fbed692d4382f6.camel@kernel.org/">Jeff Layton</a> reviewed the cover letter the next day.</p>
+<p>The client-visible fallout is still real even though the code is <code>nlmsvc_*</code>: a KASAN UAF in <code>nlm_async_call()</code> on the lockd kthread, plus a host that outlives its netns so lockd cannot unload. There is no NLM wire-protocol change.</p>
+<h2>Brief recap from last week</h2>
+<p>Shuangpeng Bai reported a KASAN slab-use-after-free in <code>nlm_async_call()</code> on 19 Aug, with a delayed reproducer. The lockd kthread was still walking a block that <code>nlmsvc_traverse_blocks()</code> had already released during <code>lockd_down()</code> / nfsd unmount. Lever’s v1 took an extra block reference across the lock-drop window. sashiko-bot then flagged a second race: holding that reference lets a retry re-insert a block the teardown scan skipped because it was off <code>nlm_blocked</code>. v2 tried to paper over that with a <code>B_DEAD</code> flag so <code>nlmsvc_insert_block()</code> would refuse a retired block. That is the state this week’s v3 walks back.</p>
+<h2>Why v3 exists: B_DEAD frees a live lock</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260822-lockd-retry-blocked-uaf-v3-0-761661eae60c@kernel.org/">Lever’s cover letter</a> is unusually blunt about the v2 misfire. Both races live in the same unlocked window:</p>
+<blockquote>
+<p>"nlmsvc_retry_blocked() is the only path that operates on a block with nlm_blocked_lock dropped. Both defects live in that window. Shuangpeng Bai's KASAN report catches one of them, a block freed while the retry is still using it. sashiko-bot flagged the other while reviewing v1. The retry re-queues a block that the teardown scan has already retired, so the host that block pins is never reaped."</p>
+</blockquote>
+<p>v2’s <code>B_DEAD</code> looked like a clean “do not requeue a dead block” gate. It is not:</p>
+<blockquote>
+<p>"v2 added a B_DEAD flag that makes nlmsvc_insert_block() refuse to queue a retired block. That appeared to repair the second race, but it doesn't work. Every caller relies on that insert to take the list reference, so a refused insert lets nlmsvc_grant_blocked() drop the last reference to a block whose file_lock the VFS still has queued on a blocker."</p>
+</blockquote>
+<p>That is the important lockd invariant: <code>nlmsvc_insert_block()</code> is not just a list splice. It is how a grant attempt takes the list reference that keeps the <code>nlm_block</code> (and the VFS <code>file_lock</code> still sitting on a blocker) alive. Refusing the insert under <code>B_DEAD</code> turns a host leak into a use-after-free of a <em>live</em> lock. v3 therefore drops <code>B_DEAD</code> entirely.</p>
+<p>The series is also split on purpose. Patch 1 is the extra block reference alone and “applies without patch 2, so it can be backported on its own.” Patch 2 “is meant for mainline only. The race it closes leaks a host, and closing it widens the f_mutex hold across the retry loop.”</p>
+<h2>Patch 1: keep the block alive across the lock-drop window</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260822-lockd-retry-blocked-uaf-v3-1-761661eae60c@kernel.org/">Patch 1</a> is a two-line change in <code>nlmsvc_retry_blocked()</code>. The function peeks at the head of <code>nlm_blocked</code> under <code>nlm_blocked_lock</code>, then drops that lock before calling <code>nlmsvc_grant_blocked()</code> or <code>retry_deferred_block()</code>. Until this patch, the list membership was the only reference keeping the block (and the <code>nlm_rqst</code> hanging off it) alive. <code>nlmsvc_grant_blocked()</code> does take its own reference, but only <em>after</em> the lock is gone. Concurrent nfsd unmount walks <code>nlmsvc_traverse_blocks()</code> → <code>nlmsvc_release_block()</code> and frees the object under the retry’s feet.</p>
+<p>The KASAN trace Lever quotes is Bai’s original report:</p>
+<blockquote>
+<p>"BUG: KASAN: slab-use-after-free in nlm_async_call+0xd6/0x230
+Read of size 8 at addr ffff88811b04c808 by task lockd/8377
+nlm_async_call+0xd6/0x230
+nlmsvc_retry_blocked+0x61c/0x800
+lockd+0x144/0x1c0
+Freed by task 8392:
+nlmsvc_release_block+0x231/0x290
+nlmsvc_traverse_blocks+0x139/0x1b0
+...
+lockd_down+0xd5/0x1c0"</p>
+</blockquote>
+<p>The fix is the obvious one: <code>nlmsvc_get_block()</code> before dropping <code>nlm_blocked_lock</code>, <code>nlmsvc_release_block()</code> after the retry returns. <code>Fixes: 0e4ac9d93515 ("lockd: handle fl_grant callbacks")</code> — the fl_grant work that first made this retry loop drop the list lock. Reported-by Bai, Closes his KASAN thread.</p>
+<h2>Patch 2: serialize retry against traverse with f_mutex</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260822-lockd-retry-blocked-uaf-v3-2-761661eae60c@kernel.org/">Patch 2</a> attacks the host leak that <code>B_DEAD</code> failed to close. <code>nlmsvc_grant_blocked()</code> unlinks the block from <code>nlm_blocked</code> for the duration of a lock retry, then re-inserts it. <code>nlmsvc_traverse_blocks()</code> skips anything not currently on that list. Interleave those two and the scan walks past a block that the retry then puts back. The resurrected block pins its host; lockd warns that it could not shut down the host module, and the host outlives <code>host-&gt;net</code>.</p>
+<p>v3’s answer is mutex ordering, not a new flag:</p>
+<blockquote>
+<p>"Hold the file's f_mutex across the retry, and extend the scan's hold across its unlink, so a scan and a retry of the same file can no longer interleave. Drop the mutex before releasing a block reference, since the last put takes f_mutex. A retry that waited out a scan re-checks under nlm_blocked_lock that its block is still queued and due."</p>
+</blockquote>
+<p>Two details matter for anyone backporting or reviewing lockd locking:</p>
+<ul>
+<li>The last <code>nlmsvc_release_block()</code> already takes <code>f_mutex</code>. Holding <code>f_mutex</code> across that put would deadlock, so the retry drops the mutex first.</li>
+<li>After waiting out a scan, the retry cannot assume the block is still the one it picked. It re-checks under <code>nlm_blocked_lock</code> that the block is still queued and due before calling the grant/deferred helpers.</li>
+</ul>
+<p>Reported-by sashiko-bot, Closes the v1 sashiko review. This is the mainline-only half: a leak, not a UAF, and it lengthens the <code>f_mutex</code> critical section around the retry.</p>
+<h2>Layton’s review, and where the series sits</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/40a5b6327dff9aaebb1cf07f75fbed692d4382f6.camel@kernel.org/">Jeff Layton</a> replied the next day with a cover-letter-level:</p>
+<blockquote>
+<p>"Reviewed-by: Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a>"</p>
+</blockquote>
+<p>No nits on the split, the dropped <code>B_DEAD</code> flag, or the <code>f_mutex</code> widening. There is no Acked-by from other lockd regulars in this window, and no merge notice yet.</p>
+<h2>Why this still matters to NFS</h2>
+<ul>
+<li><strong>Kind of change:</strong> two lockd <em>server</em> teardown races. Not an NFS protocol change. Not NFS client (<code>nlmclnt_*</code> / <code>fs/nfs</code>) code, despite lockd sitting under the NFS umbrella.</li>
+<li><strong>The UAF is the backportable piece.</strong> Patch 1 is two lines, applies alone, and matches Bai’s KASAN stack (<code>nlm_async_call</code> from the lockd kthread vs. <code>nlmsvc_release_block</code> from <code>lockd_down</code>). That is the important crash fix.</li>
+<li><strong>The host leak is mainline-only by design.</strong> Patch 2 serializes retry against <code>nlmsvc_traverse_blocks()</code> with <code>f_mutex</code> because a refused insert (v2’s <code>B_DEAD</code>) can free a block whose <code>file_lock</code> the VFS still owns.</li>
+<li><strong>Status this week:</strong> v3 posted 23 Aug, Layton Reviewed-by 24 Aug. No further comments, no v4, no indication it is in nfs-next yet.</li>
+</ul>
+<p>Until patch 1 lands in stable and patch 2 in mainline, nfsd unmount while NLM locks are blocked remains a KASAN UAF on the lockd thread and a host that can outlive its network namespace.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260822-lockd-retry-blocked-uaf-v3-1-761661eae60c@kernel.org/">2026-08-23 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 1/2] lockd: Fix use-after-free in nlmsvc_retry_blocked</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260822-lockd-retry-blocked-uaf-v3-0-761661eae60c@kernel.org/">2026-08-23 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 0/2] lockd: Fix two teardown races in the block retry loop</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260822-lockd-retry-blocked-uaf-v3-2-761661eae60c@kernel.org/">2026-08-23 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v3 2/2] lockd: Serialize block retries against host teardown</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/40a5b6327dff9aaebb1cf07f75fbed692d4382f6.camel@kernel.org/">2026-08-24 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v3 0/2] lockd: Fix two teardown races in the block retry loop</a></li>
+</ul>
+  </main>
+</body>
+</html>

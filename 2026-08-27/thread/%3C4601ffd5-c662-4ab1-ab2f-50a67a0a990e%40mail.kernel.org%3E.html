@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Stepien bows out; Layton eyes userland rpcbind</title>
+  <meta name="description" content="This week the syzbot-AI patch for nfsd_nl_listener_set_doit() effectively died as a merge candidate, and the durable fix shifted from “make kernel rpcbind asynchronous” to moving most rpcbind registration into userland — a netlink protocol…">
+  <meta property="og:title" content="Stepien bows out; Layton eyes userland rpcbind">
+  <meta property="og:description" content="This week the syzbot-AI patch for nfsd_nl_listener_set_doit() effectively died as a merge candidate, and the durable fix shifted from “make kernel rpcbind asynchronous” to moving most rpcbind registration into userland — a netlink protocol…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-27T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Stepien bows out; Layton eyes userland rpcbind">
+  <meta name="twitter:description" content="This week the syzbot-AI patch for nfsd_nl_listener_set_doit() effectively died as a merge candidate, and the durable fix shifted from “make kernel rpcbind asynchronous” to moving most rpcbind registration into userland — a netlink protocol…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-27</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Stepien bows out; Layton eyes userland rpcbind</h1>
+<h2>Summary</h2>
+<h1>Stepien bows out of the hung-task patch; Layton now wants rpcbind in userland</h1>
+<h2>Summary</h2>
+<p>This week the syzbot-AI patch for <code>nfsd_nl_listener_set_doit()</code> effectively died as a merge candidate, and the durable fix shifted from “make kernel rpcbind asynchronous” to <strong>moving most rpcbind registration into userland</strong> — a netlink protocol rev with no timeline.</p>
+<p>This is still a <strong>server-side hung-task / DoS bug-fix</strong> thread, not NFS client code. The hang lives in the nfsd generic-netlink control plane (<code>nfsd_nl_listener_set_doit()</code> holding <code>nfsd_mutex</code> while talking to local rpcbind). By Sunday, though, <a href="https://lore.kernel.org/linux-nfs/15f03f6f3c8a3b0f1d68fcf376fb082e1b4dbc5d.camel@kernel.org/">Jeff Layton</a> was describing the long-term work as a <strong>protocol change</strong>: rev the nfsd netlink API so userland does the rpcbind SET/UNSET. Until that lands, NFSv2/v3 clients keep depending on a kernel path that can stall the entire nfsd admin lock, and syzbot will keep filing hung-task reports.</p>
+<h2>Brief recap from last week</h2>
+<p>On 20 August, syzbot posted an AI-generated patch from Slawomir Stepien that blamed sequential <code>request_module()</code> calls under <code>nfsd_mutex</code> and proposed a 128-listener cap plus break-on-create-failure. <a href="https://lore.kernel.org/linux-nfs/699bacb503758fbe2ebf01f3e8aca95e3eee4128.camel@kernel.org/">Layton</a> rejected that root cause the same morning: module upcalls are fast; the stall is <strong>synchronous rpcbind registration</strong> (a local <code>rpc_ping</code> that can sit for tens of seconds when rpcbind is down). He pointed at his already-posted <a href="https://lore.kernel.org/linux-nfs/20260811-nfsd-nl-hang-v2-0-c0c92b3953c3@kernel.org/">nfsd-nl-hang v2 series</a> for the short-term cap/timeout/extack work, and invited help on the bigger project: make registration asynchronous and non-fatal.</p>
+<h2>This week: the author declines, the plan changes</h2>
+<p>On Sunday, <a href="https://lore.kernel.org/linux-nfs/aotXzLmrd-B89YRg@nr200/">Stepien</a> replied as the human signer of the AI patch. He accepted Layton’s diagnosis without argument:</p>
+<blockquote>
+<p>"Oh, OK. Thanks for clearing that up!"</p>
+</blockquote>
+<p>He then explicitly declined the follow-on that Layton had floated — asynchronous, non-fatal rpcbind so it no longer runs under <code>nfsd_mutex</code>:</p>
+<blockquote>
+<p>"I think I'm not that good to do it correctly and in some reasonable time. I might take a 2nd look at this and understand the root cause (also, based on your comments in your series) but I think in the end it might be too hard for me."</p>
+</blockquote>
+<p>He praised the hardening series (“Nice series, I've learnt something from it!”) and said he would watch for v3. There is no v2 of the syzbot patch, no Fixes: applied, and no Acked-by. The 128-cap / break-on-error AI change remains <strong>superseded</strong> by Layton’s in-flight series (which uses a 1024 cap, pre-mutex transport-name checks, a 1s local rpcbind timeout, and richer extack).</p>
+<p>Monday, <a href="https://lore.kernel.org/linux-nfs/15f03f6f3c8a3b0f1d68fcf376fb082e1b4dbc5d.camel@kernel.org/">Layton</a> did not push Stepien to take the kernel-side async work. After talking to Chuck Lever, he <strong>changed the long-term design</strong>:</p>
+<blockquote>
+<p>"Fair enough. It's a non-trivial project, and after some discussion with Chuck, I'm leaning toward moving most of the rpcbind registration into userland. That'll mean having to rev the netlink protocol, etc."</p>
+</blockquote>
+<p>That is a larger scope than last week’s “make <code>svc_register()</code> async in the kernel.” Kernel nfsd would still create listeners, but advertising <code>[program, version, proto, port]</code> to local rpcbind — the path NFSv2/v3 clients use for <code>getport</code> — would become a userspace job via an updated nfsd netlink command set. He was also clear that this is not imminent:</p>
+<blockquote>
+<p>"Right now, I don't have a timeline for working on this, so we're probably just going to have to suffer with more syzbot reports until that can come to fruition."</p>
+</blockquote>
+<p>So the near-term posture is <strong>live with the hung-task reports</strong>. The nfsd-nl-hang series can shorten the rpcbind wait and stop treating registration failure as fatal for NFSv2/v3, but it cannot remove the synchronous call from under <code>nfsd_mutex</code>. Until userland registration exists, a slow or missing rpcbind can still pin the global nfsd lock long enough for the watchdog.</p>
+<h2>NFS client relevance</h2>
+<p>No client patches land here, but the stall and the proposed protocol rev are client-visible:</p>
+<ol>
+<li><strong>Control-plane stall for every client.</strong> While <code>listener_set</code> holds <code>nfsd_mutex</code>, other nfsd netlink and <code>/proc/fs/nfsd</code> writes block — versions, threads, exports, cache flush. New listeners do not come up; admin ops that mounts depend on sit in D state until the hung-task watchdog fires. That hits NFSv4 clients as well as v2/v3, because they still need the listener and a live control plane even though they never talk to rpcbind.</li>
+<li><strong>rpcbind is how NFSv2/v3 clients find the server.</strong> Last week’s plan (async, non-fatal kernel registration) would have let a v2/v3 listener come up even when rpcbind was down; clients would then fail at mount/<code>getport</code> until the admin noticed printk/extack, rather than wedging nfsd. This week’s plan — <strong>userland registration plus a netlink rev</strong> — pushes that advertisement out of the kernel entirely. That is better isolation for the mutex, but it means nfs-utils (or equivalent) must SET/UNSET with rpcbind, and older netlink userspace will not know the new commands until the protocol is revved and tools catch up.</li>
+<li><strong>No timeline means more client-visible hung tasks.</strong> Layton’s closing line is that syzbot reports will continue. Operators of mixed v2/v3/v4 farms should treat a wedged <code>nfsd_nl_listener_set_doit</code> as “rpcbind is slow or dead,” not as a transport-module load storm.</li>
+</ol>
+<h2>Status</h2>
+<ul>
+<li><strong>Type:</strong> bug-fix / hung-task hardening around <code>nfsd_nl_listener_set_doit()</code>, now pointing at a <strong>future nfsd netlink protocol change</strong> (userland rpcbind).</li>
+<li><strong>This week’s outcome:</strong> Stepien will not pursue async kernel rpcbind. Layton, with Chuck, prefers moving registration to userland and has <strong>no schedule</strong>. The AI patch is abandoned. Short-term mitigation remains the nfsd-nl-hang series; expect further syzbot hung-task mail until the userland work exists.</li>
+<li><strong>Not merged:</strong> no Acked-by, no Fixes: applied, no v2 of the syzbot patch.</li>
+</ul>
+<h2>Key messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/aotXzLmrd-B89YRg@nr200/">Slawomir Stepien — accepts the rpcbind diagnosis; declines the async-registration project</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/15f03f6f3c8a3b0f1d68fcf376fb082e1b4dbc5d.camel@kernel.org/">Jeff Layton — after talking to Chuck, lean toward userland rpcbind and a netlink rev; no timeline</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/aotXzLmrd-B89YRg@nr200/">2026-08-23 Slawomir Stepien <a href="mailto:sst@poczta.fm">sst@poczta.fm</a> — Re: [PATCH] nfsd: prevent hung task in nfsd_nl_listener_set_doit()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/15f03f6f3c8a3b0f1d68fcf376fb082e1b4dbc5d.camel@kernel.org/">2026-08-24 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH] nfsd: prevent hung task in nfsd_nl_listener_set_doit()</a></li>
+</ul>
+  </main>
+</body>
+</html>

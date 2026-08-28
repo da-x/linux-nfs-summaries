@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Dell posts pNFS GETDEVICEINFO decoder hardening with KUnit coverage</title>
+  <meta name="description" content="This is a bug-fix / hardening series for the NFS client pNFS device-address decoders, not a protocol change and not a new layout feature. On 23 August, Prabhakar Pujeri of Dell posted a four-patch series that tightens how the client…">
+  <meta property="og:title" content="Dell posts pNFS GETDEVICEINFO decoder hardening with KUnit coverage">
+  <meta property="og:description" content="This is a bug-fix / hardening series for the NFS client pNFS device-address decoders, not a protocol change and not a new layout feature. On 23 August, Prabhakar Pujeri of Dell posted a four-patch series that tightens how the client…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-27T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Dell posts pNFS GETDEVICEINFO decoder hardening with KUnit coverage">
+  <meta name="twitter:description" content="This is a bug-fix / hardening series for the NFS client pNFS device-address decoders, not a protocol change and not a new layout feature. On 23 August, Prabhakar Pujeri of Dell posted a four-patch series that tightens how the client…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-27</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Dell posts pNFS GETDEVICEINFO decoder hardening with KUnit coverage</h1>
+<h2>Summary</h2>
+<h2>Summary</h2>
+<p>This is a <strong>bug-fix / hardening</strong> series for the <strong>NFS client</strong> pNFS device-address decoders, not a protocol change and not a new layout feature. On 23 August, <a href="https://lore.kernel.org/linux-nfs/20260823114244.3883-1-prabhakar.pujeri@dell.com/">Prabhakar Pujeri</a> of Dell posted a four-patch series that tightens how the client consumes server-supplied <code>GETDEVICEINFO</code> payloads: malformed universal-address port octets, and unbounded multipath address counts that can spin the decoder for billions of iterations once the XDR stream is exhausted. The series is based on linux-next commit <code>10f307e525a1</code> (<code>next-20260821</code>). There were <strong>no replies this week</strong>; the patches sit unreviewed on the list.</p>
+<p>Pujeri’s cover letter states the threat model in one paragraph:</p>
+<blockquote>
+<p>"pNFS GETDEVICEINFO replies contain server-provided universal addresses and multipath counts. The current decoders accept malformed port octets and can spend billions of iterations on a count that is not bounded by the reply length."</p>
+</blockquote>
+<p>All three functional patches carry <code>Fixes:</code> tags and <code>Cc: stable@vger.kernel.org</code>, so the intent is a backportable client-side robustness fix rather than a new pNFS capability.</p>
+<h2>Why the client decoder is the story</h2>
+<p>pNFS file layout and flexfiles both learn data-server endpoints from <code>GETDEVICEINFO</code>. The shared helper <code>nfs4_decode_mp_ds_addr()</code> turns a server-provided <code>netaddr4</code> (netid plus universal address, including two decimal port octets) into a socket address. The layout drivers then loop over a server-chosen multipath count. That count is a <code>u32</code>; once XDR is exhausted the decoder returns <code>NULL</code> <strong>without consuming input</strong>, so a malicious or truncated reply can keep the client in a kernel-context loop until the count wraps. That is a classic untrusted-XDR bug on the <strong>client</strong> path, not a server-side layout issue.</p>
+<p>Pujeri did not have a pNFS-capable server for this posting. He exercised the decoder directly with new KUnit suites and ran ordinary NFSv3/v4.1/v4.2 data, locking, and parallel workloads plus ACL and xattr checks on a Dell PowerEdge R660:</p>
+<blockquote>
+<p>"No pNFS-capable server was available, so the affected decoder paths were exercised directly by KUnit."</p>
+</blockquote>
+<p>The pNFS decoder suite passed 16/16, the flexfiles suite 3/3, with an empty kmemleak scan. The series builds with GCC and Clang <code>W=1</code> and Sparse <code>C=2</code>.</p>
+<h2>Patch 1: stop trusting sscanf() on port octets</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260823114244.3883-2-prabhakar.pujeri@dell.com/">Patch 1</a> rewrites the port parse in <code>nfs4_decode_mp_ds_addr()</code> (<code>fs/nfs/pnfs_nfs.c</code>). The existing code used an unchecked <code>sscanf()</code> on the two decimal port octets of the universal address. Pujeri’s diagnosis is that a missing or non-numeric field leaves part of a temporary array uninitialized, while values outside the octet range are silently folded into the resulting port.</p>
+<p>The replacement splits the two port fields at their delimiters and parses each with <code>kstrtou8()</code>. That rejects missing fields, trailing garbage, integer overflow, and values outside 0–255 <strong>before</strong> the data-server socket address is constructed.</p>
+<blockquote>
+<p>"Split the two port fields at their delimiters and parse each with kstrtou8(). This rejects missing fields, trailing garbage, integer overflow, and values outside 0 through 255 before constructing the data server socket address."</p>
+</blockquote>
+<p><code>Fixes: 6b7f3cf96364 ("nfs41: pull decode_ds_addr from file layout to generic pnfs")</code> — this is the generic pNFS helper, so both file layout and flexfiles inherit the stricter parse.</p>
+<h2>Patches 2 and 3: bound multipath loops by remaining XDR, not U32_MAX</h2>
+<p>The more serious client bug is the unbounded multipath loop. <a href="https://lore.kernel.org/linux-nfs/20260823114244.3883-3-prabhakar.pujeri@dell.com/">Patch 2</a> hits file layout (<code>nfs4_fl_alloc_deviceid_node()</code>). That function already bounds the number of data-server <strong>multipath lists</strong>, but not the number of addresses <strong>inside</strong> each list. The inner count is server-supplied and can be <code>U32_MAX</code>.</p>
+<blockquote>
+<p>"Once the XDR stream is exhausted, nfs4_decode_mp_ds_addr() returns NULL without consuming input. The enclosing loop can therefore spin for billions of iterations in kernel context when decoding a malicious GETDEVICEINFO response."</p>
+</blockquote>
+<p>The chosen bound is not an arbitrary protocol cap. A <code>netaddr4</code> needs at least the two XDR length words for its netid and universal-address strings. The decoder now rejects a count that cannot fit that minimum representation in the remaining XDR stream, so the loop is proportional to reply length. The existing file-layout multipath-<strong>list</strong> limit stays, because it is tied to the <code>u8</code> stripe-index representation. A small helper is added in <code>fs/nfs/pnfs.h</code> so flexfiles can reuse the same check.</p>
+<p><code>Fixes: 14f9a6076f53 ("NFS: Parse and store all multipath DS addresses")</code>.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260823114244.3883-4-prabhakar.pujeri@dell.com/">Patch 3</a> applies the same remaining-XDR bound to flexfiles (<code>nfs4_ff_alloc_deviceid_node()</code>), which previously did not validate the multipath address count at all. Same failure mode: <code>nfs4_decode_mp_ds_addr()</code> returns <code>NULL</code> without consuming input, so a count near <code>U32_MAX</code> can spin the client in kernel context.</p>
+<blockquote>
+<p>"This makes the loop bound proportional to the reply length without imposing an arbitrary protocol limit, matching the protection in the file-layout decoder."</p>
+</blockquote>
+<p><code>Fixes: d67ae825a59d ("pnfs/flexfiles: Add the FlexFile Layout Driver")</code>. Together, patches 2 and 3 close the same class of bug on both layout drivers that share the generic decoder.</p>
+<h2>Patch 4: KUnit for the decoder, not just a live pNFS server</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260823114244.3883-5-prabhakar.pujeri@dell.com/">Patch 4</a> is the test investment that makes the first three patches reviewable without a pNFS MDS. It adds page-backed XDR tests for <code>nfs4_decode_mp_ds_addr()</code> covering valid IPv4 and IPv6 universal addresses, boundary port values, missing fields, non-numeric fields, out-of-range values, integer overflow, and trailing garbage (<code>fs/nfs/tests/pnfs_decode_kunit.c</code>). A separate flexfiles <code>GETDEVICEINFO</code> module (<code>fs/nfs/flexfilelayout/tests/deviceid_kunit.c</code>) exercises a valid single-address payload and verifies that zero and <code>U32_MAX</code> multipath counts are rejected.</p>
+<p>The two flexfiles decoder helpers are exported only when KUnit is enabled. Both suites sit behind guideline-compliant Kconfig entries that default with <code>KUNIT_ALL_TESTS</code> and can be built as modules. Flexfiles fixtures and decoded devices are managed as KUnit resources so assertion failures do not leak them.</p>
+<p>That is the notable <strong>client development</strong> piece this week: decoder hardening plus in-tree unit coverage for a path that is otherwise hard to hit without a cooperating pNFS server.</p>
+<h2>Where things stand</h2>
+<ul>
+<li><strong>Kind of change:</strong> NFS <strong>client</strong> bug fix / XDR hardening. No protocol change. No new pNFS layout feature.</li>
+<li><strong>Scope:</strong> generic <code>nfs4_decode_mp_ds_addr()</code>, file-layout <code>GETDEVICEINFO</code>, flexfiles <code>GETDEVICEINFO</code>, plus two new KUnit modules.</li>
+<li><strong>Stable intent:</strong> all three functional patches are <code>Cc: stable</code> with <code>Fixes:</code> back to the original decoder, the multipath-address parser, and the flexfiles driver.</li>
+<li><strong>Review status:</strong> posted 23 August; <strong>no Acked-by, Reviewed-by, or maintainer comment this window.</strong> The series is unmerged as of week-end.</li>
+<li><strong>Testing gap Pujeri already flags:</strong> no pNFS-capable server was used; the new KUnit suites are the primary evidence that the decoder now rejects the bad cases.</li>
+</ul>
+<p>Until a reviewer picks this up, a malicious or truncated <code>GETDEVICEINFO</code> can still feed the client an unbounded multipath count and an unchecked port parse. The series is the proposed client-side close of that hole.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260823114244.3883-1-prabhakar.pujeri@dell.com/">2026-08-23 Prabhakar Pujeri <a href="mailto:prabhakar.pujeri@dell.com">prabhakar.pujeri@dell.com</a> — [PATCH 0/4] NFS: harden pNFS device address decoding</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260823114244.3883-2-prabhakar.pujeri@dell.com/">2026-08-23 Prabhakar Pujeri <a href="mailto:prabhakar.pujeri@dell.com">prabhakar.pujeri@dell.com</a> — [PATCH 1/4] NFS: validate pNFS data server port octets</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260823114244.3883-3-prabhakar.pujeri@dell.com/">2026-08-23 Prabhakar Pujeri <a href="mailto:prabhakar.pujeri@dell.com">prabhakar.pujeri@dell.com</a> — [PATCH 2/4] NFS: bound multipath address count in file-layout GETDEVICEINFO</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260823114244.3883-4-prabhakar.pujeri@dell.com/">2026-08-23 Prabhakar Pujeri <a href="mailto:prabhakar.pujeri@dell.com">prabhakar.pujeri@dell.com</a> — [PATCH 3/4] NFS: bound multipath address count in flexfiles GETDEVICEINFO</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260823114244.3883-5-prabhakar.pujeri@dell.com/">2026-08-23 Prabhakar Pujeri <a href="mailto:prabhakar.pujeri@dell.com">prabhakar.pujeri@dell.com</a> — [PATCH 4/4] NFS: add KUnit coverage for pNFS address decoding</a></li>
+</ul>
+  </main>
+</body>
+</html>

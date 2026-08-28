@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VFS maintainers pick a splice wrapper over an NFSD fsnotify workaround</title>
+  <meta name="description" content="Last week, Ameer Hamza’s two-patch bug-fix series for NFSD iterator READs ran into VFS pushback: the atime patch was withdrawn, and the remaining duplicate-fsnotify_access() bug was left hanging as a placement question. This week the…">
+  <meta property="og:title" content="VFS maintainers pick a splice wrapper over an NFSD fsnotify workaround">
+  <meta property="og:description" content="Last week, Ameer Hamza’s two-patch bug-fix series for NFSD iterator READs ran into VFS pushback: the atime patch was withdrawn, and the remaining duplicate-fsnotify_access() bug was left hanging as a placement question. This week the…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-27T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="VFS maintainers pick a splice wrapper over an NFSD fsnotify workaround">
+  <meta name="twitter:description" content="Last week, Ameer Hamza’s two-patch bug-fix series for NFSD iterator READs ran into VFS pushback: the atime patch was withdrawn, and the remaining duplicate-fsnotify_access() bug was left hanging as a placement question. This week the…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-27</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>VFS maintainers pick a splice wrapper over an NFSD fsnotify workaround</h1>
+<h2>Summary</h2>
+<h1>VFS maintainers pick a splice wrapper over an NFSD fsnotify workaround</h1>
+<h2>Summary</h2>
+<p>Last week, Ameer Hamza’s two-patch <strong>bug-fix</strong> series for NFSD iterator READs ran into VFS pushback: the atime patch was withdrawn, and the remaining duplicate-<code>fsnotify_access()</code> bug was left hanging as a placement question. This week the fsnotify and VFS maintainers answered that question. The discussion is still a <strong>bug fix</strong>, not a protocol change and not NFS <strong>client</strong> work; the client-visible fallout remains that inotify/fanotify watchers of exported files see two ACCESS events for iterator READs (<code>sec=krb5i</code>/<code>sec=krb5p</code>, <code>nfsd_disable_splice_read</code>, <code>NFSD_IO_DONTCACHE</code>/<code>NFSD_IO_DIRECT</code>) and one for spliced READs.</p>
+<p>The agreed direction is no longer Hamza’s original NFSD-side move of <code>fsnotify_access()</code> into <code>nfsd_splice_read()</code>. Instead, VFS should export a helper that wraps <code>splice_direct_to_actor()</code> with the permission hook and a single <code>fsnotify_access()</code>, and NFSD should call that. Chuck Lever volunteered to write it; Amir Goldstein suggested Hamza may want to fold it into a v2.</p>
+<h2>Brief recap from last week</h2>
+<p>Hamza’s <a href="https://lore.kernel.org/linux-nfs/20260818225715.572140-1-ameer.hamza@truenas.com/">patch 1/2</a> documented the mismatch: <code>vfs_iocb_iter_read()</code> already emits an access event, then <code>nfsd_finish_read()</code> emits a second one, while spliced READs get their only event from <code>nfsd_finish_read()</code> because <code>splice_direct_to_actor()</code> is silent. Christoph Hellwig <a href="https://lore.kernel.org/linux-nfs/aoVHBkmPNSRakbYW@infradead.org/">rejected papering over that in NFSD</a>, arguing <code>-&gt;splice_read</code> should not skip fsnotify and “nfsd should not work around this as fsnotify is not the business of the users of VFS APIs.” Chuck Lever <a href="https://lore.kernel.org/linux-nfs/9ad95194-983d-427d-9a07-c9eb0891d1a0@app.fastmail.com/">asked Jan Kara and Amir Goldstein</a> for a ruling, noting that today <code>do_sendfile()</code> and <code>do_splice()</code> emit the event <em>after</em> the splice helpers return, so a naive move into <code>-&gt;splice_read</code> would double <code>sendfile(2)</code>/<code>splice(2)</code> events unless those syscalls changed in lockstep.</p>
+<h2>Goldstein: one event per user READ, and a VFS wrapper for NFSD</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxgUOqFv6pVmdT_+4DjA0KQoQDCzN2Xz=xm1FyumewHZXg@mail.gmail.com/">Amir Goldstein</a> replied on 22 August with two design constraints and a concrete alternative.</p>
+<p>First, the 2023 “Tidy up file permission hooks” work intentionally pulled permission hooks <em>out</em> of the splice iterators:</p>
+<blockquote>
+<p>"we intentionally moved the permission hook outside of the splice iterators because we wanted to avoid calling them with freeze protection held and also there were some duplicate calls for this work."</p>
+</blockquote>
+<p>The matching mental model, he said, is that <code>fsnotify_{access,modify}</code> post-hooks usually live in the same context as those permission/security hooks. That argues against stuffing <code>fsnotify_access()</code> down into the low-level splice iterator, which is the direction Hellwig’s first-pass NACK had seemed to point.</p>
+<p>Second, iterator-granularity events are the wrong user-visible contract:</p>
+<blockquote>
+<p>"emitting many READ events from an iterator instead of one event for the user's READ request is more noisy and serves no purpose to users. In most cases (but not always) those events could be merged, but at the cost of futile CPU cycles."</p>
+</blockquote>
+<p>From a quick code inspection he listed the current holes and a cleaner layering: <code>fsnotify_access()</code> is missing in <code>vfs_splice_read()</code>; the <code>splice_</code> / <code>do_splice_</code> / <code>vfs_splice_</code> naming is “a horror”; the low-level <code>splice_direct_to_actor()</code> could be made static; and VFS could export <code>vfs_splice_direct_to_actor()</code> for NFSD, wrapping <code>splice_direct_to_actor()</code> with the permission hook and <code>fsnotify_access()</code>. Taste could still prefer NFSD adding the hooks itself:</p>
+<blockquote>
+<p>"Whether or not this is prettier than nfsd adding the fsnotify hooks is a matter of taste, but I can live with either."</p>
+</blockquote>
+<h2>Lever and Hellwig converge on the wrapper</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/5fb0315d-636c-44ff-8dcc-b4403e3be7c3@app.fastmail.com/">Chuck Lever</a> took the last bullet as the right layering and offered to write it:</p>
+<blockquote>
+<p>"IIUC this last bullet seems like clean layering to me. Do you want to propose a patch or shall I?"</p>
+</blockquote>
+<p><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxiVHcu2BUZejjS+YPuyyFWcsMwkpd+GxoZfxE_WKumY_g@mail.gmail.com/">Goldstein</a> declined the authorship and left the door open for Hamza:</p>
+<blockquote>
+<p>"Be my guest. Maybe Ameer will want to post it for v2."</p>
+</blockquote>
+<p><a href="https://lore.kernel.org/linux-nfs/aovPSDE_IGKggzyN@infradead.org/">Christoph Hellwig</a> then closed the placement debate. He agreed that iterator-level READ events are noise, that <code>fsnotify_access()</code> is missing from <code>vfs_splice_read()</code>, and that splice naming and structure are “horrible” — “part of that is due to the mess of inflicting a fake pipe for the fastpath callers that don't need it, but paet of it is just self-inflicted bad naming.” On the proposed helper he was unambiguous:</p>
+<blockquote>
+<p>"The latter is the right thing to do."</p>
+</blockquote>
+<p>That “latter” is Goldstein’s <code>vfs_splice_direct_to_actor()</code> export: permission hook plus one <code>fsnotify_access()</code>, with NFSD as a caller rather than a special-case emitter. Combined with last week’s withdrawal of the atime patch, Hamza’s original 1/2 (move the hook into <code>nfsd_splice_read()</code>) is no longer the intended fix.</p>
+<p>Hellwig also used the thread as a rathole into freeze protection. He still does not understand why taking <code>file_start_write</code> outside the main splice machinery is fine for <code>splice_file_range</code> callers but not for <code>do_splice_direct</code> callers, “and what consideration exists for potential new callers.”</p>
+<h2>Why two splice flavors exist (and why it still matters to NFSD)</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxgok6Yk0yp3DcxfD9Cp0ZoFJ7G6a7KasLyhHn6wGuTRyg@mail.gmail.com/">Goldstein’s follow-up</a> reconstructed the 2023 rationale. Permission hooks were moved outside <code>sb_start_write()</code> to avoid “first order deadlocks” from pre-content events and LSMs. A secondary, best-effort goal was not holding <code>file_start_write(out)</code> while reading <code>file in</code>, to dodge “second order deadlocks” with odd stacked setups. For first-order deadlocks both flavors are fine: <code>ceph_copy_file_range()</code> uses permission plus <code>file_start_write()</code> plus <code>splice_file_range()</code> because <code>-&gt;copy_file_range()</code> is already called with <code>file_start_write()</code> held from <code>vfs_copy_file_range()</code>; <code>vfs_copy_file_range()</code> itself uses permission plus <code>do_splice_direct()</code>.</p>
+<p>The <code>do_splice_direct()</code> users — overlayfs copy-up, and <strong>nfsd/ksmbd <code>copy_file_range</code></strong> — have more potential to hit the second-order case, so they try more granular <code>file_start_write()</code>. Goldstein was candid that this was never proven:</p>
+<blockquote>
+<p>"TBH, I don't think that we proved to what extent this helps avoid the second order deadlocks because obviously, those deadlocks are still possible."</p>
+</blockquote>
+<p>Cross-filesystem <code>copy_file_range(2)</code> used to be another <code>do_splice_direct()</code> consumer; that use case is gone. The split may have other forgotten reasons, “but hey, at least the kerneldoc for these helpers is pretty clear...”</p>
+<p>That history is the reason a new NFSD-facing wrapper has to sit <em>above</em> the freeze-protected splice core, matching permission and fsnotify in the same context, rather than being pushed into <code>-&gt;splice_read</code> or <code>splice_direct_to_actor()</code> itself.</p>
+<h2>Where things stand</h2>
+<p>This week converted last week’s open VFS question into a concrete plan:</p>
+<ul>
+<li><strong>The bug is real and still unfixed in-tree.</strong> Iterator READs still double-fire fsnotify ACCESS; splice READs still fire once from NFSD.</li>
+<li><strong>NFSD is not the preferred layer.</strong> Hellwig’s original NACK of an nfsd workaround stands; Goldstein’s “either is taste” option was overtaken by Hellwig’s “the latter is the right thing to do.”</li>
+<li><strong>The intended fix is a VFS helper</strong>, <code>vfs_splice_direct_to_actor()</code>, wrapping <code>splice_direct_to_actor()</code> with the permission hook and a single <code>fsnotify_access()</code>, exported for NFSD (and implicitly cleaning the same hole in <code>vfs_splice_read()</code>).</li>
+<li><strong>Authorship is unsettled but not blocked.</strong> Lever offered to write it; Goldstein pointed at Hamza’s v2. No patch landed this week.</li>
+<li><strong>Patch 2/2 (atime) stays dead.</strong> Nothing this week revived <code>file_accessed()</code> in NFSD.</li>
+<li><strong>No NFS client code</strong> appears in this thread. The server-side accounting bug still matters to anyone watching exported files, and it is a prerequisite for Hamza’s larger SUNRPC reply-page recycling series, which expands the iterator READ path that currently double-counts.</li>
+</ul>
+<p>Until that wrapper exists, NFSD’s two READ helpers remain inconsistent, and any further iterator-READ work inherits the duplicate event.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxgUOqFv6pVmdT_+4DjA0KQoQDCzN2Xz=xm1FyumewHZXg@mail.gmail.com/">2026-08-22 Amir Goldstein <a href="mailto:amir73il@gmail.com">amir73il@gmail.com</a> — Re: [PATCH 1/2] NFSD: Fix duplicate fsnotify access events for iterator READs</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/5fb0315d-636c-44ff-8dcc-b4403e3be7c3@app.fastmail.com/">2026-08-23 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 1/2] NFSD: Fix duplicate fsnotify access events for iterator READs</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aovPSDE_IGKggzyN@infradead.org/">2026-08-24 Christoph Hellwig <a href="mailto:hch@infradead.org">hch@infradead.org</a> — Re: [PATCH 1/2] NFSD: Fix duplicate fsnotify access events for iterator READs</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxiVHcu2BUZejjS+YPuyyFWcsMwkpd+GxoZfxE_WKumY_g@mail.gmail.com/">2026-08-24 Amir Goldstein <a href="mailto:amir73il@gmail.com">amir73il@gmail.com</a> — Re: [PATCH 1/2] NFSD: Fix duplicate fsnotify access events for iterator READs</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAOQ4uxgok6Yk0yp3DcxfD9Cp0ZoFJ7G6a7KasLyhHn6wGuTRyg@mail.gmail.com/">2026-08-24 Amir Goldstein <a href="mailto:amir73il@gmail.com">amir73il@gmail.com</a> — Re: [PATCH 1/2] NFSD: Fix duplicate fsnotify access events for iterator READs</a></li>
+</ul>
+  </main>
+</body>
+</html>

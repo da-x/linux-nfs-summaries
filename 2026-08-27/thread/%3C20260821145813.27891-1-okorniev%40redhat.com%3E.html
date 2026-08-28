@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>libtirpc GSS principal-name one-byte overflow</title>
+  <meta name="description" content="This week Olga Kornievskaia posted a one-line-class bug fix for libtirpc’s server-side RPCSEC_GSS helper, with no replies yet on the list.">
+  <meta property="og:title" content="libtirpc GSS principal-name one-byte overflow">
+  <meta property="og:description" content="This week Olga Kornievskaia posted a one-line-class bug fix for libtirpc’s server-side RPCSEC_GSS helper, with no replies yet on the list.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-27T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="libtirpc GSS principal-name one-byte overflow">
+  <meta name="twitter:description" content="This week Olga Kornievskaia posted a one-line-class bug fix for libtirpc’s server-side RPCSEC_GSS helper, with no replies yet on the list.">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-27</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>libtirpc GSS principal-name one-byte overflow</h1>
+<h2>Summary</h2>
+<p>This week Olga Kornievskaia posted a one-line-class bug fix for libtirpc’s server-side RPCSEC_GSS helper, with no replies yet on the list.</p>
+<h2>What landed this week</h2>
+<p>On 21 August, <a href="https://lore.kernel.org/linux-nfs/20260821145813.27891-1-okorniev@redhat.com/">Olga Kornievskaia</a> sent <code>[PATCH 1/1] libtirpc: fix rpc_gss_get_principal_name to allocate memory correctly</code>. The patch is a <strong>bug fix</strong>, not a protocol change and not a new feature: it closes a one-byte heap overflow in <code>rpc_gss_get_principal_name()</code> in <code>src/svc_auth_gss.c</code>. That helper is part of the server-side <code>rpc_gss_*()</code> API that user-space NFS (and other RPC) servers use when they import a GSS principal for RPCSEC_GSS.</p>
+<p>The function builds a principal string of the form <code>user</code>, <code>user/node</code>, or <code>user/node@secdomain</code>, then hands the buffer to <code>gss_import_name()</code>. Kornievskaia’s diagnosis is that the <em>payload</em> length is already correct, but the <em>allocation</em> is not:</p>
+<blockquote>
+<p>"The calculation for <code>namebuf.length</code> correctly accounts for the separator characters ("/" and "@") via the +1 in <code>nodelen</code> and <code>secdomlen</code>, but does NOT include space for the C string NUL terminator. The subsequent <code>strcpy()</code> and <code>strcat()</code> calls write a NUL terminator that overflows the buffer by exactly 1 byte in all cases"</p>
+</blockquote>
+<p>She walks through the three construction paths and shows they all miss the same byte:</p>
+<ul>
+<li><code>node=NULL, secdomain=NULL</code>: allocates <code>strlen(user_name)</code>, writes <code>strlen(user_name) + 1</code></li>
+<li><code>node="host", secdomain=NULL</code>: allocates <code>strlen(user_name) + strlen(node) + 1</code>, writes one extra NUL</li>
+<li>both non-NULL: same pattern, always one byte short</li>
+</ul>
+<p>The important design constraint is that <code>namebuf.length</code> is <em>supposed</em> to be the GSS payload length, without the C terminator, because that length is passed into <code>gss_import_name()</code>. Inflating <code>namebuf.length</code> would paper over the overflow while corrupting the import. Kornievskaia is explicit about that split:</p>
+<blockquote>
+<p>"The <code>namebuf.length</code> value is intentionally the <em>payload</em> length (without NUL) for the subsequent <code>gss_import_name()</code> call, so the bug is specifically in the allocation size, not in the length field itself. The proposed fix correctly introduces a separate <code>alloclen = namebuf.length + 1</code> for the allocation while preserving <code>namebuf.length</code> semantics."</p>
+</blockquote>
+<p>The code change is five lines in <code>src/svc_auth_gss.c</code>: compute <code>alloclen = namebuf.length + 1</code>, allocate that, and keep <code>namebuf.length</code> as the unterminated payload length. The patch tags <code>Fixes: dec8d9775ded ("Finish server-side rpc_gss_*() APIs")</code>, so this is a latent overflow in the completed server-side GSS API rather than a regression in this week’s NFS client work.</p>
+<h2>Why it matters for NFS</h2>
+<p>Even though the file lives in libtirpc, the function sits on the RPCSEC_GSS path that NFS servers (and some client-side user-space RPC consumers) use to turn a user/node/domain triple into a GSS name. A one-byte overflow on every principal import is the sort of heap smash that can show up as intermittent auth failures, allocator corruption, or a crash under GSS-authenticated NFS mounts. The fix is deliberately conservative: it does not change how principals are spelled, does not change the GSS import length, and does not touch the kernel NFS client. It only makes the C-string construction match the buffer that was actually allocated.</p>
+<h2>Status</h2>
+<p>This is a single-message thread. There is no Reviewed-by, Acked-by, or follow-up on the list in the week ending 27 August, and no earlier summary file for this root. The technical argument is fully stated in the original post; what remains is review and merge into libtirpc.</p>
+<p><strong>Bottom line:</strong> a real, always-on one-byte overflow in libtirpc’s GSS principal import, with a small, well-scoped allocation fix that keeps <code>gss_import_name()</code>’s length semantics intact. Await maintainer review.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260821145813.27891-1-okorniev@redhat.com/">2026-08-21 Olga Kornievskaia <a href="mailto:okorniev@redhat.com">okorniev@redhat.com</a> — [PATCH 1/1] libtirpc: fix rpc_gss_get_principal_name to allocate memory correctly</a></li>
+</ul>
+  </main>
+</body>
+</html>

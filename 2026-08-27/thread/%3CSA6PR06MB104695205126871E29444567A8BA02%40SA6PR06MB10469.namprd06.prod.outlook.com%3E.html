@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSv3 RDMA READ payload corruption when post-op attributes are omitted</title>
+  <meta name="description" content="This week’s linux-nfs traffic on Rakesh Bhargava’s report is a single, densely argued bug report—not a patch, protocol change, or feature request. Bhargava of NetApp opened the thread on 24 August describing silent data corruption on the…">
+  <meta property="og:title" content="NFSv3 RDMA READ payload corruption when post-op attributes are omitted">
+  <meta property="og:description" content="This week’s linux-nfs traffic on Rakesh Bhargava’s report is a single, densely argued bug report—not a patch, protocol change, or feature request. Bhargava of NetApp opened the thread on 24 August describing silent data corruption on the…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-27T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSv3 RDMA READ payload corruption when post-op attributes are omitted">
+  <meta name="twitter:description" content="This week’s linux-nfs traffic on Rakesh Bhargava’s report is a single, densely argued bug report—not a patch, protocol change, or feature request. Bhargava of NetApp opened the thread on 24 August describing silent data corruption on the…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-27</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSv3 RDMA READ payload corruption when post-op attributes are omitted</h1>
+<h2>Summary</h2>
+<p>This week’s linux-nfs traffic on Rakesh Bhargava’s report is a single, densely argued <strong>bug report</strong>—not a patch, protocol change, or feature request. <a href="https://lore.kernel.org/linux-nfs/SA6PR06MB104695205126871E29444567A8BA02@SA6PR06MB10469.namprd06.prod.outlook.com/">Bhargava</a> of NetApp opened the thread on 24 August describing silent data corruption on the Linux NFS client when an NFSv3 READ over RPC-over-RDMA returns a legal <code>READ3resok</code> that omits post-operation attributes. No maintainer reply landed in-window, so the diagnosis stands as an unanswered client-side defect report.</p>
+<h2>What the client does wrong</h2>
+<p>The trigger is protocol-legal. An NFSv3 server may set <code>attributes_follow = FALSE</code> and omit the <code>fattr3</code>. On a TCP mount that is usually just a header-size learning problem; on RDMA it becomes payload corruption. Bhargava’s lead sentence is the whole story:</p>
+<blockquote>
+<p>"A legal NFSv3 READ3resok response with attributes_follow = FALSE causes the Linux RPC-over-RDMA client to prepend 84 bytes of stale receive-buffer data to an otherwise correct RDMA-written file payload."</p>
+</blockquote>
+<p>The environment is a RHEL 9.5-class kernel (<code>Linux 5.14.0-503.22.1.el9_5.x86_64</code>) with <code>vers=3, proto=rdma, port=20049</code> doing 4096-byte direct reads. The server’s RDMA Write of the 4096-byte file data is correct. Corruption happens later, on the client, when <code>xdr_read_pages()</code> realigns an oversized XDR head and copies 84 bytes of junk onto the front of those pages. Those 84 bytes are exactly <code>sizeof(fattr3)</code> (21 XDR words).</p>
+<p>On a ordinary NFSv3 mount the damage is typically a one-shot event: after the first READ the client learns <code>read_hdrsize</code> and subsequent replies match the reserved head. FlexFiles NFSv3 data servers do not get that learning path, so the shorter DS header keeps hitting the same mismatch:</p>
+<blockquote>
+<p>"For a normal NFSv3 mount, only the first READ typically fails because the client subsequently learns the correct read_hdrsize. With a FlexFiles NFSv3 DS, the shorter DS header size is not learned, allowing the issue to occur repeatedly."</p>
+</blockquote>
+<p>That is the operational sting: pNFS FlexFiles over NFSv3/RDMA can corrupt every READ, not just the first one after mount.</p>
+<h2>Why the reserved head is 84 bytes too large</h2>
+<p>The client always budgets for the <em>maximum</em> NFSv3 READ reply header. In <code>fs/nfs/nfs3xdr.c</code>, <code>NFS3_fattr_sz</code> is 21 XDR words, and the max READ reply size folds in status, post-op attributes, count, eof, opaque length, and page padding. Before the first READ, <code>args-&gt;replen</code> is zero, so <code>nfs3_xdr_enc_read3args()</code> reserves that maximum: 104 bytes of NFS header. <code>rpc_prepare_reply_pages()</code> then tacks on the RPC reply and authentication header. On the observed AUTH_SYS connection the reserved head becomes 128 bytes.</p>
+<p>The actual inline RPC payload, when <code>fattr3</code> is omitted, is only 44 bytes: RPC reply/auth header, NFS status, the <code>attributes_follow</code> boolean, count, eof, and opaque length. 128 − 44 = 84, “exactly the size of fattr3.”</p>
+<p>That 44-versus-128 split is the same header-size fork the client already mishandles on TCP (the 2021 <code>read_hdrsize</code> EIO case). Here the numbers reappear as a data-integrity bug because RDMA has already deposited the file payload into the page list <em>before</em> XDR tries to shrink the head.</p>
+<h2>The RDMA receive path, then the XDR realign</h2>
+<p>Bhargava walks the receive path in order:</p>
+<ol>
+<li>The receive buffer is prepared as a 128-byte head, then the page list, then the tail.</li>
+<li>The data server RDMA-Writes the 4096-byte payload straight into those pages. At that instant the file data is still correct.</li>
+<li>RPC-over-RDMA receives only 44 bytes of inline RPC. <code>rpcrdma_decode_msg()</code> measures that inline length and calls <code>rpcrdma_inline_fixup()</code>.</li>
+</ol>
+<p>The transport then leaves the head iovec lying about its length:</p>
+<blockquote>
+<p>"rpcrdma_inline_fixup() redirects the head iovec to point directly at the received RPC reply message to avoid an extra memory copy. Although the amount of valid data is recognized as only 44 bytes, the head iovec length remains 128 bytes. As a result, bytes 44 through 127 do not contain valid RPC data and instead reference stale data remaining in a recycled RPC-over-RDMA receive buffer."</p>
+</blockquote>
+<p>NFS decode itself is not the villain. The client correctly sees <code>attributes_follow = FALSE</code>, skips <code>fattr3</code>, and advances only four bytes over the boolean. When <code>decode_read3resok()</code> later calls <code>xdr_read_pages()</code>, the decoder position is 44 bytes but the head iovec still claims 128, leaving an 84-byte gap.</p>
+<p>The generic XDR layer treats that gap as live inline payload. <code>xdr_realign_pages()</code> / <code>xdr_shrink_bufhead()</code> notice that head length exceeds the current decode position and shift the extra 84 bytes into the page list—overwriting the already-correct RDMA payload with stale receive-buffer contents.</p>
+<p>So three layers share the blame: NFSv3 XDR over-reserves the READ reply head when <code>replen</code> is unset; <code>rpcrdma_inline_fixup()</code> retargets the head iovec without shrinking <code>iov_len</code> to the actual inline length; and <code>xdr_shrink_bufhead()</code> then copies the resulting “valid” tail of the head onto pages that RDMA already filled.</p>
+<h2>Client-development implications</h2>
+<p>This is a <strong>bug fix</strong> target for the NFS client and sunrpc/xprtrdma stack, with a FlexFiles-specific severity bump. The report does not propose a patch, but the analysis points at a small set of functions:</p>
+<ul>
+<li><code>nfs3_xdr_enc_read3args()</code> / <code>nfs3_proc_read_setup()</code> / <code>nfs3_read_done()</code> — the <code>replen</code> / <code>read_hdrsize</code> learning that currently assumes a stable, full-sized READ header and does not teach a FlexFiles DS the shorter size.</li>
+<li><code>rpcrdma_inline_fixup()</code> — head iovec length left at the reserved 128 bytes after a 44-byte inline receive.</li>
+<li><code>xdr_read_pages()</code> → <code>xdr_realign_pages()</code> / <code>xdr_shrink_bufhead()</code> — the copy that turns the oversized head into payload corruption rather than an XDR overflow.</li>
+</ul>
+<p>Until someone replies, the practical conclusions from the report are:</p>
+<ul>
+<li>A spec-compliant NFSv3 READ that omits post-op attributes is enough to corrupt RDMA READ data on current Linux clients.</li>
+<li>The 84-byte smear is deterministic, not a race: it is unused <code>fattr3</code> reservation plus leftover bytes in a recycled RDMA receive buffer.</li>
+<li>Regular NFSv3/RDMA mounts may only see it on the first READ; FlexFiles NFSv3 data servers can see it on every READ because DS <code>read_hdrsize</code> is never learned.</li>
+</ul>
+<p>The thread is still waiting on maintainer reaction—Chuck Lever, Trond Myklebust, or another xprtrdma/NFS XDR regular—on whether the fix belongs in <code>rpcrdma_inline_fixup()</code> (clamp head <code>iov_len</code> to the decoded inline length), in the NFSv3 READ encoder (stop over-reserving, or learn DS header size for FlexFiles), or in XDR realign (refuse to treat unread head bytes as payload when <code>XDRBUF_READ</code> pages were already filled by RDMA). This week, the list has the diagnosis and the reproduction shape, but no agreed patch.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/SA6PR06MB104695205126871E29444567A8BA02@SA6PR06MB10469.namprd06.prod.outlook.com/">2026-08-24 "Bhargava, Rakesh" <a href="mailto:Rakesh.Bhargava@netapp.com">Rakesh.Bhargava@netapp.com</a> — [BUG] NFSv3 RDMA :  READ corrupts payload when READ3res omits post_op_attr</a></li>
+</ul>
+  </main>
+</body>
+</html>

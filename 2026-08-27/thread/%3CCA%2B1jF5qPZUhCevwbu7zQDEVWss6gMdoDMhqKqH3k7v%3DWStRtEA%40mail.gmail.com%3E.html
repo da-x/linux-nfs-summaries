@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Howells: netfs read abandonment is not a READ_PLUS sparse-read hook</title>
+  <meta name="description" content="This week’s only in-window traffic on the READ_PLUS follow-up is David Howells’ reply to Aurélien Couderc. The parent discussion is PATCH v10 30/35 of Howells’ netfslib bvecq overhaul: a simplification of how netfs collection treats a…">
+  <meta property="og:title" content="Howells: netfs read abandonment is not a READ_PLUS sparse-read hook">
+  <meta property="og:description" content="This week’s only in-window traffic on the READ_PLUS follow-up is David Howells’ reply to Aurélien Couderc. The parent discussion is PATCH v10 30/35 of Howells’ netfslib bvecq overhaul: a simplification of how netfs collection treats a…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-27T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Howells: netfs read abandonment is not a READ_PLUS sparse-read hook">
+  <meta name="twitter:description" content="This week’s only in-window traffic on the READ_PLUS follow-up is David Howells’ reply to Aurélien Couderc. The parent discussion is PATCH v10 30/35 of Howells’ netfslib bvecq overhaul: a simplification of how netfs collection treats a…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-27</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Howells: netfs read abandonment is not a READ_PLUS sparse-read hook</h1>
+<h2>Summary</h2>
+<p>This week’s only in-window traffic on the READ_PLUS follow-up is <a href="https://lore.kernel.org/linux-nfs/771538.1787600850@warthog.procyon.org.uk/">David Howells’ reply</a> to <a href="https://lore.kernel.org/linux-nfs/CA+1jF5qPZUhCevwbu7zQDEVWss6gMdoDMhqKqH3k7v=WStRtEA@mail.gmail.com/">Aurélien Couderc</a>. The parent discussion is <a href="https://lore.kernel.org/linux-nfs/20260824144130.759997-31-dhowells@redhat.com/">PATCH v10 30/35</a> of Howells’ netfslib <code>bvecq</code> overhaul: a simplification of how netfs collection treats a permanently failed subrequest. Couderc had asked whether that “partial abandonment” work could also help NFSv4.2 <code>READ_PLUS</code> (sparse-file reads). Howells’ answer is a polite no: the two problems live in different layers, and netfslib still has no sparse-read model for the NFS client to hang <code>READ_PLUS</code> on.</p>
+<h2>What the abandonment patch actually changes</h2>
+<p>Patch 30 is a <strong>bug-fix / simplification of the netfs read collector</strong>, not a protocol change and not an NFS client feature. Previously, if one subrequest in a multi-subreq read failed, collection tried to salvage folios that were fully downloaded but spanned several subreqs, provided every contributing subreq succeeded. Howells called that “quite complicated,” because a subreq can contribute to multiple folios and a folio can be contributed to by multiple subreqs.</p>
+<p>The new rule is blunt: once a <strong>permanently failed</strong> subreq is hit, abandon the rest of the request. That is what <code>read_folio</code>, DIO/unbuffered read, gap filling, RMW and write preload already need. Readahead is the odd one out — it has no error return other than unlocking folios — but even there leftover non-uptodate folios simply fall back to <code>-&gt;read_folio()</code>. Retryable failures still retry inside the request.</p>
+<p>That is the work Couderc was looking at when he asked:</p>
+<blockquote>
+<p>"What about READ_PLUS, i.e. sparse file reads? If you do this kind of work of handling partial abandonment, can such a work also benefit READ_PLUS?"</p>
+</blockquote>
+<h2>Howells: READ_PLUS is NFS, and netfslib does not know about holes</h2>
+<p>Howells’ <a href="https://lore.kernel.org/linux-nfs/771538.1787600850@warthog.procyon.org.uk/">24 August reply</a> first pins the protocol:</p>
+<blockquote>
+<p>"READ_PLUS is NFS, right?"</p>
+</blockquote>
+<p>Then he separates sparse-file I/O from fatal-error abandonment:</p>
+<blockquote>
+<p>"I'm not sure it would particularly help or hinder."</p>
+</blockquote>
+<p>The architectural argument is the one that matters for NFS client development. The VFS/VM only ever asks netfslib to read <strong>contiguous</strong> regions. Netfslib then chops those into subrequests. It currently has <strong>no knowledge of sparse reads</strong>:</p>
+<blockquote>
+<p>"The VFS/VM only asks to read contiguous regions and netfslib breaks that up into subrequests, but currently netfslib doesn't know anything about sparse reads."</p>
+</blockquote>
+<p>The filesystem, not the library, is expected to know where the holes are. Howells’ working example is Ceph, not NFS:</p>
+<blockquote>
+<p>"What I'm looking at with Ceph, for example, is that Ceph knows where the gaps are and will clear them before terminating the subrequest."</p>
+</blockquote>
+<p>Partial abandonment, by contrast, is strictly an error-path tool:</p>
+<blockquote>
+<p>"Partial abandonment is for when some sort of fatal error occurs and we cannot finish the request."</p>
+</blockquote>
+<p>In other words: a hole in a sparse file is not a failed subreq, and a failed subreq is not a hole. Salvaging or abandoning the tail of a request after a permanent error does not give the NFS client a way to consume <code>READ_PLUS</code> data/hole segments.</p>
+<h2>NFS client implications</h2>
+<p>This is <strong>not</strong> a <code>READ_PLUS</code> implementation, a protocol change, or even a netfs API for sparse replies. It is a clarification that the NFS client cannot piggy-back NFSv4.2 sparse reads on the new collector behaviour.</p>
+<p>For an NFS client that already talks to netfslib (today, mainly the fscache path), the practical picture after this exchange is:</p>
+<ul>
+<li><strong>Read abandonment</strong> is now a fail-fast collector policy. A permanently failed NFS/netfs subreq drops the remainder of that request; <code>read()</code> retries via <code>-&gt;read_folio()</code>. That is a correctness/simplification fix in the shared library, not a sparse-file optimisation.</li>
+<li><strong>Sparse files remain the filesystem’s problem.</strong> Netfslib still presents contiguous subrequests. If the NFS client later wants to issue <code>READ_PLUS</code> and punch holes / skip zeroes, it would have to do what Howells describes for Ceph: the client knows the gaps and clears them <strong>before</strong> terminating the subrequest. The library will not invent that knowledge from abandonment.</li>
+<li><strong>No netfs sparse-read model yet.</strong> Howells is explicit that netfslib “doesn't know anything about sparse reads.” The v10 series does talk about discontiguous <code>bvecq</code> chains and cache occupancy extents (<code>DATA</code> vs <code>ZERO</code>) in the parent posting, which would be the natural buffer representation if NFS ever fed <code>READ_PLUS</code> hole/data segments into netfslib — but that is not implemented, and Howells did not offer it as a <code>READ_PLUS</code> plan here.</li>
+</ul>
+<p>The discussion ends with Howells’ assessment. There is no follow-up from Couderc in-window, no NFS-client patch, and no commitment to teach netfslib about <code>READ_PLUS</code>. The conclusion for this week is Howells’ own: the abandonment work “would [not] particularly help or hinder” NFS sparse reads, because the two mechanisms solve different problems.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/771538.1787600850@warthog.procyon.org.uk/">2026-08-24 David Howells <a href="mailto:dhowells@redhat.com">dhowells@redhat.com</a> — Re: READ_PLUS in NetFS? Re: [PATCH v10 30/35] netfs: Simplify read abandonment</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FUSE and btrfs push back on dropping launder_folio; NFS conversion still unreviewed</title>
+  <meta name="description" content="Last week Matthew Wilcox posted a seven-patch VFS cleanup to delete aops-&gt;launder_folio, converting FUSE, btrfs, NFS, and OrangeFS onto filemap_invalidate_pages(). The NFS-facing change is patch 4/7: drop nfs_launder_folio() and switch…">
+  <meta property="og:title" content="FUSE and btrfs push back on dropping launder_folio; NFS conversion still unreviewed">
+  <meta property="og:description" content="Last week Matthew Wilcox posted a seven-patch VFS cleanup to delete aops-&gt;launder_folio, converting FUSE, btrfs, NFS, and OrangeFS onto filemap_invalidate_pages(). The NFS-facing change is patch 4/7: drop nfs_launder_folio() and switch…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-27T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="FUSE and btrfs push back on dropping launder_folio; NFS conversion still unreviewed">
+  <meta name="twitter:description" content="Last week Matthew Wilcox posted a seven-patch VFS cleanup to delete aops-&gt;launder_folio, converting FUSE, btrfs, NFS, and OrangeFS onto filemap_invalidate_pages(). The NFS-facing change is patch 4/7: drop nfs_launder_folio() and switch…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-27</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>FUSE and btrfs push back on dropping launder_folio; NFS conversion still unreviewed</h1>
+<h2>Summary</h2>
+<h1>FUSE and btrfs challenge Wilcox’s launder_folio removal; NFS client conversion still unacked</h1>
+<h2>Recap</h2>
+<p>Last week <a href="https://lore.kernel.org/linux-nfs/20260820193343.3852967-1-willy@infradead.org/">Matthew Wilcox posted a seven-patch VFS cleanup</a> to delete <code>aops-&gt;launder_folio</code>, converting FUSE, btrfs, NFS, and OrangeFS onto <code>filemap_invalidate_pages()</code>. The NFS-facing change is <a href="https://lore.kernel.org/linux-nfs/20260820193343.3852967-5-willy@infradead.org/">patch 4/7</a>: drop <code>nfs_launder_folio()</code> and switch directory, DIO, inode, and NFSv4.2 invalidate paths to a bulk writeback-then-remove helper. Wilcox’s diagnosis for NFS was efficiency, not correctness:</p>
+<blockquote>
+<p>"nfs relies on invalidate_inode_pages2() / invalidate_inode_pages2_range() doing writeback by calling nfs_launder_folio().  While this works, it is inefficient as each folio is written back and waited for individually."</p>
+</blockquote>
+<p>This is a page-cache invalidation refactor, not an NFS protocol change. No NFS maintainer had reviewed it as of 20 August. This week the series finally drew real review — from FUSE maintainer Miklos Szeredi, btrfs developer Boris Burkov, and VFS reviewer Jan Kara — and the debate is whether the new helper is <em>semantically</em> equivalent to per-folio launder under page lock. That question lands directly on the NFS client: the same writeback-during-invalidate contract is what <code>nfs_launder_folio()</code> currently provides for mmap, DIO, and server-driven cache drop.</p>
+<h2>FUSE: is filemap_invalidate_pages() actually equivalent?</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/CAJfpegvP3i8ZJc2T=+f4rAhZ4E1QcT5+jC6mQPLxtB-yoK9Brw@mail.gmail.com/">Miklos Szeredi</a> opened on the FUSE conversion (<a href="https://lore.kernel.org/linux-nfs/20260820193343.3852967-3-willy@infradead.org/">patch 2/7</a>) with a locking concern. The kernel-doc for <code>filemap_invalidate_pages()</code> suggests holding <code>invalidate_lock</code> to keep pages from coming back; without it, he is not sure the behavior matches <code>invalidate_inode_pages2()</code> plus <code>fuse_launder_folio()</code>:</p>
+<blockquote>
+<p>"filemap_invalidate_page() suggests to use invalidate_lock to prevent races with pages coming back.  I'm not sure that without it the behavior is identical."</p>
+</blockquote>
+<blockquote>
+<p>"Maybe add a variant that takes that lock?"</p>
+</blockquote>
+<p><a href="https://lore.kernel.org/linux-nfs/aoxHOSC9kTPbKeNq@casper.infradead.org/">Wilcox rejected a helper-internal lock</a>. Holding <code>invalidate_lock</code> only inside the function is useless, because pages can be reinstated the instant it drops:</p>
+<blockquote>
+<p>"I don't understand what use that would be.  As soon as that function drops the lock, the pages could be reinstated.  If the caller needs the pages to not come back, it must need to hold the invalidate_lock across the whole operation."</p>
+</blockquote>
+<p>He also warned filesystems off trying to close the classic O_DIRECT vs. mmap race with that lock:</p>
+<blockquote>
+<p>"Before any filesystem people get funny ideas about closing the O_DIRECT race, you can't do that because you'll deadlock on doing I/O to the same file that you've mmaped."</p>
+</blockquote>
+<p>Szeredi then sharpened the real objection: the old path guaranteed <em>no dirty data remained</em> after the call, because launder ran while the folio was locked. Bulk writeback does not:</p>
+<blockquote>
+<p>"invalidate_inode_pages2_range() together with launder_page guaranteed that no dirty data remained in the cache after that call.   Yes, the pages can be reinstated after that but those need faults and the server can then serialize those against the invalidation."</p>
+</blockquote>
+<blockquote>
+<p>"I don't see that guarantee with the filemap_write_and_wait_range() (with or without invalidate_lock actually) since the mapping can be dirtied again without the filesystem's knowledge."</p>
+</blockquote>
+<p><a href="https://lore.kernel.org/linux-nfs/aoyKxvdQdeJQfPHj@casper.infradead.org/">Wilcox asked him to name the serialization</a> that exists in the old path and not the new one, laying out both call stacks. Before: <code>fuse_open()</code> → <code>invalidate_inode_pages2()</code> → lock, unmap, <code>folio_launder()</code>, unlock. After: <code>filemap_invalidate_pages()</code> → <code>filemap_write_and_wait_range()</code> then <code>invalidate_inode_pages2_range()</code> which only <em>tests</em> dirty under the folio lock.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/CAJfpegtgenUaudDcvecJuV2_WkkVw=gdcB0Eqg=UFKPMZP1uKQ@mail.gmail.com/">Szeredi’s answer</a> is the mmap redirty window:</p>
+<blockquote>
+<p>"In the second case filemap_write_and_wait_range() won't write protect or unmap the page, so it may become dirty after the writeback."</p>
+</blockquote>
+<blockquote>
+<p>"That can't happen in the first case, since the page is written and unmapped while under page lock."</p>
+</blockquote>
+<p>He agreed that wrapping <code>filemap_invalidate_pages()</code> in <code>invalidate_lock</code> would not help (“Nothing”), and asked what would stop a writeback + unmap + writeback sequence from still racing.</p>
+<h2>Wilcox: the race was always there</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/aoyt5pL7mXYwSqsG@casper.infradead.org/">Wilcox conceded a wider window, not a new race</a>:</p>
+<blockquote>
+<p>"But that can also happen in the first case.  page_mkwrite() can be called immediately after the folio is unlocked, for example.  Or the folio can be evicted and replaced with a different folio which is then dirtied."</p>
+</blockquote>
+<blockquote>
+<p>"I've widened the race window, no doubt.  But it was always there."</p>
+</blockquote>
+<p>His prescription is the same one he gave for O_DIRECT: if a filesystem needs pages to stay clean, it must hold <code>invalidate_lock</code> across <code>filemap_invalidate_pages()</code> <em>and</em> the subsequent operation that depends on that cleanliness. A second writeback after unmap would not close it either:</p>
+<blockquote>
+<p>"We could do that -- but it won't solve the problem because the pages could still be redirtied after the second writeback."</p>
+</blockquote>
+<p>That stance matches <a href="https://lore.kernel.org/linux-nfs/20260820193343.3852967-8-willy@infradead.org/">patch 7</a> from last week, which moves the “folio got dirty again during DIO invalidate” failure into the VFS (<code>folio_unmap_invalidate()</code>) instead of asking each filesystem to launder again. For NFS, that would replace the current <code>nfs_launder_folio()</code> retry with a VFS-level fail of the invalidate.</p>
+<h2>Szeredi’s distributed-cache example (and why NFS should care)</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/CAJfpegv_SKhArUNBFUtsmkXSn+JzYgOjhFOqVf-Yd9MnsjBY_w@mail.gmail.com/">Szeredi came back with a concrete — if admittedly artificial — scenario</a> meant to prove the two paths are not equivalent. He framed it as a FUSE-based distributed filesystem that serializes writers so sub-page stores cannot revert to stale data on cached writeback, invalidating aliases on other nodes:</p>
+<blockquote>
+<p>"Let's imagine a distributed filesystem based on fuse.  It wants to serialize accesses to a file to avoid sub page writes reverting to stale data on cached writeback.  Cached writeback is unavoidable in case of writable mmap, so it tries to handle this case correctly by totally excluding cached aliases existing on different nodes."</p>
+</blockquote>
+<p>With <code>launder_page</code>, an INVALIDATE on node A locks the page, unmaps it, and writes it back under that lock, so a concurrent store either rides the launder or blocks on the page lock until writeback finishes and the server can serialize a new READ. Without launder, writeback and unmap are split:</p>
+<blockquote>
+<p>"b) happens after page writeback but before unmap:
+- since page is still mapped, store succeeds, page becomes dirty
+- at this point we have differing cache contents on A and B"</p>
+</blockquote>
+<p>He is careful not to claim a live FUSE daemon depends on this today:</p>
+<blockquote>
+<p>"It's not realistic and very unlikely to exist, yet something more subtle might be relying on this behavior.  I don't know.   At this point I'm just trying to show you that the two are really not equivalent, not that this has any practical significance."</p>
+</blockquote>
+<p>For NFS client development this is the most important remark of the week. Linux NFS is exactly a distributed cache with server-driven invalidation, writable mmap, and close-to-open / delegation recall paths that currently punch the page cache through <code>invalidate_inode_pages2*()</code> and <code>nfs_launder_folio()</code>. Szeredi’s “store after writeback, before unmap” window is the same class of mmap redirty that NFS has historically papered over with per-folio launder. If FUSE cannot accept the widened window, the NFS conversion in <a href="https://lore.kernel.org/linux-nfs/20260820193343.3852967-5-willy@infradead.org/">patch 4/7</a> needs the same scrutiny — and no NFS developer has yet provided it. Wilcox still has not answered this example in-window.</p>
+<p>Bernd Schubert’s earlier FUSE <code>len &lt;= 0</code> / “invalidate to EOF” ABI objection from 20 August also remains unanswered.</p>
+<h2>btrfs: launder_folio was never writeback</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260824215713.GB3664690@zen.localdomain/">Boris Burkov</a> reviewed <a href="https://lore.kernel.org/linux-nfs/20260820193343.3852967-4-willy@infradead.org/">patch 3/7</a> and disputed the commit message’s premise. Unlike NFS and FUSE, btrfs is not using <code>-&gt;launder_folio</code> as a writeback hook:</p>
+<blockquote>
+<p>"I don't believe btrfs_launder_folio() is doing writeback, it is just dropping otherwise leaked qgroup reservation. So this part of the commit message feels inaccurate to me, at least."</p>
+</blockquote>
+<p>The call he originally cared about is transaction-failure cleanup: invalidate remaining dirty pages that still have delalloc attached. He is checking whether forcing writeback in that “semi-failed” context still frees the qgroup reservation, and whether the series still passes the test that motivated adding this “creative” <code>-&gt;launder_folio</code> use:</p>
+<blockquote>
+<p>"I am trying to figure out if trying to force the writeback in this semi-failed context will also result in freeing the reservation, and also testing this patch series on the test that I originally fixed with launder_folio()."</p>
+</blockquote>
+<blockquote>
+<p>"With all that said, thank you for working on cleaning up the mess I made by adding this "creative" usage of -&gt;launder_folio(). Hopefully we can figure this out cleanly."</p>
+</blockquote>
+<p>That is a filesystem-specific bug-fix question, not an NFS one, but it undercuts Wilcox’s uniform “everyone used launder for writeback” story. NFS <em>does</em> use <code>nfs_launder_folio()</code> for writeback; btrfs does not. Any v2 of the series will likely need a btrfs-specific replacement for the qgroup leak, while NFS still needs a demonstrated equivalent of “write dirty folios, then drop them” under mmap.</p>
+<h2>Jan Kara: the locked-folio guarantee may still matter</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/cpxzyq5vdzuwters6mn3irrxvpvvkr6g7cjqbrsckivrupbua3@pzjpyvzqnke4/">Jan Kara</a> replied to the cover letter and likes the direction, echoing Wilcox’s “is launder_folio actually needed?” instinct — with one reservation that aligns with Szeredi:</p>
+<blockquote>
+<p>"I like the idea (and was myself wondering from time to time whether launder_folio is actually needed) but what was putting me off was that when using folio_launder() you can clean a folio while keeping folio locked and so you can guarantee later eviction without someone messing with the folio between writeout &amp; -&gt;release_folio. Maybe nobody actually needs this, which would be great, but it would be great to hear more from the folks using launder_folio about their reasons..."</p>
+</blockquote>
+<p>That is an explicit invitation to NFS. The client is one of the remaining <code>-&gt;launder_folio</code> users; <code>nfs_launder_folio()</code> exists precisely so invalidate can write a dirty folio while it stays locked, then drop it. Kara wants those users on the record before the method dies. None have spoken on linux-nfs this week.</p>
+<h2>Status and NFS client impact</h2>
+<p>This remains a VFS cleanup plus NFS client invalidation efficiency change, not a protocol change. The important NFS bug-fix/optimization on the table is still last week’s: stop per-folio writeback-and-wait in <code>nfs_launder_folio()</code> and flush invalidate ranges in bulk via <code>filemap_invalidate_pages()</code>.</p>
+<p>What changed this week is that the conversion is no longer an unreviewed drive-by. Szeredi argues the new helper is <strong>not equivalent</strong> because writeback and unmap are no longer atomic under the folio lock, and he sketched a distributed-cache failure that looks uncomfortably like NFS mmap vs. server INVALIDATE. Wilcox says the race always existed and filesystems that care must hold <code>invalidate_lock</code> themselves. Kara wants launder_folio users — NFS included — to explain whether they need the locked writeout-to-release window. Burkov shows at least one “user” of the method was never doing writeback at all.</p>
+<p>Nothing is merged or acked. The NFS client patch still has no review from Trond Myklebust, Anna Schumaker, Jeff Layton, or Neil Brown. Until someone on the NFS side answers Kara’s question — does the client rely on launder-under-folio-lock for mmap/DIO/delegation invalidation, or is a widened redirty window acceptable because it was always racy? — Wilcox’s deletion of <code>nfs_launder_folio()</code> should be treated as blocked on the same semantic debate that is now holding FUSE.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/CAJfpegvP3i8ZJc2T=+f4rAhZ4E1QcT5+jC6mQPLxtB-yoK9Brw@mail.gmail.com/">2026-08-24 Miklos Szeredi <a href="mailto:miklos@szeredi.hu">miklos@szeredi.hu</a> — Re: [PATCH 2/7] fuse: Use filemap_invalidate_pages()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aoxHOSC9kTPbKeNq@casper.infradead.org/">2026-08-24 Matthew Wilcox <a href="mailto:willy@infradead.org">willy@infradead.org</a> — Re: [PATCH 2/7] fuse: Use filemap_invalidate_pages()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAJfpegv3Ak+qNLb=fTSCSz7-taQ3Ui-Hkmqgn4PaGPe=CR4cbQ@mail.gmail.com/">2026-08-24 Miklos Szeredi <a href="mailto:miklos@szeredi.hu">miklos@szeredi.hu</a> — Re: [PATCH 2/7] fuse: Use filemap_invalidate_pages()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aoyKxvdQdeJQfPHj@casper.infradead.org/">2026-08-24 Matthew Wilcox <a href="mailto:willy@infradead.org">willy@infradead.org</a> — Re: [PATCH 2/7] fuse: Use filemap_invalidate_pages()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAJfpegtgenUaudDcvecJuV2_WkkVw=gdcB0Eqg=UFKPMZP1uKQ@mail.gmail.com/">2026-08-24 Miklos Szeredi <a href="mailto:miklos@szeredi.hu">miklos@szeredi.hu</a> — Re: [PATCH 2/7] fuse: Use filemap_invalidate_pages()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/aoyt5pL7mXYwSqsG@casper.infradead.org/">2026-08-24 Matthew Wilcox <a href="mailto:willy@infradead.org">willy@infradead.org</a> — Re: [PATCH 2/7] fuse: Use filemap_invalidate_pages()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260824215713.GB3664690@zen.localdomain/">2026-08-24 Boris Burkov <a href="mailto:boris@bur.io">boris@bur.io</a> — Re: [PATCH 3/7] btrfs: Use filemap_invalidate_pages()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAJfpegv_SKhArUNBFUtsmkXSn+JzYgOjhFOqVf-Yd9MnsjBY_w@mail.gmail.com/">2026-08-25 Miklos Szeredi <a href="mailto:miklos@szeredi.hu">miklos@szeredi.hu</a> — Re: [PATCH 2/7] fuse: Use filemap_invalidate_pages()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/cpxzyq5vdzuwters6mn3irrxvpvvkr6g7cjqbrsckivrupbua3@pzjpyvzqnke4/">2026-08-26 Jan Kara <a href="mailto:jack@suse.cz">jack@suse.cz</a> — Re: [PATCH 0/7] Remove aops-&gt;launder_folio</a></li>
+</ul>
+  </main>
+</body>
+</html>

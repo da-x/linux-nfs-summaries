@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Chuck Lever v2-patches xprtrdma WRITE-chunk READ corruption on short NFSv3 headers</title>
+  <meta name="description" content="This is a client-side bug fix in xprtrdma, not a protocol change and not a new feature. Chuck Lever posted v2 of the RPC-over-RDMA transport patch that stops a legal NFSv3 READ3resok from returning stale receive-buffer bytes in place of…">
+  <meta property="og:title" content="Chuck Lever v2-patches xprtrdma WRITE-chunk READ corruption on short NFSv3 headers">
+  <meta property="og:description" content="This is a client-side bug fix in xprtrdma, not a protocol change and not a new feature. Chuck Lever posted v2 of the RPC-over-RDMA transport patch that stops a legal NFSv3 READ3resok from returning stale receive-buffer bytes in place of…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-27T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Chuck Lever v2-patches xprtrdma WRITE-chunk READ corruption on short NFSv3 headers">
+  <meta name="twitter:description" content="This is a client-side bug fix in xprtrdma, not a protocol change and not a new feature. Chuck Lever posted v2 of the RPC-over-RDMA transport patch that stops a legal NFSv3 READ3resok from returning stale receive-buffer bytes in place of…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-27</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Chuck Lever v2-patches xprtrdma WRITE-chunk READ corruption on short NFSv3 headers</h1>
+<h2>Summary</h2>
+<p>This is a <strong>client-side bug fix</strong> in <code>xprtrdma</code>, not a protocol change and not a new feature. <a href="https://lore.kernel.org/linux-nfs/20260826143415.62041-1-cel@kernel.org/">Chuck Lever</a> posted v2 of the RPC-over-RDMA transport patch that stops a legal NFSv3 <code>READ3resok</code> from returning stale receive-buffer bytes in place of file data. There were no replies in this thread during the week: no Reviewed-by, no Tested-by, no Ack. The posting is the iteration on yesterday’s <a href="https://lore.kernel.org/linux-nfs/20260825134033.325599-1-cel@kernel.org/">RFC</a>, which itself answered <a href="https://lore.kernel.org/linux-nfs/SA6PR06MB104695205126871E29444567A8BA02@SA6PR06MB10469.namprd06.prod.outlook.com/">Rakesh Bhargava’s NetApp report</a> of silent 84-byte READ corruption on <code>vers=3,proto=rdma</code>.</p>
+<h2>Brief recap: the RFC already named the fault</h2>
+<p>The RFC thread (summarized separately) established the client-visible bug. RFC 1813 lets a server send <code>READ3resok</code> with <code>attributes_follow = FALSE</code>, omitting the 21-word <code>fattr3</code>. The Linux NFS client still reserves head-iovec space for the <em>largest</em> possible READ reply, so that inline RDMA message lands 84 bytes short of the reservation. <code>rpcrdma_inline_fixup()</code> then points the head iovec at the received message but leaves <code>iov_len</code> at the reserved size. <code>xdr_realign_pages()</code> / <code>xdr_shrink_bufhead()</code> treat the extra bytes as payload and slide them into the page list, overwriting the first 84 bytes of an RDMA Write that had already landed correctly.</p>
+<p>On an ordinary NFSv3 mount only the first READ is wrong, because <code>nfs3_read_done()</code> records the shorter header. A FlexFiles NFSv3 data server corrupts <strong>every</strong> READ, because the layout driver installs its own completion callback and that bookkeeping never runs. The regression is <code>cb0ae1fbb2f5</code> (“xprtrdma: Do not update {head, tail}.iov_len in <code>rpcrdma_inline_fixup()</code>”), which dropped the length adjustment while repairing krb5p reply decoding.</p>
+<h2>What v2 actually changes</h2>
+<p>v2 keeps the RFC’s layering decision — shrink the head <strong>only</strong> when a Write chunk carried the READ payload — and tightens the length math. Lever’s changelog is explicit:</p>
+<blockquote>
+<p>"Reduce the head iovec to the inline header bytes received."</p>
+<p>"Exclude a Responder's implicit XDR roundup from that length."</p>
+</blockquote>
+<p>The RFC reduced the head to “the number of bytes actually received.” That is too coarse: an RPC-over-RDMA responder may pad the inline message to an XDR 4-byte boundary, and those pad bytes are not NFS header. Feeding them into <code>head.iov_len</code> would still leave <code>xdr_realign_pages()</code> with extra bytes to shove into the page list. v2 therefore sets the head to the <em>inline header bytes</em>, not the raw receive length, and strips the responder’s implicit roundup before that assignment.</p>
+<p>The commit message restates the corruption path in the same terms as the RFC, now with the Write-chunk scope as the actual fix:</p>
+<blockquote>
+<p>"rpcrdma_inline_fixup() points the head iovec at the received message but leaves its length at the reserved size, so it runs past the header into stale receive buffer content. <code>xdr_realign_pages()</code> then shifts those bytes into the page list, and the READ returns transport data where READ payload belongs."</p>
+</blockquote>
+<p>And the FlexFiles blast radius, which is why this is not a one-shot first-READ curiosity:</p>
+<blockquote>
+<p>"<code>nfs3_read_done()</code> records the shorter header size, so on an ordinary NFSv3 mount, only the first READ is corrupted. However, the FlexFiles layout driver installs its own completion callback, so every READ from a data server is corrupt."</p>
+</blockquote>
+<p>The krb5p invariant is unchanged from the RFC. GSS integrity/privacy transforms the payload and therefore cannot use a Write chunk; restoring the length shrink only on the Write-chunk path leaves <code>cb0ae1fbb2f5</code>’s krb5p repair alone:</p>
+<blockquote>
+<p>"An auth flavor that transforms the payload cannot use a Write chunk, so scoping it to Write chunks leaves krb5[ip] alone."</p>
+</blockquote>
+<p>The code change is still a single-file edit of <code>net/sunrpc/xprtrdma/rpc_rdma.c</code> (14 insertions, 2 deletions versus the RFC’s 10-line addition). Credits are the same: Fixes <code>cb0ae1fbb2f5</code>, Reported-by Bhargava, Closes the NetApp bug mail. The RFC’s “Compile-tested only” disclaimer is gone from v2; Lever does not claim a runtime Tested-by either.</p>
+<h2>Why the length tweak matters for the NFS client</h2>
+<p>This is the important client-transport invariant the RFC left slightly loose. After <code>rpcrdma_inline_fixup()</code>:</p>
+<ul>
+<li>The RDMA Write payload already sits in the page list and must not be touched.</li>
+<li>The XDR decoder must see a head whose length is exactly the NFS/RPC header that arrived inline, so <code>xdr_read_pages()</code> does not invent an 84-byte “payload” from recycled receive-buffer junk.</li>
+<li>Implicit XDR roundup on the wire is padding, not header. Counting it as header would reintroduce a (smaller) realign into the pages.</li>
+<li>krb5i/krb5p replies still need the reserved <code>{head,tail}.iov_len</code> that <code>cb0ae1fbb2f5</code> preserved, because those flavors wrap the payload and never use a Write chunk.</li>
+</ul>
+<p>Bhargava’s original arithmetic still applies as the field symptom: AUTH_SYS reserved head 128 bytes, actual inline RPC 44 bytes, difference 84 bytes = <code>sizeof(fattr3)</code>. v2 does not change that diagnosis; it changes <em>which</em> received-byte count is written back into <code>head.iov_len</code> so the generic XDR layer stops treating the gap as file data.</p>
+<h2>Where v2 sits at week’s end</h2>
+<ul>
+<li><strong>Kind of change:</strong> NFS <strong>client</strong> transport bug fix in xprtrdma. No ONC RPC or NFSv3 protocol change.</li>
+<li><strong>Symptom (unfixed in-tree until this lands):</strong> short NFSv3 READ reply headers (<code>attributes_follow = FALSE</code>) prepend 84 bytes of recycled receive-buffer junk onto an otherwise correct RDMA Write payload. Ordinary mounts lose the first READ; FlexFiles NFSv3 data servers lose every READ.</li>
+<li><strong>v2 vs RFC:</strong> same Write-chunk-only shrink, but the head is now the inline header bytes received, with the responder’s implicit XDR roundup excluded. That is the only technical evolution this posting adds.</li>
+<li><strong>This thread:</strong> v2 only. No review, no Tested-by, no Ack, no further respin in-window.</li>
+<li><strong>Credits:</strong> Reported-by Bhargava, Fixes <code>cb0ae1fbb2f5</code>, Closes the NetApp bug mail. Link-to-v1 points at the RFC.</li>
+</ul>
+<p>Until a reviewed v2 is merged, NFSv3-over-RDMA clients — and especially FlexFiles DS READs — remain exposed to silent 84-byte payload corruption whenever a server omits post-op attributes.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260826143415.62041-1-cel@kernel.org/">2026-08-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2] xprtrdma: Fix Write chunk payload corruption on a short reply header</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260826143415.62041-1-cel@kernel.org/">2026-08-26 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2] xprtrdma: Fix Write chunk payload corruption on a short reply header</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS sysfs kobject UAF fix awaits merge</title>
+  <meta name="description" content="This week’s linux-nfs traffic on this thread is a status ping, not new code. The underlying change remains a tightly scoped NFS client bug fix: a use-after-free in the per-netns sysfs kobject lifetime for struct nfs_netns_client. It is not…">
+  <meta property="og:title" content="NFS sysfs kobject UAF fix awaits merge">
+  <meta property="og:description" content="This week’s linux-nfs traffic on this thread is a status ping, not new code. The underlying change remains a tightly scoped NFS client bug fix: a use-after-free in the per-netns sysfs kobject lifetime for struct nfs_netns_client. It is not…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-27T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS sysfs kobject UAF fix awaits merge">
+  <meta name="twitter:description" content="This week’s linux-nfs traffic on this thread is a status ping, not new code. The underlying change remains a tightly scoped NFS client bug fix: a use-after-free in the per-netns sysfs kobject lifetime for struct nfs_netns_client. It is not…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-27</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS sysfs kobject UAF fix awaits merge</h1>
+<h2>Summary</h2>
+<h1>NFS sysfs kobject UAF fix awaits merge</h1>
+<h2>Summary</h2>
+<p>This week’s linux-nfs traffic on this thread is a <strong>status ping</strong>, not new code. The underlying change remains a tightly scoped <strong>NFS client bug fix</strong>: a use-after-free in the per-netns sysfs kobject lifetime for <code>struct nfs_netns_client</code>. It is not a protocol change and not a feature.</p>
+<p>On 27 August, <a href="https://lore.kernel.org/linux-nfs/178783684601.144167.6448011883318625857.b4-review@b4/">Vasileios Almpanis</a> bounced the 3 August v1 after three weeks of silence:</p>
+<blockquote>
+<p>"Hello everyone, just checking on this patch. It has received required review. Is there anything else needed before it can be merged?"</p>
+</blockquote>
+<p>No maintainer replied in this window. The patch still sits at v1 with a single <code>Reviewed-by</code>.</p>
+<h2>Brief recap of the bug (week of 3 August)</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260803-nfs-v1-1-034176dab4a3@gmail.com/">Almpanis’s original patch</a> targets <code>fs/nfs/sysfs.c</code>. <code>struct nfs_netns_client</code> embeds <strong>two</strong> kobjects and is freed from <code>nfs_netns_object_release()</code>, the release callback of <code>nfs_net_kobj</code>. The sibling <code>p-&gt;kobject</code> lives in the same slab, but nothing pins the allocation until that second kobject has finished releasing:</p>
+<blockquote>
+<p>"struct nfs_netns_client embeds two kobjects and is freed by nfs_netns_object_release(), the release function of nfs_net_kobj. Despite that the first one, p-&gt;kobject lives in the same allocation. Nothing keeps the allocation from being freed before p-&gt;kobject has been released."</p>
+</blockquote>
+<p>With <code>CONFIG_DEBUG_KOBJECT_RELEASE=y</code> the two releases are deferred independently. <code>nfs_net_kobj</code> can free the object first; <code>p-&gt;kobject</code>’s delayed work then fires from freed memory, and KASAN reports a write in <code>__run_timers</code>. The repro is client-side netns churn (<code>unshare -n</code>), not the NFS server. The <code>Fixes:</code> tag points at <a href="https://git.kernel.org/linus/e96f9268eea6">e96f9268eea6</a> (<code>NFS: Make all of /sys/fs/nfs network-namespace unique</code>).</p>
+<p>The eight-line fix is the classic nested-kobject pattern: take a reference on <code>nfs_net_kobj</code> for the lifetime of <code>p-&gt;kobject</code> and drop it from <code>nfs_netns_client_release()</code>, so the allocation is always freed last:</p>
+<blockquote>
+<p>"Give p-&gt;kobject a reference on nfs_net_kobj for its whole lifetime and drop it from nfs_netns_client_release(), so the allocation is always freed after p-&gt;kobject has been released."</p>
+</blockquote>
+<p><a href="https://lore.kernel.org/linux-nfs/4FA2A276-5C44-4D7E-8C33-1322A7BB8AB4@hammerspace.com/">Benjamin Coddington</a> reviewed it the next day with no requested changes:</p>
+<blockquote>
+<p>"Reviewed-by: Benjamin Coddington <a href="mailto:bcodding@hammerspace.com">bcodding@hammerspace.com</a>"</p>
+</blockquote>
+<p>There was no debate over the diagnosis and no v2.</p>
+<h2>Why the ping matters for NFS client development</h2>
+<p>The hole is in the client’s <code>/sys/fs/nfs</code> netns glue. Namespace create/destroy is a hot path for containers and test harnesses, and the UAF is real timer-wheel memory corruption; <code>CONFIG_DEBUG_KOBJECT_RELEASE</code> only makes the race deterministic. That makes the patch a candidate for stable once it lands.</p>
+<p>This week adds no technical argument and no alternative design. Almpanis’s claim that the patch “has received required review” matches the on-list record (Coddington’s Reviewed-by on v1). What is still missing is maintainer pickup. Until someone queues it, the client sysfs UAF remains unfixed upstream.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/178783684601.144167.6448011883318625857.b4-review@b4/">2026-08-27 Vasileios Almpanis — Re: [PATCH] NFS: sysfs: fix use-after-free on delayed kobject release</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/178783684601.144167.6448011883318625857.b4-review@b4/">2026-08-27 Vasileios Almpanis <a href="mailto:vasilisalmpanis@gmail.com">vasilisalmpanis@gmail.com</a> — Re: [PATCH] NFS: sysfs: fix use-after-free on delayed kobject release</a></li>
+</ul>
+  </main>
+</body>
+</html>

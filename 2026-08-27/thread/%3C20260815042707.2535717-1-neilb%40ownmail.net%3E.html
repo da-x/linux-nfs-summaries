@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS verifier walk sleeps under i_lock; tmpfs readdir fix is incomplete</title>
+  <meta name="description" content="This week Chuck Lever’s xfstests run against NeilBrown’s v2 negative-dentry RFC turns the NFS client conversion of nfs_clear_verifier_directory() from preparatory lock-splitting into a real sleep-in-atomic bug, and Neil’s reply to last…">
+  <meta property="og:title" content="NFS verifier walk sleeps under i_lock; tmpfs readdir fix is incomplete">
+  <meta property="og:description" content="This week Chuck Lever’s xfstests run against NeilBrown’s v2 negative-dentry RFC turns the NFS client conversion of nfs_clear_verifier_directory() from preparatory lock-splitting into a real sleep-in-atomic bug, and Neil’s reply to last…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-27T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS verifier walk sleeps under i_lock; tmpfs readdir fix is incomplete">
+  <meta name="twitter:description" content="This week Chuck Lever’s xfstests run against NeilBrown’s v2 negative-dentry RFC turns the NFS client conversion of nfs_clear_verifier_directory() from preparatory lock-splitting into a real sleep-in-atomic bug, and Neil’s reply to last…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-27</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS verifier walk sleeps under i_lock; tmpfs readdir fix is incomplete</h1>
+<h2>Summary</h2>
+<p>This week Chuck Lever’s xfstests run against NeilBrown’s v2 negative-dentry RFC turns the NFS client conversion of <code>nfs_clear_verifier_directory()</code> from preparatory lock-splitting into a real <strong>sleep-in-atomic bug</strong>, and Neil’s reply to last week’s 13/18 review knocks down the claim that the same-parent <code>__d_move</code> change is a standalone tmpfs <code>readdir</code> fix. The series remains a <strong>VFS/dcache bug-fix RFC</strong> with a small NFS client delta — not a protocol change and not a new NFS feature. Neil promises another RFC; Chuck offers a follow-on d_sib ordering patch. Nothing is queued.</p>
+<h2>Brief bridge from last week</h2>
+<p>v2 (posted 15 August) tries to fix parent <code>d_lockref</code> overflow and soft lockups walking <code>-&gt;d_children</code> without shrinking the negative-dentry population. The NFS-facing work is <a href="https://lore.kernel.org/linux-nfs/20260815042707.2535717-5-neilb@ownmail.net/">04/18</a> (split the locked regions in <code>nfs_clear_verifier_directory()</code>) and <a href="https://lore.kernel.org/linux-nfs/20260815042707.2535717-6-neilb@ownmail.net/">05/18</a> (put that walk on <code>d_for_each_positive_child</code>). The iterator is only allowed to <code>cond_resched()</code> after later patches have stripped every other spinlock from the walk.</p>
+<p>Last week <a href="https://lore.kernel.org/linux-nfs/c3cc4175-1ca3-467d-849b-22462a7514fc@app.fastmail.com/">Chuck Lever</a> R-by’d <a href="https://lore.kernel.org/linux-nfs/20260815042707.2535717-14-neilb@ownmail.net/">13/18</a> and reclassified it as a tmpfs <code>offset_readdir</code> duplicate-entry bug after <code>rename("a","b")</code>, not mere preparation for the sleepable iterator. Neil had not replied in-window. Al Viro’s <code>d_walk</code>/<code>rename_lock</code> objection from 15 August is unchanged.</p>
+<h2>Classification</h2>
+<p>Two in-window sub-threads, both <strong>bug fixes</strong> inside the RFC:</p>
+<ol>
+<li>An NFS <strong>client locking bug</strong> exposed by applying the series: <code>d_for_each_positive_child()</code> (which <code>might_sleep()</code> after 14/18) is reached from <code>nfs_clear_verifier_delegated()</code> while <code>i_lock</code> is held.</li>
+<li>A <strong>VFS/libfs correctness</strong> debate: whether 13/18 actually restores <code>d_children</code> vs offset-cookie order for tmpfs same-directory rename.</li>
+</ol>
+<p>No protocol change. No new NFS feature.</p>
+<h2>The NFS client sleep-in-atomic bug</h2>
+<p>On 24 August <a href="https://lore.kernel.org/linux-nfs/f9d16f36-10e6-4bec-aa8e-b9b3cb3ad872@app.fastmail.com/">Chuck</a> reports a non-deterministic hit while running xfstests against tmpfs with the series applied. The trigger was incidental — “an unrelated process chmod'ed a file on an NFSv4 mount while xfstests was running” — but the path is not exotic:</p>
+<blockquote>
+<p>"the path looks reachable by any SETATTR that returns a delegation on a directory"</p>
+</blockquote>
+<p>The splat is a classic atomic-context sleep:</p>
+<blockquote>
+<p>"BUG: sleeping function called from invalid context at fs/nfs/dir.c:1497"</p>
+</blockquote>
+<p><code>in_atomic()</code> is 1, <code>preempt_count</code> is 1. The stack is the NFSv4 setattr / delegation-return path:</p>
+<p><code>chmod_common</code> → <code>notify_change</code> → <code>nfs_setattr</code> → <code>nfs4_proc_setattr</code> → <code>nfs4_inode_make_writeable</code> → <code>nfs4_inode_return_delegation</code> → <code>nfs_start_delegation_return</code> → <code>nfs_clear_verifier_delegated</code>.</p>
+<p>Chuck pins line 1497 as the <code>d_for_each_positive_child()</code> call that 05/18 introduced and that 14/18 annotated <code>might_sleep()</code>.</p>
+<p>That is exactly the hazard 04/18 was written to <em>prepare</em> for, not to create. <a href="https://lore.kernel.org/linux-nfs/20260815042707.2535717-5-neilb@ownmail.net/">Neil’s original 04/18</a> only dropped and retake the <strong>directory</strong> lock between <code>nfs_unset_verifier_delegated()</code> on the parent and the child walk, because:</p>
+<blockquote>
+<p>"Subsequent patches will use a helper for walking the d_children list and that helper may drop the lock temporarily."</p>
+</blockquote>
+<p>It did not look at the <strong>caller</strong>. The sleepable iterator is now reachable from a path that still holds <code>i_lock</code>.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/178763098869.3510150.7453977572617670907@noble.neil.brown.name/">Neil</a> thanks Chuck for the testing and diagnoses the missing lock drop (he writes <code>nfs_clear_verifier_deleted()</code>, but the stack is <code>nfs_clear_verifier_delegated</code>):</p>
+<blockquote>
+<p>"nfs_clear_verifier_deleted() holds the inode i_lock across nfs_clear_verifier_directory() which walks the the d_children list.
+I'll need to use d_find_alias() to get the dentry like I did in the notify code.
+Hopefully I'll send another RFC tomorrow."</p>
+</blockquote>
+<p>That is the same pattern as v2’s <a href="https://lore.kernel.org/linux-nfs/20260815042707.2535717-8-neilb@ownmail.net/">07/18</a> for <code>fsnotify_set_children_dentry_flags()</code>: <code>d_find_alias()</code> + <code>dget()</code>, drop <code>i_lock</code>, walk, <code>dput()</code>. Until that lands, applying the series makes a directory SETATTR that returns a delegation a client-side sleeping-from-atomic BUG, not merely a theoretical soft lockup on huge <code>d_sib</code> lists.</p>
+<h2>13/18 does not actually fix tmpfs readdir</h2>
+<p>Neil finally answers Chuck’s 20 August review of 13/18.</p>
+<p>He accepts the commit-message nit. Chuck had asked that “both dentries” be qualified because, on an ordinary move, only <code>dentry-&gt;d_sib</code> is relocated; <code>target-&gt;d_sib</code> moves only on the exchange path. <a href="https://lore.kernel.org/linux-nfs/178769497289.3510150.1755559233711012616@noble.neil.brown.name/">Neil</a>:</p>
+<blockquote>
+<p>"Thanks, I'll adjust that."</p>
+</blockquote>
+<p>He does <strong>not</strong> accept the larger claim — that 13/18 is independently a tmpfs <code>offset_readdir</code> correctness fix. Chuck’s <code>rename("a","b")</code> example (create a, b, c; after the rename, <code>a</code> kept offset 4 and was rotated to the head, so a restarted readdir could report <code>a</code> twice) is a case the patch happens to help. A different same-directory rename does not:</p>
+<blockquote>
+<p>"Thanks for the review, but I think the above is a false hope.
+In that particular case my patch helps, but in a different case it doesn't.
+Suppose instead of rename("a", "b"), I did rename("a", "c")."</p>
+</blockquote>
+<p>Before the rename, <code>d_children</code> holds <code>(name,offset)</code> pairs <code>("c", 5), ("b", 4), ("a", 3)</code>. After 13/18, dentries are not rotated, but the name and offset of <code>"c"</code> are still copied onto <code>"a"</code> and the original <code>"c"</code> is unhashed:</p>
+<blockquote>
+<p><code>["c", -], ("b",4), ("c", 5)</code></p>
+<p>"which has the wrong ordering."</p>
+</blockquote>
+<p>So the invariant Chuck needs — offset order is the reverse of <code>d_children</code> order, which is what lets <code>offset_readdir()</code> recover a stale cookie with <code>mas_find_rev()</code> and then walk siblings — is still broken for overwrite-rename of a later sibling. 13/18 remains what Neil said it was: stop <code>__d_move()</code> rotating a still-present child in front of a dropped-lock cursor, so the sleepable NFS/fsnotify/libfs walk cannot skip a dentry that never left the directory.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/0c46ce23-5a78-40af-8acd-3fcc4504242d@app.fastmail.com/">Chuck</a> does not withdraw the <code>Reviewed-by</code>. He says he already has a follow-on:</p>
+<blockquote>
+<p>"I have a fix for that, I believe, that applies on top of this one.
+I can post it if interested."</p>
+</blockquote>
+<p>He does not post it in-window. Whether 13/18 can still land on its own as “don’t rotate same-parent <code>d_sib</code>” (Neil’s original justification, which the NFS iterator still needs) is unaddressed; the tmpfs-readdir-fix story is now explicitly incomplete.</p>
+<h2>Why this matters for NFS client development</h2>
+<p>This is the first in-series <strong>NFS client regression</strong> found by testing, and it is on the hot setattr/delegation-return path.</p>
+<p><code>nfs_clear_verifier_directory()</code> / <code>nfs_clear_verifier_delegated()</code> is the NFS analogue of the fsnotify children walk: unsetting change-attribute verifiers on a directory and its positive children. v2 put that walk on a common iterator that is allowed to drop <code>d_lock</code> and <code>cond_resched()</code>. Chuck’s splat shows a lock the series did not drop: the inode <code>i_lock</code> held by the delegated-verifier caller. That is the same class of bug 07/18 already fixed for fsnotify, and Neil’s proposed remedy is the same <code>d_find_alias()</code> pattern.</p>
+<p>Until the next RFC:</p>
+<ul>
+<li>applying v2 makes <code>chmod</code>/<code>SETATTR</code> on a delegated directory a <code>might_sleep()</code>-under-<code>i_lock</code> BUG, independent of negative-dentry count;</li>
+<li>the original soft-lockup hazard (a huge <code>d_sib</code> list of negative children) is still not fixed in a mergeable form, because the iterator cannot be allowed to sleep while any spinlock remains;</li>
+<li>the parallel v1 fsnotify argument (Neil still wants callers to own an <code>update_children</code> flag so no <code>d_children</code> walk runs under <code>mark-&gt;lock</code>) is unchanged this week in <em>this</em> thread.</li>
+</ul>
+<p>Patch 13’s NFS relevance is unchanged by the tmpfs counter-example. The NFS verifier walk still needs same-parent <code>__d_move</code> not to rotate a live child in front of a cursor. Chuck’s promised follow-on would be a libfs/tmpfs cookie-order fix on top, not an NFS client change.</p>
+<h2>Final conclusions (as of 27 August)</h2>
+<ul>
+<li><strong>Classification:</strong> VFS/dcache bug-fix RFC; this week’s NFS-visible result is a <strong>client locking bug</strong> (sleep in atomic context on the NFSv4 setattr/delegation-return path) plus a <strong>partial</strong> VFS rename/<code>d_sib</code> change whose tmpfs-readdir benefit Neil rejects as “a false hope.”</li>
+<li><strong>NFS client:</strong> <a href="https://lore.kernel.org/linux-nfs/f9d16f36-10e6-4bec-aa8e-b9b3cb3ad872@app.fastmail.com/">Chuck</a> reproduced <code>sleeping function called from invalid context</code> at the <code>d_for_each_positive_child()</code> in <code>nfs_clear_verifier_delegated()</code>. <a href="https://lore.kernel.org/linux-nfs/178763098869.3510150.7453977572617670907@noble.neil.brown.name/">Neil</a> will drop <code>i_lock</code> first via <code>d_find_alias()</code>, matching the fsnotify patch, and aims to post another RFC “tomorrow.”</li>
+<li><strong>13/18:</strong> Neil will fix the “both dentries” wording. He will not sell the patch as a complete tmpfs <code>offset_readdir</code> fix; <code>rename("a","c")</code> still leaves <code>d_children</code> mis-ordered relative to offsets. Chuck says he has a stacked fix and offers to post it; it is not on the list this week. His earlier <code>Reviewed-by</code> is not withdrawn.</li>
+<li><strong>Disposition:</strong> still RFC/RFT, now with a known NFS client BUG on the series as posted. No maintainer queue. The next revision has to treat <code>i_lock</code> on the delegated-verifier path the same way 07/18 treated it for fsnotify, or the sleepable child iterator cannot ship.</li>
+</ul>
+<h2>Key messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/f9d16f36-10e6-4bec-aa8e-b9b3cb3ad872@app.fastmail.com/">Chuck Lever: sleep-in-atomic in nfs_clear_verifier_delegated via SETATTR</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178763098869.3510150.7453977572617670907@noble.neil.brown.name/">NeilBrown: i_lock is held across the walk; will d_find_alias() and respin</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178769497289.3510150.1755559233711012616@noble.neil.brown.name/">NeilBrown: 13/18 does not restore d_children/offset order for rename("a","c")</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/0c46ce23-5a78-40af-8acd-3fcc4504242d@app.fastmail.com/">Chuck Lever: has a follow-on fix for that ordering, can post</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/f9d16f36-10e6-4bec-aa8e-b9b3cb3ad872@app.fastmail.com/">2026-08-24 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v2 04/18] nfs: separate locked regions in nfs_clear_verifier_directory()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178763098869.3510150.7453977572617670907@noble.neil.brown.name/">2026-08-25 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v2 04/18] nfs: separate locked regions in nfs_clear_verifier_directory()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178769497289.3510150.1755559233711012616@noble.neil.brown.name/">2026-08-25 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH v2 13/18] VFS: don't move dentries in d_sib list when they have the same parent</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/0c46ce23-5a78-40af-8acd-3fcc4504242d@app.fastmail.com/">2026-08-26 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v2 13/18] VFS: don't move dentries in d_sib list when they have the same parent</a></li>
+</ul>
+  </main>
+</body>
+</html>

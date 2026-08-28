@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>pNFS blocklayout lost-wakeup fix switches to a completion</title>
+  <meta name="description" content="This week’s linux-nfs traffic produced a second, more careful client-side bug fix for a hang in the pNFS block layout driver’s userspace device-map upcall path. Two days after an RFC that merely reordered set_current_state(), FAN YE posted…">
+  <meta property="og:title" content="pNFS blocklayout lost-wakeup fix switches to a completion">
+  <meta property="og:description" content="This week’s linux-nfs traffic produced a second, more careful client-side bug fix for a hang in the pNFS block layout driver’s userspace device-map upcall path. Two days after an RFC that merely reordered set_current_state(), FAN YE posted…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-27T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="pNFS blocklayout lost-wakeup fix switches to a completion">
+  <meta name="twitter:description" content="This week’s linux-nfs traffic produced a second, more careful client-side bug fix for a hang in the pNFS block layout driver’s userspace device-map upcall path. Two days after an RFC that merely reordered set_current_state(), FAN YE posted…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-27</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>pNFS blocklayout lost-wakeup fix switches to a completion</h1>
+<h2>Summary</h2>
+<h2>Summary</h2>
+<p>This week’s linux-nfs traffic produced a second, more careful client-side bug fix for a hang in the pNFS block layout driver’s userspace device-map upcall path. Two days after an <a href="https://lore.kernel.org/linux-nfs/20260821-rpc-pipefs-blwake-v1-1-3e70ec9b0537@gmail.com/">RFC that merely reordered <code>set_current_state()</code></a>, <a href="https://lore.kernel.org/linux-nfs/20260823-rpc-pipefs-blwake-v2-1-68d73e3393ef@gmail.com/">FAN YE</a> posted <code>[PATCH v2] pnfs/blocklayout: fix lost wakeup in bl_resolve_deviceid()</code>, replacing the open-coded wait entirely.</p>
+<p>The underlying race is unchanged. <code>bl_resolve_deviceid()</code> queues the current task on <code>nn-&gt;bl_wq</code> and calls <code>rpc_queue_upcall()</code>, but it only then sets <code>TASK_UNINTERRUPTIBLE</code>. If <code>blkmapd</code> answers on another CPU in that window, <code>wake_up()</code> from <code>bl_pipe_downcall()</code> sees a still-runnable waiter; the later <code>set_current_state()</code> overwrites that wakeup, and <code>schedule()</code> never returns. Because the waiter already holds <code>nn-&gt;bl_mutex</code>, the stall is not local:</p>
+<blockquote>
+<p>"The caller holds nn-&gt;bl_mutex, so every later blocklayout device resolution blocks behind it."</p>
+</blockquote>
+<p>v1 tried to close that window by moving the uninterruptible state assignment <em>before</em> the upcall. Ye now withdraws that approach outright:</p>
+<blockquote>
+<p>"Apologies for v1: I sent it without checking that rpc_queue_upcall() can sleep, so the fix it proposed could not have worked."</p>
+</blockquote>
+<p>That is the same hazard the RFC had flagged as an open question: <code>rpc_queue_upcall()</code> can <code>dput()</code>, and putting the task to sleep first means any blocking <code>dput()</code> on an unlinked rpc_pipefs dentry would run while <code>!TASK_RUNNING</code>. v2 therefore does what the RFC had asked maintainers about, and what <code>__cld_pipe_upcall()</code> in <code>fs/nfsd/nfs4recover.c</code> already does:</p>
+<blockquote>
+<p>"Replace the open-coded wait with a completion, the way <code>__cld_pipe_upcall()</code> waits."</p>
+</blockquote>
+<p>The patch is small: <code>wait_queue_head_t bl_wq</code> in <code>struct nfs_net</code> becomes <code>struct completion bl_done</code>; <code>bl_pipe_downcall()</code> and the abort path in <code>bl_pipe_destroy_msg()</code> call <code>complete()</code> instead of <code>wake_up()</code>; <code>bl_resolve_deviceid()</code> does <code>reinit_completion()</code> and <code>wait_for_completion()</code>. The change is still tagged <code>Fixes: fe0a9b740881 ("pnfsblock: add device operations")</code>.</p>
+<p>v2 also closes a second, independent client bug that the RFC left untouched. <code>bl_mount_reply</code> was never reinitialised, so a wakeup from <code>bl_pipe_destroy_msg()</code> (daemon closing the pipe unread) left the caller reading the previous resolution’s device number. Ye now resets <code>reply-&gt;status</code> before the upcall:</p>
+<blockquote>
+<p>"The reply status is reset before the upcall so that the abort path in <code>bl_pipe_destroy_msg()</code> cannot leave the caller looking at the reply from an earlier resolution."</p>
+</blockquote>
+<p>That stale-reply path, Ye writes, is</p>
+<blockquote>
+<p>"a bug of its own, independent of the lost wakeup."</p>
+</blockquote>
+<p>Reproduction remains synthetic. The hang has</p>
+<blockquote>
+<p>"Not seen on a real pNFS mount."</p>
+</blockquote>
+<p>Everything reported is from a VM where a debugfs hook calls <code>bl_resolve_deviceid()</code> with a fake <code>nfs_server</code> and a fake <code>blkmapd</code> answers every upcall in the same loop iteration. Three kernels, same initramfs, all built with <code>CONFIG_DEBUG_ATOMIC_SLEEP</code>, produced a four-row matrix that is the real news of this posting:</p>
+<ul>
+<li>5000 upcalls with no added delay: upstream hung twice (task stuck at the <code>schedule()</code> after <code>set_current_state()</code>, still holding <code>nn-&gt;bl_mutex</code>); both v1 and v2 were clean.</li>
+<li><code>rpc_queue_upcall()</code> forced to block 50 ms: upstream hung; v1 fell through and returned the <em>previous</em> device number because an <code>msleep()</code> at the <code>dput()</code> cleared task state; v2 was clean.</li>
+<li>Upcall aborted by the daemon closing the pipe unread: upstream and v1 both returned a stale device; v2 returned 0 plus a warning.</li>
+<li><code>DEBUG_ATOMIC_SLEEP</code>: upstream quiet; v1 warned on the first upcall, before any race — <code>"do not call blocking ops when !TASK_RUNNING; state=2 set at bl_resolve_deviceid"</code>; v2 quiet.</li>
+</ul>
+<p>That table is why v2 exists. The RFC reorder papered over the lost wakeup in the no-delay case, but it introduced an atomic-sleep warning and, once <code>rpc_queue_upcall()</code> actually slept, it turned a hang into a silent wrong device number. The completion rewrite is the only of the three kernels that is correct on every injected path.</p>
+<p>No replies landed on this v2 thread during the week. The discussion therefore ends with a well-tested client hang fix, a second stale-reply fix in the same patch, and no maintainer Ack or review yet. Until that lands, the blocklayout device-resolution path remains the only <code>rpc_queue_upcall()</code> waiter that can lose a wakeup, serialize every subsequent resolution behind <code>nn-&gt;bl_mutex</code>, and, on pipe abort, hand back a device id from an earlier resolution.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260823-rpc-pipefs-blwake-v2-1-68d73e3393ef@gmail.com/">2026-08-23 FAN YE via B4 Relay — [PATCH v2] pnfs/blocklayout: fix lost wakeup in bl_resolve_deviceid()</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260823-rpc-pipefs-blwake-v2-1-68d73e3393ef@gmail.com/">2026-08-23 FAN YE via B4 Relay <a href="mailto:devnull+fy15309206903.gmail.com@kernel.org">devnull+fy15309206903.gmail.com@kernel.org</a> — [PATCH v2] pnfs/blocklayout: fix lost wakeup in bl_resolve_deviceid()</a></li>
+</ul>
+  </main>
+</body>
+</html>

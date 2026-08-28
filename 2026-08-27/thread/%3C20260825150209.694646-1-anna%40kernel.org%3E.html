@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS client CB_NOTIFY v2 draws first dcache review</title>
+  <meta name="description" content="This week Anna Schumaker posted v2 of her four-patch new feature series that teaches the Linux NFS client to consume CB_NOTIFY callbacks for directory delegations. The work is not a protocol change — CB_NOTIFY has been in NFSv4.1 since RFC…">
+  <meta property="og:title" content="NFS client CB_NOTIFY v2 draws first dcache review">
+  <meta property="og:description" content="This week Anna Schumaker posted v2 of her four-patch new feature series that teaches the Linux NFS client to consume CB_NOTIFY callbacks for directory delegations. The work is not a protocol change — CB_NOTIFY has been in NFSv4.1 since RFC…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-08-27T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS client CB_NOTIFY v2 draws first dcache review">
+  <meta name="twitter:description" content="This week Anna Schumaker posted v2 of her four-patch new feature series that teaches the Linux NFS client to consume CB_NOTIFY callbacks for directory delegations. The work is not a protocol change — CB_NOTIFY has been in NFSv4.1 since RFC…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-08-27</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS client CB_NOTIFY v2 draws first dcache review</h1>
+<h2>Summary</h2>
+<h2>Overview</h2>
+<p>This week Anna Schumaker posted <strong>v2</strong> of her four-patch <strong>new feature</strong> series that teaches the Linux NFS client to consume <code>CB_NOTIFY</code> callbacks for directory delegations. The work is not a protocol change — <code>CB_NOTIFY</code> has been in NFSv4.1 since RFC 5661 / 8881 — and it is not a bug-fix series. It is the missing client half of directory delegations: the client already knows how to <em>request</em> a directory lease; these patches teach it what to do when the server later says the directory changed.</p>
+<p>The v1 posting (4 August) sat unanswered. v2 arrived on 25 August with decoder and handler cleanups, and this time it drew a first review: <a href="https://lore.kernel.org/linux-nfs/c0704acb89cdf5593970c6d7a7f000c6ef9f24c6.camel@kernel.org/">Jeff Layton</a> challenged the REMOVE path’s use of <code>d_drop()</code>, asking whether a remove notification should instead leave a negative dentry. Schumaker had not replied by the end of the window. Nothing from the series merged.</p>
+<h2>Bridge from v1</h2>
+<p>Three weeks ago Schumaker posted the original four patches with an explicit request for comments and no replies in that window. The design thesis has not changed. In the <a href="https://lore.kernel.org/linux-nfs/20260825150209.694646-1-anna@kernel.org/">v2 cover letter</a> she restates the same conservative client-engineering choice:</p>
+<blockquote>
+<p>"These patches add support for the CB_NOTIFY callback operation from NFS servers. Editing directory order or placement in our caches isn't easy or practical the way things are structured now. Instead, I use CB_NOTIFY as an indication that the client needs to refresh its view of the directory."</p>
+</blockquote>
+<p>That is still the heart of the series: treat <code>CB_NOTIFY</code> as a cache-invalidation / refresh signal rather than a full directory-journal replay. A naïve implementation would splice, reorder, or rewrite dentries in place as <code>NOTIFY4_*</code> events arrive. Schumaker argues the current NFS client cache layout makes that kind of surgical edit impractical.</p>
+<p>She closed again with a one-word invitation — &gt; "Thoughts?" — and this time Layton answered, on the REMOVE handler.</p>
+<h2>What changed in v2</h2>
+<p>The cover letter lists three explicit v2 deltas:</p>
+<ul>
+<li>Fix signed / unsigned type mixups</li>
+<li>Don't try to share lookup code between <code>NOTIFY4_REMOVE</code> and <code>NOTIFY4_ADD</code></li>
+<li>Add handling for the <code>NOTIFY4_ADD</code> <code>na_have_old_entry</code> case</li>
+</ul>
+<p>Those map onto the per-patch notes. <a href="https://lore.kernel.org/linux-nfs/20260825150209.694646-2-anna@kernel.org/">Patch 1</a> changes the callback result to <code>ssize_t</code>. <a href="https://lore.kernel.org/linux-nfs/20260825150209.694646-3-anna@kernel.org/">Patch 2</a> initializes <code>res</code> to 0 in <code>nfs4_callback_notify()</code>, adds missing error handling, and <strong>removes</strong> the shared <code>nfs4_cb_notify_lookup()</code> helper that v1 tried to use for both add and remove. <a href="https://lore.kernel.org/linux-nfs/20260825150209.694646-4-anna@kernel.org/">Patch 3</a> is the largest rewrite: handle <code>na_have_old_entry</code>, initialize <code>fattr-&gt;valid</code> to 0 before decoding, actually check <code>decode_fattr_cb()</code>'s return code, and reshape <code>nfs4_cb_notify_add()</code> so it more closely resembles <code>nfs_prime_dcache()</code>. <a href="https://lore.kernel.org/linux-nfs/20260825150209.694646-5-anna@kernel.org/">Patch 4</a> is still the thin rename composition.</p>
+<p>The diffstat is essentially unchanged from v1 — six files, 409 insertions, 5 deletions — all on the client callback path: <code>fs/nfs/callback.h</code>, <code>fs/nfs/callback_proc.c</code>, <code>fs/nfs/callback_xdr.c</code>, <code>fs/nfs/nfs4_fs.h</code>, <code>fs/nfs/nfs4xdr.c</code>, and <code>include/linux/nfs4.h</code>. No <code>fs/nfs/dir.c</code> rewrite. That still matches a decoder plus three notification handlers, not a readdir-cache journal.</p>
+<p>The split of lookup code is the most important client-correctness fix in v2. Sharing a lookup helper between REMOVE (name is gone; dcache should forget or go negative) and ADD (name now exists; dcache should grow a positive dentry) was always a type-confusion risk. Dropping <code>nfs4_cb_notify_lookup()</code> and giving ADD its own <code>nfs_prime_dcache()</code>-shaped path is the right structural answer, even before Layton's review of the REMOVE side.</p>
+<h2>Patch 1: CB_NOTIFY skeleton</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260825150209.694646-2-anna@kernel.org/">Patch 1</a> still only wires <code>CB_NOTIFY</code> into the client's callback operation table and XDR decoder:</p>
+<blockquote>
+<p>"Support for individual notification types will be added over the next few patches."</p>
+</blockquote>
+<p>The v2 note — change <code>res</code> to a <code>ssize_t</code> — is the signed/unsigned mixup fix from the cover. Until the later patches land, an incoming <code>CB_NOTIFY</code> can be recognized and parsed far enough to be dispatched rather than treated as an unknown callback. The outline is where the protocol constants (<code>include/linux/nfs4.h</code>), argument structs (<code>fs/nfs/callback.h</code>), stub procedure, and decode path live.</p>
+<h2>Patch 2: REMOVE_ENTRY, and Layton's d_drop question</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260825150209.694646-3-anna@kernel.org/">Patch 2</a> is the first real handler, and it still follows the cover letter's "refresh, don't rewrite" rule almost verbatim:</p>
+<blockquote>
+<p>"When the server tells us that a directory entry has been removed then we need to take that as an indication that our knowledge of the directory has changed and needs to be refreshed."</p>
+</blockquote>
+<p>The implementation looks up the child dentry and then <code>d_drop()</code>s it. That is the line Layton stopped on. In his <a href="https://lore.kernel.org/linux-nfs/c0704acb89cdf5593970c6d7a7f000c6ef9f24c6.camel@kernel.org/">reply</a> he asked:</p>
+<blockquote>
+<p>"Should this instead make this a negative dentry?"</p>
+</blockquote>
+<p>and spelled out the consequence of the current code:</p>
+<blockquote>
+<p>"I think this will just drop the existing dentry and it'll trigger a lookup next time we end up trying to hit it."</p>
+</blockquote>
+<p>That is the first real design fight of the series, and it is a client-dcache question, not an XDR one.</p>
+<p><code>d_drop()</code> unhashes the dentry. The next <code>lookup()</code> of that name misses the dcache and goes to the server. That matches a conservative "our knowledge is stale, go refresh" policy, and it is hard to get wrong: no leftover positive dentry for a name the server just deleted. But it also <strong>throws away</strong> the information the notification just delivered. With a directory delegation held, the whole point of <code>CB_NOTIFY</code> is that the client may keep serving the namespace from cache. A negative dentry would let the next lookup answer <code>ENOENT</code> locally, without a round trip, which is exactly the performance win directory delegations are supposed to buy.</p>
+<p>The tension with the cover letter is now explicit. Schumaker said surgical dcache edits are impractical and <code>CB_NOTIFY</code> should mean "refresh." Layton is pointing at the one surgical edit REMOVE <em>can</em> do cheaply and correctly: turn the name negative. That is also the more delegation-friendly answer. Leaving the name unhashed forces a GETATTR/LOOKUP that a holder of a directory delegation should not need.</p>
+<p>v2's other REMOVE-side fixes — initialize <code>res</code> to 0, add missing error handling, stop sharing lookup with ADD — are the sort of correctness nits that belong in a second posting. They do not resolve Layton's question. The thread ended there; Schumaker had not answered by week's end.</p>
+<h2>Patch 3: ADD_ENTRY still instantiates</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260825150209.694646-4-anna@kernel.org/">Patch 3</a> is still the one place the series <em>does</em> reach into the dcache, and v2 leans further into that rather than backing off:</p>
+<blockquote>
+<p>"When the server tells us that a directory entry has been created, we need to instantiate a new dentry and add it to the dcache on the client."</p>
+</blockquote>
+<p>An add notification carries enough information for the client to create a positive dentry immediately, so a subsequent lookup can hit without a round trip. That is a stronger action than the cover letter's "refresh the view" slogan, and it is the operation most likely to interact badly with concurrent local creates, negative dentries, and the existing <code>nfs_force_lookup_revalidate()</code> machinery that directory delegations already shortcut.</p>
+<p>The v2 rewrite of <code>nfs4_cb_notify_add()</code> to resemble <code>nfs_prime_dcache()</code> is the right client-side instinct. <code>nfs_prime_dcache()</code> is the well-worn helper that READDIR uses to stuff names into the dcache; cloning that shape for a callback-context add is much safer than inventing a third insertion path. Handling <code>na_have_old_entry</code> closes a protocol hole v1 ignored: the server may tell the client that the added name <em>replaced</em> a previous entry, which is the ADD-side twin of Layton's negative-dentry question. Zeroing <code>fattr-&gt;valid</code> before decode and checking <code>decode_fattr_cb()</code> are ordinary but necessary XDR hygiene; a stale <code>valid</code> mask from the stack would let a truncated attribute set look complete.</p>
+<p>This remains the patch that will need the closest review. Instantiating dentries from callback context is a classic source of locking and lifetime bugs, and the client's earlier directory-delegation work already had a rough winter of verifier and state-recovery crashes. Layton reviewed REMOVE first; ADD is the obvious next target, especially the <code>na_have_old_entry</code> case (old name should go negative or be dropped, new name instantiated).</p>
+<h2>Patch 4: RENAME_ENTRY as remove-plus-add</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260825150209.694646-5-anna@kernel.org/">Patch 4</a> is still the smallest of the four (38 insertions) because it refuses to invent a third code path:</p>
+<blockquote>
+<p>"Renaming an entry essentially combines a remove with an add, allowing us to reuse most of the code from the previous patches to do the work for us."</p>
+</blockquote>
+<p>That composition is faithful to the NFSv4 notify model — a rename is a remove of the old name plus an add of the new one, possibly across directories. It also means Layton's <code>d_drop()</code> vs. negative-dentry question <strong>inherits into rename</strong>. If REMOVE only unhashes the old name, a rename notification will force a lookup on the source name the next time anyone hits it, even though the client just learned the name is gone. If ADD instantiates the target, the destination side of the rename is cache-hot and the source side is not. Cross-directory rename notifications will exercise both, which is exactly the combination a directory-delegation holder needs when another client rearranges a tree — but only if the two halves of the policy agree.</p>
+<h2>How this fits the existing client directory-delegation work</h2>
+<p>The November 2025 client-side directory-delegation series already sent <code>GET_DIR_DELEGATION</code> / <code>GDD_GETATTR</code>, requested a directory lease on <code>ACCESS</code>, <code>CREATE</code>, <code>UNLINK</code>, and same-directory <code>RENAME</code>, short-circuited lookup revalidation while a directory delegation is held, and added a module option to turn the feature off.</p>
+<p>What it did <strong>not</strong> do is react to server-initiated directory change notifications. Without <code>CB_NOTIFY</code>, a client that holds a directory delegation has only two choices when another client mutates the directory: wait for a recall, or discover the change the hard way when a verifier or getattr fails. A working <code>CB_NOTIFY</code> path is what lets the client <em>keep</em> the delegation across other clients' creates, unlinks, and renames, instead of bouncing the lease on every remote mutation.</p>
+<p>That is why Layton's negative-dentry question is not a nit. If REMOVE <code>d_drop()</code>s and the next access of that name issues a LOOKUP, the client is paying a round trip for information it already has, and it is exercising the very lookup-revalidation path directory delegations were meant to skip. If the LOOKUP also causes the client to question the delegation, the feature unravels. Turning the dentry negative keeps the lease useful.</p>
+<p>The earlier client work also left scars reviewers remember. Directory-delegation verifier checks and state-recovery paths produced kernel Oopses over the 2025–2026 holiday window; Trond Myklebust at one point warned that another incident might mean disabling directory delegations on the client until the next release. This <code>CB_NOTIFY</code> decoder walks some of the same inode and dcache edges. The conservative "refresh the directory" policy in the cover letter looks like a reaction to that history. Layton is now asking whether that conservatism is leaving performance on the table — and whether <code>d_drop()</code> is even the correct VFS primitive for "this name is gone."</p>
+<h2>Status</h2>
+<ul>
+<li><strong>Type:</strong> new NFS client feature (directory-delegation <code>CB_NOTIFY</code> support). Not a protocol change, not a bug-fix series. v2 of the 4 August posting.</li>
+<li><strong>Posted:</strong> 25 August 2026, four patches, ~409 lines, client callback / XDR only.</li>
+<li><strong>v2 focus:</strong> type-safety, stop sharing ADD/REMOVE lookup, handle <code>na_have_old_entry</code>, reshape ADD toward <code>nfs_prime_dcache()</code>.</li>
+<li><strong>Review:</strong> Jeff Layton on patch 2 only. Open question: <code>d_drop()</code> vs. a negative dentry on <code>CB_NOTIFY4_REMOVE_ENTRY</code>. No reply from Schumaker in-window. No comments yet on ADD, RENAME, or the XDR outline.</li>
+<li><strong>Not merged.</strong> The client still cannot usefully hold a directory delegation across remote namespace changes until some version of this decoder lands, and the REMOVE-side dcache policy is now the gate.</li>
+</ul>
+<p>The obvious next step is a v3 that answers Layton — either by converting the removed name to a negative dentry (and doing the same for the source of a rename), or by defending <code>d_drop()</code> as the intentional "force a refresh" behavior the cover letter described. ADD's <code>na_have_old_entry</code> path should get the same treatment, or the two notification types will disagree about what "the old name is gone" means.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260825150209.694646-1-anna@kernel.org/">2026-08-25 Anna Schumaker <a href="mailto:anna@kernel.org">anna@kernel.org</a> — [PATCH v2 0/4] NFS: Add directory delegation support for CB_NOTIFY</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260825150209.694646-2-anna@kernel.org/">2026-08-25 Anna Schumaker <a href="mailto:anna@kernel.org">anna@kernel.org</a> — [PATCH v2 1/4] NFS: Add an outline for the CB_NOTIFY operation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260825150209.694646-4-anna@kernel.org/">2026-08-25 Anna Schumaker <a href="mailto:anna@kernel.org">anna@kernel.org</a> — [PATCH v2 3/4] NFS: Add support for CB_NOTIFY4_ADD_ENTRY</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260825150209.694646-3-anna@kernel.org/">2026-08-25 Anna Schumaker <a href="mailto:anna@kernel.org">anna@kernel.org</a> — [PATCH v2 2/4] NFS: Add support for CB_NOTIFY4_REMOVE_ENTRY</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260825150209.694646-5-anna@kernel.org/">2026-08-25 Anna Schumaker <a href="mailto:anna@kernel.org">anna@kernel.org</a> — [PATCH v2 4/4] NFS: Add support for CB_NOTIFY4_RENAME_ENTRY</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/c0704acb89cdf5593970c6d7a7f000c6ef9f24c6.camel@kernel.org/">2026-08-25 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v2 2/4] NFS: Add support for CB_NOTIFY4_REMOVE_ENTRY</a></li>
+</ul>
+  </main>
+</body>
+</html>
