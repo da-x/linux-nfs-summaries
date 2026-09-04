@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd v2 Netlink client dump, O(1) state counts</title>
+  <meta name="description" content="Dell’s Prabhakar Pujeri posted v2 of the nfsd Generic Netlink client-visibility series on 31 August, shrinking last week’s three-patch proposal to two: a privileged client-get dump of NFSv4 clients, plus O(1) per-client session and stateid…">
+  <meta property="og:title" content="nfsd v2 Netlink client dump, O(1) state counts">
+  <meta property="og:description" content="Dell’s Prabhakar Pujeri posted v2 of the nfsd Generic Netlink client-visibility series on 31 August, shrinking last week’s three-patch proposal to two: a privileged client-get dump of NFSv4 clients, plus O(1) per-client session and stateid…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-09-03T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd v2 Netlink client dump, O(1) state counts">
+  <meta name="twitter:description" content="Dell’s Prabhakar Pujeri posted v2 of the nfsd Generic Netlink client-visibility series on 31 August, shrinking last week’s three-patch proposal to two: a privileged client-get dump of NFSv4 clients, plus O(1) per-client session and stateid…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-09-03</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd v2 Netlink client dump, O(1) state counts</h1>
+<h2>Summary</h2>
+<h1>nfsd v2 Netlink client dump, O(1) state counts</h1>
+<h2>Summary</h2>
+<p>Dell’s Prabhakar Pujeri posted v2 of the nfsd Generic Netlink client-visibility series on 31 August, shrinking last week’s three-patch proposal to two: a privileged <code>client-get</code> dump of NFSv4 clients, plus O(1) per-client session and stateid counters. This is a <strong>new userspace ABI / admin feature</strong> on the server, not a wire-protocol change and not a runtime bug fix. No NFS <em>client</em> code is touched.</p>
+<p>Jeff Layton reviewed patch 1/2 the next day. He called the dump “pretty sane” but asked for nfsd-style naming (<code>find</code>/<code>marshal</code> instead of <code>get</code>/<code>put</code>) and a less clever dump iterator. There was no reply, no review of patch 2/2, and no merge in this thread by week’s end.</p>
+<h2>Brief bridge from v1</h2>
+<p>Last week’s <a href="https://lore.kernel.org/linux-nfs/cover.1787638668.git.prabhakar.pujeri@dell.com/">v1 cover</a> also wanted a grace-status attribute on <code>threads-get</code>. Layton objected that it mirrored <code>/proc/fs/nfsd/v4_end_grace</code> and therefore answered the wrong operational question (NFSv4 recovery done ≠ files accessible; system grace is NLM ∪ v4). Chuck Lever then asked that any new API not freeze grace as a server-wide boolean, because per-export grace is an open possibility for re-export / backend reboot. Pujeri dropped the grace patch; Lever’s “WFM!” closed that design dispute. This v2 is the promised client-dump reroll without grace.</p>
+<h2>What v2 actually adds</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/cover.1787988917.git.prabhakar.pujeri@dell.com/">Pujeri’s cover</a> restates the operational problem: administrators can already inspect NFSv4 clients through the nfsd filesystem, “but collecting a server-wide view requires walking one directory and opening multiple files for every client.” The existing nfsdfs files stay unchanged. A companion nfs-utils v2 series (cover <code>&lt;cover.1787988918.git.prabhakar.pujeri@dell.com&gt;</code>) adds <code>nfsdctl clients</code>.</p>
+<p>The two remaining steps:</p>
+<ol>
+<li>Dump basic NFSv4 client identity, address, lease, confirmation, reclaim, and callback state.</li>
+<li>Add O(1) snapshots of per-client session and stateid record counts.</li>
+</ol>
+<p>He is explicit about the grace split:</p>
+<blockquote>
+<p>"This reroll intentionally drops the grace-status patch. As discussed with Chuck, that interface needs an explicitly scoped design that can represent both current server-wide grace and possible per-export grace in the future. I will address it in a separate proposal."</p>
+</blockquote>
+<p>Material changes since v1:</p>
+<ul>
+<li>raw sockaddr attribute replaced by separate IPv4/IPv6 address, port, and optional IPv6 scope-ID attributes</li>
+<li>nonzero client-table generation plus <code>genl_dump_check_consistent()</code>, so churn marks the dump <code>NLM_F_DUMP_INTR</code></li>
+<li>session-list and stateid-IDR walks under <code>cl_lock</code> replaced by maintained <code>u64</code> counters, making every per-client snapshot O(1)</li>
+<li>counts encoded as variable-width Netlink uint attributes</li>
+<li>rebase onto nfsd-testing at <code>65b583e874b3</code></li>
+</ul>
+<p>Validation is unusually thorough for an admin ABI: strict checkpatch, YNL regeneration (33 schema checks), Sphinx <code>-W</code> docs, <code>W=1</code> GCC 16.1.1, Sparse over every <code>fs/nfsd</code> translation unit, and two independent two-vCPU QEMU boots. Each boot created one live NFSv4.2 client with one session, open stateid, lock stateid, and delegation stateid (zero layouts); raw Netlink, <code>nfsdctl</code>, and <code>/proc/fs/nfsd/clients</code> agreed. The series carries <code>Assisted-by: LLM sparse</code>.</p>
+<h2>Patch 1/2: privileged client-get dump</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/2d682b47dca234b5c270b0b1ea03022c28bbeaa3.1787988917.git.prabhakar.pujeri@dell.com/">Patch 1/2</a> is the ABI core. It emits one bounded message per confirmed or unconfirmed client: server-generated client ID, peer address, minor version, client and callback states, signed lease time remaining, and <code>RECLAIM_COMPLETE</code> status.</p>
+<p>Concurrency is still conservative. Each client is pinned for the snapshot; mutable lease and confirmation fields sit under the per-net client lock; server shutdown is serialized with <code>nfsd_mutex</code>. The v1 “best-effort snapshot” caveat is now a real dump-consistency flag:</p>
+<blockquote>
+<p>"Track client-table changes with a nonzero generation counter and use genl_dump_check_consistent() so a dump that can skip or repeat a client is marked NLM_F_DUMP_INTR."</p>
+</blockquote>
+<p>The sockaddr split is the other ABI cleanup: the peer is no longer a raw <code>sockaddr</code> blob, which is what monitoring tools actually want (family, address, port, optional IPv6 scope ID).</p>
+<h2>Patch 2/2: O(1) per-client state usage</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/f028a8839133f52e3ff04d5e4645308e63ce8dc6.1787988917.git.prabhakar.pujeri@dell.com/">Patch 2/2</a> is the monitoring-oriented follow-on. A client can “retain substantial server-side state even when its lease and callback channel look healthy,” so the dump grows separate counts for sessions and for open, lock, delegation, and layout <strong>stateid records</strong>. The lock count is deliberately not a byte-range or LOCK-operation count:</p>
+<blockquote>
+<p>"A lock stateid represents a lock-owner/file pair and can cover multiple byte-range locks, so document that these are record counts rather than protocol operation or byte-range counts."</p>
+</blockquote>
+<p>v1 walked the session list and the stateid IDR under <code>cl_lock</code>. v2 maintains <code>u64</code> counters at the existing session and stateid publish/removal points, so the dump takes an O(1) snapshot instead of holding the spinlock across an unbounded IDR. Counters decrement only at final IDR removal, preserving the existing record-count semantics for retained stateids. Encoding is variable-width Netlink uint (four bytes when the value fits in <code>u32</code>, eight otherwise).</p>
+<p>That is the important server-side performance fix in this series: not a client I/O bug, but a dump that will not stall <code>cl_lock</code> on a client with a huge stateid table.</p>
+<h2>Jeff Layton: naming, defensive programming, dump iterator</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/31530d8e7bc120ae48d018001e126ad345995d9c.camel@kernel.org/">Layton’s review</a> is confined to patch 1/2. He did not object to the feature, the Netlink family choice, or the generation/<code>NLM_F_DUMP_INTR</code> churn handling. The nits are nfsd house style and dump-state clarity.</p>
+<p>On the lookup helper:</p>
+<blockquote>
+<p>"I'd call this nfsd_nl_find_client() as we usually use "get" in terms of reference counting."</p>
+</blockquote>
+<p>On walking unconfirmed clients when the table cursor has already reached <code>NFSD4_NL_CLIENT_DONE</code>:</p>
+<blockquote>
+<p>"This means that table == NFSD4_NL_CLIENT_DONE means the same an "UNCONFIRMED". The caller shouldn't call it in that case I guess, but this is a lack of defensive programming."</p>
+</blockquote>
+<p>On marshalling the peer address (v1-style <code>put</code> in the helper name):</p>
+<blockquote>
+<p>"In nfsd, we often use "put" with reference counting, so looking at this cold, this is confusingly named. Maybe change this to be named nfsd4_nl_client_marshal_address() ?"</p>
+</blockquote>
+<p>On the dump loop that increments <code>cb-&gt;args[0]</code> through confirmed then unconfirmed tables:</p>
+<blockquote>
+<p>"This while loop is a bit too clever for our own good. cb-&gt;args[0] is effectively a state enum, so why are we incrementing through its values?"</p>
+<p>"It's looking at confirmed, then unconfirmed clients, but that's not evident here."</p>
+</blockquote>
+<p>He closed with a net-positive verdict:</p>
+<blockquote>
+<p>"The rest looks pretty sane though."</p>
+</blockquote>
+<p>No comments landed on the O(1) counters, the uint encoding, or the YAML/RST docs this week.</p>
+<h2>What this means for NFS client development and bug fixes</h2>
+<p>Nothing in this thread is an NFS client patch, a protocol change, or a client-visible bug fix. The client-visible impact, if v2 lands after Layton’s nits, is still indirect and operational: a privileged Netlink dump that a restart/failover harness — or an operator watching a busy NFSv4 server — can consume without walking <code>/proc/fs/nfsd/clients</code>. Identity, lease remaining, confirmation, reclaim, callbacks, and per-client session/open/lock/delegation/layout record counts are the data that harness needs; the grace half of that picture remains deferred to a later, scoped operation.</p>
+<p>The only “bug-fix-shaped” change is defensive dump quality: <code>NLM_F_DUMP_INTR</code> on client-table churn, and O(1) counters so the dump does not walk unbounded IDRs under <code>cl_lock</code>. Those are server observability hardening, not client I/O fixes.</p>
+<p>Status at week’s end: <strong>v2, under review, not merged</strong>. Layton’s naming and iterator comments are the open review items; patch 2/2 is unreviewed in this thread. A later v3 exists as a separate series and is out of scope here.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/cover.1787988917.git.prabhakar.pujeri@dell.com/">2026-08-31 Prabhakar Pujeri — [PATCH v2 0/2] nfsd: expose NFSv4 client state through Netlink</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/2d682b47dca234b5c270b0b1ea03022c28bbeaa3.1787988917.git.prabhakar.pujeri@dell.com/">2026-08-31 Prabhakar Pujeri — [PATCH v2 1/2] nfsd: add a Netlink dump of NFSv4 clients</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/f028a8839133f52e3ff04d5e4645308e63ce8dc6.1787988917.git.prabhakar.pujeri@dell.com/">2026-08-31 Prabhakar Pujeri — [PATCH v2 2/2] nfsd: report per-client NFSv4 state usage through Netlink</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/31530d8e7bc120ae48d018001e126ad345995d9c.camel@kernel.org/">2026-09-01 Jeff Layton — Re: [PATCH v2 1/2] nfsd: add a Netlink dump of NFSv4 clients</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/cover.1787988917.git.prabhakar.pujeri@dell.com/">2026-08-31 Prabhakar Pujeri <a href="mailto:prabhakar.pujeri@dell.com">prabhakar.pujeri@dell.com</a> — [PATCH v2 0/2] nfsd: expose NFSv4 client state through Netlink</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/2d682b47dca234b5c270b0b1ea03022c28bbeaa3.1787988917.git.prabhakar.pujeri@dell.com/">2026-08-31 Prabhakar Pujeri <a href="mailto:prabhakar.pujeri@dell.com">prabhakar.pujeri@dell.com</a> — [PATCH v2 1/2] nfsd: add a Netlink dump of NFSv4 clients</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/f028a8839133f52e3ff04d5e4645308e63ce8dc6.1787988917.git.prabhakar.pujeri@dell.com/">2026-08-31 Prabhakar Pujeri <a href="mailto:prabhakar.pujeri@dell.com">prabhakar.pujeri@dell.com</a> — [PATCH v2 2/2] nfsd: report per-client NFSv4 state usage through Netlink</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/31530d8e7bc120ae48d018001e126ad345995d9c.camel@kernel.org/">2026-09-01 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v2 1/2] nfsd: add a Netlink dump of NFSv4 clients</a></li>
+</ul>
+  </main>
+</body>
+</html>

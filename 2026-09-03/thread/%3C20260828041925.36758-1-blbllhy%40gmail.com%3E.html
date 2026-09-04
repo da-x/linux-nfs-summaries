@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd: lock cl_openowners walk to close EXCHANGE_ID UAF</title>
+  <meta name="description" content="This week&#39;s linux-nfs traffic included a compact but consequential bug-fix thread for the NFSD state machine: a KASAN-confirmed slab use-after-free in client_has_state() / client_has_openowners(), triggered on the EXCHANGE_ID path when an…">
+  <meta property="og:title" content="nfsd: lock cl_openowners walk to close EXCHANGE_ID UAF">
+  <meta property="og:description" content="This week&#39;s linux-nfs traffic included a compact but consequential bug-fix thread for the NFSD state machine: a KASAN-confirmed slab use-after-free in client_has_state() / client_has_openowners(), triggered on the EXCHANGE_ID path when an…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-09-03T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd: lock cl_openowners walk to close EXCHANGE_ID UAF">
+  <meta name="twitter:description" content="This week&#39;s linux-nfs traffic included a compact but consequential bug-fix thread for the NFSD state machine: a KASAN-confirmed slab use-after-free in client_has_state() / client_has_openowners(), triggered on the EXCHANGE_ID path when an…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-09-03</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd: lock cl_openowners walk to close EXCHANGE_ID UAF</h1>
+<h2>Summary</h2>
+<p>This week's linux-nfs traffic included a compact but consequential <strong>bug-fix</strong> thread for the NFSD state machine: a KASAN-confirmed slab use-after-free in <code>client_has_state()</code> / <code>client_has_openowners()</code>, triggered on the EXCHANGE_ID path when an openowner is unhashed and freed under <code>cl_lock</code> while another thread walks the same list without that lock.</p>
+<p>The discussion is entirely <strong>server-side</strong> (<code>fs/nfsd/nfs4state.c</code>). There is no NFS <em>client</em> code change here; the practical impact for client developers is that a concurrent EXCHANGE_ID with mismatched credentials could previously crash the server, which in turn would stall or reset client mounts. The patch is tagged for stable.</p>
+<h2>The race: unlocked openowner walk vs. <code>nfs4_put_stateowner()</code></h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260828041925.36758-1-blbllhy@gmail.com/">Cen Zhang of Microsoft Security FORGE Labs</a> posted a one-file patch that takes <code>clp-&gt;cl_lock</code> for the duration of the openowner walk in <code>client_has_state()</code>. The commit message lays out the race with unusual clarity:</p>
+<blockquote>
+<p>"client_has_openowners() walks clp-&gt;cl_openowners and reads so_stateids without clp-&gt;cl_lock. nfs4_put_stateowner() unhashes that openowner under cl_lock and then frees it, so a concurrent EXCHANGE_ID with mismatched creds can use-after-free the nfs4_openowner."</p>
+</blockquote>
+<p>KASAN caught it in the EXCHANGE_ID compound:</p>
+<pre><code>BUG: KASAN: slab-use-after-free in client_has_state+0x10a/0x140
+  fs/nfsd/nfs4state.c:3718 client_has_openowners()
+  nfsd4_exchange_id
+  nfsd4_proc_compound
+  nfsd_dispatch
+  svc_process
+</code></pre>
+<p>The regression is pinned to <code>4eaea1342507</code> ("nfsd: improve client_has_state to check for unused openowners") — the earlier improvement that started inspecting unused openowners (and their <code>so_stateids</code>) without also taking the lock that serializes unhash/free. Xiang Mei (Microsoft) is credited as reporter; the patch Ccs <code>AutonomousCodeSecurity@microsoft.com</code> and <code>stable@vger.kernel.org</code>.</p>
+<p>The mechanical change is small (12 lines in <code>fs/nfsd/nfs4state.c</code>): acquire <code>clp-&gt;cl_lock</code> before walking <code>cl_openowners</code>, drop it afterwards. That matches the locking already used by <code>nfs4_put_stateowner()</code> when it unhashes an openowner, so the list walk can no longer observe a freed <code>nfs4_openowner</code>.</p>
+<h2>Process niggle: From: address vs. applying a UAF fix</h2>
+<p>The only technical objection this week was not about the lock at all. <a href="https://lore.kernel.org/linux-nfs/2026082828-palpable-dingo-241b@gregkh/">Greg Kroah-Hartman</a> asked Zhang to resend from a corporate address:</p>
+<blockquote>
+<p>"Please use your microsoft.com email address, and not a random gmail.com address. It's kind of odd that Microsoft would have to rely on Google to send kernel patches :)"</p>
+</blockquote>
+<p><a href="https://lore.kernel.org/linux-nfs/978293e7-430d-4b11-9a29-1fb479cb0082@app.fastmail.com/">Chuck Lever</a>, as NFSD maintainer, treated that as a process question rather than a NAK of the fix, and asked Greg whether he should wait:</p>
+<blockquote>
+<p>"Greg, would you prefer that I hold off on applying this to nfsd-testing until Cen can post this one again?"</p>
+</blockquote>
+<p><a href="https://lore.kernel.org/linux-nfs/2026082948-sleeve-blaming-b901@gregkh/">Greg declined to dictate</a>:</p>
+<blockquote>
+<p>"That's your call."</p>
+</blockquote>
+<h2>Conclusion: applied to nfsd-testing</h2>
+<p>Lever then applied the original patch without waiting for a resend. <a href="https://lore.kernel.org/linux-nfs/178801882864.2077660.2011534008442729318.b4-ty@b4/">His b4-ty note</a> records:</p>
+<blockquote>
+<p>"Applied to nfsd-testing, thanks!"</p>
+</blockquote>
+<p>as commit <code>6882aca9f9cabfaec5ea23d1512f345fbd288b65</code> (<code>nfsd: hold cl_lock in client_has_state()</code>).</p>
+<p>No follow-up from Zhang, no alternative locking scheme, and no argument that the UAF diagnosis was wrong. The thread therefore ends this week as a <strong>stable-bound NFSD bug fix already in nfsd-testing</strong>: the openowner list walk in <code>client_has_state()</code> is now serialized with unhash/free, closing a KASAN-visible use-after-free on concurrent EXCHANGE_ID. Client-side work is unaffected except insofar as a previously crashable server is now expected to survive that race.</p>
+<p><strong>Classification:</strong> bug fix (locking / use-after-free), not a new feature or protocol change. <strong>Status:</strong> applied to nfsd-testing; From-address hygiene left as a maintainer judgment call rather than a blocker.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828041925.36758-1-blbllhy@gmail.com/">2026-08-28 "Cen Zhang (Microsoft Security FORGE Labs)" <a href="mailto:blbllhy@gmail.com">blbllhy@gmail.com</a> — [PATCH] nfsd: hold cl_lock in client_has_state()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/2026082828-palpable-dingo-241b@gregkh/">2026-08-28 Greg KH <a href="mailto:gregkh@linuxfoundation.org">gregkh@linuxfoundation.org</a> — Re: [PATCH] nfsd: hold cl_lock in client_has_state()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/978293e7-430d-4b11-9a29-1fb479cb0082@app.fastmail.com/">2026-08-28 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH] nfsd: hold cl_lock in client_has_state()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/2026082948-sleeve-blaming-b901@gregkh/">2026-08-29 Greg Kroah-Hartman <a href="mailto:gregkh@linuxfoundation.org">gregkh@linuxfoundation.org</a> — Re: [PATCH] nfsd: hold cl_lock in client_has_state()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178801882864.2077660.2011534008442729318.b4-ty@b4/">2026-08-29 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH] nfsd: hold cl_lock in client_has_state()</a></li>
+</ul>
+  </main>
+</body>
+</html>

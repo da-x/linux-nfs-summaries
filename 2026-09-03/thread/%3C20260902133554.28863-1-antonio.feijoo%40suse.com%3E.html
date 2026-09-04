@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Flexfiles NFS root hang: softdep on nfsv3</title>
+  <meta name="description" content="Antonio Alvarez Feijoo posted a one-line NFS client bug-fix for the pNFS FlexFiles layout driver: nfs_layout_flexfiles now declares MODULE_SOFTDEP(&quot;pre: nfsv3&quot;) so the NFSv3 client is pulled in when the layout module is loaded, instead of…">
+  <meta property="og:title" content="Flexfiles NFS root hang: softdep on nfsv3">
+  <meta property="og:description" content="Antonio Alvarez Feijoo posted a one-line NFS client bug-fix for the pNFS FlexFiles layout driver: nfs_layout_flexfiles now declares MODULE_SOFTDEP(&quot;pre: nfsv3&quot;) so the NFSv3 client is pulled in when the layout module is loaded, instead of…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-09-03T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Flexfiles NFS root hang: softdep on nfsv3">
+  <meta name="twitter:description" content="Antonio Alvarez Feijoo posted a one-line NFS client bug-fix for the pNFS FlexFiles layout driver: nfs_layout_flexfiles now declares MODULE_SOFTDEP(&quot;pre: nfsv3&quot;) so the NFSv3 client is pulled in when the layout module is loaded, instead of…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-09-03</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Flexfiles NFS root hang: softdep on nfsv3</h1>
+<h2>Summary</h2>
+<h1>Flexfiles NFS root hang: softdep on nfsv3</h1>
+<h2>Summary</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260902133554.28863-1-antonio.feijoo@suse.com/">Antonio Alvarez Feijoo</a> posted a one-line <strong>NFS client bug-fix</strong> for the pNFS FlexFiles layout driver: <code>nfs_layout_flexfiles</code> now declares <code>MODULE_SOFTDEP("pre: nfsv3")</code> so the NFSv3 client is pulled in when the layout module is loaded, instead of being discovered on the first data-server I/O. The change targets an unbootable NFSv4 root against a Linux knfsd with FlexFiles enabled. There were no replies in-window; the patch is unreviewed as of this week.</p>
+<p>This is not a protocol change and not a new feature. It is a client-side module-loading fix for a deadlock that became fatal once FlexFiles stopped falling back to the metadata server.</p>
+<h2>The hang</h2>
+<p>An NFS root mounted over NFSv4 against a Linux NFS server wedges during boot: either it never leaves the switch-root <code>execve()</code>, or a loaded machine spins until the softlockup watchdog fires. Feijoo traces it to the FlexFiles path into <code>nfs4_pnfs_ds_connect()</code> on the first I/O through a layout segment. For an NFSv3 data server that call does <code>symbol_request(nfs3_set_ds_client)</code>, which becomes <code>request_module("symbol:nfs3_set_ds_client")</code> when <code>nfsv3</code> is not already resident. <code>request_module()</code> execs <code>/sbin/modprobe</code> via the usermode helper. On an NFS root, that binary — and libkmod, and the libraries behind it — must be read from the very filesystem whose I/O is blocked waiting for the DS connection:</p>
+<blockquote>
+<p>"the helper cannot make progress, so neither can the mount."</p>
+</blockquote>
+<p>On a system whose init is on NFS, the first such I/O is typically the <code>execve()</code> of init itself, immediately after <code>pivot_root()</code>, at which point the initramfs — and the only reachable copy of modprobe — is gone. Feijoo includes a warning from <code>fs/nfs/pnfs_nfs.c:792</code> in <code>nfs4_pnfs_ds_connect()</code>, with <code>CPU#0: systemd/1</code> and a call chain through <code>nfs4_ff_layout_prepare_ds</code> → <code>ff_layout_choose_ds_for_read</code> → <code>ff_layout_pg_init_read</code> → <code>nfs_readahead</code> → <code>bprm_execve</code>. The linked-modules list has <code>nfs_layout_flexfiles</code> and <code>nfsv4</code> but, as he notes, no <code>nfsv3</code>.</p>
+<h2>Why it stayed latent, and why it is fatal now</h2>
+<p>The bug has been latent since the FlexFiles driver was added (<code>d67ae825a59d</code>, "pnfs/flexfiles: Add the FlexFile Layout Driver"). A fatal DS connect error used to be absorbed: <code>ff_layout_read_pagelist()</code> returned <code>PNFS_NOT_ATTEMPTED</code> and <code>pnfs_do_read()</code> reissued the I/O through <code>pnfs_read_through_mds()</code>. The read completed over plain NFSv4 against the metadata server, so nobody noticed that the layout had been abandoned.</p>
+<p>Commit <code>7a375cafc14e</code> ("NFSv4/flexfiles: honor FF_FLAGS_NO_IO_THRU_MDS on fatal DS connect errors") removed that fallback for layouts carrying <code>FF_FLAGS_NO_IO_THRU_MDS</code>. Feijoo agrees that was the right protocol behavior:</p>
+<blockquote>
+<p>"correctly, since silently contradicting the flag was a bug."</p>
+</blockquote>
+<p>The catch is that knfsd sets that flag on <strong>every</strong> FlexFiles layout it hands out (<code>fs/nfsd/flexfilelayout.c</code>: <code>FF_FLAGS_NO_LAYOUTCOMMIT | FF_FLAGS_NO_IO_THRU_MDS | FF_FLAGS_NO_READ_IO</code>, unconditionally). Against a Linux server, the no-fallback path is therefore not the appliance corner case that commit described — it is every layout. With no MDS fallback left, a DS connect that cannot complete is now fatal to the boot.</p>
+<p><code>FF_FLAGS_NO_READ_IO</code> does not rescue the read either. The client only diverts reads off <code>IOMODE_RW</code> segments; a read-only NFS root is served <code>IOMODE_READ</code> segments, where that flag does not apply.</p>
+<h2>The client fix</h2>
+<p>The proposed change is a softdep, not a runtime <code>request_module()</code> from I/O context. The layout driver is itself loaded by <code>request_module("nfs-layouttype4-4")</code> from <code>find_pnfs_driver()</code> during <code>mount()</code>, which on an initramfs boot happens while the initramfs and a working <code>/sbin/modprobe</code> are still in place. Resolving <code>MODULE_SOFTDEP("pre: nfsv3")</code> at that point is when the usermode helper can actually run.</p>
+<p>The acknowledged cost is over-pulling:</p>
+<blockquote>
+<p>"This pulls in nfsv3 whenever the flexfiles driver is loaded, including for layouts whose data servers all speak NFSv4.1 and which would never have needed it. That seemed the better trade against an unbootable system."</p>
+</blockquote>
+<p>The patch is a two-line edit of <code>fs/nfs/flexfilelayout/flexfilelayout.c</code> (one insertion, one deletion). It is tagged <code>Fixes: d67ae825a59d</code> (the original FlexFiles driver, not the later no-fallback commit) and <code>Cc: stable@vger.kernel.org</code>.</p>
+<h2>Reproduction and workaround</h2>
+<p>Reported on openSUSE Tumbleweed with kernel 7.2.2 under QEMU, and reproducible with dracut's <code>TEST-60-NFS</code> suite against any knfsd built with <code>CONFIG_NFSD_FLEXFILELAYOUT=y</code>. Booting with <code>rd.driver.pre=nfsv3</code>, which loads the module from the initramfs before the pivot, is a complete workaround and confirms the diagnosis.</p>
+<h2>Conclusions</h2>
+<ul>
+<li><strong>Type of change:</strong> NFS <strong>client</strong> bug fix in the FlexFiles layout driver (<code>nfs_layout_flexfiles</code>). Not a protocol change, not a new pNFS feature, not an NFSD patch.</li>
+<li><strong>Root cause:</strong> first FlexFiles DS I/O does <code>symbol_request(nfs3_set_ds_client)</code> → <code>request_module()</code>, which on an NFSv4 root after <code>pivot_root()</code> tries to exec <code>/sbin/modprobe</code> from the filesystem that is blocked waiting for that same DS connect.</li>
+<li><strong>Why it is a regression now:</strong> <code>7a375cafc14e</code> correctly stopped MDS fallback on <code>FF_FLAGS_NO_IO_THRU_MDS</code>, but knfsd sets that flag on every FlexFiles layout, so a failed DS connect is fatal to boot rather than silently falling back to NFSv4 MDS I/O.</li>
+<li><strong>Proposed fix:</strong> <code>MODULE_SOFTDEP("pre: nfsv3")</code> so <code>nfsv3</code> is loaded when the layout driver is requested at mount time, while the initramfs still has a working modprobe.</li>
+<li><strong>Trade-off accepted by the author:</strong> <code>nfsv3</code> is pulled in even for NFSv4.1-only data servers, in preference to an unbootable system.</li>
+<li><strong>Workaround:</strong> <code>rd.driver.pre=nfsv3</code>.</li>
+<li><strong>Status this week:</strong> single patch, no Reviewed-by / Acked-by, no maintainer comment. Watch for review of the softdep approach versus a narrower load of <code>nfsv3</code> only when the DS actually speaks v3.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260902133554.28863-1-antonio.feijoo@suse.com/">2026-09-02 Antonio Alvarez Feijoo — [PATCH] NFSv4/flexfiles: add a soft dependency on nfsv3</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260902133554.28863-1-antonio.feijoo@suse.com/">2026-09-02 Antonio Alvarez Feijoo <a href="mailto:antonio.feijoo@suse.com">antonio.feijoo@suse.com</a> — [PATCH] NFSv4/flexfiles: add a soft dependency on nfsv3</a></li>
+</ul>
+  </main>
+</body>
+</html>

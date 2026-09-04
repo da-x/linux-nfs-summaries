@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSv2 NFSERR_INVAL cleanup breaks U-Boot symlink boot</title>
+  <meta name="description" content="This week a December 2025 NFSD status-code cleanup came back as a real-world bug fix for an NFSv2 client: U-Boot’s NFS boot path no longer recognizes Linux’s error when a READ hits a symlink. Maintainers rejected a revert to the illegal…">
+  <meta property="og:title" content="NFSv2 NFSERR_INVAL cleanup breaks U-Boot symlink boot">
+  <meta property="og:description" content="This week a December 2025 NFSD status-code cleanup came back as a real-world bug fix for an NFSv2 client: U-Boot’s NFS boot path no longer recognizes Linux’s error when a READ hits a symlink. Maintainers rejected a revert to the illegal…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-09-03T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSv2 NFSERR_INVAL cleanup breaks U-Boot symlink boot">
+  <meta name="twitter:description" content="This week a December 2025 NFSD status-code cleanup came back as a real-world bug fix for an NFSv2 client: U-Boot’s NFS boot path no longer recognizes Linux’s error when a READ hits a symlink. Maintainers rejected a revert to the illegal…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-09-03</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSv2 NFSERR_INVAL cleanup breaks U-Boot symlink boot</h1>
+<h2>Summary</h2>
+<p>This week a December 2025 NFSD status-code cleanup came back as a real-world <strong>bug fix</strong> for an NFSv2 client: U-Boot’s NFS boot path no longer recognizes Linux’s error when a READ hits a symlink. Maintainers rejected a revert to the illegal <code>NFSERR_INVAL</code> mapping and instead agreed to make NFSD return the historic Sun/Solaris code <code>NFSERR_ISDIR</code>, which U-Boot already treats as “follow the symlink.”</p>
+<h2>Prior work (brief)</h2>
+<p>In December 2025, <a href="https://lore.kernel.org/linux-nfs/20251210002850.318350-1-cel@kernel.org/">Chuck Lever posted</a> a two-patch series that aligned NFSD status codes with the RFCs after comparing hand-written headers with xdrgen output. Patch 2, <a href="https://lore.kernel.org/linux-nfs/20251210002850.318350-3-cel@kernel.org/">NFS: NFSERR_INVAL is not defined by NFSv2</a>, noted that RFC 1094 never defines <code>NFSERR_INVAL</code> (<code>NFS3ERR_INVAL</code> arrives only in RFC 1813) and that <code>nfsd_map_status()</code> had been mapping <code>nfserr_symlink</code> and <code>nfserr_wrong_type</code> to that illegal v2 code. Lever’s proposed replacement was <code>NFSERR_IO</code>.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/45662e818b57ef1e65156a76736a49a0609517fa.camel@kernel.org/">Jeff Layton</a> and <a href="https://lore.kernel.org/linux-nfs/176532847537.16766.17141101695422327144@noble.neil.brown.name/">NeilBrown</a> both Reviewed-by the series. Brown added a caveat that later proved optimistic:</p>
+<blockquote>
+<p>"I cannot easily find a path that would lead to NFSv2 being presented with nfserr_symlink or nfserr_wrong_type, so that change probably isn't visible."</p>
+</blockquote>
+<p>The mapping change landed as commit <code>0ac903d1bfdc</code> and sat quietly until this week.</p>
+<h2>The regression: U-Boot’s NFS client</h2>
+<p>On 28 August, <a href="https://lore.kernel.org/linux-nfs/apE90ZRZB8IW_AiS@jo-so.de/">Jörg Sommer</a> reopened the thread against patch 2, reporting that NFSv2 boot via U-Boot had broken and asking how “to get it working again.” That is a firmware NFS <strong>client</strong> regression, not a Linux <code>nfs.ko</code> issue: U-Boot uses NFSv2 READ, and when the target is a symlink it expects a specific status so it can issue READLINK.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/178791679053.3510150.70411349578293852@noble.neil.brown.name/">NeilBrown diagnosed the client</a> from U-Boot’s NFS state machine:</p>
+<pre><code>} else if ((rlen == -NFSERR_ISDIR) || (rlen == -NFSERR_INVAL)) {
+        /* symbolic link */
+        nfs_state = STATE_READLINK_REQ;
+</code></pre>
+<p>After <code>0ac903d1bfdc</code>, NFSD returns <code>NFSERR_IO</code> (5) for that case. U-Boot does not treat 5 as “this is a symlink,” so netboot of a symlink path fails. Brown laid out three unattractive options: have nfsdv2 return <code>NFSERR_ISDIR</code> for a non-directory, restore the illegal <code>NFSERR_INVAL</code>, or teach U-Boot to also accept <code>NFSERR_IO</code>. His first instinct was a revert:</p>
+<blockquote>
+<p>"There is no "good" option. I suspect we should revert this change and document that we violate the RFC for historical compatibility with u-boot."</p>
+</blockquote>
+<h2>Protocol vs. deployed clients</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/91e02ca3-e985-47fa-aed8-0b50a5d7a3c9@app.fastmail.com/">Chuck Lever refused to restore <code>NFSERR_INVAL</code></a>. He split U-Boot’s two checks: <code>NFSERR_ISDIR</code> is the Sun-compatible path; the <code>NFSERR_INVAL</code> arm was “presumably added for Linux NFSD.” Going back to the pre-<code>0ac903d1bfdc</code> mapping was off the table:</p>
+<blockquote>
+<p>"So the pre-0ac903d1bfdc code is not something I want to go back to. Returning NFSERR_INVAL is incompatible with the reference NFSv2 implementation, and so is NFSERR_IO."</p>
+</blockquote>
+<p>The constructive alternative is to map <code>nfserr_symlink</code> to <code>NFSERR_ISDIR</code> for NFSv2 READ/WRITE/SETATTR. Solaris already returns <code>NFSERR_ISDIR</code> when READ or WRITE hits a non-regular object, “which suggests to me that is the behavior clients will expect.” He wanted <code>nfserr_wrong_type</code> left alone until someone files a concrete complaint.</p>
+<p>U-Boot maintainer <a href="https://lore.kernel.org/linux-nfs/20260828205116.GA266670@bill-the-cat/">Tom Rini then made the client-side cost explicit</a>. The NFS code dates to 2004, borrowed from NetBSD, with symlink handling stacked on top—“we're likely the originator of the incorrect behavior.” But every U-Boot that ever used this feature now fails, and the lag between the kernel change and the report implies field firmware that will not be updated:</p>
+<blockquote>
+<p>"But also, this means that everything U-Boot that's ever been using this feature now fails. … So perhaps things do need to go back to the way it was."</p>
+</blockquote>
+<p>Lever <a href="https://lore.kernel.org/linux-nfs/a9a48faa-2663-40d7-86c8-ec2eaa967cdf@app.fastmail.com/">pushed back</a> that a revert “moves NFSD backwards instead of forward,” is fine for stable trees, but would take as long to land in mainline as a correct fix. The “can’t be updated” argument also cut both ways: those boxes would not pick up a kernel revert either.</p>
+<p>Rini <a href="https://lore.kernel.org/linux-nfs/20260828211855.GL3959812@bill-the-cat/">clarified the firmware reality</a>. This is decades-old NFSv2, not a new protocol feature, and it looks like an ABI break with no security rationale. He already had a U-Boot-side fix from Sommer that could make the October release, but:</p>
+<blockquote>
+<p>"When will that actually be seen by people using U-Boot? Well, maybe newer products based on... Fedora will pick up v2027.04, some semis will base on v2027.01, but most places? Probably never."</p>
+</blockquote>
+<blockquote>
+<p>"By deployments I mean U-Boot deployments. It's notoriously hard to update firmwares most of the time. … So most of the time, it's never updated."</p>
+</blockquote>
+<h2>The agreed server-side fix</h2>
+<p>Lever then <a href="https://lore.kernel.org/linux-nfs/a832bec6-fdcf-4405-b8ed-87418bc704cf@app.fastmail.com/">reframed the NFSD change</a> so it does not depend on the Linux NFS client or on shipping new U-Boot:</p>
+<blockquote>
+<p>"I'm talking about changing NFSD to return NFSERR_ISDIR, which would be picked up by the first "if" check above, which already exists in U-Boot."</p>
+</blockquote>
+<blockquote>
+<p>"That addresses the regression and can be backported into the LTS Linux kernels that have commit 0ac903d1bfdc [*]. It does not depend on making changes to U-Boot."</p>
+</blockquote>
+<p>Affected trees, as he counted them: LTS v6.12 and v6.18, plus stables v7.1 and v7.2.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260828221250.GM3959812@bill-the-cat/">Rini accepted that plan immediately</a>: “Yes, something that doesn't require changing U-Boot is good, thanks.”</p>
+<p><a href="https://lore.kernel.org/linux-nfs/178795659577.3510150.12183147665128116121@noble.neil.brown.name/">NeilBrown endorsed it</a> as matching OpenSolaris <code>nfs_srv.c</code> (archived lines 619–624), “the closest thing to a real standard for NFSv2.” Lever closed the week with <a href="https://lore.kernel.org/linux-nfs/8eb7450b-70c2-4354-a92a-7a1296cbd118@app.fastmail.com/">“Exactly. Patch coming soon.”</a></p>
+<h2>Conclusions</h2>
+<ul>
+<li><strong>Type of change:</strong> compatibility <strong>bug fix</strong> on top of an earlier protocol-correctness patch, not a new feature and not an RFC change. Linux’s in-kernel NFS client is not being modified; the affected client is U-Boot’s NFSv2 bootloader.</li>
+<li><strong>Do not revert</strong> <code>0ac903d1bfdc</code> on mainline just to restore illegal <code>NFSERR_INVAL</code>. That code was never in RFC 1094 and is not what the Sun reference server did.</li>
+<li><strong>Do map <code>nfserr_symlink</code> → <code>NFSERR_ISDIR</code></strong> for NFSv2 READ (and the related WRITE/SETATTR paths). That is what Solaris does, what U-Boot already checks, and what can be backported to the LTS/stable kernels that shipped the regression.</li>
+<li><strong>Leave <code>nfserr_wrong_type</code> alone</strong> until a specific field report appears.</li>
+<li>A U-Boot-side check for <code>NFSERR_IO</code> is welcome for new firmware, but cannot be the primary fix: most deployed bootloaders will never be updated.</li>
+</ul>
+<p>No patch had been posted by the end of the window; Lever’s follow-up is the next item to watch.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/apE90ZRZB8IW_AiS@jo-so.de/">2026-08-28 Jörg Sommer <a href="mailto:joerg@jo-so.de">joerg@jo-so.de</a> — Re: [PATCH 2/2] NFS: NFSERR_INVAL is not defined by NFSv2</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178791679053.3510150.70411349578293852@noble.neil.brown.name/">2026-08-28 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH 2/2] NFS: NFSERR_INVAL is not defined by NFSv2</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/apF3Kv66IaDONfqo@jo-so.de/">2026-08-28 Jörg Sommer <a href="mailto:joerg@jo-so.de">joerg@jo-so.de</a> — Re: [PATCH 2/2] NFS: NFSERR_INVAL is not defined by NFSv2</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/91e02ca3-e985-47fa-aed8-0b50a5d7a3c9@app.fastmail.com/">2026-08-28 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 2/2] NFS: NFSERR_INVAL is not defined by NFSv2</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828205116.GA266670@bill-the-cat/">2026-08-28 Tom Rini <a href="mailto:trini@konsulko.com">trini@konsulko.com</a> — Re: [PATCH 2/2] NFS: NFSERR_INVAL is not defined by NFSv2</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/a9a48faa-2663-40d7-86c8-ec2eaa967cdf@app.fastmail.com/">2026-08-28 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 2/2] NFS: NFSERR_INVAL is not defined by NFSv2</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828211855.GL3959812@bill-the-cat/">2026-08-28 Tom Rini <a href="mailto:trini@konsulko.com">trini@konsulko.com</a> — Re: [PATCH 2/2] NFS: NFSERR_INVAL is not defined by NFSv2</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/a832bec6-fdcf-4405-b8ed-87418bc704cf@app.fastmail.com/">2026-08-28 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 2/2] NFS: NFSERR_INVAL is not defined by NFSv2</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828221250.GM3959812@bill-the-cat/">2026-08-28 Tom Rini <a href="mailto:trini@konsulko.com">trini@konsulko.com</a> — Re: [PATCH 2/2] NFS: NFSERR_INVAL is not defined by NFSv2</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178795659577.3510150.12183147665128116121@noble.neil.brown.name/">2026-08-28 NeilBrown <a href="mailto:neilb@ownmail.net">neilb@ownmail.net</a> — Re: [PATCH 2/2] NFS: NFSERR_INVAL is not defined by NFSv2</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/8eb7450b-70c2-4354-a92a-7a1296cbd118@app.fastmail.com/">2026-08-28 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH 2/2] NFS: NFSERR_INVAL is not defined by NFSv2</a></li>
+</ul>
+  </main>
+</body>
+</html>

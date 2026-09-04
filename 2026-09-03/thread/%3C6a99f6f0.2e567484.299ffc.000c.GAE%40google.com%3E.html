@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>syzbot: hung task in nfsd4_cld_tracking_init on nfsdcld upcall</title>
+  <meta name="description" content="This is a bug report, not a feature and not a protocol change. Late on 3 September, syzbot filed a new hung-task against NFSD’s NFSv4 client-tracking (cld) upcall. There is no human reply in this thread, no patch, and no #syz dup: against…">
+  <meta property="og:title" content="syzbot: hung task in nfsd4_cld_tracking_init on nfsdcld upcall">
+  <meta property="og:description" content="This is a bug report, not a feature and not a protocol change. Late on 3 September, syzbot filed a new hung-task against NFSD’s NFSv4 client-tracking (cld) upcall. There is no human reply in this thread, no patch, and no #syz dup: against…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-09-03T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="syzbot: hung task in nfsd4_cld_tracking_init on nfsdcld upcall">
+  <meta name="twitter:description" content="This is a bug report, not a feature and not a protocol change. Late on 3 September, syzbot filed a new hung-task against NFSD’s NFSv4 client-tracking (cld) upcall. There is no human reply in this thread, no patch, and no #syz dup: against…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-09-03</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>syzbot: hung task in nfsd4_cld_tracking_init on nfsdcld upcall</h1>
+<h2>Summary</h2>
+<p>This is a <strong>bug report</strong>, not a feature and not a protocol change. Late on 3 September, <a href="https://lore.kernel.org/linux-nfs/6a99f6f0.2e567484.299ffc.000c.GAE@google.com/">syzbot</a> filed a new hung-task against NFSD’s NFSv4 client-tracking (cld) upcall. There is <strong>no human reply</strong> in this thread, <strong>no patch</strong>, and <strong>no <code>#syz dup:</code></strong> against the week’s other nfsd hangs. The stack is server-side — <code>write_threads</code> → <code>nfsd4_cld_tracking_init</code> — but the waiter is the shared SUNRPC <code>rpc_pipefs</code> completion that NFS <strong>client</strong> idmap, gssd, and pNFS blocklayout also sit on, and that Chuck Lever spent this same week rewriting.</p>
+<h2>Classification</h2>
+<p>syzbot hung <code>syz-executor224</code> for more than 143 seconds on upstream HEAD <code>940de590b839</code> (<code>Merge tag 'hardening-v7.3-rc2'</code>), a <code>PREEMPT(full)</code> syzkaller build, <strong>untainted</strong>:</p>
+<blockquote>
+<p>"INFO: task syz-executor224:5626 blocked for more than 143 seconds.
+Not tainted syzkaller #0"</p>
+</blockquote>
+<p>Unlike several sibling reports this week, this one already has both a syz reproducer and a <strong>C reproducer</strong>. syzbot asked that any fix carry:</p>
+<blockquote>
+<p>"Reported-by: syzbot+edbebd898142ee5e24ce@syzkaller.appspotmail.com"</p>
+</blockquote>
+<p>Nobody used the <code>#syz test:</code> hook before the week closed. This thread has no prior weekly history; GlobOutputs found no earlier summary under this root.</p>
+<h2>The stack: GetVersion, not rpcbind</h2>
+<p>The hung task is in D-state inside <code>__wait_for_common</code> / <code>schedule_timeout</code>, i.e. an uninterruptible completion wait, not a mutex acquire:</p>
+<blockquote>
+<p>"__cld_pipe_upcall fs/nfsd/nfs4recover.c:673 [inline]
+cld_pipe_upcall fs/nfsd/nfs4recover.c:691 [inline]
+nfsd4_cld_get_version fs/nfsd/nfs4recover.c:1425 [inline]
+nfsd4_cld_tracking_init+0x4be/0x10f0 fs/nfsd/nfs4recover.c:1490
+nfsd4_client_tracking_init+0xe5/0x1c0 fs/nfsd/nfs4recover.c:1941
+nfs4_state_start_net.cold+0xb7/0x480 fs/nfsd/nfs4state.c:9838
+nfsd_startup_net fs/nfsd/nfssvc.c:391 [inline]
+nfsd_svc+0x54a/0x7d0 fs/nfsd/nfssvc.c:775
+write_threads+0x316/0x600 fs/nfsd/nfsctl.c:438"</p>
+</blockquote>
+<p>That is NFSD <strong>startup</strong>, not listener rebuild. Writing <code>/proc/fs/nfsd/threads</code> starts the server; <code>nfs4_state_start_net()</code> then probes <code>nfsdcld</code> with a GetVersion upcall before NFSv4 client tracking is live. <code>__cld_pipe_upcall()</code> queues a <code>struct rpc_pipe_msg</code> and waits on <code>cu_done</code> with <code>TASK_UNINTERRUPTIBLE</code>. If the daemon never answers — or answers in a way that never completes the waiter — the threads writer never returns.</p>
+<p>The lock listing makes the blast radius explicit. The hung task already holds three locks, on CPU 1:</p>
+<table><thead><tr><th>#</th><th>Lock</th><th>Site</th></tr></thead><tbody>
+<tr><td>0</td><td><code>&amp;f-&gt;f_pos_lock</code></td><td><code>fdget_pos</code></td></tr>
+<tr><td>1</td><td><code>sb_writers#9</code></td><td><code>ksys_write</code></td></tr>
+<tr><td>2</td><td><strong><code>nfsd_mutex</code></strong></td><td><strong><code>write_threads+0x288</code> (<code>nfsctl.c:436</code>)</strong></td></tr>
+</tbody></table>
+<p>This is not the week’s rpcbind-under-mutex story. The holder <strong>is</strong> the hung task: <code>write_threads</code> took <code>nfsd_mutex</code> and then blocked in the cld pipe. Every other nfsd admin path — netlink <code>listener_set</code>, <code>unlock_filesystem</code>, <code>write_ports</code>, <code>write_versions</code>, umount via <code>nfsd_shutdown_threads</code> — queues behind a GetVersion upcall that is not coming back. The NMI backtraces are a red herring for the NFS path (CPU 1 is <code>khungtaskd</code> dumping stacks; CPU 0 is <code>serial8250_console_write</code>).</p>
+<h2>Same waiter Lever already named; complementary failure to Alemi’s KASAN</h2>
+<p>This dump is the <strong>hang</strong> face of a bug class the list has been working all week. Farhad Alemi’s 7.1-rc5 syzkaller report was a KASAN vmalloc-OOB because <code>__cld_pipe_upcall()</code> <strong>returned too soon</strong>, leaving a stack <code>rpc_pipe_msg</code> queued. <a href="https://lore.kernel.org/linux-nfs/20260901-alemi-v2-0-e163f94a3a6e@kernel.org/">Chuck Lever’s v2 series</a> (<code>[PATCH v2 0/8] Fix premature completion of rpc_pipefs upcalls</code>, 1 September) is the opposite failure, described in the cover letter before this syzbot id existed:</p>
+<blockquote>
+<p>"Guarding the reply exposes the opposite failure. Once a daemon has read a whole upcall, rpc_pipe_read() unlinks the message from every pipe list, so nothing the pipe purges on close can reach it. A daemon that exits between the read and the write leaves its waiter sleeping uninterruptibly with no way back."</p>
+</blockquote>
+<p>And, from v2 patch 3 / the v1 diagnosis of a faulting downcall:</p>
+<blockquote>
+<p>"__cld_pipe_upcall() waits on cu_done uninterruptibly, so the nfsd thread that sent the upcall is stuck, and nfsd shutdown hangs behind it."</p>
+</blockquote>
+<p>This week’s stack is exactly that waiter, entered from <code>nfsd4_cld_get_version</code> rather than GraceStart. Two holes in current <code>__cld_pipe_upcall()</code> produce a 143-second hung-task:</p>
+<ol>
+<li><strong>No complete on pipe close.</strong> <code>cld_upcall_ops</code> has no <code>.release_pipe</code>. Once <code>nfsdcld</code> has read the GetVersion record, <code>rpc_pipe_read()</code> unlinks the message; if the daemon then exits (or never writes a downcall), <code>cld_pipe_destroy_msg()</code> does not complete <code>cu_done</code>. Lever’s v2 patch 7 is the intended fix: complete consumed-but-unanswered upcalls with <code>-EPIPE</code> on close, not the <code>-EAGAIN</code> that would make <code>cld_pipe_upcall()</code> retry.</li>
+<li><strong>No complete on a faulting reply copy.</strong> <code>cld_pipe_downcall()</code> drops the xid from <code>cn_list</code> before <code>copy_from_user()</code>. A faulting write returns <code>-EFAULT</code> without waking the waiter, and a retry cannot find the upcall. v2 patch 3 records the fault and completes.</li>
+</ol>
+<p>A third, older path is also in scope for a syzkaller environment: the cld pipe is created with <code>RPC_PIPE_WAIT_FOR_OPEN</code>, so an absent <code>nfsdcld</code> queues the GetVersion message and waits for a daemon that never appears. If <code>cld_pipe_destroy_msg()</code> still refuses to complete “because a downcall was expected,” the timeout/purge path does not save <code>write_threads</code> either.</p>
+<p>Lever’s v2 is <strong>not</strong> in the kernel syzbot tested. The report is against linus <code>940de590b839</code>; the eight-patch series was posted to the list on 1 September and had no Acked-by, no merge, and no <code>#syz fix:</code> before this filing. The C reproducer is therefore a test vector for that series, not a demonstration that it failed.</p>
+<p>This is also <strong>not</strong> Jeff Layton’s listener_set / rpcbind hang, which dominated the week’s other <code>[syzbot] [nfs?] INFO: task hung in …</code> subjects (<code>nfsd_nrthreads</code>, <code>nfsd_nl_unlock_filesystem_doit</code>). Those waiters sit in <code>__mutex_lock(nfsd_mutex)</code> while <code>write_ports</code> or <code>nfsd_nl_listener_set_doit</code> talks to a silent rpcbind. Here the threads writer <em>is</em> the holder, and the I/O is the nfsdcld pipe. Deduplicating this extid against the rpcbind reports would be wrong.</p>
+<h2>NFS client impact</h2>
+<p>There is no client function on the stack and no client patch in this thread. The stall still sits on paths NFS <strong>clients</strong> actually use, and the waiter is the same <code>rpc_pipefs</code> object the client copies.</p>
+<ul>
+<li><strong>NFSv4 server never finishes coming up.</strong> <code>nfsd4_client_tracking_init()</code> is on the <code>nfs4_state_start_net()</code> path. Until GetVersion returns, <code>nfsd_svc()</code> does not complete, <code>/proc/fs/nfsd/threads</code> stays in D-state, and there is no NFSv4 state machine. A client <code>mount</code> against that server simply does not complete for the duration of the hang — 143 seconds in this dump, unbounded if the hung-task watchdog is disabled.</li>
+<li><strong>Reclaim and grace depend on this upcall.</strong> <code>nfsdcld</code> is how the server persists client ids across restart. A GetVersion that never completes means tracking never initializes, so even after an operator kills the stuck <code>echo</code> the next startup has no daemon protocol version and no reclaim database. NFSv4 clients that expected to reclaim opens, delegations, and locks after a server restart lose that contract.</li>
+<li><strong><code>nfsd_mutex</code> turns a daemon stall into a control-plane DoS.</strong> While <code>write_threads</code> holds the global nfsd lock across <code>__cld_pipe_upcall()</code>, export-cache downcalls, listener changes, <code>NFSD_CMD_UNLOCK_FILESYSTEM</code>, and umount-time <code>nfsd_shutdown_threads</code> all block. That is the same mutex the week’s rpcbind reports already showed as a single point of failure; this dump proves the cld pipe is another synchronous userspace round-trip taken under it.</li>
+<li><strong>Shared waiter with the NFS client.</strong> <code>__cld_pipe_upcall()</code> is the completion model FAN YE’s pNFS blocklayout series treated as safe, and that Lever’s v2 patches 5 and 8 rewrite on the client. gss and idmap already keep <code>rpc_pipe_msg</code> in a heap object and gss already releases what a departing daemon left behind; cld and <code>bl_resolve_deviceid()</code> did neither. A dying <code>blkmapd</code> that has read a device-map upcall and then exited is the client-side twin of this hang, except the client waiter also holds <code>nn-&gt;bl_mutex</code> and freezes every later GETDEVICEINFO in the net namespace. Client developers watching this syzbot id are looking at the nfsd half of that audit.</li>
+</ul>
+<p>Nothing in this week’s other linux-nfs traffic — Layton’s listener_set v5 landing in <code>nfsd-testing</code>, the <code>svc_addsock</code> <code>-EBUSY</code> duplicate — touches <code>__cld_pipe_upcall()</code> or <code>nfsd4_cld_get_version</code>. They do not mitigate this hang.</p>
+<h2>Status</h2>
+<ul>
+<li><strong>Type:</strong> hung-task / DoS in the nfsd <strong>procfs</strong> startup path (<code>write_threads</code> → <code>nfsd4_cld_tracking_init</code> → <code>__cld_pipe_upcall</code>). Uninterruptible wait on the nfsdcld GetVersion upcall while holding <code>nfsd_mutex</code>. Complementary to Alemi’s premature-completion KASAN, not a duplicate of the rpcbind <code>listener_set</code> hangs.</li>
+<li><strong>Reproducer:</strong> <strong>yes.</strong> C reproducer and syz reproducer linked from the report.</li>
+<li><strong>Human reply:</strong> none in this thread as of 3 September.</li>
+<li><strong>Likely on-list fix, not yet applied here:</strong> Lever’s v2 patches 3 and 7 (complete on copy fault; complete on pipe close with <code>-EPIPE</code>), with patches 1–2 moving the message off the stack so a hostile or broken <code>nfsdcld</code> cannot also leave a <code>list_head</code> in a returned frame. That series is unreviewed and unmerged from its own thread; this syzbot kernel does not contain it.</li>
+<li><strong>Fix tag requested:</strong> <code>Reported-by: syzbot+edbebd898142ee5e24ce@syzkaller.appspotmail.com</code>.</li>
+<li><strong>Test hook unused:</strong> a <code>#syz test:</code> of Lever’s v2 (or a <code>#syz fix:</code> once it lands) is the obvious next step. Nobody sent either on this thread.</li>
+</ul>
+<p>Until <code>__cld_pipe_upcall()</code> completes on every path that drops the pipe — close, purge, copy fault, and “daemon never opened” — starting NFSD via <code>/proc/fs/nfsd/threads</code> remains a way to pin <code>nfsd_mutex</code> for minutes and leave NFSv4 clients with a server that never finishes coming up. This week’s filing does not change Lever’s diagnosis. It gives maintainers a C reproducer whose stack is <code>nfsd4_cld_get_version</code>, which is enough to test the close-path patch and not enough to ship it from this thread.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/6a99f6f0.2e567484.299ffc.000c.GAE@google.com/">2026-09-03 syzbot — [syzbot] [nfs?] INFO: task hung in nfsd4_cld_tracking_init</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/6a99f6f0.2e567484.299ffc.000c.GAE@google.com/">2026-09-03 syzbot <a href="mailto:syzbot+edbebd898142ee5e24ce@syzkaller.appspotmail.com">syzbot+edbebd898142ee5e24ce@syzkaller.appspotmail.com</a> — [syzbot] [nfs?] INFO: task hung in nfsd4_cld_tracking_init</a></li>
+</ul>
+  </main>
+</body>
+</html>

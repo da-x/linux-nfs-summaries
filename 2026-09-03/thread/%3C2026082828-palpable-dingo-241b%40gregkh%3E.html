@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd: hold cl_lock in client_has_state()</title>
+  <meta name="description" content="This week’s linux-nfs traffic around client_has_state() is a server-side bug fix, not an NFS client feature or protocol change. Cen Zhang (Microsoft Security FORGE Labs) posted a one-line locking patch for a KASAN-confirmed use-after-free…">
+  <meta property="og:title" content="nfsd: hold cl_lock in client_has_state()">
+  <meta property="og:description" content="This week’s linux-nfs traffic around client_has_state() is a server-side bug fix, not an NFS client feature or protocol change. Cen Zhang (Microsoft Security FORGE Labs) posted a one-line locking patch for a KASAN-confirmed use-after-free…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-09-03T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd: hold cl_lock in client_has_state()">
+  <meta name="twitter:description" content="This week’s linux-nfs traffic around client_has_state() is a server-side bug fix, not an NFS client feature or protocol change. Cen Zhang (Microsoft Security FORGE Labs) posted a one-line locking patch for a KASAN-confirmed use-after-free…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-09-03</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd: hold cl_lock in client_has_state()</h1>
+<h2>Summary</h2>
+<p>This week’s linux-nfs traffic around <code>client_has_state()</code> is a <strong>server-side bug fix</strong>, not an NFS client feature or protocol change. Cen Zhang (Microsoft Security FORGE Labs) posted a one-line locking patch for a KASAN-confirmed use-after-free in NFSD’s NFSv4 state machine, then spent the rest of the thread answering Greg Kroah-Hartman’s From: address policy. Chuck Lever applied the original patch to <code>nfsd-testing</code> anyway.</p>
+<h2>The race: unlocked openowner walk vs. <code>nfs4_put_stateowner()</code></h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260828041925.36758-1-blbllhy@gmail.com/">Zhang’s patch</a> targets <code>fs/nfsd/nfs4state.c</code>. <code>client_has_openowners()</code> walks <code>clp-&gt;cl_openowners</code> and inspects <code>so_stateids</code> <strong>without</strong> <code>clp-&gt;cl_lock</code>. Meanwhile <code>nfs4_put_stateowner()</code> unhashes that openowner under <code>cl_lock</code> and frees it. A concurrent <code>EXCHANGE_ID</code> with mismatched credentials can therefore use-after-free the <code>nfs4_openowner</code>.</p>
+<p>Zhang’s report is explicit:</p>
+<blockquote>
+<p>"client_has_openowners() walks clp-&gt;cl_openowners and reads so_stateids without clp-&gt;cl_lock. nfs4_put_stateowner() unhashes that openowner under cl_lock and then frees it, so a concurrent EXCHANGE_ID with mismatched creds can use-after-free the nfs4_openowner."</p>
+</blockquote>
+<p>The KASAN splat cited in the commit message lands in <code>client_has_state()</code> itself:</p>
+<blockquote>
+<p>"BUG: KASAN: slab-use-after-free in client_has_state+0x10a/0x140<br />
+fs/nfsd/nfs4state.c:3718 client_has_openowners()<br />
+nfsd4_exchange_id<br />
+nfsd4_proc_compound<br />
+nfsd_dispatch<br />
+svc_process"</p>
+</blockquote>
+<p>The proposed fix is correspondingly small: take <code>clp-&gt;cl_lock</code> for the duration of the openowner walk inside <code>client_has_state()</code>. The patch is tagged</p>
+<p><code>Fixes: 4eaea1342507 ("nfsd: improve client_has_state to check for unused openowners")</code></p>
+<p>with <code>Cc: stable@vger.kernel.org</code>, <code>Reported-by: Xiang Mei (Microsoft)</code>, and a Microsoft Autonomous Code Security contact. In other words, this is a <strong>stable-worthy locking hole</strong> in the server’s notion of “does this NFS client still have state?”, not a client-side change and not a wire-protocol tweak.</p>
+<p>There was <strong>no technical objection</strong> on the list this week to the lock placement, the diagnosis, or the <code>Fixes</code> tag. Review energy went to process, not to the race.</p>
+<h2>Process: gmail From: vs. applying a UAF fix</h2>
+<p>Greg Kroah-Hartman <a href="https://lore.kernel.org/linux-nfs/2026082828-palpable-dingo-241b@gregkh/">replied first</a>, not with a code review but with a From: policy reminder:</p>
+<blockquote>
+<p>"Please use your microsoft.com email address, and not a random gmail.com address. It's kind of odd that Microsoft would have to rely on Google to send kernel patches :)"</p>
+</blockquote>
+<p><a href="https://lore.kernel.org/linux-nfs/20260828123312.26927-1-blbllhy@gmail.com/">Zhang’s only message in this split</a> is an apology and a pause on further postings:</p>
+<blockquote>
+<p>"Sorry for making you raise this again. I will hold off on new patch submissions until my approved Microsoft email address is available, which should be soon."</p>
+</blockquote>
+<p>Chuck Lever then <a href="https://lore.kernel.org/linux-nfs/978293e7-430d-4b11-9a29-1fb479cb0082@app.fastmail.com/">asked Greg</a> whether the existing patch should wait for a resend from a microsoft.com address:</p>
+<blockquote>
+<p>"Greg, would you prefer that I hold off on applying this to nfsd-testing until Cen can post this one again?"</p>
+</blockquote>
+<p>Greg <a href="https://lore.kernel.org/linux-nfs/2026082948-sleeve-blaming-b901@gregkh/">declined to dictate</a>:</p>
+<blockquote>
+<p>"That's your call."</p>
+</blockquote>
+<h2>Outcome: applied to nfsd-testing</h2>
+<p>Lever took that as leave to land the UAF fix. On 29 August he <a href="https://lore.kernel.org/linux-nfs/178801882864.2077660.2011534008442729318.b4-ty@b4/">applied the original gmail-posted patch</a> to <code>nfsd-testing</code>:</p>
+<blockquote>
+<p>"Applied to nfsd-testing, thanks!"</p>
+</blockquote>
+<p>as commit <code>6882aca9f9cabfaec5ea23d1512f345fbd288b65</code> (<code>nfsd: hold cl_lock in client_has_state()</code>).</p>
+<p><strong>Bottom line for this week:</strong> the technical conclusion is that <code>client_has_state()</code> must hold <code>cl_lock</code> while walking openowners, closing a use-after-free on the NFSD client-state path during <code>EXCHANGE_ID</code>. The social conclusion is that Greg wants a microsoft.com From: on future Microsoft submissions, Zhang will wait for that address, and Lever still queued the locking fix rather than block a KASAN UAF on identity paperwork. No NFS client code, mount options, or protocol fields changed.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828123312.26927-1-blbllhy@gmail.com/">2026-08-28 "Cen Zhang (Microsoft)" <a href="mailto:blbllhy@gmail.com">blbllhy@gmail.com</a> — Re: [PATCH] nfsd: hold cl_lock in client_has_state()</a></li>
+</ul>
+  </main>
+</body>
+</html>

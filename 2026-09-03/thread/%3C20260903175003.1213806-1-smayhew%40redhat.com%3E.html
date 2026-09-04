@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>statd notify_list leak in nlist_free</title>
+  <meta name="description" content="This week Scott Mayhew posted a small but consequential nfs-utils PATCH that repairs a long-standing memory leak (and a related wrong-free) in rpc.statd&#39;s notify-list teardown. The change is a userspace bug fix, not a protocol change: it…">
+  <meta property="og:title" content="statd notify_list leak in nlist_free">
+  <meta property="og:description" content="This week Scott Mayhew posted a small but consequential nfs-utils PATCH that repairs a long-standing memory leak (and a related wrong-free) in rpc.statd&#39;s notify-list teardown. The change is a userspace bug fix, not a protocol change: it…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-09-03T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="statd notify_list leak in nlist_free">
+  <meta name="twitter:description" content="This week Scott Mayhew posted a small but consequential nfs-utils PATCH that repairs a long-standing memory leak (and a related wrong-free) in rpc.statd&#39;s notify-list teardown. The change is a userspace bug fix, not a protocol change: it…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-09-03</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>statd notify_list leak in nlist_free</h1>
+<h2>Summary</h2>
+<p>This week Scott Mayhew posted a small but consequential <a href="https://lore.kernel.org/linux-nfs/20260903175003.1213806-1-smayhew@redhat.com/">nfs-utils PATCH</a> that repairs a long-standing memory leak (and a related wrong-free) in <code>rpc.statd</code>'s notify-list teardown. The change is a userspace bug fix, not a protocol change: it targets the NSM helper that NFS clients rely on for lock recovery after a server reboot.</p>
+<p>There is no prior-week history for this thread. The posting arrived on 3 September with no replies yet in the window, so the discussion is still at the "proposed fix" stage.</p>
+<h2>Why it matters for the NFS client</h2>
+<p><code>rpc.statd</code> is the Network Status Monitor daemon. NFS clients (and servers) register hosts with it so that, after a crash or reboot, SM_NOTIFY can drive NLM lock reclaim. The notify list is the in-memory structure that carries those cloned host records through SM_NOTIFY processing and SM_UNMON teardown. A leak there is not a data-path performance tweak; it is a slow leak on every monitor/unmonitor and notify cycle, which is exactly the traffic a lock-using NFS client generates.</p>
+<p>Mayhew's diagnosis is blunt: <code>nlist_free()</code> never matched its own contract.</p>
+<blockquote>
+<p>"nlist_free() freed an entry's string members but never the notify_list struct itself, despite its name and comment ("Destroy an entry ... and free the memory"). Every caller was expected to free the struct separately, but several did not"</p>
+</blockquote>
+<p>The leaky callers he names are all on the NSM request paths that a client (or a client-facing statd) actually hits:</p>
+<ul>
+<li><code>process_reply()</code> and <code>process_notify_list()</code> in <code>rmtcall.c</code>, which clean up entries cloned onto the notify list during SM_NOTIFY handling</li>
+<li><code>sm_unmon_1_svc()</code> and <code>sm_unmon_all_1_svc()</code> in <code>monitor.c</code>, which leak the same way on SM_UNMON</li>
+</ul>
+<p>That is the client-visible bug: notify and unmonitor processing drop string members and then abandon the <code>notify_list</code> node.</p>
+<h2>The second bug: nlist_kill() freed the wrong node</h2>
+<p>The same helper had a more dangerous mistake on the kill path. Mayhew writes:</p>
+<blockquote>
+<p>"nlist_kill() previously called nlist_free(head, *head) followed by free(*head); since nlist_remove() (called from nlist_free) already advanced *head to the next entry, that free(*head) freed the wrong, still-live element."</p>
+</blockquote>
+<p>In other words, the intended free of the just-destroyed entry instead released the <em>next</em> live list node. That is a use-after-free / double-free class defect sitting next to the leak, not merely an accounting miss.</p>
+<h2>The fix</h2>
+<p>Rather than paper over each caller, Mayhew moves ownership into <code>nlist_free()</code> itself so the function actually frees the struct. Call sites that already did the extra <code>free()</code> — <code>sm_mon_1_svc()</code> and <code>load_one_host()</code> — drop those now-redundant calls to avoid a double-free. <code>nlist_kill()</code> is taught to pass <code>NULL</code> so <code>nlist_free()</code> only frees the current entry, then the list pointer is advanced by hand.</p>
+<p>The diff is tiny: two files (<code>utils/statd/monitor.c</code>, <code>utils/statd/notlist.c</code>), two insertions and four deletions. The design choice is the interesting part: fix the helper's contract instead of sprinkling <code>free()</code> at every SM_NOTIFY / SM_UNMON cleanup site. That is the right shape for a leak that several independent callers had already gotten wrong.</p>
+<p>The patch carries <code>Assisted-by: Claude Opus 4.8</code> and Mayhew's <code>Signed-off-by</code>. No reviewer Acked-by or comments landed this week.</p>
+<h2>Status</h2>
+<p>This is an unreviewed nfs-utils bug-fix posting. It does not change NSM on the wire; it corrects userspace lifetime of the notify-list nodes that the NFS client's lock-recovery helper allocates. Until it is reviewed and merged, <code>rpc.statd</code> still leaks <code>notify_list</code> structs on SM_NOTIFY cleanup and SM_UNMON, and <code>nlist_kill()</code> still risks freeing a live successor. Watch for review on the next list cycle.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260903175003.1213806-1-smayhew@redhat.com/">2026-09-03 Scott Mayhew <a href="mailto:smayhew@redhat.com">smayhew@redhat.com</a> — [nfs-utils PATCH] statd: fix notify_list struct leak in nlist_free</a></li>
+</ul>
+  </main>
+</body>
+</html>

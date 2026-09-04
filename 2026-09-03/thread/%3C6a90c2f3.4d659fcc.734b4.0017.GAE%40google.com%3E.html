@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>syzbot: C reproducer for nfsd_nrthreads hang under rpcbind</title>
+  <meta name="description" content="This is a bug report, not a feature and not a protocol change. The thread remains an nfsd server control-plane hung-task: a write to /proc/fs/nfsd/threads blocks in nfsd_nrthreads() on the global nfsd_mutex while a sibling write to…">
+  <meta property="og:title" content="syzbot: C reproducer for nfsd_nrthreads hang under rpcbind">
+  <meta property="og:description" content="This is a bug report, not a feature and not a protocol change. The thread remains an nfsd server control-plane hung-task: a write to /proc/fs/nfsd/threads blocks in nfsd_nrthreads() on the global nfsd_mutex while a sibling write to…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-09-03T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="syzbot: C reproducer for nfsd_nrthreads hang under rpcbind">
+  <meta name="twitter:description" content="This is a bug report, not a feature and not a protocol change. The thread remains an nfsd server control-plane hung-task: a write to /proc/fs/nfsd/threads blocks in nfsd_nrthreads() on the global nfsd_mutex while a sibling write to…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-09-03</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>syzbot: C reproducer for nfsd_nrthreads hang under rpcbind</h1>
+<h2>Summary</h2>
+<h2>Summary</h2>
+<p>This is a <strong>bug report</strong>, not a feature and not a protocol change. The thread remains an nfsd <strong>server</strong> control-plane hung-task: a write to <code>/proc/fs/nfsd/threads</code> blocks in <code>nfsd_nrthreads()</code> on the global <code>nfsd_mutex</code> while a sibling write to <code>/proc/fs/nfsd/portlist</code> already holds that mutex in <code>write_ports()</code>. There is still <strong>no NFS client code</strong> in the stack and still <strong>no human reply</strong>. What changed this week is that the hang is no longer a one-off lock dump: <a href="https://lore.kernel.org/linux-nfs/6a98a3c5.27a413cd.1e878c.0010.GAE@google.com/">syzbot</a> now has a C reproducer, and the lock listing names the missing piece of last week's diagnosis — the holder is sitting in <code>rpcb_create_local()</code>.</p>
+<h2>Prior week (brief)</h2>
+<p>On 27 August, <a href="https://lore.kernel.org/linux-nfs/6a90c2f3.4d659fcc.734b4.0017.GAE@google.com/">syzbot's original report</a> hung two tasks of the same process for more than 143 seconds on upstream <code>502d45774af0</code>. The waiter was <code>write_threads</code> → <code>nfsd_nrthreads</code>; the holder was <code>write_ports</code>. There was no reproducer. The lock dump already matched Jeff Layton's July diagnosis of the related netlink <code>listener_set</code> hangs: listener setup registers with local rpcbind <strong>while still holding <code>nfsd_mutex</code></strong>, and a down or slow rpcbind turns that into a tens-of-seconds stall. Neil Brown's question from that earlier thread — why wait a whole minute for a local service — was still unanswered. Layton had already said, after talking to Chuck Lever, that the long-term plan is to move most rpcbind SET/UNSET into userland, with no timeline, so the list would "suffer with more syzbot reports." This week's mail is that prediction, now with a test case.</p>
+<h2>What landed this week</h2>
+<p>Late Wednesday, 2 September, <a href="https://lore.kernel.org/linux-nfs/6a98a3c5.27a413cd.1e878c.0010.GAE@google.com/">syzbot followed up</a> on linus HEAD <code>89a312991dc6</code> (<code>Merge tag 'cifs-fixes-7.3-rc2'</code>). The important sentence is the one that was missing last week:</p>
+<blockquote>
+<p>"syzbot has found a reproducer for the following issue"</p>
+</blockquote>
+<p>The C reproducer is at <code>https://syzkaller.appspot.com/x/repro.c?x=143c8b49580000</code>. The kernel is again a <code>PREEMPT(full)</code> syzkaller build, this time <strong>untainted</strong>. The hung-task watchdog fired at the default 10-second threshold rather than the 143-second figure from the first dump, which is consistent with a now-repeatable stall rather than a long, accidental timeout. syzbot again asked that any fix carry:</p>
+<blockquote>
+<p>"Reported-by: syzbot+86a9d43d89b86def6d59@syzkaller.appspotmail.com"</p>
+</blockquote>
+<p>and offered the usual <code>#syz test:</code> hook. Nobody on linux-nfs used it this week.</p>
+<h2>The lock dump now names rpcbind</h2>
+<p>The waiter is unchanged. Task <code>syz-executor195/6046</code> is in D-state on <code>nfsd_mutex</code> in the legacy nfsctl threads writer:</p>
+<blockquote>
+<p>"nfsd_nrthreads+0x57/0xd0 fs/nfsd/nfssvc.c:252
+write_threads+0x34a/0x600 fs/nfsd/nfsctl.c:445
+nfsctl_transaction_write+0x106/0x1a0 fs/nfsd/nfsctl.c:114"</p>
+</blockquote>
+<p>It already holds <code>&amp;f-&gt;f_pos_lock</code> and <code>sb_writers</code> from <code>ksys_write</code>.</p>
+<p>The holder is the same sibling pattern as 27 August, but the lock listing is more specific. Task <code>syz-executor195/6044</code> holds four locks, on CPU 3:</p>
+<table><thead><tr><th>#</th><th>Lock</th><th>Site</th></tr></thead><tbody>
+<tr><td>0</td><td><code>&amp;f-&gt;f_pos_lock</code></td><td><code>fdget_pos</code></td></tr>
+<tr><td>1</td><td><code>sb_writers#13</code></td><td><code>ksys_write</code></td></tr>
+<tr><td>2</td><td><strong><code>nfsd_mutex</code></strong></td><td><strong><code>write_ports+0xa5</code> (<code>nfsctl.c:867</code>)</strong></td></tr>
+<tr><td>3</td><td><strong><code>rpcb_create_local_mutex</code></strong></td><td><strong><code>rpcb_create_local+0x100</code> (<code>rpcb_clnt.c:353</code>)</strong></td></tr>
+</tbody></table>
+<p>That fourth lock is the smoking gun last week's dump did not print. <code>write_ports()</code> — the <code>/proc/fs/nfsd/portlist</code> writer that creates nfsd listeners — is not merely "taking a long time." It is inside <code>rpcb_create_local()</code>, the SunRPC helper that builds the in-kernel rpcbind client (and does a synchronous RPC ping of local rpcbind) <strong>while still holding <code>nfsd_mutex</code></strong>. <code>nfsd_nrthreads()</code> is an innocent waiter: it only takes that mutex to read <code>nn-&gt;nfsd_serv-&gt;sv_nrthreads</code>. Every other nfsd admin path that uses the same lock queues behind the rpcbind I/O.</p>
+<p>This is not an AB-BA deadlock between threads and ports. Both tasks take <code>nfsd_mutex</code> in the same direction. The hang is a <strong>long hold</strong>: listener setup coupled to local rpcbind under a global mutex that also serializes thread-count changes, export-cache upcalls, and nfsd teardown.</p>
+<p>The NMI backtraces are again a red herring for the NFS path. CPU 0 is in <code>csd_lock_wait</code> / <code>smp_text_poke_batch_finish</code> from a kfence <code>toggle_allocation_gate</code> work item; CPU 2 is in <code>serial8250_console_write</code>; CPU 3 is idle. None of that is on the nfsd stacks. The nfsd story is entirely <code>write_ports</code> → <code>rpcb_create_local</code> holding <code>nfsd_mutex</code> across a local rpcbind operation while <code>write_threads</code> waits.</p>
+<h2>Same root cause, now mechanically reproducible</h2>
+<p>The 2 September dump is the procfs twin of the netlink <code>listener_set</code> hangs from late August. Both paths create listeners and, for NFSv2/v3, register them with local rpcbind while still holding <code>nfsd_mutex</code>. <code>write_ports</code> adds sockets one at a time through the nfsctl file; <code>listener_set</code> can batch many in one netlink message. Either way, a down, slow, or not-yet-started local rpcbind turns each registration into a stall long enough for <code>hung_task_timeout_secs</code>.</p>
+<p>Jeff Layton's diagnosis from the July cache-flush thread still applies almost verbatim, and this week's lock listing is the first time this particular thread has shown the rpcbind client being created on the holder:</p>
+<blockquote>
+<p>"The hard problem here is that rpcbind registration is done synchronously under the nfsd_mutex. To talk to rpcbind, the kernel has to create a RPC client, which does a RPC ping first. If rpcbind is down then it can take up to a minute for the RPC ping to time out."</p>
+</blockquote>
+<p>The C reproducer is concurrent nfsctl writes (ports vs threads) on a syzkaller kernel. Operators do not need syzkaller to hit the same shape: <code>echo</code> a listener into <code>/proc/fs/nfsd/portlist</code> while <code>rpc.nfsd</code> or a script writes <code>/proc/fs/nfsd/threads</code>, with rpcbind slow or absent. The 10-second hung-task report is then the control plane, not the data path.</p>
+<p>The design fork is unchanged from last week. Short-term options on the table in the related <code>listener_set</code> discussion were: shorten the local <code>rpc_ping</code> timeout (Neil Brown: if a local service has not answered in one second, it is not going to), drop <code>nfsd_mutex</code> around registration, or cap the listener list (already rejected as the wrong root cause). The long-term plan Layton described after talking to Chuck Lever is to move most rpcbind SET/UNSET into userland, which would rev the nfsd netlink protocol. None of those patches appeared in this thread this week. There is still no timeline.</p>
+<h2>NFS client impact</h2>
+<p>There is no client patch here and no client-side bug to fix. The stall still sits on paths NFS <strong>clients</strong> actually use, and the new <code>rpcb_create_local</code> evidence makes that coupling explicit.</p>
+<ul>
+<li><strong>Thread and listener control.</strong> <code>write_threads</code> / <code>nfsd_nrthreads</code> is how nfsd is started and how the thread pool is resized. While it is stuck behind <code>write_ports</code> → <code>rpcb_create_local</code>, new nfsd threads do not come up. NFSv4 clients never talk to rpcbind, but they still need a live listener and a responsive control plane. A client <code>mount</code> against a server that is still bringing up nfsd simply does not complete for the duration of the hang.</li>
+<li><strong>Export-cache and mount.</strong> The same <code>nfsd_mutex</code> serializes export-table dumps and downcalls. A client <code>mount</code> of a just-exported path that still needs an export-cache fill waits out the rpcbind stall even if the operator never touched portlist from that client.</li>
+<li><strong>NFSv2/v3 discovery.</strong> The underlying rpcbind-under-mutex problem is specifically a v2/v3 client-visibility issue: nfsd will serve without a successful registration, but clients that find the server via portmap see a missing or stale table. The hung <code>nfsd_nrthreads</code> is the control-plane counterpart of that same stall. <code>rpcb_create_local_mutex</code> on the holder is the kernel building the rpcbind client that those v2/v3 clients depend on, on the wrong side of the mutex that also starts the server.</li>
+<li><strong>Admin tools that still use <code>/proc/fs/nfsd</code>.</strong> Not every deployment has moved to nfsd netlink. <code>rpc.nfsd</code>, nfs-utils, and scripts that <code>echo N &gt; /proc/fs/nfsd/threads</code> are the waiters in this dump. They hang even when the operator is only trying to start or resize the server, not add ports. The C reproducer is that workload, automated.</li>
+</ul>
+<p>Nothing in this week's other linux-nfs traffic — Chuck Lever's NFS3ERR / nfserr header rework, the cifs-fixes merge named in the syzbot HEAD — touches <code>nfsd_mutex</code> or <code>rpcb_create_local</code>. They do not mitigate this hang.</p>
+<h2>Status</h2>
+<ul>
+<li><strong>Type:</strong> hung-task / DoS bug in the nfsd <strong>procfs</strong> control plane (<code>write_threads</code> / <code>nfsd_nrthreads</code> waiting on <code>write_ports</code> → <code>rpcb_create_local</code>). Same <code>nfsd_mutex</code> × synchronous rpcbind root cause as the July/August netlink reports; still unpatched.</li>
+<li><strong>Reproducer:</strong> <strong>yes, as of 2 September.</strong> C reproducer linked from the follow-up. Last week's lock dump is confirmed, not superseded.</li>
+<li><strong>New evidence this week:</strong> the holder also owns <code>rpcb_create_local_mutex</code> in <code>net/sunrpc/rpcb_clnt.c</code>. That is the first on-list confirmation in <em>this</em> thread that the long <code>nfsd_mutex</code> hold is the in-kernel rpcbind client, not some other listener-setup work.</li>
+<li><strong>Human reply:</strong> none in this thread as of 2 September. The related <code>listener_set</code> discussion already has a design fork (shorten <code>rpc_ping</code>, drop the mutex around registration, or move rpcbind to userland) but no merged fix and no timeline for the userland protocol rev.</li>
+<li><strong>Fix tag requested:</strong> <code>Reported-by: syzbot+86a9d43d89b86def6d59@syzkaller.appspotmail.com</code>.</li>
+<li><strong>Test hook unused:</strong> syzbot will apply a pasted patch or <code>#syz test: git://repo/address.git branch-or-commit-hash</code>. Nobody sent either this week.</li>
+</ul>
+<p>Until listener setup no longer holds <code>nfsd_mutex</code> across rpcbind I/O — or until that I/O fails in well under a second — every nfsd admin path, netlink <strong>or</strong> <code>/proc/fs/nfsd</code>, is another hung-task report waiting to happen. This week's follow-up does not change the diagnosis. It gives maintainers a C reproducer and a lock dump that names <code>rpcb_create_local</code> on the holder, which is enough to test a fix and not enough to ship one.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/6a98a3c5.27a413cd.1e878c.0010.GAE@google.com/">2026-09-02 syzbot — Re: [syzbot] [nfs?] INFO: task hung in nfsd_nrthreads</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/6a98a3c5.27a413cd.1e878c.0010.GAE@google.com/">2026-09-02 syzbot <a href="mailto:syzbot+86a9d43d89b86def6d59@syzkaller.appspotmail.com">syzbot+86a9d43d89b86def6d59@syzkaller.appspotmail.com</a> — Re: [syzbot] [nfs?] INFO: task hung in nfsd_nrthreads</a></li>
+</ul>
+  </main>
+</body>
+</html>

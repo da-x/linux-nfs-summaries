@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RFC: NFS client lock-contention cuts for RDMA</title>
+  <meta name="description" content="On 31 August, Chuck Lever posted an eight-patch RFC that attacks lock contention in the Linux NFS client under a 4KB NFSv3 workload on 100GbE RDMA. This is not a protocol change. It is a performance series: three independent SUNRPC…">
+  <meta property="og:title" content="RFC: NFS client lock-contention cuts for RDMA">
+  <meta property="og:description" content="On 31 August, Chuck Lever posted an eight-patch RFC that attacks lock contention in the Linux NFS client under a 4KB NFSv3 workload on 100GbE RDMA. This is not a protocol change. It is a performance series: three independent SUNRPC…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-09-03T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="RFC: NFS client lock-contention cuts for RDMA">
+  <meta name="twitter:description" content="On 31 August, Chuck Lever posted an eight-patch RFC that attacks lock contention in the Linux NFS client under a 4KB NFSv3 workload on 100GbE RDMA. This is not a protocol change. It is a performance series: three independent SUNRPC…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-09-03</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>RFC: NFS client lock-contention cuts for RDMA</h1>
+<h2>Summary</h2>
+<h1>RFC: NFS client lock-contention cuts for RDMA</h1>
+<h2>Summary</h2>
+<p>On 31 August, <a href="https://lore.kernel.org/linux-nfs/20260831-performance-v1-0-8d9fd9b67f96@kernel.org/">Chuck Lever posted</a> an eight-patch <strong>RFC</strong> that attacks lock contention in the Linux NFS <strong>client</strong> under a 4KB NFSv3 workload on 100GbE RDMA. This is not a protocol change. It is a performance series: three independent SUNRPC hot-path lock splits plus a workqueue affinity override on <code>rpciod</code>, <code>nfsiod</code>, and <code>xprtiod</code>. No one replied in this thread. Two days later Lever superseded the series with <a href="https://lore.kernel.org/linux-nfs/20260902-performance-v2-0-b71c0c082f9d@kernel.org/">RFC v2</a>, dropping the most aggressive scheduler change after it reopened a known pNFS deadlock.</p>
+<p>The cover letter frames the problem in CPU-profile terms, not IOPS:</p>
+<blockquote>
+<p>"Under a 4KB NFSv3 workload on 100GbE RDMA, roughly 150 RPC worker threads drive the client, and lock contention dominates its CPU profile: up to 53% of non-idle cycles are spent in native_queued_spin_lock_slowpath."</p>
+</blockquote>
+<p>The test harness is transport-limited, so the cycles that come back do not raise IOPS. They show up as tighter submission latency and a lower tail:</p>
+<blockquote>
+<p>"My test harness is transport-limited, so the freed cycles appear as reduced submission latency variance and lower tail completion latency rather than higher IOPS."</p>
+</blockquote>
+<h2>Prior context (brief)</h2>
+<p>An earlier RFC tried to fix this in the workqueue core by falling back to a finer affinity scope when an unbound queue collapsed to a single pod. Tejun Heo rejected a finer <strong>global</strong> default for unbound workqueues and offered two alternatives: a sharded scope between CACHE and SMT, and a per-workqueue scope change on the NFS queues themselves. The first became <code>WQ_AFFN_CACHE_SHARD</code>. Lever’s cover letter explains why that is still not enough on the machines he cares about:</p>
+<blockquote>
+<p>"The first became the WQ_AFFN_CACHE_SHARD default, whose 8-core shards still leave a 12-core single-LLC system with only two pools. This series does the second."</p>
+</blockquote>
+<p>Patches 6–8 are tagged <code>Suggested-by: Tejun Heo</code>.</p>
+<h2>What kind of change this is</h2>
+<ul>
+<li><strong>Not a protocol change.</strong> Wire formats, XID semantics, and NFS versions are untouched.</li>
+<li><strong>Not a classic correctness bug fix</strong>, except that v2 later identified a use-after-free in the <code>queue_lock</code> split and a pNFS deadlock in the async-inline patch.</li>
+<li><strong>Client performance work</strong> in <code>net/sunrpc/</code> and <code>fs/nfs/</code>, plus a small <code>kernel/workqueue.c</code> export so sunrpc/nfs can retune unbound queues without a module reload.</li>
+</ul>
+<p>The three contended locks named in the later v2 cover — <code>reserve_lock</code> on every XID allocation, <code>queue_lock</code> on every submit and completion, and the unbound worker pool lock on every <code>rpciod</code>/<code>nfsiod</code>/<code>xprtiod</code> enqueue and dequeue — are exactly the three axes of this v1 series.</p>
+<h2>Patch 1: take XID allocation off <code>reserve_lock</code></h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260831-performance-v1-1-8d9fd9b67f96@kernel.org/">PATCH 1/8</a> replaces the <code>reserve_lock</code>-protected XID counter with <code>atomic_t</code>. <code>xprt_alloc_xid()</code> currently grabs <code>reserve_lock</code> just to increment a counter. Under the same 100GbE RDMA NFSv3 load, that lock is 1.06% of system-wide CPU in <code>xprt_request_init</code> as ~150 RPC workers serialize on it.</p>
+<p>Lever’s invariant is that XID allocation does not need the slot table or the backlog:</p>
+<blockquote>
+<p>"reserve_lock protects the slot table and backlog queue, but XID allocation is an independent operation that does not require synchronization with either."</p>
+</blockquote>
+<p>This is the cheapest win in the series: a counter that never needed the lock it was sitting behind.</p>
+<h2>Patch 2: run the first async FSM states in the caller (later withdrawn)</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260831-performance-v1-2-8d9fd9b67f96@kernel.org/">PATCH 2/8</a> is the most aggressive SUNRPC scheduler change, and the one v2 dropped. Today every async RPC is bounced onto <code>rpciod</code> before its first FSM state runs, even though <code>call_start</code> through <code>call_allocate</code> typically complete without blocking. That is one enqueue, one dequeue, and one context switch per RPC, and it feeds the <code>rpciod</code> pool lock.</p>
+<p>The proposed fix is to have <code>rpc_execute()</code> call <code>__rpc_execute()</code> directly for async tasks too. Initial states run in the submitter; <code>__rpc_execute()</code> returns to the caller when the task first sleeps; later wake-ups still go through <code>rpc_make_runnable()</code> onto <code>rpciod</code>.</p>
+<p>Lever argues this does not undo commit <code>d6a1ed08c6ac</code> ("SUNRPC: Reduce asynchronous RPC task stack usage"), which moved async dispatch onto <code>rpciod</code> to bound caller stack depth:</p>
+<blockquote>
+<p>"Inline execution preserves that bound because __rpc_execute() still runs each state from the same stack frame."</p>
+</blockquote>
+<p>v2’s cover letter is the post-mortem. Running the first states in the submitter also lets <strong>completion callbacks</strong> run there. A pNFS read resent from <code>rpc_release</code> then waits for a layout segment its submitter still holds — the deadlock commit <code>54e4a0dfa25d</code> ("pNFS: Fix a deadlock between read resends and layoutreturn") already fixed. v2 therefore leaves the <code>rpciod</code> hop in place. That is an important client-development conclusion from this RFC even though the objection never landed as a reply on v1: <strong>do not inline async RPC startup</strong>. The workqueue hop is load-bearing for pNFS.</p>
+<h2>Patch 3: split <code>recv_lock</code> out of <code>xprt-&gt;queue_lock</code></h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260831-performance-v1-3-8d9fd9b67f96@kernel.org/">PATCH 3/8</a> is the lock that accounts for the 53% figure. <code>xprt-&gt;queue_lock</code> currently protects two independent structures: the <code>recv_queue</code> rb-tree used for reply matching, and the <code>xmit_queue</code> list used for transmit draining. No hot path touches both in one critical section, but every RPC submit and every completion contends on the same lock. The RDMA completion worker running <code>rpcrdma_reply_handler</code> serializes against ~150 kworkers enqueuing receives and transmits.</p>
+<p>The split is surgical:</p>
+<blockquote>
+<p>"Introduce xprt-&gt;recv_lock for the receive path -- recv_queue operations, request lookup, receive-side pinning, and completion -- leaving queue_lock to the xmit_queue and the xprt_transmit drain loop."</p>
+</blockquote>
+<p>A second, smaller shrink: move the <code>rq_private_buf</code> memcpy in <code>xprt_request_enqueue_receive</code> <strong>above</strong> the lock. Until the rb-tree insert publishes the request, the reply handler cannot see it, so the copy is safe unlocked and the submitter’s critical section collapses to the insert alone.</p>
+<p>This is the core NFS-client bug-adjacent fix in the series: a lock that was protecting two unrelated queues on the hottest path in the RDMA client. v2 kept the split and added a send-bvec use-after-free fix in <code>xprt_request_dequeue_xprt()</code> (credited to sashiko), which is why this patch should not be cherry-picked from v1 as-is.</p>
+<h2>Patches 4–5: expose NFS workqueues and export workqueue attribute helpers</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260831-performance-v1-4-8d9fd9b67f96@kernel.org/">PATCH 4/8</a> sets <code>WQ_SYSFS</code> on the key NFS-related workqueues so affinity scope can be tuned under <code>/sys/devices/virtual/workqueue/</code> without reloading modules.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260831-performance-v1-5-8d9fd9b67f96@kernel.org/">PATCH 5/8</a> exports the workqueue allocation, apply, and teardown helpers so modules such as sunrpc can change affinity scope at run time. v2 replaced this three-function export with a single <code>workqueue_set_affn_scope()</code> helper after Tejun Heo engaged on that API; v1 never received that review in-thread.</p>
+<p>v2 also records a remaining race that v1 leaves open: the scope change is applied <strong>after</strong> <code>alloc_workqueue()</code> has registered the queue in sysfs, so an administrator write that lands in between is overwritten. Closing that window needs <code>workqueue_sysfs_register()</code> exported and <code>WQ_SYSFS</code> dropped from the alloc calls. This series does not close it.</p>
+<h2>Patches 6–8: <code>WQ_AFFN_SMT</code> on <code>rpciod</code>, <code>nfsiod</code>, and <code>xprtiod</code></h2>
+<p>These three patches are the payload Tejun suggested: override affinity scope on the NFS workqueues rather than changing the unbound default.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260831-performance-v1-6-8d9fd9b67f96@kernel.org/">PATCH 6/8</a> sets <code>WQ_AFFN_SMT</code> on <code>rpciod</code>. On a 12-core system, 30–40% of cycles are lost to <code>native_queued_spin_lock_slowpath</code> in the <code>rpciod</code> pool at <code>WQ_AFFN_CACHE</code> (one pool per LLC). <code>WQ_AFFN_CACHE_SHARD</code> barely helps: its 8-core shards split that machine into two pools of six. Lever’s justification for a per-queue override, rather than another global default fight, is explicit:</p>
+<blockquote>
+<p>"Most UNBOUND workqueues never contend on the pool lock and profit from a coarser scope's cache locality. rpciod's sustained completion traffic makes the lock a first-order bottleneck, so the override belongs on this workqueue rather than in the system-wide default. Idle kworkers are culled, so the extra pools cost little on large systems."</p>
+</blockquote>
+<p><a href="https://lore.kernel.org/linux-nfs/20260831-performance-v1-7-8d9fd9b67f96@kernel.org/">PATCH 7/8</a> does the same for <code>nfsiod</code>. On a single-socket system whose LLC fits in one CACHE_SHARD, every NFS I/O completion serializes on one <code>nfsiod</code> pool lock. Profiling 4KB random writes over NFSv3/RDMA with <code>nconnect=3</code> shows that lock at 17% of CPU: 8% dequeuing work, 9% enqueuing follow-on work from <code>rpciod</code> and <code>nfsiod</code> workers. <code>WQ_AFFN_SMT</code> gives each CPU its own pool, so <code>queue_work_on()</code> no longer takes a lock on another CPU. Enqueue contention disappears; dequeue contention drops to 1.4%. Throughput is unchanged (transport-limited), but the latency numbers are the client-visible result:</p>
+<blockquote>
+<p>"the freed cycles cut submission latency variance by 67% (slat stdev 31.6 us to 10.5 us), IOPS stdev by 31%, and p99.9 completion latency by 11%."</p>
+</blockquote>
+<p><a href="https://lore.kernel.org/linux-nfs/20260831-performance-v1-8-8d9fd9b67f96@kernel.org/">PATCH 8/8</a> applies the same <code>WQ_AFFN_SMT</code> override to <code>xprtiod</code>, which handles socket receive processing, error recovery, and connection lifecycle and contends on the unbound pool lock the same way <code>rpciod</code> does.</p>
+<p>v2 kept all three overrides, split the <code>WQ_SYSFS</code> change into separate SUNRPC and NFS patches, and corrected the pool-cost and SMT-group wording.</p>
+<h2>Evolution and conclusions</h2>
+<p>This v1 thread is a <strong>drive-by RFC</strong>: eight patches, zero replies, then a v2 two days later. The technical argument is entirely in Lever’s commit messages, and it is aimed squarely at NFS <strong>client</strong> development:</p>
+<ol>
+<li><strong>XID allocation does not belong under <code>reserve_lock</code>.</strong> Make it <code>atomic_t</code>. Cheap, independent, 1% of CPU.</li>
+<li><strong><code>queue_lock</code> is doing two jobs.</strong> Split <code>recv_lock</code> for the reply rb-tree; leave <code>queue_lock</code> for transmit drain. This is the 53% lock. Do not take v1 as-is — v2 fixes a send-bvec use-after-free in <code>xprt_request_dequeue_xprt()</code>.</li>
+<li><strong>Do not inline the first async RPC states.</strong> v1 proposed it to skip a <code>rpciod</code> hop; v2 withdrew it because completion callbacks in the submitter re-create the pNFS read-resend vs. layoutreturn deadlock of <code>54e4a0dfa25d</code>.</li>
+<li><strong>Workqueue pool locks are a first-order NFS client bottleneck</strong> on high-IOPS RDMA, and <code>WQ_AFFN_CACHE_SHARD</code> is too coarse on single-LLC 12-core boxes. Override <code>rpciod</code>, <code>nfsiod</code>, and <code>xprtiod</code> to <code>WQ_AFFN_SMT</code> rather than fighting for a finer global default. That is Tejun’s suggested path, and it is the one this series takes.</li>
+<li><strong>Expect latency, not IOPS.</strong> On a transport-limited 100GbE RDMA client the win is submission-latency variance (−67%), IOPS stdev (−31%), and p99.9 completion latency (−11%).</li>
+</ol>
+<p>No Reviewed-by, no nits, and no merge conclusion in this thread. Treat v1 as the problem statement and the lock-split design; treat v2 as the series that actually has a chance to land, minus the async-inline patch and with a narrower workqueue API.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260831-performance-v1-0-8d9fd9b67f96@kernel.org/">2026-08-31 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH RFC 0/8] Reduce lock contention in the NFS client</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260831-performance-v1-1-8d9fd9b67f96@kernel.org/">2026-08-31 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH RFC 1/8] SUNRPC: Use atomic_t for XID allocation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260831-performance-v1-3-8d9fd9b67f96@kernel.org/">2026-08-31 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH RFC 3/8] SUNRPC: Split recv_lock out of xprt-&gt;queue_lock</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260831-performance-v1-2-8d9fd9b67f96@kernel.org/">2026-08-31 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH RFC 2/8] SUNRPC: Execute initial async RPC states in caller's context</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260831-performance-v1-4-8d9fd9b67f96@kernel.org/">2026-08-31 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH RFC 4/8] Set WQ_SYSFS on key NFS-related workqueues</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260831-performance-v1-5-8d9fd9b67f96@kernel.org/">2026-08-31 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH RFC 5/8] workqueue: Export the functions needed for WQ attribute modification</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260831-performance-v1-7-8d9fd9b67f96@kernel.org/">2026-08-31 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH RFC 7/8] NFS: Reduce nfsiod workqueue contention</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260831-performance-v1-6-8d9fd9b67f96@kernel.org/">2026-08-31 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH RFC 6/8] SUNRPC: Reduce rpciod workqueue contention</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260831-performance-v1-8-8d9fd9b67f96@kernel.org/">2026-08-31 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH RFC 8/8] SUNRPC: Reduce xprtiod workqueue contention</a></li>
+</ul>
+  </main>
+</body>
+</html>

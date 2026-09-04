@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>syzbot: hung task in nfsd_nl_unlock_filesystem_doit behind listener_set</title>
+  <meta name="description" content="This is a bug report — a hung-task / control-plane DoS on the NFS server generic-netlink family, not a protocol change and not a new feature. There is no NFS client code in the stack and no human reply. Google&#39;s syzbot hung…">
+  <meta property="og:title" content="syzbot: hung task in nfsd_nl_unlock_filesystem_doit behind listener_set">
+  <meta property="og:description" content="This is a bug report — a hung-task / control-plane DoS on the NFS server generic-netlink family, not a protocol change and not a new feature. There is no NFS client code in the stack and no human reply. Google&#39;s syzbot hung…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-09-03T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="syzbot: hung task in nfsd_nl_unlock_filesystem_doit behind listener_set">
+  <meta name="twitter:description" content="This is a bug report — a hung-task / control-plane DoS on the NFS server generic-netlink family, not a protocol change and not a new feature. There is no NFS client code in the stack and no human reply. Google&#39;s syzbot hung…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-09-03</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>syzbot: hung task in nfsd_nl_unlock_filesystem_doit behind listener_set</h1>
+<h2>Summary</h2>
+<p>This is a <strong>bug report</strong> — a hung-task / control-plane DoS on the NFS <strong>server</strong> generic-netlink family, not a protocol change and not a new feature. There is <strong>no NFS client code</strong> in the stack and <strong>no human reply</strong>. Google's <a href="https://lore.kernel.org/linux-nfs/6a913a46.4d659fcc.734b4.001a.GAE@google.com/">syzbot</a> hung <code>nfsd_nl_unlock_filesystem_doit</code> (<code>NFSD_CMD_UNLOCK_FILESYSTEM</code>) on the global <code>nfsd_mutex</code> while a sibling netlink <code>listener_set</code> already holds that mutex. The unlock handler is an innocent waiter; the stall is the same rpcbind-under-mutex long hold Jeff Layton diagnosed in July.</p>
+<h2>Classification</h2>
+<p>On Friday, 28 August, syzbot filed a single unreproduced report against upstream HEAD <code>45c13f3f9e3b</code> (<code>Merge tag 'hwlock-v7.3'</code>):</p>
+<blockquote>
+<p>"INFO: task syz.2.1768:11730 blocked for more than 143 seconds."</p>
+</blockquote>
+<blockquote>
+<p>"Unfortunately, I don't have any reproducer for this issue yet."</p>
+</blockquote>
+<p>The kernel is a <code>PREEMPT(full)</code> syzkaller build, tainted <code>L</code> (SOFTLOCKUP). The hung task entered via <code>genl_family_rcv_msg_doit</code> / <code>sendmsg</code> and blocked in <code>__mutex_lock</code> at <code>nfsd_nl_unlock_filesystem_doit+0x203/0x410</code> (<code>fs/nfsd/nfsctl.c:2677</code>). syzbot asked that any fix carry:</p>
+<blockquote>
+<p>"Reported-by: syzbot+0093d3ab8d8eb2fdde82@syzkaller.appspotmail.com"</p>
+</blockquote>
+<p>This thread has no prior weekly history. It is a new syzbot id, not a follow-up on last week's <code>nfsd_nrthreads</code> or <code>listener_set</code> reports, but the lock dump is the same class of failure those threads already named.</p>
+<h2>The lock dump: filesystem-unlock waits on listener_set, umount waits too</h2>
+<p>The hung stack itself only says "waiting for a mutex." The "Showing all locks held in the system" listing names <strong>three</strong> tasks on <code>nfsd_mutex</code> at once:</p>
+<table><thead><tr><th>Task</th><th>Handler</th><th>Role</th></tr></thead><tbody>
+<tr><td><code>syz.0.1424/10896</code></td><td><code>nfsd_nl_listener_set_doit</code> (<code>nfsctl.c:2057</code>)</td><td><strong>holds</strong> <code>nfsd_mutex</code> (plus generic-netlink <code>cb_lock</code>)</td></tr>
+<tr><td><code>syz.2.1768/11730</code> (the hung task)</td><td><code>nfsd_nl_unlock_filesystem_doit</code> (<code>nfsctl.c:2677</code>)</td><td><strong>waiting</strong> on <code>nfsd_mutex</code> (already holds <code>cb_lock</code>)</td></tr>
+<tr><td><code>syz.1.2261/12930</code></td><td><code>nfsd_shutdown_threads</code> (<code>nfssvc.c:582</code>)</td><td><strong>waiting</strong> on <code>nfsd_mutex</code> while already holding <code>s_umount</code> from <code>deactivate_super</code></td></tr>
+</tbody></table>
+<p>This is not an AB-BA deadlock between unlock and listener_set. <code>cb_lock</code> is an rwsem, so the netlink tasks can hold it as readers. Both netlink ops take <code>nfsd_mutex</code> in the same direction. The hang is a <strong>long hold</strong>: <code>listener_set</code> is not releasing the global nfsd lock for more than 143 seconds, and every other nfsd netlink command — including the admin filesystem-unlock that walks NFSv4 client state — queues behind it.</p>
+<p>The umount waiter is the extra wrinkle, and it is the same pattern the 25 July <code>unlock_export</code> dump already showed. <code>syz.1.2261</code> holds <code>&amp;type-&gt;s_umount_key#75</code> taken in <code>deactivate_super</code> and then blocks in <code>nfsd_shutdown_threads</code>. That is not proven as a deadlock here — <code>listener_set</code> is not shown taking <code>s_umount</code> — but it is a lock-order hazard: any nfsd path that holds <code>nfsd_mutex</code> and then needs a superblock lock will deadlock against a umount that already took <code>s_umount</code> and is now waiting for <code>nfsd_mutex</code>. Even without that deadlock, a filesystem umount that sits in D-state for more than two minutes is a client-visible outage of its own.</p>
+<p>The NMI backtrace is a red herring for the NFS path. CPU 0 is <code>khungtaskd</code> dumping stacks; the <code>SOFTLOCKUP</code> taint and the incidental tty / bridge / unix-dgram locks in the listing are syzkaller noise. The nfsd story is entirely <code>listener_set</code> holding <code>nfsd_mutex</code> across a slow operation while filesystem-unlock and server teardown wait.</p>
+<p>Line numbers have moved since the summer reports (<code>unlock_filesystem</code> was <code>nfsctl.c:2345</code> in the 14 August <code>write_versions</code> dump; <code>listener_set</code> was <code>nfsctl.c:1964</code> in July). The hang has not.</p>
+<h2>Same waiter, now the subject line</h2>
+<p><code>nfsd_nl_unlock_filesystem_doit</code> is <code>NFSD_CMD_UNLOCK_FILESYSTEM</code>: the administrator-driven path that walks the NFSv4 client hash tables to revoke open state, NLM locks, delegations, and in-flight async <code>COPY</code> for a whole superblock. Chuck Lever described that contract when he hardened the same three unlock entry points (<code>write_unlock_fs</code>, <code>nfsd_nl_unlock_filesystem_doit</code>, <code>nfsd_nl_unlock_export_doit</code>) in June:</p>
+<blockquote>
+<p>"Writing to /proc/fs/nfsd/unlock_filesystem, or sending the NFSD_CMD_UNLOCK_FILESYSTEM or NFSD_CMD_UNLOCK_EXPORT netlink command, walks the NFSv4 client hash tables to revoke open state and cancel async COPY operations."</p>
+</blockquote>
+<p>Those June fixes were <strong>crash</strong> bugs, not hangs. Musaab Khan's post-shutdown UAF and XIAO WU's startup-window NULL deref both came from walking <code>nn-&gt;conf_id_hashtbl</code> outside the window where the tables are live. Lever's follow-up switched the three unlock paths from testing <code>nn-&gt;nfsd_serv</code> to <code>NFSD_NET_UP</code>, which "brackets the window where the tables are live: set at the end of <code>nfsd_startup_net()</code> and cleared in <code>nfsd_shutdown_net()</code> after they are freed, both under <code>nfsd_mutex</code>." That work made the unlock command <em>safe</em> to run. It did not make it <em>timely</em>: the handler still takes the same global mutex that listener setup holds across synchronous rpcbind I/O.</p>
+<p>The filesystem-unlock hang is not even new as a <em>waiter</em>. On 14 August syzbot already listed <code>nfsd_nl_unlock_filesystem_doit</code> as a secondary waiter behind a stuck <code>write_ports</code> in the <code>write_versions</code> dump. The 25 July <code>nfsd_nl_unlock_export_doit</code> report was the per-export twin of this command, with <code>listener_set</code> as the named holder. This week's mail is the first time <code>unlock_filesystem</code> itself is the hung-task subject — the whole-superblock revoke path, not just one export.</p>
+<h2>Root cause already diagnosed; still unpatched</h2>
+<p>Layton's July diagnosis of the cache-flush / <code>listener_set</code> hangs applies here almost verbatim:</p>
+<blockquote>
+<p>"The hard problem here is that rpcbind registration is done synchronously under the nfsd_mutex. To talk to rpcbind, the kernel has to create a RPC client, which does a RPC ping first. If rpcbind is down then it can take up to a minute for the RPC ping to time out."</p>
+</blockquote>
+<p>And:</p>
+<blockquote>
+<p>"If we couple those delays with a long list of listeners, then it's easy to see how to reproduce the hang."</p>
+</blockquote>
+<p>This dump names <code>nfsd_nl_listener_set_doit</code> as the holder at <code>nfsctl.c:2057</code>, so the mechanism does not need to be inferred. The netlink <code>listener_set</code> handler can install many sockets in one call; each one may try to register with local rpcbind while still holding <code>nfsd_mutex</code>. A down, slow, or not-yet-started rpcbind turns each registration into a tens-of-seconds stall. Two such stalls is 143 seconds of hung-task watchdog — exactly what syzbot observed.</p>
+<p>Neil Brown's question from that earlier thread is still the design fork:</p>
+<blockquote>
+<p>"Why are we waiting a whole minute for a local service to respond? If it hasn't responded in 1 second, is it ever really likely to?"</p>
+</blockquote>
+<p>Layton's answer then — a shorter timeout is necessary but not sufficient, because "even at 1s, you could easily cause a lockup warning with just a few hundred listeners" — is why this new report will not be fixed by touching <code>nfsd_nl_unlock_filesystem_doit</code> itself. The unlock handler is not the bug. <strong>Any</strong> nfsd netlink op, including the admin-revocation command NFSv4 clients depend on for timely state teardown, takes the same global mutex that listener setup holds across rpcbind I/O.</p>
+<p>The short-term hardening series (Layton's nfsd-nl-hang v2: 1024-entry cap, 1s local rpcbind timeout, non-fatal v2/v3 registration, richer extack) was still awaiting v3 as of mid-August. Last week Layton, after talking to Chuck Lever, <strong>changed the long-term plan</strong>: move most rpcbind SET/UNSET into userland, which would rev the nfsd netlink protocol. He was explicit about the near term:</p>
+<blockquote>
+<p>"Right now, I don't have a timeline for working on this, so we're probably just going to have to suffer with more syzbot reports until that can come to fruition."</p>
+</blockquote>
+<p>This week's <code>unlock_filesystem</code> report is that prediction, one day into the new week. Nobody <code>#syz dup</code>'d it against the July <code>unlock_export</code> hang or the August <code>listener_set</code> reports. Nobody used the <code>#syz test:</code> hook.</p>
+<h2>NFS client impact</h2>
+<p>There is no client patch here and no client-side bug to fix. The stall sits on <strong>server</strong> paths that NFS clients actually depend on for state teardown, for the server staying reachable, and for mounts completing.</p>
+<ul>
+<li><strong>Admin filesystem-revoke.</strong> <code>NFSD_CMD_UNLOCK_FILESYSTEM</code> is how an administrator tears down <em>all</em> NFSv4 opens, locks, delegations, layouts, and async <code>COPY</code> for a superblock without taking the whole server down — the "umount kills NFSv4 state" contract that landed earlier this year. If that handler sits in D-state for minutes behind <code>nfsd_mutex</code>, revoked state stays live: a client continues to hold opens it should have lost, a delegated write is not recalled, and an in-flight inter-server <code>COPY</code> is not cancelled. That is worse than the per-export <code>UNLOCK_EXPORT</code> hang of 25 July, because the blast radius is the whole filesystem.</li>
+<li><strong>Filesystem umount itself is a waiter.</strong> This dump shows <code>deactivate_super</code> → <code>nfsd_shutdown_threads</code> blocked on the same mutex while already holding <code>s_umount</code>. A server-side umount that cannot finish is a client-visible outage: the export is neither fully up nor fully gone, <code>nfsd</code> threads cannot be stopped, and any subsequent <code>listener_set</code> / thread-count change queues behind it. Linux NFS clients see that as a server that has gone silent, not as a netlink admin stall.</li>
+<li><strong>Control plane for every client, including NFSv4.</strong> While <code>listener_set</code> holds <code>nfsd_mutex</code>, other nfsd netlink and <code>/proc/fs/nfsd</code> writes block — versions, threads, exports, cache flush, unlock. New listeners do not come up. A client <code>mount</code> against a server that is still bringing up nfsd, or that is trying to revoke state for an export being taken down, simply does not complete for the duration of the hang. NFSv4 clients never talk to rpcbind, but they still need a live listener and a responsive control plane.</li>
+<li><strong>NFSv2/v3 discovery.</strong> The underlying rpcbind-under-mutex problem is specifically a v2/v3 client-visibility issue: nfsd will serve without a successful registration, but clients that find the server via portmap see a missing or stale table. Brown put it cleanly in July: "nfsd doesn't need the registration, only clients do." Until registration moves to userland — or until it no longer runs under <code>nfsd_mutex</code> — those clients keep depending on a kernel path that can stall the entire nfsd admin lock.</li>
+</ul>
+<p>Nothing in this week's other linux-nfs traffic — Chuck Lever's NFSv2 <code>NFSERR_ISDIR</code> mapping for U-Boot, the cifs-fixes merge named in a sibling syzbot HEAD — touches <code>nfsd_mutex</code> or <code>nfsd_nl_unlock_filesystem_doit</code>. They do not mitigate this hang. The sibling <a href="https://lore.kernel.org/linux-nfs/6a90c2f3.4d659fcc.734b4.0017.GAE@google.com/">nfsd_nrthreads</a> report in this same week is the <strong>procfs</strong> twin (threads writer waiting on <code>write_ports</code> → <code>rpcb_create_local</code>); this report is the <strong>netlink</strong> filesystem-unlock twin of the same long hold.</p>
+<h2>Status</h2>
+<ul>
+<li><strong>Type:</strong> hung-task / DoS bug in the nfsd <strong>netlink</strong> control plane (<code>NFSD_CMD_UNLOCK_FILESYSTEM</code> waiting on <code>nfsd_nl_listener_set_doit</code>). Same <code>nfsd_mutex</code> × synchronous rpcbind root cause as the July/August netlink and procfs reports; still unpatched.</li>
+<li><strong>Reproducer:</strong> none. syzbot said so explicitly.</li>
+<li><strong>Human reply:</strong> none in this thread as of 28 August. The related <code>listener_set</code> discussion already has a design fork (shorten <code>rpc_ping</code>, drop the mutex around registration, or move rpcbind to userland) but no merged fix and no timeline for the userland protocol rev.</li>
+<li><strong>Not a crash in the unlock path.</strong> The June UAF / NULL-deref work on <code>nfsd_nl_unlock_filesystem_doit</code> is a different failure mode. This dump is a hang, and the unlock function is not the site that needs the patch.</li>
+<li><strong>Fix tag requested:</strong> <code>Reported-by: syzbot+0093d3ab8d8eb2fdde82@syzkaller.appspotmail.com</code>.</li>
+<li><strong>Test hook unused:</strong> syzbot will keep the issue open until a <code>#syz fix:</code> / <code>#syz dup:</code> reply lands.</li>
+</ul>
+<p>Until listener setup no longer holds <code>nfsd_mutex</code> across rpcbind I/O — or until that I/O fails in well under a second — every nfsd admin path, netlink <strong>or</strong> <code>/proc/fs/nfsd</code>, is another hung-task report waiting to happen. This week's <code>unlock_filesystem</code> filing does not change the diagnosis. It documents the whole-superblock revoke command, and a concurrent umount, sitting behind the same <code>listener_set</code> hold that already stalled export-install, export-revoke, cache flush, versions, and threads.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/6a913a46.4d659fcc.734b4.001a.GAE@google.com/">2026-08-28 syzbot — [syzbot] [nfs?] INFO: task hung in nfsd_nl_unlock_filesystem_doit</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/6a913a46.4d659fcc.734b4.001a.GAE@google.com/">2026-08-28 syzbot <a href="mailto:syzbot+0093d3ab8d8eb2fdde82@syzkaller.appspotmail.com">syzbot+0093d3ab8d8eb2fdde82@syzkaller.appspotmail.com</a> — [syzbot] [nfs?] INFO: task hung in nfsd_nl_unlock_filesystem_doit</a></li>
+</ul>
+  </main>
+</body>
+</html>

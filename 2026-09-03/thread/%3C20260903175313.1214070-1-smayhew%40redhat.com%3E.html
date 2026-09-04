@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfs-utils junction hardening: buffer over-read and use-after-free</title>
+  <meta name="description" content="Scott Mayhew posted a two-patch nfs-utils hardening series on 3 September aimed at memory-safety bugs in junction handling, the userspace path that turns FedFS/XML junction attributes into NFS referral (fs_locations) data. The thread is a…">
+  <meta property="og:title" content="nfs-utils junction hardening: buffer over-read and use-after-free">
+  <meta property="og:description" content="Scott Mayhew posted a two-patch nfs-utils hardening series on 3 September aimed at memory-safety bugs in junction handling, the userspace path that turns FedFS/XML junction attributes into NFS referral (fs_locations) data. The thread is a…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-09-03T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfs-utils junction hardening: buffer over-read and use-after-free">
+  <meta name="twitter:description" content="Scott Mayhew posted a two-patch nfs-utils hardening series on 3 September aimed at memory-safety bugs in junction handling, the userspace path that turns FedFS/XML junction attributes into NFS referral (fs_locations) data. The thread is a…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-09-03</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfs-utils junction hardening: buffer over-read and use-after-free</h1>
+<h2>Summary</h2>
+<p>Scott Mayhew posted a two-patch nfs-utils hardening series on 3 September aimed at memory-safety bugs in junction handling, the userspace path that turns FedFS/XML junction attributes into NFS referral (<code>fs_locations</code>) data. The thread is a same-day drop with no replies yet in this window; it is a bug-fix series, not a protocol change or new feature.</p>
+<p>Mayhew framed the work in the <a href="https://lore.kernel.org/linux-nfs/20260903175313.1214070-1-smayhew@redhat.com/">cover letter</a> as two independent but related defects:</p>
+<blockquote>
+<p>"The first patch fixes a buffer overrun in junction_parse_xml_read() and the second fixes a use-after-free when parsing multi-location junctions in locations_to_fslocdata()."</p>
+</blockquote>
+<p>Together the patches touch only <code>support/junction/junction.c</code> and <code>support/export/cache.c</code> (+8/-1). That is the export-cache / junction plumbing used when nfs-utils materializes referrals for clients, so the practical impact is on NFS referral correctness and daemon robustness rather than on the kernel NFS client itself.</p>
+<h2>Patch 1: opaque xattr treated as a C string</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260903175313.1214070-2-smayhew@redhat.com/">PATCH 1/2</a> addresses a buffer over-read (the cover letter calls it an overrun; the patch subject is more precise) in <code>junction_parse_xml_read()</code>. <code>junction_get_xattr()</code> returns an opaque, length-delimited buffer, but the XML parser later hands that buffer to <code>xlog()</code> as if it were a NUL-terminated string. Mayhew's diagnosis is terse:</p>
+<blockquote>
+<p>"junction_get_xattr() returns an opaque buffer, but junction_parse_xml_read() treats it as a string by passing it to xlog()."</p>
+</blockquote>
+<p>The chosen fix is at the source rather than at the log call: allocate one extra byte in <code>junction_get_xattr()</code> and NUL-terminate the buffer before returning it. That makes the xattr payload safe for <code>%s</code>-style logging without changing the XML parse path itself. The change is three lines in <code>support/junction/junction.c</code>.</p>
+<p>For NFS client-facing behavior this is a hardening fix around junction XML that can be stored as an xattr: a missing terminator could make <code>xlog()</code> walk off the end of the allocation when a junction is dumped, which is a classic over-read on a path that runs in the nfs-utils daemons rather than in the kernel client.</p>
+<h2>Patch 2: dangling <code>last_path</code> on multi-location junctions</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260903175313.1214070-3-smayhew@redhat.com/">PATCH 2/2</a> is the more operationally interesting bug for referral handling. In <code>locations_to_fslocdata()</code>, multi-location junctions are collapsed into <code>fs_locations</code> data by comparing each location's <code>root_path</code> against <code>last_path</code>. Mayhew describes a classic aliasing mistake:</p>
+<blockquote>
+<p>"While parsing a multi-location junction, locations_to_fslocdata() sets last_path = root_path and then frees root_path, leaving last_path dangling. On the next iteration, strcmp(rootpath, last_path) dereferences freed memory."</p>
+</blockquote>
+<p>The next location therefore compares against freed heap. The repair transfers ownership instead of aliasing-then-freeing:</p>
+<blockquote>
+<p>"Fix it by transferring ownership of root_path to last_path when they should be aliased."</p>
+</blockquote>
+<p>The six-line change lives in <code>support/export/cache.c</code>, which is the export-cache conversion of junction locations into fsloc data that NFS clients consume as referrals. A use-after-free here is not a kernel-client bug, but it can corrupt or crash userspace junction/export processing precisely on the multi-location case that referrals are meant to express.</p>
+<h2>Status this week</h2>
+<p>No review, Acked-by, or follow-up appeared before the window closed. The series therefore stands as an unreviewed nfs-utils bug-fix drop: one over-read from treating junction xattrs as C strings, and one use-after-free in multi-location <code>locations_to_fslocdata()</code>. Both are hardening/correctness fixes on the userspace junction path that feeds NFS referrals, not kernel NFS client changes and not a protocol revision.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260903175313.1214070-2-smayhew@redhat.com/">2026-09-03 Scott Mayhew <a href="mailto:smayhew@redhat.com">smayhew@redhat.com</a> — [nfs-utils PATCH 1/2] junction: fix buffer over-read in junction_parse_xml_read()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260903175313.1214070-1-smayhew@redhat.com/">2026-09-03 Scott Mayhew <a href="mailto:smayhew@redhat.com">smayhew@redhat.com</a> — [nfs-utils PATCH 0/2] Two hardening fixes for junction handling</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260903175313.1214070-3-smayhew@redhat.com/">2026-09-03 Scott Mayhew <a href="mailto:smayhew@redhat.com">smayhew@redhat.com</a> — [nfs-utils PATCH 2/2] junction: fix use-after-free in locations_to_fslocdata()</a></li>
+</ul>
+  </main>
+</body>
+</html>

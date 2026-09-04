@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Flexfiles v2 review: 64-bit stripe_unit and ndc_immediate nits</title>
+  <meta name="description" content="Review of Benjamin Coddington’s 23-patch NFS client series on flexfiles CB_NOTIFY_DEVICEID handling and wide-stripe cache scaling resumed this week with two focused exchanges between Coddington and NFS maintainer Anna Schumaker. The series…">
+  <meta property="og:title" content="Flexfiles v2 review: 64-bit stripe_unit and ndc_immediate nits">
+  <meta property="og:description" content="Review of Benjamin Coddington’s 23-patch NFS client series on flexfiles CB_NOTIFY_DEVICEID handling and wide-stripe cache scaling resumed this week with two focused exchanges between Coddington and NFS maintainer Anna Schumaker. The series…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-09-03T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Flexfiles v2 review: 64-bit stripe_unit and ndc_immediate nits">
+  <meta name="twitter:description" content="Review of Benjamin Coddington’s 23-patch NFS client series on flexfiles CB_NOTIFY_DEVICEID handling and wide-stripe cache scaling resumed this week with two focused exchanges between Coddington and NFS maintainer Anna Schumaker. The series…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-09-03</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Flexfiles v2 review: 64-bit stripe_unit and ndc_immediate nits</h1>
+<h2>Summary</h2>
+<h1>Flexfiles v2 review: 64-bit stripe_unit and ndc_immediate nits</h1>
+<h2>Summary</h2>
+<p>Review of Benjamin Coddington’s 23-patch NFS <strong>client</strong> series on flexfiles <code>CB_NOTIFY_DEVICEID</code> handling and wide-stripe cache scaling resumed this week with two focused exchanges between Coddington and NFS maintainer Anna Schumaker. The series remains a mix of <strong>stable-bound client bug fixes</strong>, a <strong>protocol-correctness feature</strong> for CHANGE/DELETE notifications under live layouts (RFC 8881), and <strong>cache scaling</strong>. Nothing merged. The design question that closed last week — reject a 64-bit <code>stripe_unit</code> that does not fit 32 bits, or promote the I/O path to full 64-bit arithmetic — is now settled in favor of the latter, and will land in v3. Schumaker’s first look at the <code>ndc_immediate</code> CHANGE path produced only comment nits, which Coddington accepted.</p>
+<h2>Brief bridge from last week</h2>
+<p>On 21 August Coddington posted <a href="https://lore.kernel.org/linux-nfs/cover.1787327939.git.bcodding@hammerspace.com/">PATCH v2 00/23</a>, rebuilding the client’s device-node pin so a CHANGE can re-point a live layout, implementing RFC 8881 Section 18.40.4 DELETE race recovery, and growing the deviceid and data-server caches toward 1024-device striping. The first six patches are standalone client bug fixes (Cc: stable): silent 32-bit truncation of <code>stripe_unit</code>, an unbounded <code>CB_NOTIFY_DEVICEID</code> array allocation, a decoder that dropped <code>ndc_immediate</code> and then misaligned the rest of the array, a 32-bit file-offset truncation on the flexfiles <strong>read</strong> DS-selection path, and two page-coalescing bugs that sent bytes past a stripe boundary to the wrong data server.</p>
+<p>Last week’s only review was <a href="https://lore.kernel.org/linux-nfs/59de74d2-e2bf-457d-a0cc-b3dfedc5b8c8@app.fastmail.com/">Schumaker’s push-back on patch 01</a>. Coddington had proposed rejecting a <code>stripe_unit</code> that does not fit 32 bits with <code>-EINVAL</code> so the layout is discarded and I/O falls back to the MDS, matching the existing <code>fh_count</code> check. Schumaker asked instead:</p>
+<blockquote>
+<p>"What would it take to update the users of stripe_unit that you mention above to treat it as a u64 instead of a u32? The calls to do_div() could be replaced with div64_u64() for example. It just feels a little more robust to me than artificially limiting ourselves to a 32-bit value."</p>
+</blockquote>
+<p>That question was still open when the week closed.</p>
+<h2>Patch 01: 32-bit rejection dropped in favor of u64 arithmetic</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/7C602108-0528-4B48-B10B-BC9110475F00@hammerspace.com/">Coddington answered on 28 August</a>, agreeing that promoting the consumers is the better client fix:</p>
+<blockquote>
+<p>"I agree it would be better that way, storage is already u64.  I don't think the division cost is a big deal.  I'll make that change for v3."</p>
+</blockquote>
+<p>That is a material rewrite of the first stable fix. <code>ff_layout_alloc_lseg()</code> already decodes <code>stripe_unit</code> as the protocol’s 64-bit value; the truncation lives in the consumers — <code>nfs4_ff_layout_calc_dss_id()</code> divides with <code>do_div()</code> (which casts the divisor) and <code>ff_layout_pg_test()</code> copies the unit into a <code>u32</code> first. A value that does not fit is silently truncated, so the client stripes on a unit the server did not specify, or divides by zero if the low 32 bits happen to be clear. Rejecting the layout was the conservative path: MDS fallback, no new arithmetic, and the existing <code>stripe_unit == 0</code> case moved off the <code>-EIO</code> exit that failed I/O instead of falling back.</p>
+<p>Schumaker’s alternative keeps the server’s 64-bit stripe unit all the way through DS selection and page coalescing. Coddington’s concession that “storage is already u64” and that <code>div64_u64()</code> is cheap enough means v3 will replace the <code>-EINVAL</code> gate with 64-bit consumers rather than paper over the truncation. That also touches the coalescing helpers in patches 05/23 and (indirectly) 04/23, which already exist to stop treating file offsets as 32-bit quantities on the read path. The rest of the stack — RCU-managed pins, the <code>reresolve_deviceid</code> hook, DELETE recovery, hash-table growth — is unaffected, but the first Cc:stable commit will not land as posted.</p>
+<h2>Patch 14: <code>ndc_immediate</code> review is comment nits, not a protocol objection</h2>
+<p>Later the same day Schumaker opened the CHANGE path, starting at <a href="https://lore.kernel.org/linux-nfs/da98de51fe276a11faef6b42d469ed73dd4ff53f.1787327939.git.bcodding@hammerspace.com/">PATCH v2 14/23</a>. That patch is the protocol-correctness piece that actually honors <code>ndc_immediate</code> on <code>CB_NOTIFY_DEVICEID</code> CHANGE. RFC 8881 Section 20.12 says an immediate change is enforced at once and the client might not complete pending I/O. Today the client only unhashes the cached device; references pinned inside layout-driver segments keep sending I/O to the old mapping until those layouts are freed. Patch 14, sitting on top of the new in-place re-resolve walker, marks the old node unavailable in addition to unpinning it.</p>
+<p>The mark is deliberately leaky. Coddington’s commit message is explicit that it does not recall references already handed out:</p>
+<blockquote>
+<p>"A write whose DS connection is already up keeps using the old node until that I/O errors: nfs4_ff_layout_prepare_ds() returns early on a live ds_clp, and the unavailable flag is only consulted when a connection is being established.  What the mark does change is that a read skips the node while another mirror is usable, and that an IOMODE_RW segment still pinning it stops counting as fully available -- so I/O the server rejects falls back to the MDS rather than being retried against a mapping the server has already withdrawn."</p>
+</blockquote>
+<p>The subtle client bug the patch is careful not to introduce is marking a node that already carries the <strong>new</strong> mapping. A re-resolve that completed between the unhash and the walk reaching the stripe — raced by this walk, or by a later CHANGE for the same deviceid — can install a fresh node that the walk then exchanges out. Ripping that node out is harmless (it is still hashed, so the next I/O re-pins it from the cache), but marking it unavailable would poison the new mapping. Stale nodes are distinguishable by hashed-ness: every superseded node was unhashed before its walk began and is never re-inserted, while a fresh node is inserted before it is installed. The test is <code>hlist_unhashed_lockless()</code>, because the hook runs under the layout inode’s <code>i_lock</code> and <code>rcu_read_lock()</code> but <strong>not</strong> under <code>nfs4_deviceid_lock</code>, which is what serializes writers of <code>node.pprev</code>. <code>__hlist_del()</code> stores a neighbour’s <code>pprev</code> with <code>WRITE_ONCE()</code>, so removing any other entry in the same bucket can write the field this test reads.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/fdf3cf24-a0b2-4350-961b-028847c47bc9@app.fastmail.com/">Schumaker’s review</a> did not challenge that race analysis, the RFC reading, or the unavailable-mark semantics. She objected to the comment’s vocabulary and length. On the phrase “Only mark stale vintages”:</p>
+<blockquote>
+<p>"I don't think I've seen "vintage" used when talking about anything other than wine before."</p>
+</blockquote>
+<p>And on the lockless explanation:</p>
+<blockquote>
+<p>"Nit: this comment is pretty wordy. Do we really need to define what "lockless" means here?"</p>
+</blockquote>
+<p><a href="https://lore.kernel.org/linux-nfs/53B11861-643C-4B3F-9634-617736EC7E38@hammerspace.com/">Coddington’s reply</a> treated both as accepted nits. On “vintage”:</p>
+<blockquote>
+<p>"Not even cheese?"</p>
+</blockquote>
+<p>And on the comment:</p>
+<blockquote>
+<p>"I'll trim it up!"</p>
+</blockquote>
+<p>That is the entire technical substance of the patch-14 review this week: the <code>ndc_immediate</code> path, the hashed-ness test, and the decision not to recall in-flight writes are unchallenged. v3 will carry a shorter comment and a less vinous noun.</p>
+<h2>Status and what is still unreviewed</h2>
+<p>Two of twenty-three patches have now drawn comments. Patch 01 will be rewritten for v3 as a 64-bit-arithmetic client bug fix rather than a layout-rejection gate. Patch 14 needs only comment cleanup. The rest of the client stack — reference ownership across DS setup, I/O, and layoutstats (07–09); the RCU pin and <code>reresolve_deviceid</code> hook (10–13); the per-<code>nfs_client</code> CHANGE/GETDEVICEINFO race epoch (15); RFC 8881 Section 18.40.4 DELETE recovery, including the v2 fix that stops treating <code>NFS4ERR_OLD_STATEID</code> as confirming a delete of a still-live layout (16–19); the 32-to-256 deviceid hash, the data-server cache re-home, the set-equality keying that closes a one-directional aliasing bug, and the flexfiles <code>dataserver_nconnect</code> cap (20–23) — has not been reviewed.</p>
+<p>No tags, no merge, no v3 posting yet. The open item to watch is the v3 rewrite of patch 01 and whatever fallout it has on the coalescing helpers that still copy <code>stripe_unit</code> into a <code>u32</code>. Until that lands, the stable-bound striped-layout fixes and the CHANGE/DELETE feature work remain blocked together in the same series.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/7C602108-0528-4B48-B10B-BC9110475F00@hammerspace.com/">2026-08-28 Benjamin Coddington — Re: [PATCH v2 01/23] NFSv4/flexfiles: reject a stripe_unit that does not fit 32 bits</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/fdf3cf24-a0b2-4350-961b-028847c47bc9@app.fastmail.com/">2026-08-28 Anna Schumaker — Re: [PATCH v2 14/23] NFSv4/flexfiles: Honor ndc_immediate on CB_NOTIFY_DEVICEID CHANGE</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/53B11861-643C-4B3F-9634-617736EC7E38@hammerspace.com/">2026-08-28 Benjamin Coddington — Re: [PATCH v2 14/23] NFSv4/flexfiles: Honor ndc_immediate on CB_NOTIFY_DEVICEID CHANGE</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/7C602108-0528-4B48-B10B-BC9110475F00@hammerspace.com/">2026-08-28 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — Re: [PATCH v2 01/23] NFSv4/flexfiles: reject a stripe_unit that does not fit 32 bits</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/fdf3cf24-a0b2-4350-961b-028847c47bc9@app.fastmail.com/">2026-08-28 "Anna Schumaker" <a href="mailto:anna@kernel.org">anna@kernel.org</a> — Re: [PATCH v2 14/23] NFSv4/flexfiles: Honor ndc_immediate on CB_NOTIFY_DEVICEID CHANGE</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/53B11861-643C-4B3F-9634-617736EC7E38@hammerspace.com/">2026-08-28 Benjamin Coddington <a href="mailto:ben.coddington@hammerspace.com">ben.coddington@hammerspace.com</a> — Re: [PATCH v2 14/23] NFSv4/flexfiles: Honor ndc_immediate on CB_NOTIFY_DEVICEID CHANGE</a></li>
+</ul>
+  </main>
+</body>
+</html>

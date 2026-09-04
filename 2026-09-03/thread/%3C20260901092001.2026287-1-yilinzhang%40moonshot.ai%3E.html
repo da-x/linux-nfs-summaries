@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SUNRPC rejects truncated deferrals to close GSS replay bypass</title>
+  <meta name="description" content="This week’s linux-nfs traffic included a standalone security fix from Yilin Zhang of Moonshot AI, targeting a SUNRPC server-side hole in request deferral rather than any NFS client path. The patch, titled “[PATCH] SUNRPC: reject deferral…">
+  <meta property="og:title" content="SUNRPC rejects truncated deferrals to close GSS replay bypass">
+  <meta property="og:description" content="This week’s linux-nfs traffic included a standalone security fix from Yilin Zhang of Moonshot AI, targeting a SUNRPC server-side hole in request deferral rather than any NFS client path. The patch, titled “[PATCH] SUNRPC: reject deferral…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-09-03T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="SUNRPC rejects truncated deferrals to close GSS replay bypass">
+  <meta name="twitter:description" content="This week’s linux-nfs traffic included a standalone security fix from Yilin Zhang of Moonshot AI, targeting a SUNRPC server-side hole in request deferral rather than any NFS client path. The patch, titled “[PATCH] SUNRPC: reject deferral…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-09-03</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>SUNRPC rejects truncated deferrals to close GSS replay bypass</h1>
+<h2>Summary</h2>
+<p>This week’s linux-nfs traffic included a standalone security fix from Yilin Zhang of Moonshot AI, targeting a SUNRPC server-side hole in request deferral rather than any NFS client path. The patch, titled “[PATCH] SUNRPC: reject deferral when rq_arg.len &lt; head[0].iov_len”, landed on 1 September with no replies in-window.</p>
+<h2>What kind of change this is</h2>
+<p>This is a <strong>bug fix with security impact</strong>, not a protocol change and not a new feature. The code under repair is <code>svc_defer()</code> in <code>net/sunrpc/svc_xprt.c</code> — the NFS <em>server</em> RPC layer that snapshots an incoming request so it can be replayed later. NFS client development is untouched: there is no client-side code, no mount-option work, and no <code>nfs.ko</code> change in this thread.</p>
+<p>Zhang frames the defect as a missing length-consistency check that lets a crafted <code>RPCSEC_GSS</code> packet poison the deferred copy of a request:</p>
+<blockquote>
+<p>"svc_defer() misses the rq_arg.len vs head[0].iov_len check, so a crafted RPCSEC_GSS packet can make the deferred snapshot no longer be the original request."</p>
+</blockquote>
+<p>The security consequence follows from how deferred replays are authenticated:</p>
+<blockquote>
+<p>"Since deferred replays skip GSS verification, this may lead to an authentication bypass."</p>
+</blockquote>
+<p>The report is credited to Kimi Security Team (<code>bug-report@moonshot.ai</code>).</p>
+<h2>Technical argument</h2>
+<p>SUNRPC deferral is the mechanism nfsd uses when a request cannot be completed immediately (cache waits, recall/delegation conflicts, and similar “come back later” cases). <code>svc_defer()</code> is supposed to freeze a faithful copy of the original RPC arguments. Later, when the server is ready, that snapshot is replayed as if it were the same request.</p>
+<p>Zhang’s claim is that the snapshot path does not enforce the same <code>rq_arg.len</code> versus <code>head[0].iov_len</code> invariant that other receive/parse paths expect. If those two lengths disagree — specifically if the recorded argument length is <em>smaller</em> than the first iovec — a crafted GSS-wrapped packet can make the deferred buffer no longer represent the original request. Because the replay path skips GSS verification (the request was already “authenticated” on first receipt), a mismatched snapshot can be executed without a second integrity check.</p>
+<p>The proposed fix is small: four added lines in <code>net/sunrpc/svc_xprt.c</code> that refuse deferral when <code>rq_arg.len &lt; head[0].iov_len</code>. In other words, if the argument vector is internally inconsistent, do not take a deferred snapshot at all. That is a conservative server-side rejection rather than an attempt to reconstruct or clamp the buffer.</p>
+<h2>Evolution of the discussion</h2>
+<p>There is no evolution yet. <a href="https://lore.kernel.org/linux-nfs/20260901092001.2026287-1-yilinzhang@moonshot.ai/">Zhang’s patch</a> is the only message in the thread this week, and <code>ListThreadMessages</code> shows no follow-ups, Reviewed-by tags, or maintainer ACK. Prior-week summaries on this list do not cover this Message-ID; the issue appears as a new report rather than a continuation of the nfsd netlink hang series or other in-flight SUNRPC work.</p>
+<h2>Client-development angle</h2>
+<p>Readers tracking NFS <em>client</em> development can treat this as adjacent infrastructure, not a client bug:</p>
+<ul>
+<li>The vulnerable function is <code>svc_defer()</code>, used by nfsd / the in-kernel RPC server.</li>
+<li>The attack surface is a crafted <code>RPCSEC_GSS</code> packet arriving at a server that defers requests.</li>
+<li>Client GSS (RPCSEC_GSS on <code>nfs</code>/<code>rpc.gssd</code>) is not implicated; a well-behaved client would not generate the inconsistent <code>rq_arg.len</code> / <code>head[0].iov_len</code> pair that the patch now rejects.</li>
+</ul>
+<p>The important client-adjacent takeaway is operational: any site that uses RPCSEC_GSS to nfsd, and that exercises server deferral (common under cache/delegation load), should treat this as a server authentication-bypass candidate until the four-line guard is reviewed and merged. There is no client workaround described in the thread.</p>
+<h2>Conclusions this week</h2>
+<p><strong>No conclusion from maintainers yet.</strong> The reporter’s own conclusion is that deferral must be refused when the argument header is longer than the recorded request length, because otherwise a GSS-crafted packet can replace the deferred snapshot and skip GSS on replay. Until review lands, the thread stands as an unacked security patch against SUNRPC request deferral, not as an accepted fix and not as NFS client work.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260901092001.2026287-1-yilinzhang@moonshot.ai/">2026-09-01 "Yilin Zhang" <a href="mailto:yilinzhang@moonshot.ai">yilinzhang@moonshot.ai</a> — [PATCH] SUNRPC: reject deferral when rq_arg.len &lt; head[0].iov_len</a></li>
+</ul>
+  </main>
+</body>
+</html>

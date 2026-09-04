@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>gssd: fix upcall_* leak on service-info re-read</title>
+  <meta name="description" content="Red Hat&#39;s Scott Mayhew posted a one-patch nfs-utils change that plugs a definite strdup() leak in rpc.gssd when the daemon re-reads a client&#39;s rpc_pipefs &quot;info&quot; file. This is a bug fix in the NFS client userspace helper, not a protocol…">
+  <meta property="og:title" content="gssd: fix upcall_* leak on service-info re-read">
+  <meta property="og:description" content="Red Hat&#39;s Scott Mayhew posted a one-patch nfs-utils change that plugs a definite strdup() leak in rpc.gssd when the daemon re-reads a client&#39;s rpc_pipefs &quot;info&quot; file. This is a bug fix in the NFS client userspace helper, not a protocol…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-09-03T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="gssd: fix upcall_* leak on service-info re-read">
+  <meta name="twitter:description" content="Red Hat&#39;s Scott Mayhew posted a one-patch nfs-utils change that plugs a definite strdup() leak in rpc.gssd when the daemon re-reads a client&#39;s rpc_pipefs &quot;info&quot; file. This is a bug fix in the NFS client userspace helper, not a protocol…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-09-03</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>gssd: fix upcall_* leak on service-info re-read</h1>
+<h2>Summary</h2>
+<h1>gssd: fix upcall_* leak when re-reading service info</h1>
+<h2>Summary</h2>
+<p>Red Hat's <a href="https://lore.kernel.org/linux-nfs/20260831230256.814412-1-smayhew@redhat.com/">Scott Mayhew</a> posted a one-patch nfs-utils change that plugs a definite <code>strdup()</code> leak in <code>rpc.gssd</code> when the daemon re-reads a client's rpc_pipefs "info" file. This is a <strong>bug fix</strong> in the NFS <strong>client</strong> userspace helper, not a protocol change and not a new feature: Kerberos upcall semantics stay the same; only lifetime of four cached strings is corrected.</p>
+<p>No replies, acks, or nacks landed in the week ending 3 September 2026. The thread is a single posting.</p>
+<p>It is the companion to Mayhew's same-day <a href="https://lore.kernel.org/linux-nfs/20260831230247.814387-1-smayhew@redhat.com/">gssd: clean up threads on shutdown</a> patch. Together they are a Valgrind-driven leak-hunting pass on the client GSS daemon.</p>
+<h2>The leak</h2>
+<p><code>rpc.gssd</code> watches rpc_pipefs with inotify. When a client directory appears or changes, <code>gssd_inotify_clnt()</code> walks into <code>gssd_scan_clnt()</code>, which calls <code>gssd_read_service_info()</code> whenever <code>clp-&gt;prog == 0</code>. That function parses the per-client "info" file and caches four strings on the client object: <code>upcall_address</code>, <code>upcall_port</code>, <code>upcall_protoname</code>, and <code>upcall_service</code>.</p>
+<p>The fail path is the problem. If the first read is incomplete — Mayhew's example is the "info" file not yet fully populated when inotify fires — the function still <code>strdup()</code>s whatever it parsed into those four fields, then leaves <code>clp-&gt;prog == 0</code>. The next scan therefore calls <code>gssd_read_service_info()</code> again. Both the success path (which NULLs the pointers) and a subsequent fail path (which <code>strdup()</code>s fresh copies) overwrite the previous allocations without freeing them.</p>
+<p>Mayhew states the overwrite plainly:</p>
+<blockquote>
+<p>"A subsequent re-scan then calls gssd_read_service_info() again and overwrites those fields without freeing them first: the success path sets them to NULL and the fail path strdup()s fresh copies, leaking the previous allocations."</p>
+</blockquote>
+<p>Valgrind classified the result as a definite leak, not a "possibly lost" TLS leftover like the companion shutdown-join patch:</p>
+<blockquote>
+<p>"5 bytes in 1 blocks are definitely lost in loss record 13 of 929 ... at malloc ... strdup ... gssd_read_service_info (gssd.c:373) ... gssd_scan_clnt (gssd.c:734) ... gssd_inotify_clnt (gssd.c:922) ... gssd_inotify_cb ... event_base_loop ... main"</p>
+</blockquote>
+<p>The stack is the client inotify path: libevent delivers the watch callback, <code>gssd_inotify_clnt()</code> rescans the client, and <code>gssd_read_service_info()</code> leaks the previous <code>strdup()</code>. The 5-byte block is consistent with a short parsed token (address, port, protoname, or service) that was replaced on the next read.</p>
+<p>This is a real leak in a live daemon, not a shutdown artifact. Every time inotify fires before the "info" file is complete, <code>rpc.gssd</code> can drop another small heap block. On a busy client that is mounting, remounting, or racing rpc_pipefs population, that can accumulate.</p>
+<h2>The fix</h2>
+<p>The patch is 15 insertions in <code>utils/gssd/gssd.c</code>. Mayhew's approach is the obvious one: free the four <code>upcall_*</code> fields at the top of <code>gssd_read_service_info()</code> before the function repopulates them.</p>
+<blockquote>
+<p>"Free the upcall_* fields at the top of the function before repopulating. clp is calloc()'d so the fields are NULL on the first call, making the free() calls safe."</p>
+</blockquote>
+<p>That is important for the first-call case. Client objects come from <code>calloc()</code>, so the pointers start NULL and <code>free(NULL)</code> is a no-op. Subsequent calls, whether they succeed or fail, now drop the previous strings before writing new ones (or NULLing them on success). The fail path can still <code>strdup()</code> partial results and leave <code>clp-&gt;prog == 0</code> so a later scan retries; it just no longer leaks the previous copies.</p>
+<p>The change does not alter how <code>rpc.gssd</code> interprets the "info" file, how it talks to the kernel NFS client, or how GSS upcalls are dispatched. It is strictly allocation hygiene around a retry that already existed.</p>
+<h2>Client-side context</h2>
+<p><code>rpc.gssd</code> is the userspace half of the Linux NFS client's Kerberos/GSS stack. The kernel posts upcalls through rpc_pipefs; gssd reads per-client service metadata (program number, address, port, protocol, service name) from the "info" file and then runs the GSS context dance. <code>gssd_scan_clnt()</code> treating <code>clp-&gt;prog == 0</code> as "not yet initialized" is why a partial inotify event retries the read. That retry is correct; the missing <code>free()</code> on the cached strings was not.</p>
+<p>Mayhew marked the patch <code>Assisted-by: Claude Opus 4.8</code>. The commit message and Valgrind traceback are his; the assistant credit is noted but the diagnosis is specific to gssd's inotify/scan path.</p>
+<h2>Status this week</h2>
+<p>The patch stands alone. There is no review commentary in-window, no v2, and no indication yet whether nfs-utils maintainers want the fail path to avoid caching partial strings at all (which would also stop the leak, by never storing them until <code>prog</code> is set) versus Mayhew's free-before-repopulate approach. The posted fix is the latter: keep the existing retry-and-cache behavior, just stop leaking.</p>
+<p>Until someone reviews it, the conclusion is Mayhew's own: <code>gssd_read_service_info()</code> must free <code>upcall_address</code>, <code>upcall_port</code>, <code>upcall_protoname</code>, and <code>upcall_service</code> before it overwrites them, because inotify can call it more than once while <code>clp-&gt;prog</code> is still zero.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260831230256.814412-1-smayhew@redhat.com/">2026-08-31 Scott Mayhew <a href="mailto:smayhew@redhat.com">smayhew@redhat.com</a> — [nfs-utils PATCH] gssd: fix upcall_* leak when re-reading service info</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260831230256.814412-1-smayhew@redhat.com/">2026-08-31 Scott Mayhew <a href="mailto:smayhew@redhat.com">smayhew@redhat.com</a> — [nfs-utils PATCH] gssd: fix upcall_* leak when re-reading service info</a></li>
+</ul>
+  </main>
+</body>
+</html>

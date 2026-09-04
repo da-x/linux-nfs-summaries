@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>v2 rpciod SMT override still hits 15 GB/s NFS/RDMA cliff</title>
+  <meta name="description" content="This is a client performance-regression investigation, not a protocol change. Chuck Lever’s RFC 6/8 (v1, kept as v2 6/8) sets WQ_AFFN_SMT on rpciod so each SMT group gets its own unbound worker pool and lock. The stated goal is to cut…">
+  <meta property="og:title" content="v2 rpciod SMT override still hits 15 GB/s NFS/RDMA cliff">
+  <meta property="og:description" content="This is a client performance-regression investigation, not a protocol change. Chuck Lever’s RFC 6/8 (v1, kept as v2 6/8) sets WQ_AFFN_SMT on rpciod so each SMT group gets its own unbound worker pool and lock. The stated goal is to cut…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-09-03T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="v2 rpciod SMT override still hits 15 GB/s NFS/RDMA cliff">
+  <meta name="twitter:description" content="This is a client performance-regression investigation, not a protocol change. Chuck Lever’s RFC 6/8 (v1, kept as v2 6/8) sets WQ_AFFN_SMT on rpciod so each SMT group gets its own unbound worker pool and lock. The stated goal is to cut…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-09-03</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>v2 rpciod SMT override still hits 15 GB/s NFS/RDMA cliff</h1>
+<h2>Summary</h2>
+<h1>v2 rpciod SMT override still hits 15 GB/s NFS/RDMA cliff</h1>
+<h2>Summary</h2>
+<p>This is a <strong>client performance-regression investigation</strong>, not a protocol change. Chuck Lever’s RFC 6/8 (<a href="https://lore.kernel.org/linux-nfs/20260831-performance-v1-6-8d9fd9b67f96@kernel.org/">v1</a>, kept as <a href="https://lore.kernel.org/linux-nfs/20260902-performance-v2-6-b71c0c082f9d@kernel.org/">v2 6/8</a>) sets <code>WQ_AFFN_SMT</code> on <code>rpciod</code> so each SMT group gets its own unbound worker pool and lock. The stated goal is to cut <code>native_queued_spin_lock_slowpath</code> contention on the RPC state-machine workqueue. This week’s only new mail in this thread is <a href="https://lore.kernel.org/linux-nfs/20260903235032.960219-1-tmenninger@everpuredata.com/">Tim Menninger’s v2 follow-up</a>, answering the six diagnostic questions <a href="https://lore.kernel.org/linux-nfs/dc18f84a-f53f-440f-b0cb-f27b44e090eb@app.fastmail.com/">Chuck posed</a> after Tim’s original 45→15 GB/s report. The headline for NFS client development: <strong>the low-throughput mode survives v2, but it is no longer pinned to the SMT affinity knob.</strong></p>
+<h2>Prior context (brief)</h2>
+<p>On 2 September <a href="https://lore.kernel.org/linux-nfs/20260902204048.4100864-1-tmenninger@everpuredata.com/">Tim reported</a> a bisected regression on a 96-CPU two-socket NFS/RDMA box: default <code>cache_shard</code> held ~45 GB/s; <code>WQ_AFFN_SMT</code> dropped some runs to ~15–25 GB/s, and a live sysfs toggle of <code>/sys/bus/workqueue/devices/rpciod/affinity_scope</code> flipped throughput immediately without restarting the workload. His merge bar was:</p>
+<blockquote>
+<p>"Given the magnitude of the regression, I think this needs to be understood before the rpciod SMT affinity change is merged."</p>
+</blockquote>
+<p><a href="https://lore.kernel.org/linux-nfs/dc18f84a-f53f-440f-b0cb-f27b44e090eb@app.fastmail.com/">Chuck</a> declined to conclude until the setup was characterized. Question one was the client-scheduler distinction v2 already made:</p>
+<blockquote>
+<p>"Does v2 of the series behave the same way? v2 dropped the patch that ran the first RPC states in the submitter's context, so the rpciod traffic pattern differs from v1."</p>
+</blockquote>
+<p>v2 dropped that inline-async hop because it re-created the pNFS read-resend vs. layoutreturn deadlock of <code>54e4a0dfa25d</code>. The rest of Chuck’s list was RDMA-client plumbing: mlx5 completion IRQ placement, <code>perf</code> locality of <code>rpciod</code> vs. <code>ib-comp-wq</code>, <code>wq_monitor.py rpciod</code>, workload/<code>nconnect</code> shape, and the base kernel plus RDMA driver.</p>
+<h2>v2 still bimodal; the live SMT toggle is gone</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260903235032.960219-1-tmenninger@everpuredata.com/">Tim’s 3 September reply</a> is the week’s payload. He applied the full v2 series on <code>940de590b839</code> and re-ran the same high-throughput client. The 3× swing is still there; the causal story is not:</p>
+<blockquote>
+<p>"The v2 series behaves similarly insofar as some runs see ~15 GB/s and other runs see ~45 GB/s, but the low-throughput state no longer appears to be directly controlled by the rpciod affinity scope."</p>
+</blockquote>
+<p>With both <code>smt</code> and <code>cache_shard</code> he saw all three of: start and stay at ~45 GB/s, start and stay at ~15 GB/s, and start at ~45 GB/s then drop abruptly to ~15 GB/s. No pattern for how long a good run lasts.</p>
+<blockquote>
+<p>"cache_shard does still seem somewhat more likely to give me a ~45 GB/s run, particularly as uptime increases, but unlike v1 I can reproduce both good and bad runs with either scope. The deterministic live smt -&gt; cache_shard -&gt; smt behavior I reported for v1 is no longer present in v2."</p>
+</blockquote>
+<blockquote>
+<p>"So the low-throughput state remains with v2, but it no longer seems to be from the SMT affinity change alone."</p>
+</blockquote>
+<p>That is an important correction to the v1 bisection. v1’s extra <code>rpciod</code> hop (every async RPC bounced onto the workqueue before <code>call_start</code>) made SMT affinity look like <em>the</em> cause. Once that hop is gone — as it must be, to keep pNFS completions off the submitter — affinity is at most a bias. Client developers should treat the v1 live toggle as contaminated by a scheduler change v2 already withdrew.</p>
+<h2>Workload: pNFS flexfiles, 1 MiB reads, nconnect=16</h2>
+<p>This is not Lever’s 4KB NFSv3/RDMA microbenchmark. The client is:</p>
+<pre><code>elbencho --iter 1 --threads 160 --files 16 --size 256G \
+    --block 1m --dropcache --iodepth 64 --direct --read
+</code></pre>
+<p>Mount: NFSv4.1, <code>rsize=wsize=524288</code>, <code>nconnect=16</code>, <code>proto=tcp</code> in <code>/proc/mounts</code>, but:</p>
+<blockquote>
+<p>"It's pNFS over RDMA with one client, one MDS, one DS."</p>
+</blockquote>
+<blockquote>
+<p>"This is a pNFS flexfiles workload. The MDS connection is TCP, and I see 16 RDMA rpc_xprt instances for the data-server traffic during these tests."</p>
+</blockquote>
+<p>Hardware: two NVIDIA/Mellanox ConnectX-7 (<code>mlx5_0</code>/<code>mlx5_1</code>, PCI 15b3:1021), firmware 28.47.2682, <code>mlx5_core</code> 7.3.0-rc1. irqbalance is inactive; Tim did not pin IRQs by hand. Substantial completion traffic is on <code>0000:2a:00.0</code>. mlx5 completion vectors are one-per-CPU (<code>mlx5_comp0</code>→CPU 0 … wrapping across sockets to CPU 71 then back). Affinity was the same in good and bad captures, so IRQ placement does not explain the 3× swing by itself.</p>
+<h2><code>wq_monitor.py</code>: bad cache_shard is busier; bad SMT is idler</h2>
+<p>The four v2 windows are the most useful client-side numbers in this thread.</p>
+<p><strong>cache_shard good (~46 GB/s):</strong> <code>rpciod</code> <code>total</code> climbing ~200k per sample, CPUtime ~3 units, CMW/RPR ~14k, <strong>mayday 16</strong>.</p>
+<p><strong>cache_shard bad (~15 GB/s):</strong> much higher cumulative <code>total</code> (~71.7M vs ~27.6M) and CPUtime (~933 vs ~537), CMW/RPR ~4k, <strong>mayday 0</strong>. Throughput is down, but the RPC state machine is not idle.</p>
+<p><strong>smt good (~46 GB/s):</strong> <code>total</code> climbing ~180k per sample, CPUtime ~2, CMW/RPR ~70k, mayday 0.</p>
+<p><strong>smt bad (~26 GB/s):</strong> much lower <code>total</code> (~5M vs ~17M), CPUtime (~44 vs ~147), CMW/RPR ~25k, mayday 0. Completions are not arriving, or not being turned into <code>rpciod</code> work, at the same rate.</p>
+<p>Two client-visible facts follow. First, a simple “pool lock is too coarse / too fine” story does not cover the bad <code>cache_shard</code> run: <code>rpciod</code> is <em>busier</em> while bytes/s collapse. Second, bad SMT looks like a starvation / completion-delivery problem, not lock contention. That is consistent with Chuck’s suspicion that SMT affinity can put <code>rpciod</code> completions on the same siblings as mlx5 completion vectors, or starve <code>ib-comp-wq</code>, without any SUNRPC lock being “wrong.”</p>
+<p>Tim’s <code>perf record -a -g</code> capture is not yet usable:</p>
+<blockquote>
+<p>"The perf results aren't showing anything useful yet. With the requested --sort comm,cpu, the top of the report is dominated by perf itself. Without that sort, the top entries are things like cpuidle_enter_state and cpuidle_enter."</p>
+</blockquote>
+<blockquote>
+<p>"I'll keep working on the perf capture and follow up if/when I get something useful, but I didn't want to hold up the rest of this on that."</p>
+</blockquote>
+<p>Until that lands, the open client questions — which CPUs <code>rpciod</code> kworkers and <code>ib-comp-wq</code> threads run on under each scope, and whether SMT siblings collide with mlx5 completion vectors — remain unanswered.</p>
+<h2>Evolution and conclusions</h2>
+<p>This thread is a <strong>performance-feature regression report</strong> against a proposed NFS <strong>client</strong> workqueue override. No protocol bits moved. No Reviewed-by landed. Chuck has not withdrawn RFC 6/8. The week’s evidence, now that v2 data is in, says:</p>
+<ol>
+<li><strong>Do not merge <code>WQ_AFFN_SMT</code> on <code>rpciod</code> on the v1 bisection alone.</strong> On this 96-CPU pNFS/RDMA flexfiles client, v1’s SMT scope cut 45 GB/s to 15–25 GB/s and live-toggled through sysfs. That is a first-order client bug relative to the series’ stated goal. Tim’s original bar still holds.</li>
+<li><strong>v2’s removal of async-inline execution changed the failure mode.</strong> The 15 GB/s cliff remains, but it is no longer pinned to <code>affinity_scope</code>. The extra <code>rpciod</code> hop in v1 was load-bearing for the <em>appearance</em> of an SMT bug; it was also the hop v2 dropped to avoid a pNFS deadlock. Treat v1 SMT results as contaminated by that hop.</li>
+<li><strong><code>cache_shard</code> is not a clean default either</strong>, even though it is “somewhat more likely” to stay at 45 GB/s as uptime grows. Both scopes can start good and then fall off a cliff. That points at a scheduler / IRQ / <code>nconnect=16</code> / <code>ib-comp-wq</code> interaction that the affinity knob only modulates.</li>
+<li><strong>IRQ maps do not explain the swing.</strong> mlx5 completion vectors are individually affinitized, irqbalance is off, and the mapping was identical in good and bad captures.</li>
+<li><strong><code>wq_monitor.py</code> splits the two bad modes.</strong> Bad <code>cache_shard</code> still queues a lot of <code>rpciod</code> work (high cumulative <code>total</code>/<code>CPUtime</code>, mayday 0 vs. 16 on the good run). Bad SMT is the opposite: much lower <code>total</code> and CPUtime. Completions are not being turned into RPC-state-machine work at the same rate.</li>
+<li><strong>The missing piece is still CPU locality.</strong> Until Tim gets a usable <code>perf</code> of <code>rpciod</code> vs. <code>ib-comp-wq</code> under each scope, the client-development question Chuck asked — SMT siblings colliding with mlx5 completion vectors — is open.</li>
+</ol>
+<p>The series remains RFC. No “drop SMT,” no alternative scope, no ack. The practical NFS client conclusion this week is Tim’s original merge bar, now refined: understand the 15 GB/s mode — and why v1 made SMT look uniquely guilty — before <code>WQ_AFFN_SMT</code> on <code>rpciod</code> (and by extension <code>nfsiod</code> / <code>xprtiod</code>) goes upstream. The discussion is waiting on the next perf capture.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260903235032.960219-1-tmenninger@everpuredata.com/">2026-09-03 Tim Menninger <a href="mailto:tmenninger@everpuredata.com">tmenninger@everpuredata.com</a> — Re: [PATCH RFC 6/8] SUNRPC: Reduce rpciod workqueue contention</a></li>
+</ul>
+  </main>
+</body>
+</html>

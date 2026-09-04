@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RFC splits migrate_pages paths and threads policy into migrate_control</title>
+  <meta name="description" content="Shivank Garg posted an 11-patch RFC that reworks the core migrate_pages() engine and, as a side effect, changes the filesystem -&gt;migrate_folio() callback that the NFS client implements. The series is a refactor / interface extension, not…">
+  <meta property="og:title" content="RFC splits migrate_pages paths and threads policy into migrate_control">
+  <meta property="og:description" content="Shivank Garg posted an 11-patch RFC that reworks the core migrate_pages() engine and, as a side effect, changes the filesystem -&gt;migrate_folio() callback that the NFS client implements. The series is a refactor / interface extension, not…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-09-03T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="RFC splits migrate_pages paths and threads policy into migrate_control">
+  <meta name="twitter:description" content="Shivank Garg posted an 11-patch RFC that reworks the core migrate_pages() engine and, as a side effect, changes the filesystem -&gt;migrate_folio() callback that the NFS client implements. The series is a refactor / interface extension, not…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-09-03</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>RFC splits migrate_pages paths and threads policy into migrate_control</h1>
+<h2>Summary</h2>
+<p>Shivank Garg posted an 11-patch RFC that reworks the core <code>migrate_pages()</code> engine and, as a side effect, changes the filesystem <code>-&gt;migrate_folio()</code> callback that the NFS client implements. The series is a <strong>refactor / interface extension</strong>, not an NFS protocol change and not a client bug fix: LRU and hugetlb behavior is intended to stay the same, while movable_ops pages get a dedicated pass with a few deliberate differences. The NFS-relevant payoff is that <code>nfs_migrate_folio()</code> would start receiving a <code>const struct migrate_control *</code> instead of a bare <code>enum migrate_mode</code>, so future copy-cache or offload policy can reach the client without another round of aops churn.</p>
+<h2>Why the core is being split</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260902-migrate-refactor-shivank-v1-0-9dcca87669c4@amd.com/">Garg’s cover letter</a> argues that <code>migrate_pages()</code> currently juggles three page classes whose locking, mapping, and retry rules do not match:</p>
+<blockquote>
+<p>"migrate_pages() handles hugetlb folios, movable_ops pages and LRU folios, although their locking, mapping and retry requirements differ. It already dispatches hugetlb folios to a dedicated engine but movable_ops pages still pass through the regular folio unmap and move machinery."</p>
+</blockquote>
+<p>Policy is the second problem. <code>migrate_mode</code> (blocking discipline) and <code>migrate_reason</code> travel as independent positional arguments, and only the mode reaches <code>address_space_operations-&gt;migrate_folio()</code>. Adding another dimension — non-temporal copies, DMA offload, batch size — would mean more arguments, an overloaded mode, or hidden side state.</p>
+<p>The proposed new dispatcher is:</p>
+<pre><code>migrate_pages(ctl)
+  +-- migrate_hugetlbs()
+  +-- migrate_movable_ops_pages()
+  `-- migrate_lru_folios()
+        `-- __migrate_lru_folios()
+              +-- async: migrate_folios_batch()
+              `-- sync: async pre-pass, then one-at-a-time retry
+</code></pre>
+<p><code>migrate_pages()</code> would only classify work. Each class owns its lists and retries; the LRU engine also owns batching and the synchronous fallback. Garg credits Zi Yan and David Hildenbrand for shaping the design, and notes he used AI tools to hunt edge cases.</p>
+<h2>Patch-by-patch: class and phase boundaries</h2>
+<p>Patches 1–8 stay inside <code>mm/migrate.c</code> and are the mechanical split:</p>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260902-migrate-refactor-shivank-v1-1-9dcca87669c4@amd.com/">01/11</a> extracts the unmap retry loop into <code>migrate_folios_unmap()</code>, so unmap, TLB flush, move, and undo become distinct phases.</li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260902-migrate-refactor-shivank-v1-2-9dcca87669c4@amd.com/">02/11</a> moves the move-phase retry bookkeeping into <code>migrate_folios_move()</code> itself, matching the unmap helper’s <code>nr_failed</code> reporting.</li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260902-migrate-refactor-shivank-v1-3-9dcca87669c4@amd.com/">03/11</a> factors large-folio split-on-alloc-failure into <code>migrate_folio_split_on_alloc_fail()</code>.</li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260902-migrate-refactor-shivank-v1-4-9dcca87669c4@amd.com/">04/11</a> collects hugetlb folios onto a dedicated list so <code>migrate_hugetlbs()</code> no longer rescans the mixed source list on every retry.</li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260902-migrate-refactor-shivank-v1-5-9dcca87669c4@amd.com/">05/11</a> is the one intentional behavior change: a new <code>migrate_movable_ops_pages()</code> pass runs <strong>before</strong> LRU migration. Movable_ops pages skip unmap/TLB/copy/LRU handling and talk to the driver callback directly. Garg lists four differences versus today:
+<ul>
+<li>they are processed before LRU folios rather than in source-list order;</li>
+<li>synchronous callers use the requested mode from the first attempt (no LRU async pre-pass);</li>
+<li>a callback <code>-EAGAIN</code> drops the destination so the retry allocates a fresh one;</li>
+<li><code>MIGRATE_SYNC_LIGHT</code> waits for the page lock instead of giving up, “because !uptodate check is not applicable for movable_ops pages.”</li>
+</ul>
+</li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260902-migrate-refactor-shivank-v1-6-9dcca87669c4@amd.com/">06/11</a> renames <code>migrate_pages_batch()</code> to <code>migrate_folios_batch()</code> now that movable_ops is gone from that path.</li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260902-migrate-refactor-shivank-v1-7-9dcca87669c4@amd.com/">07/11</a> and <a href="https://lore.kernel.org/linux-nfs/20260902-migrate-refactor-shivank-v1-8-9dcca87669c4@amd.com/">08/11</a> hoist async/sync LRU dispatch and <code>NR_MAX_BATCHED_MIGRATION</code> batching into <code>migrate_lru_folios()</code> / <code>__migrate_lru_folios()</code>, leaving <code>migrate_pages()</code> as a class dispatcher.</li>
+</ul>
+<p>The movable_ops split is also preparatory: those pages are expected to lose their folio representation (memdescs). Isolating them now keeps folio/<code>folio-&gt;lru</code> assumptions out of that path.</p>
+<h2>Policy: <code>struct migrate_control</code></h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260902-migrate-refactor-shivank-v1-9-9dcca87669c4@amd.com/">09/11</a> introduces caller-owned, stack-allocated, <code>const</code> <code>struct migrate_control</code> in <code>include/linux/migrate_mode.h</code>. Internal helpers take the struct instead of separate mode/reason. Async pre-passes and split-folio retries get a <strong>derived</strong> control (copy, then override mode) so extra policy fields survive. Public aops are left alone in this patch.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260902-migrate-refactor-shivank-v1-10-9dcca87669c4@amd.com/">10/11</a> pushes that into the <code>migrate_pages()</code> prototype. Compaction, DAMON, GUP, memory-failure, hotplug, mempolicy, page_alloc, and vmscan all construct a stack <code>migrate_control</code>. Async derivatives still copy the caller’s control and only flip the mode.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260902-migrate-refactor-shivank-v1-11-9dcca87669c4@amd.com/">11/11</a> is the NFS-facing change. <code>migrate_folio()</code>, the common helpers, and <code>address_space_operations-&gt;migrate_folio</code> take <code>const struct migrate_control *</code>. Documentation (<code>locking.rst</code>, <code>vfs.rst</code>) and every in-tree implementation are updated, including:</p>
+<ul>
+<li><code>fs/nfs/internal.h</code></li>
+<li><code>fs/nfs/write.c</code> (<code>nfs_migrate_folio()</code>)</li>
+</ul>
+<p>Garg is explicit that <strong>no NFS behavior change is intended yet</strong>:</p>
+<blockquote>
+<p>"Existing callbacks continue to make their decisions from ctl-&gt;mode only, none changes behavior yet."</p>
+</blockquote>
+<p>That is the client-development story this week: a mechanical aops signature change so <code>nfs_migrate_folio()</code> can later inspect more than blocking mode (for example a cache hint) without another filesystem-wide API break. The cover letter frames that as one-time caller pain:</p>
+<blockquote>
+<p>"This is one-time pain of updating callers, but doing it once avoids repeating that churn whenever a new use case or optimization need additional policy."</p>
+</blockquote>
+<p>Follow-on sketches (not in this series) show a demotion caller setting <code>ctl.cache_hint = MIGRATE_COPY_NT</code> beside existing <code>MR_DEMOTION</code> / <code>MIGRATE_ASYNC</code>, and a later batch-copy/offload series stuffing copy-engine preference into the same struct.</p>
+<h2>Review this week</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/gz3vibrercrujs6oykvlsyrgwaslpzjgmegnouthmkjaswznzg@haaqpwmacdwc/">Jan Kara</a> reviewed 11/11 the same morning and signed off the filesystem interface:</p>
+<blockquote>
+<p>"The changes to FS interface look good to me. Feel free to add: Reviewed-by: Jan Kara <a href="mailto:jack@suse.cz">jack@suse.cz</a>"</p>
+</blockquote>
+<p>That is the only external review so far. No NFS maintainer comment landed in-window.</p>
+<p>Separately, an automated review (“Sashiko”) on <a href="https://lore.kernel.org/linux-nfs/20260902-migrate-refactor-shivank-v1-9-9dcca87669c4@amd.com/">09/11</a> found a real <strong>uninitialized-stack bug</strong> in <code>__migrate_lru_folios()</code>: if <code>ctl-&gt;mode == MIGRATE_ASYNC</code>, an early <code>goto out</code> skips <code>async_ctl</code> initialization; a subsequent split-folio retry can then call <code>migrate_folios_batch()</code> with garbage policy — potentially treating an async migration as <code>MIGRATE_SYNC</code> and sleeping. <a href="https://lore.kernel.org/linux-nfs/1508939ba49c28e06b9cec344ec6a69ab57ce8ac.camel@amd.com/">Garg acknowledged it immediately</a>:</p>
+<blockquote>
+<p>"Yes, this is valid issue. I should initialize async_ctl early before it make goto jump."</p>
+</blockquote>
+<p>He posted a five-line fix moving the <code>async_ctl</code> init ahead of the goto. That is the only concrete bug called out this week, and it is in the new LRU engine, not in NFS.</p>
+<h2>Status</h2>
+<p>The thread opened and closed on 2026-09-02: the RFC, Kara’s FS <code>Reviewed-by</code>, and Garg’s agreement on the <code>async_ctl</code> init bug. Nothing is merged; no v2 yet. For NFS client readers the actionable piece is 11/11’s <code>nfs_migrate_folio()</code> prototype change — still mode-only in behavior, but the hook that future migration policy will use — plus Kara’s blessing of that VFS/aops shape. The uninitialized <code>async_ctl</code> issue needs to be in the next revision before the LRU path is trustworthy under async split-folio retries.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260902-migrate-refactor-shivank-v1-0-9dcca87669c4@amd.com/">2026-09-02 Shivank Garg <a href="mailto:shivankg@amd.com">shivankg@amd.com</a> — [PATCH RFC 00/11] mm/migrate: separate migration paths and carry migration policy</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260902-migrate-refactor-shivank-v1-1-9dcca87669c4@amd.com/">2026-09-02 Shivank Garg <a href="mailto:shivankg@amd.com">shivankg@amd.com</a> — [PATCH RFC 01/11] mm/migrate: extract folio unmap phase</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260902-migrate-refactor-shivank-v1-2-9dcca87669c4@amd.com/">2026-09-02 Shivank Garg <a href="mailto:shivankg@amd.com">shivankg@amd.com</a> — [PATCH RFC 02/11] mm/migrate: handle retries in migrate_folios_move()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260902-migrate-refactor-shivank-v1-3-9dcca87669c4@amd.com/">2026-09-02 Shivank Garg <a href="mailto:shivankg@amd.com">shivankg@amd.com</a> — [PATCH RFC 03/11] mm/migrate: factor out folio splitting on allocation failure</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260902-migrate-refactor-shivank-v1-4-9dcca87669c4@amd.com/">2026-09-02 Shivank Garg <a href="mailto:shivankg@amd.com">shivankg@amd.com</a> — [PATCH RFC 04/11] mm/migrate: use a dedicated list for hugetlb folios</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260902-migrate-refactor-shivank-v1-5-9dcca87669c4@amd.com/">2026-09-02 Shivank Garg <a href="mailto:shivankg@amd.com">shivankg@amd.com</a> — [PATCH RFC 05/11] mm/migrate: add a dedicated movable_ops migration pass</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260902-migrate-refactor-shivank-v1-6-9dcca87669c4@amd.com/">2026-09-02 Shivank Garg <a href="mailto:shivankg@amd.com">shivankg@amd.com</a> — [PATCH RFC 06/11] mm/migrate: rename migrate_pages_batch() to migrate_folios_batch()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260902-migrate-refactor-shivank-v1-7-9dcca87669c4@amd.com/">2026-09-02 Shivank Garg <a href="mailto:shivankg@amd.com">shivankg@amd.com</a> — [PATCH RFC 07/11] mm/migrate: add migrate_lru_folios() entry point</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260902-migrate-refactor-shivank-v1-8-9dcca87669c4@amd.com/">2026-09-02 Shivank Garg <a href="mailto:shivankg@amd.com">shivankg@amd.com</a> — [PATCH RFC 08/11] mm/migrate: move LRU batching into migrate_lru_folios()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260902-migrate-refactor-shivank-v1-9-9dcca87669c4@amd.com/">2026-09-02 Shivank Garg <a href="mailto:shivankg@amd.com">shivankg@amd.com</a> — [PATCH RFC 09/11] mm/migrate: thread migration policy through a control struct</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260902-migrate-refactor-shivank-v1-10-9dcca87669c4@amd.com/">2026-09-02 Shivank Garg <a href="mailto:shivankg@amd.com">shivankg@amd.com</a> — [PATCH RFC 10/11] mm/migrate: pass migrate_control to migrate_pages()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260902-migrate-refactor-shivank-v1-11-9dcca87669c4@amd.com/">2026-09-02 Shivank Garg <a href="mailto:shivankg@amd.com">shivankg@amd.com</a> — [PATCH RFC 11/11] mm/migrate: pass migrate_control to migrate_folio()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/gz3vibrercrujs6oykvlsyrgwaslpzjgmegnouthmkjaswznzg@haaqpwmacdwc/">2026-09-02 Jan Kara <a href="mailto:jack@suse.cz">jack@suse.cz</a> — Re: [PATCH RFC 11/11] mm/migrate: pass migrate_control to migrate_folio()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/1508939ba49c28e06b9cec344ec6a69ab57ce8ac.camel@amd.com/">2026-09-02 "Garg, Shivank" <a href="mailto:shivankg@amd.com">shivankg@amd.com</a> — Re: [sos-linux-ext-patches] [PATCH RFC 09/11] mm/migrate: thread migration policy through a control struct</a></li>
+</ul>
+  </main>
+</body>
+</html>

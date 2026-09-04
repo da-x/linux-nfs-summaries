@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>svcrdma credit-grant clamp and extra-dispatch fixes</title>
+  <meta name="description" content="On 28 August, Chuck Lever posted a three-patch series of bug fixes for the in-kernel NFS/RDMA server (svcrdma) and the shared SUNRPC transport layer. The cover letter is short and unsentimental:">
+  <meta property="og:title" content="svcrdma credit-grant clamp and extra-dispatch fixes">
+  <meta property="og:description" content="On 28 August, Chuck Lever posted a three-patch series of bug fixes for the in-kernel NFS/RDMA server (svcrdma) and the shared SUNRPC transport layer. The cover letter is short and unsentimental:">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-09-03T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="svcrdma credit-grant clamp and extra-dispatch fixes">
+  <meta name="twitter:description" content="On 28 August, Chuck Lever posted a three-patch series of bug fixes for the in-kernel NFS/RDMA server (svcrdma) and the shared SUNRPC transport layer. The cover letter is short and unsentimental:">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-09-03</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>svcrdma credit-grant clamp and extra-dispatch fixes</h1>
+<h2>Summary</h2>
+<h1>svcrdma credit-grant clamp and extra-dispatch fixes</h1>
+<h2>Summary</h2>
+<p>On 28 August, <a href="https://lore.kernel.org/linux-nfs/20260828135036.796842-1-cel@kernel.org/">Chuck Lever posted</a> a three-patch series of <strong>bug fixes</strong> for the in-kernel NFS/RDMA server (<code>svcrdma</code>) and the shared SUNRPC transport layer. The cover letter is short and unsentimental:</p>
+<blockquote>
+<p>"Rediscovered these while cleaning out old development branches. All minor fixes."</p>
+</blockquote>
+<p>Nothing in the series is a protocol change, and nothing adds a new feature. Two of the three patches are correctness fixes that matter to NFS/RDMA <strong>clients</strong>; the third is a small accounting skip that only UDP ever consulted. No replies, Reviewed-by tags, or follow-up versions landed in-window. The discussion this week is the posting itself.</p>
+<h2>What this is</h2>
+<ul>
+<li><strong>Type:</strong> bug-fix series (two svcrdma correctness/perf patches, one SUNRPC accounting skip).</li>
+<li><strong>Not</strong> a new feature, <strong>not</strong> an RFC/protocol change, <strong>not</strong> a Linux <code>nfs.ko</code> code change.</li>
+<li>Client impact is still real: patch 1 can drop an NFS/RDMA connection with an RNR error if the client honors the advertised credit grant; patch 2 cuts a wasted server-side dispatch that shows up as extra cycles on every RPC.</li>
+</ul>
+<h2>Patch 1: credits after the RQ clamp (client-visible disconnect)</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260828135036.796842-2-cel@kernel.org/">PATCH 1/3</a> is the important client-facing fix. <code>svc_rdma_accept()</code> currently computes <code>sc_fc_credits</code> from <code>sc_max_requests</code> <strong>before</strong> the Receive Queue depth is checked against the device's <code>max_qp_wr</code>. When that check lowers <code>sc_max_requests</code>, the credit grant keeps the original value. Lever's diagnosis is blunt:</p>
+<blockquote>
+<p>"When that check lowers sc_max_requests, the credit grant keeps the original value, so the server advertises more credits than it has Receives posted. A client that uses the full grant overruns the Receive Queue, and the connection is lost with an RNR error."</p>
+</blockquote>
+<p>The one-line change is to set <code>sc_fc_credits</code> <strong>after</strong> the clamp, so the advertised grant matches the number of Receives the server actually posts. Tagged <code>Fixes: fc2e69db82c1 ("svcrdma: Clean up comment in svc_rdma_accept()")</code> — a comment-cleanup commit that apparently left the assignment on the wrong side of the clamp.</p>
+<p>For NFS <strong>client</strong> development this is the headline. Linux <code>xprtrdma</code> (and any other NFS/RDMA client that trusts the server's credit grant) will post Sends up to that grant. If the server over-advertises, the client's next Send hits an empty Receive Queue, the QP goes RNR, and the connection dies. The bug is silent until a device with a tight <code>max_qp_wr</code> actually clamps <code>sc_max_requests</code>; on roomy hardware the two values stay equal and nobody notices. The client does not need a matching patch — it is already behaving correctly by using the grant — but operators of NFS/RDMA clients will see fewer unexplained disconnects once this lands on the server.</p>
+<h2>Patch 2: leftover XPT_DATA dispatches a second thread</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260828135036.796842-3-cel@kernel.org/">PATCH 2/3</a> is a server-side dispatch bug that wastes a thread per RPC. <code>svc_rdma_wc_receive()</code> and <code>svc_rdma_wc_read_done()</code> set <code>XPT_DATA</code> after queuing a completed context. <code>svc_rdma_recvfrom()</code> then dequeues <strong>one</strong> context and leaves the flag set, so <code>svc_xprt_received()</code> re-enqueues the transport and <code>svc_xprt_enqueue()</code> wakes a second thread that finds both queues empty and returns zero.</p>
+<p>The fix rechecks the receive queues after each dequeue and clears <code>XPT_DATA</code> when the last context is taken, rather than only when a dequeue finds nothing. Lever also relaxes <code>svc_xprt_received()</code>'s kernel-doc, which no longer described every transport's <code>XPT_DATA</code> protocol.</p>
+<p>The measurements are on one NFSv4.2 connection over 100GbE RoCE, and they are specific enough to quote:</p>
+<blockquote>
+<p>"A 4KB random read at queue depth 1 falls from 2.997 transport dequeues per RPC to 1.998, and from 96,629 to 82,398 server cycles per RPC. A 256KB random write falls from 3.270 dequeues to 2.004, and from 259,936 to 246,059 cycles. Each dispatch removed is worth about 10,000 cycles."</p>
+</blockquote>
+<p>The gain shrinks as the receive queues fill — a leftover <code>XPT_DATA</code> then dispatches a thread that finds real work. An 8KB random write at queue depth 512 already runs at the two dequeues an RPC with a Read chunk requires, and shows no change. Throughput only moves where the server has no idle CPU to absorb the saving, so only the queue-depth-1 read gains, by 1.8%.</p>
+<p>One dispatch per RPC remains on purpose:</p>
+<blockquote>
+<p>"svc_rdma_send_ctxt_put() sets XPT_DATA to schedule a drain of sc_send_release_list, and svc_rdma_recvfrom() does not service that list."</p>
+</blockquote>
+<p>Client I/O is unchanged; this is a server-cycle tax on every NFS/RDMA RPC. Low-QD, latency-sensitive clients (single-threaded 4K reads) are the ones that will notice the 1.8% throughput bump.</p>
+<h2>Patch 3: stop accounting xpt_reserved on TCP and RDMA</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260828135036.796842-4-cel@kernel.org/">PATCH 3/3</a> is housekeeping with a small hot-path win. The <code>xpt_reserved</code> counter exists for UDP socket-buffer back-pressure. <code>svc_udp_has_wspace()</code> is the only <code>has_wspace</code> implementation that consults it, so on TCP and RDMA the counter is maintained and never read. <code>svc_handle_xprt()</code> adds to it once per RPC; <code>svc_reserve()</code> shrinks it again from <code>svc_process_common()</code>, from <code>svc_xprt_release()</code>, and from every proc function that calls <code>svc_reserve_auth()</code>. Every shrinking call also runs <code>svc_xprt_resource_released()</code>, which issues an <code>smp_mb()</code> and can enqueue the transport.</p>
+<p>The patch adds an <code>xcl_flags</code> field to <code>svc_xprt_class</code>, sets <code>SVC_XPRT_FLAG_WSPACE_RESERVE</code> on the UDP class, and gates the accounting on that flag. After the change, <code>svc_reserve()</code> no longer calls <code>svc_xprt_resource_released()</code> on TCP and RDMA. Two paths still cover that enqueue: <code>svc_xprt_release()</code> via <code>svc_xprt_release_slot()</code>, and <code>svc_xprt_received()</code> for a transport whose <code>XPT_DATA</code> remains set.</p>
+<p>This is not a client bug fix. It is a server-side skip of a counter and a memory barrier that TCP and RDMA never needed. Combined with patch 2, it trims spurious transport enqueues on the NFS/RDMA and NFS/TCP server paths.</p>
+<h2>Client-development takeaway</h2>
+<p>Linux <code>nfs.ko</code> / <code>xprtrdma</code> is not modified. The series still belongs in a client-development roundup because patch 1 is a <strong>server bug that only manifests on the client</strong>: an NFS/RDMA client that uses the full advertised credit grant overruns the server RQ and loses the connection with an RNR error. That is exactly how a well-behaved client is specified to behave. Until the clamp and the grant stay in lockstep, operators will keep seeing "the RDMA mount dropped" on devices whose <code>max_qp_wr</code> is tighter than <code>sc_max_requests</code>. Patch 2 then shaves a wasted server dispatch that shows up as extra latency on low-QD NFS/RDMA reads.</p>
+<h2>Conclusions</h2>
+<ul>
+<li><strong>Bug-fix series, not a feature and not a protocol change.</strong> Three patches, 40 insertions, no discussion yet.</li>
+<li><strong>Patch 1 is the must-land item.</strong> Grant credits from the <em>clamped</em> <code>sc_max_requests</code> so the server never advertises more Receives than it posted. Without it, a client that honors the grant can RNR the QP and drop the mount. Tagged against <code>fc2e69db82c1</code>.</li>
+<li><strong>Patch 2 stops a leftover <code>XPT_DATA</code> from waking a second, empty recvfrom.</strong> Measured ~10k cycles per avoided dispatch; 1.8% throughput on QD1 4K reads over 100GbE RoCE. One dispatch remains because send-context release still uses the flag.</li>
+<li><strong>Patch 3 gates <code>xpt_reserved</code> on a new <code>SVC_XPRT_FLAG_WSPACE_RESERVE</code></strong>, set only on UDP. TCP and RDMA stop paying <code>smp_mb()</code> + possible enqueue on every <code>svc_reserve()</code>.</li>
+<li><strong>No review in-window.</strong> The series left the week as posted-and-unacked. Watch for Reviewed-by tags and for patch 1 to be treated as a stable candidate, given the <code>Fixes:</code> tag and the client-visible disconnect.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828135036.796842-1-cel@kernel.org/">2026-08-28 Chuck Lever — [PATCH 0/3] Minor fixes for svcrdma</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828135036.796842-2-cel@kernel.org/">2026-08-28 Chuck Lever — [PATCH 1/3] svcrdma: Grant credits from the clamped sc_max_requests</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828135036.796842-3-cel@kernel.org/">2026-08-28 Chuck Lever — [PATCH 2/3] svcrdma: Clear XPT_DATA when the last receive context is consumed</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828135036.796842-4-cel@kernel.org/">2026-08-28 Chuck Lever — [PATCH 3/3] SUNRPC: Skip xpt_reserved accounting for non-UDP transports</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828135036.796842-2-cel@kernel.org/">2026-08-28 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 1/3] svcrdma: Grant credits from the clamped sc_max_requests</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828135036.796842-1-cel@kernel.org/">2026-08-28 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 0/3] Minor fixes for svcrdma</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828135036.796842-3-cel@kernel.org/">2026-08-28 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 2/3] svcrdma: Clear XPT_DATA when the last receive context is consumed</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828135036.796842-4-cel@kernel.org/">2026-08-28 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 3/3] SUNRPC: Skip xpt_reserved accounting for non-UDP transports</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>syzbot&#39;s svc_addsock EBUSY patch duplicates Lever&#39;s nfsd-testing fix</title>
+  <meta name="description" content="This is a server-side bug-fix thread, not a protocol change and not an NFS client patch. On 3 September, syzbot posted an AI-generated patch signed off by Slawomir Stepien that refuses to re-attach a socket already claimed by SUNRPC.…">
+  <meta property="og:title" content="syzbot&#39;s svc_addsock EBUSY patch duplicates Lever&#39;s nfsd-testing fix">
+  <meta property="og:description" content="This is a server-side bug-fix thread, not a protocol change and not an NFS client patch. On 3 September, syzbot posted an AI-generated patch signed off by Slawomir Stepien that refuses to re-attach a socket already claimed by SUNRPC.…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-09-03T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="syzbot&#39;s svc_addsock EBUSY patch duplicates Lever&#39;s nfsd-testing fix">
+  <meta name="twitter:description" content="This is a server-side bug-fix thread, not a protocol change and not an NFS client patch. On 3 September, syzbot posted an AI-generated patch signed off by Slawomir Stepien that refuses to re-attach a socket already claimed by SUNRPC.…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-09-03</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>syzbot's svc_addsock EBUSY patch duplicates Lever's nfsd-testing fix</h1>
+<h2>Summary</h2>
+<h1>syzbot's <code>svc_addsock</code> EBUSY patch duplicates Lever's nfsd-testing fix</h1>
+<h2>Summary</h2>
+<p>This is a <strong>server-side bug-fix</strong> thread, not a protocol change and not an NFS client patch. On 3 September, <a href="https://lore.kernel.org/linux-nfs/554e50fa-697c-4e57-b5a5-a1c280816436@mail.kernel.org/">syzbot posted an AI-generated patch</a> signed off by Slawomir Stepien that refuses to re-attach a socket already claimed by SUNRPC. Twenty minutes later <a href="https://lore.kernel.org/linux-nfs/c31de847-f77f-4dd8-87c4-46e3d21c57a9@app.fastmail.com/">Chuck Lever pointed at a similar three-line check already sitting in <code>nfsd-testing</code></a>. Stepien dropped the resubmission. There is no NFS client code in the dump, the patch, or the replies.</p>
+<p>The takeaway for client readers is the same as in mid-August: the recursion lives in NFSD's <code>/proc/fs/nfsd/portlist</code> injection path and the shared SUNRPC <code>svc_sock</code> setup. Client TCP uses <code>xs_tcp_state_change</code> in <code>xprtsock.c</code>, not <code>svc_tcp_state_change</code>. Ordinary NFSv4 mounts do not hit this. The interesting shared-SUNRPC lesson is that <code>svc_setup_socket()</code> is not idempotent, and <code>sk_user_data</code> is the ownership bit that must fail closed before NFSD overwrites another consumer's socket.</p>
+<h2>The crash: <code>svc_tcp_state_change</code> calling itself from <code>connect()</code></h2>
+<p><a href="https://lore.kernel.org/linux-nfs/554e50fa-697c-4e57-b5a5-a1c280816436@mail.kernel.org/">syzbot's cover letter</a> (authored as Stepien, "Assisted-by" Gemini, posted through the syzbot-AI pipeline) restates the double-attach story that Chuck Lever diagnosed on 15 August. Writing a socket FD to <code>/proc/fs/nfsd/portlist</code> goes through <code>svc_addsock()</code> → <code>svc_setup_socket()</code>. That helper saves the socket's original callbacks (<code>sk_state_change</code>, <code>sk_data_ready</code>, <code>sk_write_space</code>) into <code>struct svc_sock</code> and replaces them with SUNRPC's. It also plants the new <code>svc_sock</code> in <code>sk-&gt;sk_user_data</code>.</p>
+<p>A second add of the same descriptor runs <code>svc_setup_socket()</code> again. This time <code>svsk-&gt;sk_ostate</code> captures the <em>already replaced</em> <code>svc_tcp_state_change</code>. The next TCP state event — here a <code>connect()</code> that ends in <code>tcp_reset</code> / <code>tcp_done_with_error</code> — has <code>svc_tcp_state_change()</code> invoke <code>svsk-&gt;sk_ostate</code>, which is itself. The stack guard page dies:</p>
+<blockquote>
+<p>"When a state change event subsequently occurs on the socket (for example, when connect() is called), svc_tcp_state_change() invokes svsk-&gt;sk_ostate, calling itself in an infinite recursion until the kernel stack overflows and triggers a stack guard page fault"</p>
+</blockquote>
+<p>The posted splat is the same class as the 24 August syzbot report (<code>syzbot+c9834a0c0215e6d8697a</code>): RIP in <code>svc_tcp_state_change</code>, hundreds of recursive frames, entered from <code>tcp_rcv_synsent_state_process</code> while <code>__inet_stream_connect</code> waits. That is the <strong>non-listen / connecting</strong> TCP path, not the listener <code>svc_tcp_listen_data_ready</code> path Jeff Layton asked Lever to name in the August changelog.</p>
+<p>The proposed code is three lines in <code>svc_addsock()</code>: if <code>so-&gt;sk-&gt;sk_user_data</code> is already non-NULL, return <code>-EBUSY</code> and skip <code>svc_setup_socket()</code>. Tags:</p>
+<ul>
+<li><code>Fixes: fa9251afc33c</code> ("SUNRPC: Call the default socket callbacks instead of open coding") — the commit that made saved callbacks actually get invoked, which is what turns a double-attach into unbounded recursion.</li>
+<li><code>Reported-by: syzbot+c9834a0c0215e6d8697a</code> — the TCP <code>inet_stream_connect</code> overflow, not the earlier UDP <code>svc_write_space</code> one.</li>
+</ul>
+<h2>Duplicate of the August <code>sk_user_data</code> check, now in nfsd-testing</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/c31de847-f77f-4dd8-87c4-46e3d21c57a9@app.fastmail.com/">Chuck Lever</a> did not nack the approach. He simply noted it is already queued:</p>
+<blockquote>
+<p>"A similar fix is already in nfsd-testing:
+https://git.kernel.org/pub/scm/linux/kernel/git/cel/linux.git/commit/net/sunrpc/svcsock.c?h=nfsd-testing&amp;id=7e8d1b4845aac4ad3c7bcd39032754917f5b966d"</p>
+</blockquote>
+<p>That commit is Lever's 15 August v1, "[PATCH v1] SUNRPC: Reject a socket that already has an svc_sock attached". Same three-line <code>sk_user_data</code> test, same <code>-EBUSY</code> return, same <code>net/sunrpc/svcsock.c</code>. Layton had already Reviewed-by'd it on 17 August. The only material differences versus this week's syzbot patch are the tags:</p>
+<table><thead><tr><th></th><th>Lever (now in nfsd-testing)</th><th>syzbot / Stepien (this week)</th></tr></thead><tbody>
+<tr><td><code>Fixes:</code></td><td><code>b41b66d63c73</code> (original <code>portlist</code> FD passing)</td><td><code>fa9251afc33c</code> (callback chaining)</td></tr>
+<tr><td><code>Reported-by</code></td><td><code>syzbot+54cdc566f64abf51b7f1</code> (UDP <code>svc_write_space</code>)</td><td><code>syzbot+c9834a0c0215e6d8697a</code> (TCP <code>svc_tcp_state_change</code> / <code>connect</code>)</td></tr>
+</tbody></table>
+<p>Both <code>Fixes:</code> tags are defensible. <code>b41b66d63c73</code> is when NFSD grew the injection surface; <code>fa9251afc33c</code> is when saved callbacks started being called instead of open-coded, which is the recursion primitive. Lever's commit message also made the broader ownership argument that the syzbot letter omits: <code>svc_setup_socket()</code> overwrites <code>sk_user_data</code> unconditionally, so a socket some <em>other</em> consumer had already claimed would be corrupted even if the callbacks did not recurse.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/apl-u5wtRUO6o5wC@nr200/">Stepien</a> closed the loop in one sentence:</p>
+<blockquote>
+<p>"Ah ok, a different extid of syzbug that's why I've missed it. Thanks!"</p>
+</blockquote>
+<p>The two syzbot bugs are the UDP and TCP faces of the same non-idempotent <code>svc_setup_socket()</code>. The AI pipeline generated a correct patch against the TCP extid without noticing Lever had already covered both callbacks from the UDP report.</p>
+<h2>NFS client angle</h2>
+<p>Despite the <code>[nfs?]</code> heritage of the original syzbot splat, <strong>this is not an NFS client I/O or client-transport bug</strong>.</p>
+<ul>
+<li>Overflowing function: <code>svc_tcp_state_change</code> in <code>net/sunrpc/svcsock.c</code> (SUNRPC <strong>server</strong> sockets).</li>
+<li>Client TCP state machine: <code>xs_tcp_state_change</code> in <code>net/sunrpc/xprtsock.c</code>. Different callback, different file.</li>
+<li>Trigger: a raw <code>connect(2)</code> on a socket that already has server callbacks installed via <code>svc_addsock</code> / <code>portlist</code>. Not <code>nfs_file_write</code>, not an RPC client reconnect.</li>
+</ul>
+<p>Shared SUNRPC still matters to client developers: lockd and other in-kernel RPC services use the same <code>svc_setup_socket()</code> helper. A recursive <code>sk_state_change</code> can take down whichever thread happens to be in <code>release_sock</code> / <code>tcp_done</code> — here, the connecting task itself. Client test matrices that mix compat <code>connect(2)</code> with nfsctl socket passing would trip it. Ordinary client mounts would not.</p>
+<h2>Status this week</h2>
+<p>The discussion is a <strong>duplicate bug-fix</strong>, closed the same afternoon it opened.</p>
+<ul>
+<li><strong>Class:</strong> kernel stack overflow / unbounded recursion (Oops / DoS) on double <code>svc_addsock</code>.</li>
+<li><strong>Site:</strong> <code>svc_tcp_state_change()</code> entered from <code>tcp_done</code> while <code>connect()</code> waits in SYN-SENT; the UDP sibling overflows in <code>svc_write_space</code> during setup.</li>
+<li><strong>Fix:</strong> refuse a socket that already carries <code>sk_user_data</code> before <code>svc_setup_socket()</code> claims it. Return <code>-EBUSY</code>.</li>
+<li><strong>Disposition:</strong> Lever's August patch is in <code>nfsd-testing</code> as <code>7e8d1b4845aa</code>. The syzbot/Stepien resubmission is not needed. Stepien agrees.</li>
+<li><strong>Not an NFS client change.</strong> No protocol update. No merge of the AI patch was requested after Chuck's pointer.</li>
+</ul>
+<p>What remains off-list, if anything, is tagging the TCP syzbot extid (<code>c9834a0c0215e6d8697a</code>) onto the commit already in <code>nfsd-testing</code> so the dashboard closes both bugs. That did not happen in this thread.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/554e50fa-697c-4e57-b5a5-a1c280816436@mail.kernel.org/">2026-09-03 "syzbot" <a href="mailto:syzbot@kernel.org">syzbot@kernel.org</a> — [PATCH] sunrpc: reject socket already in use in svc_addsock()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/c31de847-f77f-4dd8-87c4-46e3d21c57a9@app.fastmail.com/">2026-09-03 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH] sunrpc: reject socket already in use in svc_addsock()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/apl-u5wtRUO6o5wC@nr200/">2026-09-03 Slawomir Stepien <a href="mailto:sst@poczta.fm">sst@poczta.fm</a> — Re: [PATCH] sunrpc: reject socket already in use in svc_addsock()</a></li>
+</ul>
+  </main>
+</body>
+</html>

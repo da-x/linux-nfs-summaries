@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SUNRPC deferred-call copy underflow with RPCSEC_GSS</title>
+  <meta name="description" content="This week Chuck Lever posted a v1 security fix for SUNRPC&#39;s deferred-request path, a server-side bug that NFS clients using RPCSEC_GSS can trigger when a Call is snapshotted for later replay.">
+  <meta property="og:title" content="SUNRPC deferred-call copy underflow with RPCSEC_GSS">
+  <meta property="og:description" content="This week Chuck Lever posted a v1 security fix for SUNRPC&#39;s deferred-request path, a server-side bug that NFS clients using RPCSEC_GSS can trigger when a Call is snapshotted for later replay.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-09-03T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="SUNRPC deferred-call copy underflow with RPCSEC_GSS">
+  <meta name="twitter:description" content="This week Chuck Lever posted a v1 security fix for SUNRPC&#39;s deferred-request path, a server-side bug that NFS clients using RPCSEC_GSS can trigger when a Call is snapshotted for later replay.">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-09-03</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>SUNRPC deferred-call copy underflow with RPCSEC_GSS</h1>
+<h2>Summary</h2>
+<p>This week Chuck Lever posted a v1 security fix for SUNRPC's deferred-request path, a server-side bug that NFS clients using RPCSEC_GSS can trigger when a Call is snapshotted for later replay.</p>
+<h2>What landed on the list</h2>
+<p>On 2 September, <a href="https://lore.kernel.org/linux-nfs/20260902133101.48914-1-cel@kernel.org/">Chuck Lever posted</a> <code>[PATCH v1] SUNRPC: Copy the deferred RPC Call from the head buffer</code>. There were no replies in-window. The change is a <strong>bug fix</strong> (with a privilege-escalation flavor), not a protocol change or a new feature. It touches <code>net/sunrpc/svc_xprt.c</code> only: seven insertions, fifteen deletions.</p>
+<p>The reporter credit goes to Kimi Security Team and Yilin Zhang. Lever tags it:</p>
+<blockquote>
+<p>"Fixes: 260c1d1298f6 ("svc: Add transport hdr size for defer/revisit")"</p>
+</blockquote>
+<p>That 260c1d1298f6-era backup of a transport header is the historical reason <code>svc_defer()</code> still computes a start address as <code>(rq_arg.len - head[0].iov_len)</code> bytes <em>before</em> <code>head[0].iov_base</code>. Lever notes the premise has been dead since <code>983084b2672c</code> ("SUNRPC: Remove svc_rqst::rq_xprt_hlen"):</p>
+<blockquote>
+<p>"No transport has had one since commit 983084b2672c … so the two lengths are meant to be equal."</p>
+</blockquote>
+<h2>The underflow, and why GSS makes it exploitable</h2>
+<p><code>svc_defer()</code> snapshots an RPC Call so the server can replay it after a pending cache upcall. The old copy start is fine when <code>rq_arg.len == head[0].iov_len</code>. An <strong>RPCSEC_GSS</strong> Call breaks that equality:</p>
+<ul>
+<li>Integrity unwrap <strong>truncates</strong> <code>rq_arg.len</code> by the trailing checksum length.</li>
+<li>Privacy unwrap leaves <code>rq_arg.len</code> short by an amount <strong>the client chooses</strong>, via trailing bytes after the wrap token.</li>
+<li>Neither path adjusts <code>head[0].iov_len</code>.</li>
+</ul>
+<p>Because both lengths are <code>size_t</code>, the subtraction <strong>underflows</strong>. The memcpy then starts <em>past</em> <code>head[0].iov_base</code>. Lever's diagnosis is blunt:</p>
+<blockquote>
+<p>"Every deferred integrity Call replays a shifted snapshot."</p>
+</blockquote>
+<p>The security consequence is on the <strong>server</strong>, but it is driven by what the <strong>client</strong> put on the wire. A deferred replay <strong>skips GSS verification</strong>, so the shifted snapshot is treated as an already-authenticated Call. With the privacy service the skip distance is client-chosen:</p>
+<blockquote>
+<p>"A forged Call placed in that window, naming another user's GSS context handle, runs under that identity."</p>
+</blockquote>
+<p>In other words: a malicious NFS client using RPCSEC_GSS privacy can arrange that a deferred replay executes under a victim context. Integrity-protected Calls are "only" shifted (still wrong, still authenticated without a fresh MIC check). Privacy-protected Calls give the attacker a controllable window.</p>
+<p>This is not an NFS client-core patch — <code>svc_defer()</code> lives on the server — but it is an important interoperability and security bug for any Linux NFS client that talks RPCSEC_GSS to a Linux <code>nfsd</code>/<code>svcrpc</code> stack. Deferred cache upcalls (typical for auth/idmapping) are the trigger; the client does not have to do anything exotic beyond sending a GSS-wrapped Call that the server later defers.</p>
+<h2>The proposed fix</h2>
+<p>Lever's v1 does two things:</p>
+<ol>
+<li><strong>Copy from <code>head[0].iov_base</code></strong>, dropping the obsolete transport-header backup.</li>
+<li><strong>Refuse to defer</strong> a Call whose length runs past the head buffer, so the snapshot cannot read out of bounds.</li>
+</ol>
+<p>That second check is the bounds-safety counterpart of the first: once the copy origin is the head iovec, a Call that spills into pages must not be deferred with a naive linear copy.</p>
+<p>No ACK, NAK, or v2 appeared before the window closed. The thread is therefore a <strong>posted-but-unreviewed security fix</strong> as of 3 September. Operators of GSS-authenticated NFS servers should treat the report as high priority even before review lands: the failure mode is "deferred integrity Call always shifted" plus "privacy offset is client-chosen," and replay skips GSS verification.</p>
+<h2>Client-side takeaway</h2>
+<p>NFS client developers do not need a matching client patch from this thread. They do need to know:</p>
+<ul>
+<li>Linux servers still defer GSS Calls through <code>svc_defer()</code>; a shifted snapshot is accepted as authenticated.</li>
+<li>A client using <strong>integrity</strong> can hit the underflow on every deferred Call (checksum length mismatch).</li>
+<li>A client using <strong>privacy</strong> can <em>choose</em> the underflow, which is the identity-confusion path Lever describes.</li>
+<li>Until this lands, the practical client-side mitigation is to avoid depending on server-side defer/revisit of GSS-wrapped Calls against unpatched Linux servers — not something a client can reliably control.</li>
+</ul>
+<p>Watch for review of the head-buffer-only copy and the "refuse to defer if it does not fit in the head" policy; those are the two behavioral changes NFS client/server pairs will see once the patch is merged.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260902133101.48914-1-cel@kernel.org/">2026-09-02 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v1] SUNRPC: Copy the deferred RPC Call from the head buffer</a></li>
+</ul>
+  </main>
+</body>
+</html>

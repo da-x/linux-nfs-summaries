@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>v2 implied-ACK DRC eviction draws Layton review over NFSv3 reconnect races</title>
+  <meta name="description" content="This is a server-side performance feature, not an NFS client patch and not a protocol change. Two days after posting v1 with no review, Chuck Lever respun implied-ACK eviction for NFSD’s duplicate reply cache as a seven-patch v2. The only…">
+  <meta property="og:title" content="v2 implied-ACK DRC eviction draws Layton review over NFSv3 reconnect races">
+  <meta property="og:description" content="This is a server-side performance feature, not an NFS client patch and not a protocol change. Two days after posting v1 with no review, Chuck Lever respun implied-ACK eviction for NFSD’s duplicate reply cache as a seven-patch v2. The only…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-09-03T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="v2 implied-ACK DRC eviction draws Layton review over NFSv3 reconnect races">
+  <meta name="twitter:description" content="This is a server-side performance feature, not an NFS client patch and not a protocol change. Two days after posting v1 with no review, Chuck Lever respun implied-ACK eviction for NFSD’s duplicate reply cache as a seven-patch v2. The only…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-09-03</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>v2 implied-ACK DRC eviction draws Layton review over NFSv3 reconnect races</h1>
+<h2>Summary</h2>
+<h2>Summary</h2>
+<p>This is a <strong>server-side performance feature</strong>, not an NFS <strong>client</strong> patch and not a protocol change. Two days after posting v1 with no review, <a href="https://lore.kernel.org/linux-nfs/20260828-duplicate-reply-cache-v2-0-25069e660a7b@kernel.org/">Chuck Lever</a> respun implied-ACK eviction for NFSD’s duplicate reply cache as a seven-patch v2. The only listed delta from v1 is cosmetic: print the DRC eviction tracepoints’ <code>age</code> field as unsigned. The technical design is unchanged from last week’s posting: on TCP and RDMA, arrival of a later request on the same <code>svc_xprt</code> is treated as evidence that earlier replies were delivered, so completed DRC entries can be dropped immediately instead of sitting until the 120-second <code>RC_EXPIRE</code> timeout.</p>
+<p>This week the series finally got review. <a href="https://lore.kernel.org/linux-nfs/85acfa01848e5d7829ca18ad8864410fbb5e12b7.camel@kernel.org/">Jeff Layton</a> nitted the plumbing, then challenged the central claim that “the cache is advisory.” The resulting exchange is the first real debate over whether implied-ACK eviction can drop a non-idempotent NFSv3 reply just before a reconnecting client retransmits it. No Acked-by landed, and Lever did not post a v3 in this window.</p>
+<p>There is <strong>no Linux NFS client code</strong> in the series. Client-visible impact is entirely through the server’s DRC: shorter-lived entries on the NFSv3 lookup hot path, and a narrower window in which a reconnecting client can still hit a cached non-idempotent reply.</p>
+<h2>The v2 series, briefly</h2>
+<p>The cover letter repeats the v1 motivation and the same <code>perf</code> numbers from an NFSv3/RDMA 4KB random-write workload:</p>
+<blockquote>
+<p>"nfsd_cache_lookup overhead dropped from 1.53% to 0.76% of CPU cycles. The rb-tree operations (rb_erase, rb_insert_color) that dominated LLC cache misses fell from a combined 13.2% to 1.1% of all LLC-load-misses, because shorter-lived entries keep the per-bucket trees small."</p>
+</blockquote>
+<p>The seven patches are the same scaffolding as v1:</p>
+<ul>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260828-duplicate-reply-cache-v2-1-25069e660a7b@kernel.org/">PATCH v2 1/7</a></strong> — per-netns cyclic IDR identifier on each <code>svc_xprt</code>, so DRC entries can name a transport without holding a reference and without ABA collisions when SLUB reuses the address. <code>svc_xprt_init()</code> now returns a boolean; callers unwind on allocation failure.</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260828-duplicate-reply-cache-v2-2-25069e660a7b@kernel.org/">PATCH v2 2/7</a></strong> — record that xprt id in each DRC entry. No behavior change.</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260828-duplicate-reply-cache-v2-3-25069e660a7b@kernel.org/">PATCH v2 3/7</a></strong> — <code>xpt_last_recv</code> on <code>svc_xprt</code>, updated after each successful <code>xpo_recvfrom()</code>. Deferred requests leave the stamp alone.</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260828-duplicate-reply-cache-v2-4-25069e660a7b@kernel.org/">PATCH v2 4/7</a></strong> — <code>XPT_ORDERED</code> on TCP and RDMA, left clear for UDP, so implied-ACK eviction is confined to transports where in-order delivery holds.</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260828-duplicate-reply-cache-v2-5-25069e660a7b@kernel.org/">PATCH v2 5/7</a></strong> — the eviction policy itself. During <code>nfsd_prune_bucket_locked()</code>, compare each <code>RC_DONE</code> entry’s <code>c_timestamp</code> against <code>xpt_last_recv</code> on the transport the current request arrived on. Bound the walk to four times the eviction limit, because implied ACK no longer evicts in age order and an unbounded XID-hash scan would hold <code>cache_lock</code> over a packed bucket.</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260828-duplicate-reply-cache-v2-6-25069e660a7b@kernel.org/">PATCH v2 6/7</a></strong> — tracepoints for each eviction reason (pressure, expiry, implied ACK).</li>
+<li><strong><a href="https://lore.kernel.org/linux-nfs/20260828-duplicate-reply-cache-v2-7-25069e660a7b@kernel.org/">PATCH v2 7/7</a></strong> — <code>entries=</code> on <code>nfsd_drc_found</code>, passed as an explicit argument so a later per-connection lookup path can supply its own depth without changing the tracepoint format.</li>
+</ul>
+<p>RFC 1813 §4.5 is again the protocol reading: on a live connection-oriented transport, a duplicate request comes from reconnection, not from inside an established stream. UDP is excluded because a UDP <code>svc_xprt</code> is shared by every peer and carries timeout retransmits. Patch 4 still flags the svcrdma cost: <code>handle_connect_req()</code> zeroes the remote port in the DRC key so a cached reply survives a reconnect, and implied-ACK eviction can retire that entry while the original connection is still up. Lever treats that as consistent with TCP rebinding a reserved port.</p>
+<h2>Layton’s nits on the plumbing</h2>
+<p>Review arrived the same afternoon. On <a href="https://lore.kernel.org/linux-nfs/798a28cffecc0c16e30841f8a5edaba2a718986b.camel@kernel.org/">patch 4</a>, Layton asked for the <code>XPT_ORDERED</code> consumer to be visible in the same commit:</p>
+<blockquote>
+<p>"It would be helpful to see how this new flag will be used other than in the tracepoint. Maybe this patch should be folded into the following one?"</p>
+</blockquote>
+<p>On <a href="https://lore.kernel.org/linux-nfs/45e98e76b1739b5440f2250a20c922eb0d1bca23.camel@kernel.org/">patch 1</a>, he questioned a local-variable hoist in the socket setup path (<code>int err</code> moved to the outer scope). Neither nit was answered in this window.</p>
+<h2>The real argument: is the DRC advisory?</h2>
+<p>The substantive fight is over <a href="https://lore.kernel.org/linux-nfs/20260828-duplicate-reply-cache-v2-5-25069e660a7b@kernel.org/">patch 5</a>. Lever’s commit message still says the cache is advisory and that a premature eviction “costs a miss and re-execution, the same outcome memory pressure and RC_EXPIRE already produce.” Layton rejected that framing outright:</p>
+<blockquote>
+<p>"No, it's not. The DRC is necessary for proper function, and if we drop non-idempotent requests prematurely, then that could cause spurious errors."</p>
+</blockquote>
+<p>He added that the basic approach and code looked OK “modulo some nits,” and asked whether BSD already takes this approach — a question Lever did not answer here.</p>
+<p>Lever’s <a href="https://lore.kernel.org/linux-nfs/10c97c34-1061-4aa2-a5b5-234e4d01e894@app.fastmail.com/">reply</a> drew a hard line between the old NFSv2/v3 DRC and the NFSv4.1 session cache:</p>
+<blockquote>
+<p>"Not talking about the NFSv4.1 session cache. The old DRC has always been best-effort. It cannot be relied upon for proper function, since the DRC is non-deterministic."</p>
+</blockquote>
+<p>His performance argument is that actively dropping entries that are very unlikely to be hit <em>reduces</em> the chance that more valuable entries get pushed out by the size cap or the shrinker. That is the inverse of Layton’s concern: Lever wants a hotter, smaller cache; Layton wants the cache to still be there when a non-idempotent replay arrives.</p>
+<h2>The RENAME-then-reconnect race</h2>
+<p>Layton then spelled out the client-visible failure he is worried about, in <a href="https://lore.kernel.org/linux-nfs/a99df73fc1db0f976da665cfb4ea39682f680118.camel@kernel.org/">a follow-up</a>:</p>
+<blockquote>
+<p>"- client does a v3 RENAME (anything non-idempotent, really)</p>
+<ul>
+<li>reply to the RENAME goes out just before a new call comes in (WRITE or something maybe). The RENAME DRC entry's timestamp is a few jiffies earlier so we evict it.</li>
+<li>connection drops before client gets the reply and client reconnects and retransmits the v3 RENAME</li>
+</ul>
+<p>...hilarity ensues? Maybe this sort of bad luck never happens in practice, but I don't see what would prevent it."</p>
+</blockquote>
+<p>That is exactly the pipelined-client case the series already admits is not conclusive evidence: a client with several requests outstanding sends the next one without waiting for the previous reply, so <code>xpt_last_recv</code> can move forward while the earlier reply is still in flight. Implied ACK then treats the in-flight RENAME as delivered and drops it. If the connection dies before the client sees the reply, the retransmit hits a miss and the server re-executes a non-idempotent op.</p>
+<p>Layton also noted that the traditional prune path evicts oldest-first and is sized to outlast typical retransmission windows:</p>
+<blockquote>
+<p>"Sure, but usually we evict the oldest stuff first, and we generally keep a big enough cache to get past the point where retransmissions occur. This patchset changes that and will evict things earlier.</p>
+<p>Maybe that's OK in practice."</p>
+</blockquote>
+<p>Lever’s <a href="https://lore.kernel.org/linux-nfs/56384440-7fae-4e40-9c0b-fb2162828522@app.fastmail.com/">closing note</a> did not deny the race. He argued it is already possible under load, and that modern hardware makes DRC overrun more likely, not less:</p>
+<blockquote>
+<p>"The same thing can happen if NFSD is handling a thousand chatty clients. With fast networks and fast storage, overrunning the DRC is more likely than it ever has been."</p>
+</blockquote>
+<p>He said he has more patches that “moderate this behavior some,” but held them back to keep the series narrow. On the reconnect case specifically:</p>
+<blockquote>
+<p>"The reconnect case is the only one I'm really concerned about. I'm not brushing aside your concern, but missing a non-idempotent reply during a reconnect storm is somewhat rare, and is already not 100% deterministic.</p>
+<p>And we have NFSv4.1 now. For anyone who is deeply concerned about this race, NFSv4.1 is the only total answer."</p>
+</blockquote>
+<p>That last sentence is the policy conclusion of the thread: implied-ACK eviction is a heuristic for the old DRC, not a correctness fix, and anyone who needs deterministic replay of non-idempotent ops should be on sessions.</p>
+<h2>Client impact, and what this is not</h2>
+<p>This series does <strong>not</strong> touch the Linux NFS client. Client-side DRC, NFSv4.1 session slots, retransmission timers, and <code>nconnect</code> are out of scope. The client-visible effect, if any, is on the server’s ability to absorb a replay of a non-idempotent NFSv3 RPC after the next request on the same TCP/RDMA connection has already arrived.</p>
+<p>That is also why the thread matters to NFS <strong>client</strong> development even though no client patch is here. NFSv3/TCP and NFSv3/RDMA write-heavy clients are the workload Lever profiled; they spend less server CPU in <code>nfsd_cache_lookup</code> if the DRC trees stay small. The same clients are the ones exposed to Layton’s RENAME/reconnect race: a Linux NFSv3 client that pipelines a non-idempotent call with a later WRITE, then loses the connection before the first reply lands, can now miss the DRC and re-execute. UDP clients keep the 120-second hold. NFSv4.1 clients are unaffected because they do not use this DRC.</p>
+<p>It is not a protocol change. RFC 1813 §4.5 is used as justification for a local eviction heuristic. It is not a bug fix either, though patch 5’s four-times-eviction-limit bound is hardening against a lock-held linear scan of a packed XID bucket.</p>
+<h2>Where things stand</h2>
+<ul>
+<li><strong>Kind of change:</strong> NFSD/SUNRPC performance feature (implied-ACK DRC eviction) with supporting xprt identity and tracing. Not a bug fix, not a protocol change, not NFS client code.</li>
+<li><strong>v2 vs v1:</strong> only the unsigned <code>age</code> field in the eviction tracepoints. Design and numbers are unchanged from the 2026-08-26 posting.</li>
+<li><strong>Review this window:</strong> Layton nitted patches 1 and 4, accepted the overall approach on patch 5 “modulo some nits,” and then argued the DRC is not advisory. Lever defended best-effort semantics and pointed at NFSv4.1 for anyone who needs a total answer. No Acked-by, Reviewed-by, or v3.</li>
+<li><strong>Open questions left on the table:</strong> fold <code>XPT_ORDERED</code> into the eviction patch; the <code>err</code> hoist in patch 1; whether BSD already does this; the RENAME-then-reconnect race; and the unposted “moderate this behavior” follow-ups Lever mentioned.</li>
+<li><strong>Why it still matters to NFS clients:</strong> NFSv3/RDMA and NFSv3/TCP write-heavy workloads spend less server CPU in <code>nfsd_cache_lookup</code> if this lands. The same clients take a narrower DRC hit window on reconnect after a pipelined non-idempotent RPC. NFSv4.1 is Lever’s recommended escape hatch.</li>
+</ul>
+<p>Until a v3 addresses Layton’s race, or someone Acks the current heuristic, the 120-second <code>RC_EXPIRE</code> hold remains the in-tree policy.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-duplicate-reply-cache-v2-0-25069e660a7b@kernel.org/">2026-08-28 Chuck Lever — [PATCH v2 0/7] Implied-ACK eviction for NFSD's duplicate reply cache</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-duplicate-reply-cache-v2-1-25069e660a7b@kernel.org/">2026-08-28 Chuck Lever — [PATCH v2 1/7] SUNRPC: Assign a unique identifier to each svc_xprt</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-duplicate-reply-cache-v2-2-25069e660a7b@kernel.org/">2026-08-28 Chuck Lever — [PATCH v2 2/7] NFSD: Track transport in DRC entries</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-duplicate-reply-cache-v2-3-25069e660a7b@kernel.org/">2026-08-28 Chuck Lever — [PATCH v2 3/7] SUNRPC: Record last-request timestamp on svc_xprt</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-duplicate-reply-cache-v2-4-25069e660a7b@kernel.org/">2026-08-28 Chuck Lever — [PATCH v2 4/7] SUNRPC: Mark connection-oriented transports on svc_xprt</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-duplicate-reply-cache-v2-5-25069e660a7b@kernel.org/">2026-08-28 Chuck Lever — [PATCH v2 5/7] NFSD: Evict completed DRC entries via implied ACK</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-duplicate-reply-cache-v2-6-25069e660a7b@kernel.org/">2026-08-28 Chuck Lever — [PATCH v2 6/7] NFSD: Add tracepoints for DRC entry eviction</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-duplicate-reply-cache-v2-7-25069e660a7b@kernel.org/">2026-08-28 Chuck Lever — [PATCH v2 7/7] NFSD: Record DRC population in lookup tracepoints</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/798a28cffecc0c16e30841f8a5edaba2a718986b.camel@kernel.org/">2026-08-28 Jeff Layton — Re: [PATCH v2 4/7] SUNRPC: Mark connection-oriented transports on svc_xprt</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/45e98e76b1739b5440f2250a20c922eb0d1bca23.camel@kernel.org/">2026-08-28 Jeff Layton — Re: [PATCH v2 1/7] SUNRPC: Assign a unique identifier to each svc_xprt</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/85acfa01848e5d7829ca18ad8864410fbb5e12b7.camel@kernel.org/">2026-08-28 Jeff Layton — Re: [PATCH v2 5/7] NFSD: Evict completed DRC entries via implied ACK</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/10c97c34-1061-4aa2-a5b5-234e4d01e894@app.fastmail.com/">2026-08-28 Chuck Lever — Re: [PATCH v2 5/7] NFSD: Evict completed DRC entries via implied ACK</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/a99df73fc1db0f976da665cfb4ea39682f680118.camel@kernel.org/">2026-08-28 Jeff Layton — Re: [PATCH v2 5/7] NFSD: Evict completed DRC entries via implied ACK</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/56384440-7fae-4e40-9c0b-fb2162828522@app.fastmail.com/">2026-08-28 Chuck Lever — Re: [PATCH v2 5/7] NFSD: Evict completed DRC entries via implied ACK</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-duplicate-reply-cache-v2-1-25069e660a7b@kernel.org/">2026-08-28 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 1/7] SUNRPC: Assign a unique identifier to each svc_xprt</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-duplicate-reply-cache-v2-0-25069e660a7b@kernel.org/">2026-08-28 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 0/7] Implied-ACK eviction for NFSD's duplicate reply cache</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-duplicate-reply-cache-v2-2-25069e660a7b@kernel.org/">2026-08-28 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 2/7] NFSD: Track transport in DRC entries</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-duplicate-reply-cache-v2-3-25069e660a7b@kernel.org/">2026-08-28 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 3/7] SUNRPC: Record last-request timestamp on svc_xprt</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-duplicate-reply-cache-v2-4-25069e660a7b@kernel.org/">2026-08-28 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 4/7] SUNRPC: Mark connection-oriented transports on svc_xprt</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-duplicate-reply-cache-v2-5-25069e660a7b@kernel.org/">2026-08-28 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 5/7] NFSD: Evict completed DRC entries via implied ACK</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-duplicate-reply-cache-v2-7-25069e660a7b@kernel.org/">2026-08-28 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 7/7] NFSD: Record DRC population in lookup tracepoints</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-duplicate-reply-cache-v2-6-25069e660a7b@kernel.org/">2026-08-28 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v2 6/7] NFSD: Add tracepoints for DRC entry eviction</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/798a28cffecc0c16e30841f8a5edaba2a718986b.camel@kernel.org/">2026-08-28 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v2 4/7] SUNRPC: Mark connection-oriented transports on svc_xprt</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/45e98e76b1739b5440f2250a20c922eb0d1bca23.camel@kernel.org/">2026-08-28 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v2 1/7] SUNRPC: Assign a unique identifier to each svc_xprt</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/85acfa01848e5d7829ca18ad8864410fbb5e12b7.camel@kernel.org/">2026-08-28 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v2 5/7] NFSD: Evict completed DRC entries via implied ACK</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/10c97c34-1061-4aa2-a5b5-234e4d01e894@app.fastmail.com/">2026-08-28 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v2 5/7] NFSD: Evict completed DRC entries via implied ACK</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/a99df73fc1db0f976da665cfb4ea39682f680118.camel@kernel.org/">2026-08-28 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v2 5/7] NFSD: Evict completed DRC entries via implied ACK</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/56384440-7fae-4e40-9c0b-fb2162828522@app.fastmail.com/">2026-08-28 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v2 5/7] NFSD: Evict completed DRC entries via implied ACK</a></li>
+</ul>
+  </main>
+</body>
+</html>

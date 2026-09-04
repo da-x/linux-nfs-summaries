@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>rpcbind hardening: rmtcalls, stats, and spoofed replies</title>
+  <meta name="description" content="Scott Mayhew posted a six-patch rpcbind hardening series on 3 September, targeting userspace rpcbind rather than the kernel NFS client. The work is a collection of bug fixes and defensive hardening, not a protocol change. Most of the…">
+  <meta property="og:title" content="rpcbind hardening: rmtcalls, stats, and spoofed replies">
+  <meta property="og:description" content="Scott Mayhew posted a six-patch rpcbind hardening series on 3 September, targeting userspace rpcbind rather than the kernel NFS client. The work is a collection of bug fixes and defensive hardening, not a protocol change. Most of the…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-09-03T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="rpcbind hardening: rmtcalls, stats, and spoofed replies">
+  <meta name="twitter:description" content="Scott Mayhew posted a six-patch rpcbind hardening series on 3 September, targeting userspace rpcbind rather than the kernel NFS client. The work is a collection of bug fixes and defensive hardening, not a protocol change. Most of the…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-09-03</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>rpcbind hardening: rmtcalls, stats, and spoofed replies</h1>
+<h2>Summary</h2>
+<p>Scott Mayhew posted a six-patch <a href="https://lore.kernel.org/linux-nfs/20260903174245.1213147-1-smayhew@redhat.com/">rpcbind hardening series</a> on 3 September, targeting userspace rpcbind rather than the kernel NFS client. The work is a collection of <strong>bug fixes and defensive hardening</strong>, not a protocol change. Most of the patches close resource-exhaustion and spoofing holes around CALLIT/BCAST/INDIRECT processing — the remote-call path that NFS stacks historically used for PMAPPROC_CALLIT-style broadcasts, and that is supposed to be off unless <code>--enable-rmtcalls</code> is passed at configure time.</p>
+<p>Mayhew framed the series around a gap in that default:</p>
+<blockquote>
+<p>"Many of these are related to CALLIT/BCAST/INDIRECT processing, which in theory should be disabled when --enable-rmtcalls was not passed to the configure script, except currently that only prevents the forwarding port from being created."</p>
+</blockquote>
+<p>No review replies landed in-window. The six patches stand as posted.</p>
+<h2>Logging fork bomb in check_callit()</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260903174245.1213147-2-smayhew@redhat.com/">Patch 1/6</a> stops <code>check_callit()</code> from calling <code>logit()</code> on every rejected CALLIT/BROADCAST/INDIRECT unless rpcbind was started with <code>-l</code> (connection logging). <code>logit()</code> forks a child just to call <code>syslog()</code>, so a remote client can spam those procedures and burn CPU, scheduler slots, and PIDs. Failures still fail closed; they simply stop generating a child process per packet.</p>
+<h2>Unbounded rpcbind stats lists</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260903174245.1213147-3-smayhew@redhat.com/">Patch 2/6</a> caps the <code>addrinfo</code> and <code>rmtinfo</code> linked lists built by <code>rpcbs_getaddr()</code> and <code>rpcbs_rmtcall()</code> at 4096 entries, trimming the oldest tail node after each prepend. Unique program/version/netid combinations previously grew those lists without bound, so a client that walked program numbers could force unbounded memory growth even when the request itself was later rejected. The patch is marked <code>Assisted-by: Claude:claude-opus-4-6</code>.</p>
+<h2><code>--enable-rmtcalls</code> was only half-disabled</h2>
+<p>The centerpiece is <a href="https://lore.kernel.org/linux-nfs/20260903174245.1213147-4-smayhew@redhat.com/">patch 3/6</a>. Commit <code>2e9c289</code> ("rpcbind: Disable remote calls by default") added <code>--enable-rmtcalls</code> (off by default) but only skipped creating <code>rmtcallfd</code> for a netconfig entry. Clients could still send CALLIT/BCAST/INDIRECT; processing bailed out later in <code>rpcbproc_callit_com()</code> after <code>find_rmtcallfd_by_netid()</code> failed — but not before <code>logit()</code> (the fork) or <code>rpcbs_rmtcall()</code> (a stats bucket for a unique program/procedure) had already run.</p>
+<p>With the option unset, those procedures now return <code>PROC_UNAVAIL</code> immediately. Dispatch is wired through <code>pmap_svc.c</code>, <code>rpcb_svc.c</code>, <code>rpcb_svc_4.c</code>, <code>rpcb_svc_com.c</code>, <code>rpcb_stat.c</code>, and <code>security.c</code>, with a new helper in <code>rpcbind.h</code>. Mayhew:</p>
+<blockquote>
+<p>"If configure is run without the '--enable-rmtcalls' option, then fully disable remote call functionality. Attempts to call CALLIT/BCAST/INDIRECT will receive an accept state of PROC_UNAVAIL."</p>
+</blockquote>
+<p>That is the change that actually matches the documented default for NFS deployments that never opted into remote calls.</p>
+<h2>GETSTAT no longer answers the network</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260903174245.1213147-5-smayhew@redhat.com/">Patch 4/6</a> restricts <code>RPCBPROC_GETSTAT</code> to loopback callers in <code>security.c</code>. Mayhew's rationale is blunt:</p>
+<blockquote>
+<p>"There's no reason to allow remote machines to query the local machine's rpcbind statistics."</p>
+</blockquote>
+<p>Together with the stats-list cap, this keeps rpcbind's internal counters from being both a remote reconnaissance surface and an allocation oracle.</p>
+<h2>Null netmask in addrmerge()</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260903174245.1213147-6-smayhew@redhat.com/">Patch 5/6</a> is a small defensive fix in <code>util.c</code>. <code>getifaddrs(3)</code> allows <code>ifa_netmask</code> to be NULL; <code>addrmerge()</code> now skips those interfaces instead of handing a null pointer to <code>bitmaskcmp()</code>. Mayhew called it mainly defensive — <code>bitmaskcmp()</code> is only used for AF_INET/AF_INET6, and he is "not sure it's possible for an interface to have an IP address but no netmask" — but a NULL deref in address merging would take down the daemon that NFS clients and servers use to find portmapper/rpcbind services.</p>
+<h2>Spoofed XIDs freeing forward slots</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260903174245.1213147-7-smayhew@redhat.com/">Patch 6/6</a> tightens <code>handle_reply()</code> so a forward slot is freed only when the reply XID matches the original request XID. If remote calls <em>are</em> enabled and the ephemeral forwarding ports are reachable, an attacker can spoof replies with a bogus XID, free slots out from under in-flight forwards, and disrupt replies to legitimate CALLIT requesters. The one-line policy change is the series' only explicit spoofing fix, and it matters for any NFS/rpcbind deployment that still compiles with <code>--enable-rmtcalls</code>.</p>
+<h2>Status</h2>
+<p>Eight files, +78/−13. The series is <strong>hardening/bug-fix</strong> work on the userspace rpcbind that the Linux NFS client (and NFSD) still depend on for portmap/rpcbind lookups and, when enabled, remote calls. Nothing in-window ACK'd, NAK'd, or iterated the patches; they remain Mayhew's v1 drop from 3 September. The practical takeaway for NFS client deployments is that default builds (no <code>--enable-rmtcalls</code>) would finally reject CALLIT/BCAST/INDIRECT at the procedure table instead of after allocating stats and forking loggers, while GETSTAT and spoofed forward replies are fenced even when remote calls stay on.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260903174245.1213147-1-smayhew@redhat.com/">2026-09-03 Scott Mayhew <a href="mailto:smayhew@redhat.com">smayhew@redhat.com</a> — [rpcbind PATCH 0/6] rpcbind: various hardening fixes</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260903174245.1213147-5-smayhew@redhat.com/">2026-09-03 Scott Mayhew <a href="mailto:smayhew@redhat.com">smayhew@redhat.com</a> — [rpcbind PATCH 4/6] rpcbind: restrict RPCBPROC_GETSTAT to loopback callers</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260903174245.1213147-6-smayhew@redhat.com/">2026-09-03 Scott Mayhew <a href="mailto:smayhew@redhat.com">smayhew@redhat.com</a> — [rpcbind PATCH 5/6] rpcbind: check for null netmask in addrmerge()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260903174245.1213147-7-smayhew@redhat.com/">2026-09-03 Scott Mayhew <a href="mailto:smayhew@redhat.com">smayhew@redhat.com</a> — [rpcbind PATCH 6/6] rpcbind: only free the forward slot if the reply xid matched the request xid</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260903174245.1213147-2-smayhew@redhat.com/">2026-09-03 Scott Mayhew <a href="mailto:smayhew@redhat.com">smayhew@redhat.com</a> — [rpcbind PATCH 1/6] rpcbind: only log failures in check_callit() if connection logging is enabled</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260903174245.1213147-4-smayhew@redhat.com/">2026-09-03 Scott Mayhew <a href="mailto:smayhew@redhat.com">smayhew@redhat.com</a> — [rpcbind PATCH 3/6] rpcbind: fully disable remote calls when --enable-rmtcalls is unset</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260903174245.1213147-3-smayhew@redhat.com/">2026-09-03 Scott Mayhew <a href="mailto:smayhew@redhat.com">smayhew@redhat.com</a> — [rpcbind PATCH 2/6] rpcbind: bound stats lists in rpcbs_getaddr() and rpcbs_rmtcall()</a></li>
+</ul>
+  </main>
+</body>
+</html>

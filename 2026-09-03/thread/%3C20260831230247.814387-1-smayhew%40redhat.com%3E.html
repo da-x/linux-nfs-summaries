@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>gssd: clean up upcall threads on shutdown</title>
+  <meta name="description" content="Red Hat&#39;s Scott Mayhew posted a one-patch nfs-utils change that teaches rpc.gssd to join and free its GSS upcall worker threads when the daemon is going down. The work is a bug fix for a userspace NFS client leak, not a protocol change and…">
+  <meta property="og:title" content="gssd: clean up upcall threads on shutdown">
+  <meta property="og:description" content="Red Hat&#39;s Scott Mayhew posted a one-patch nfs-utils change that teaches rpc.gssd to join and free its GSS upcall worker threads when the daemon is going down. The work is a bug fix for a userspace NFS client leak, not a protocol change and…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-09-03T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="gssd: clean up upcall threads on shutdown">
+  <meta name="twitter:description" content="Red Hat&#39;s Scott Mayhew posted a one-patch nfs-utils change that teaches rpc.gssd to join and free its GSS upcall worker threads when the daemon is going down. The work is a bug fix for a userspace NFS client leak, not a protocol change and…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-09-03</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>gssd: clean up upcall threads on shutdown</h1>
+<h2>Summary</h2>
+<h1>gssd: clean up upcall threads on shutdown</h1>
+<p>Red Hat's <a href="https://lore.kernel.org/linux-nfs/20260831230247.814387-1-smayhew@redhat.com/">Scott Mayhew</a> posted a one-patch nfs-utils change that teaches <code>rpc.gssd</code> to join and free its GSS upcall worker threads when the daemon is going down. The work is a <strong>bug fix</strong> for a userspace NFS <strong>client</strong> leak, not a protocol change and not a new feature: Kerberos upcall handling is unchanged; only process-exit hygiene is.</p>
+<p>No replies, acks, or nacks landed in the week ending 3 September 2026. The thread is a single posting.</p>
+<h2>The leak Valgrind sees</h2>
+<p><code>rpc.gssd</code> is the NFS client's GSS helper. Kernel upcalls for context establishment are dispatched from the libevent loop in <code>handle_gssd_upcall()</code> into per-upcall pthreads created by <code>start_upcall_thread()</code> in <code>gssd_proc.c</code>. Mayhew ran the daemon under Valgrind and got a "possibly lost" report on thread-local storage allocated inside <code>pthread_create()</code>:</p>
+<blockquote>
+<p>"Valgrind reports leaks such as the following: 736 bytes in 2 blocks are possibly lost ... at calloc ... allocate_dtv ... _dl_allocate_tls ... pthread_create@@GLIBC_2.34 ... start_upcall_thread ... handle_gssd_upcall ... event_base_loop ... main"</p>
+</blockquote>
+<p>He traces the blocks to two allocations that the existing watchdog is <em>supposed</em> to reclaim:</p>
+<blockquote>
+<p>"This is due to the thread-local storage allocated by pthread_create() as well as the upcall_thread_info struct allocated by start_upcall_thread(). Those do eventually get freed by the watchdog thread in scan_active_thread_list(). The thread-local storage gets freed when pthread_tryjoin_np() succeeds and the upcall_thread_info gets freed via TAILQ_REMOVE() + free()."</p>
+</blockquote>
+<p>The catch is timing. The watchdog sleeps between scans — 30 seconds by default — so a clean shutdown that does not wait for the next scan looks like a leak to Valgrind and similar tools:</p>
+<blockquote>
+<p>"But since the watchdog thread sleeps between iterations (30 seconds by default), from the perspective of tools like valgrind there’s a leak."</p>
+</blockquote>
+<p>That watchdog is itself NFS-client machinery Mayhew added years ago (the 2021 <code>gssd: add timeout for upcall threads</code> series) so hung Kerberos upcalls cannot pin <code>rpc.gssd</code> forever. The leak is therefore not a missing free in the steady-state path; it is a missing <em>shutdown</em> path that would drain the same list the watchdog walks.</p>
+<h2>The fix</h2>
+<p>The patch is 60 insertions in <code>utils/gssd/gssd.c</code>. Mayhew's stated goal is narrow:</p>
+<blockquote>
+<p>"Add logic to clean up the threads on shutdown to make tools like valgrind happy."</p>
+</blockquote>
+<p>Functionally, that means joining leftover upcall threads and releasing their <code>upcall_thread_info</code> nodes when <code>rpc.gssd</code> is exiting, instead of relying on a sleeping watchdog iteration that may never run. TLS from <code>pthread_create()</code> is reclaimed by a successful join (<code>pthread_tryjoin_np()</code> in the watchdog; an explicit join on shutdown), and the info structs go away with the same <code>TAILQ_REMOVE()</code> + <code>free()</code> sequence the scanner already uses.</p>
+<p>This is client-side daemon hygiene. It does not change how the kernel NFS client posts gssd upcalls, how rpc_pipefs delivers them, or how GSS tokens are built. It does make it practical to run <code>rpc.gssd</code> under leak detectors without a 30-second wait, and it avoids leaving joinable pthreads behind when the helper is stopped.</p>
+<h2>Status this week</h2>
+<p>The patch stands alone. There is no review commentary in-window, no v2, and no indication yet whether nfs-utils maintainers want the shutdown drain to cancel still-running upcalls, wait on them, or only reap threads that have already exited — details that live in the omitted diff rather than the cover note.</p>
+<p>It sits next to Mayhew's same-day companion <a href="https://lore.kernel.org/linux-nfs/20260831230256.814412-1-smayhew@redhat.com/">gssd: fix upcall_* leak when re-reading service info</a>, another Valgrind-driven <code>rpc.gssd</code> leak fix (strdup of <code>upcall_address</code> / <code>upcall_port</code> / <code>upcall_protoname</code> / <code>upcall_service</code> on a failed <code>gssd_read_service_info()</code>). Together they show a client-userspace leak-hunting pass on gssd this week, alongside the separate Pujeri name-validation series, but this thread itself is only the shutdown-join change.</p>
+<p>Until someone reviews it, the conclusion is Mayhew's own: the watchdog already frees these objects, and shutdown should do the same work immediately so leak tools stop flagging <code>rpc.gssd</code>.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260831230247.814387-1-smayhew@redhat.com/">2026-08-31 Scott Mayhew <a href="mailto:smayhew@redhat.com">smayhew@redhat.com</a> — [nfs-utils PATCH] gssd: clean up threads on shutdown</a></li>
+</ul>
+  </main>
+</body>
+</html>

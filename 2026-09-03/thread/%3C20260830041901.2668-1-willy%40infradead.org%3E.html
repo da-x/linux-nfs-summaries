@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Wilcox FGP_NOFS cleanup touches NFS dir folio lookup</title>
+  <meta name="description" content="Matthew Wilcox posted a nine-patch cleanup this week that retires the FGP_NOFS folio-get flag in favor of the scoped memalloc_nofs_save() API. The series is a cleanup / API-simplification, not a protocol change and not an NFS bug fix; the…">
+  <meta property="og:title" content="Wilcox FGP_NOFS cleanup touches NFS dir folio lookup">
+  <meta property="og:description" content="Matthew Wilcox posted a nine-patch cleanup this week that retires the FGP_NOFS folio-get flag in favor of the scoped memalloc_nofs_save() API. The series is a cleanup / API-simplification, not a protocol change and not an NFS bug fix; the…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-09-03T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Wilcox FGP_NOFS cleanup touches NFS dir folio lookup">
+  <meta name="twitter:description" content="Matthew Wilcox posted a nine-patch cleanup this week that retires the FGP_NOFS folio-get flag in favor of the scoped memalloc_nofs_save() API. The series is a cleanup / API-simplification, not a protocol change and not an NFS bug fix; the…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-09-03</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Wilcox FGP_NOFS cleanup touches NFS dir folio lookup</h1>
+<h2>Summary</h2>
+<p>Matthew Wilcox posted a nine-patch cleanup this week that retires the <code>FGP_NOFS</code> folio-get flag in favor of the scoped <code>memalloc_nofs_save()</code> API. The series is a <strong>cleanup / API-simplification</strong>, not a protocol change and not an NFS bug fix; the NFS client is touched only because <code>fs/nfs/dir.c</code> was one of the last remaining <code>FGP_NOFS</code> users.</p>
+<h2>Why this landed on linux-nfs</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260830041901.2668-1-willy@infradead.org/">Wilcox framed the work</a> as a small step toward the broader agreement that <code>__GFP_FS</code> should disappear:</p>
+<blockquote>
+<p>"There is broad agreement that we should eliminate __GFP_FS in favour of using memalloc_nofs_save(). This is a small step in that direction by getting rid of FGP_NOFS. It's also a nice simplification in its own right."</p>
+</blockquote>
+<p>He listed four patterns that still used the flag: (1) callers that already pass <code>FGP_NOWAIT</code> (so reclaim never happens), (2) callers already inside a <code>memalloc_nofs</code> scope, (3) callers that never needed NOFS at all, and (4) callers that should switch to <code>memalloc_nofs_save()</code>. The NFS change is pattern (1).</p>
+<p>Patch 1 rewrites the <code>memalloc_nofs_save()</code> kerneldoc to be filesystem-centric rather than MM-centric, which Wilcox explicitly asked filesystem maintainers to review. <a href="https://lore.kernel.org/linux-nfs/wriwrbwg3sx5kpl6s7yggam5x7ljml2sul5rz4dm7ftbyyoqyu@yqjepgxxtd3g/">Jan Kara</a> liked the rewrite:</p>
+<blockquote>
+<p>"Yeah, I think the documentation is better."</p>
+</blockquote>
+<h2>NFS client: one-line dir.c cleanup</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260830041901.2668-5-willy@infradead.org/">Patch 4/9</a> is the only NFS-client change. In <code>fs/nfs/dir.c</code> Wilcox drops <code>FGP_NOFS</code> from a <code>__filemap_get_folio()</code> call whose flags already include <code>FGP_NOWAIT</code>:</p>
+<blockquote>
+<p>"The flags already include FGP_NOWAIT which prohibits all reclaim, not just reclaiming from the filesystem."</p>
+</blockquote>
+<p>That is a correctness-preserving simplification, not a behavior change. <code>FGP_NOWAIT</code> already forbids waiting on reclaim of any kind, so the extra <code>__GFP_FS</code> suppression was dead. The NFS directory-cache folio lookup still fails fast under memory pressure; it simply no longer pretends to need a narrower NOFS constraint.</p>
+<p>No NFS maintainer (Trond Myklebust, Anna Schumaker, Jeff Layton, Chuck Lever) replied this week. The only review of the NFS hunk came from <a href="https://lore.kernel.org/linux-nfs/qabnsbfd2jknm6g6h2jqlavbpxiem3f2rfu6lwozmlt264aknw@6vxajyigvkaz/">Jan Kara</a>, who treated it as obvious:</p>
+<blockquote>
+<p>"Obvious enough :) feel free to add: Reviewed-by: Jan Kara <a href="mailto:jack@suse.cz">jack@suse.cz</a>"</p>
+</blockquote>
+<p>From a client-development standpoint this is housekeeping: directory readdir/lookup folio allocation stays non-blocking, and the NFS code path will keep compiling once <code>FGP_NOFS</code> is deleted from <code>include/linux/pagemap.h</code> in patch 9.</p>
+<h2>Rest of the series (context for the NFS drop)</h2>
+<p>The other filesystem patches exist so that patch 9 can actually delete the flag:</p>
+<ul>
+<li><strong>ext4</strong> (<a href="https://lore.kernel.org/linux-nfs/20260830041901.2668-3-willy@infradead.org/">2/9</a>): two <code>FGP_NOFS</code> uses in <code>fs/ext4/inline.c</code> are dropped because they run inside a journal transaction, which already calls <code>memalloc_nofs_save()</code>. Reviewed by <a href="https://lore.kernel.org/linux-nfs/pfgtqekyfsprme6htklelwrvuiazrm45oimome6a3h3fhuvalo@p4mridqzxu42/">Jan Kara</a>, <a href="https://lore.kernel.org/linux-nfs/156326be-7d4a-4bdf-b0c0-030dc951af2e@linux.alibaba.com/">Baokun Li</a>, <a href="https://lore.kernel.org/linux-nfs/70d1f9a7-362a-4152-b323-58ae010ebbf6@huaweicloud.com/">Zhang Yi</a>, and <a href="https://lore.kernel.org/linux-nfs/apmHuRN-r4gfWnTX@mit.edu/">acked by Ted Ts'o</a>.</li>
+<li><strong>erofs</strong> (<a href="https://lore.kernel.org/linux-nfs/20260830041901.2668-4-willy@infradead.org/">3/9</a>): same <code>FGP_NOWAIT</code> redundancy as NFS. Reviewed by <a href="https://lore.kernel.org/linux-nfs/7cb6z6bmqbk3dj7mwew3tiomxstzjigs5tel6qhbxmhej3rd3q@pajlpq7y25og/">Jan Kara</a> and <a href="https://lore.kernel.org/linux-nfs/apZo3lDaDp3hQhRq@XiangdeMacBook-Pro.local/">Gao Xiang</a>.</li>
+<li><strong>ntfs</strong> (<a href="https://lore.kernel.org/linux-nfs/20260830041901.2668-6-willy@infradead.org/">5/9</a>, <a href="https://lore.kernel.org/linux-nfs/20260830041901.2668-7-willy@infradead.org/">6/9</a>): one site is argued to be unnecessary because the sibling non-resident pwrite path never used NOFS; the other is <code>FGP_NOWAIT</code> redundancy plus a switch to <code>mapping_gfp_mask()</code> so <code>GFP_MOVABLE</code> is preserved. Both reviewed by <a href="https://lore.kernel.org/linux-nfs/CAKYAXd8qgCe0Kt_Pmpd+228LP+hCtF2shmVqftazX1+xrSCkFQ@mail.gmail.com/">Namjae Jeon</a>.</li>
+<li><strong>filemap</strong> (<a href="https://lore.kernel.org/linux-nfs/20260830041901.2668-9-willy@infradead.org/">8/9</a>, <a href="https://lore.kernel.org/linux-nfs/20260830041901.2668-10-willy@infradead.org/">9/9</a>): drop the last in-tree <code>FGP_NOWAIT|FGP_NOFS</code> combination, then delete <code>FGP_NOFS</code> from <code>pagemap.h</code> and <code>mm/filemap.c</code>. Kara reviewed both.</li>
+</ul>
+<h2>Open question: squashfs (not NFS)</h2>
+<p>The only push-back this week is on <a href="https://lore.kernel.org/linux-nfs/20260830041901.2668-8-willy@infradead.org/">patch 7/9</a>, which replaces squashfs's <code>FGP_NOFS</code> with an explicit <code>memalloc_nofs_save()</code> around folio allocation while a folio is locked. Wilcox's rationale:</p>
+<blockquote>
+<p>"Since we can allocate memory while holding a folio locked, we cannot allow page reclaim to call into the filesystem and attempt to compact the folio we're currently holding locked."</p>
+</blockquote>
+<p><a href="https://lore.kernel.org/linux-nfs/kg2pupprlig5gqaqgjydpxfkrsi42bu2li6cingcmu3aidqhyp@afi5wxdrauk6/">Jan Kara asked</a> why the extra scope is needed at all:</p>
+<blockquote>
+<p>"Why do you need this? The only allocation I can see is the one using FGP_NOWAIT below..."</p>
+</blockquote>
+<p>Wilcox had not answered by the end of the week. That question does not affect the NFS hunk: NFS already uses <code>FGP_NOWAIT</code>, so it does not need a new <code>memalloc_nofs_save()</code> wrapper.</p>
+<h2>Status</h2>
+<p>This is <strong>cleanup, not a bug fix</strong>. Reviews are in for the NFS, erofs, ext4, ntfs, documentation, and filemap patches; the series is blocked only on the squashfs <code>memalloc_nofs_save()</code> debate. Once that is resolved, deleting <code>FGP_NOFS</code> will leave the NFS client directory folio path using <code>FGP_NOWAIT</code> alone — same non-blocking reclaim behavior, one fewer obsolete GFP flag.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260830041901.2668-7-willy@infradead.org/">2026-08-30 "Matthew Wilcox (Oracle)" <a href="mailto:willy@infradead.org">willy@infradead.org</a> — [PATCH 6/9] ntfs: Remove redundant FGP_NOFS from ntfs_wof_collect_dest()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260830041901.2668-3-willy@infradead.org/">2026-08-30 "Matthew Wilcox (Oracle)" <a href="mailto:willy@infradead.org">willy@infradead.org</a> — [PATCH 2/9] ext4: Remove uses of FGP_NOFS</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260830041901.2668-6-willy@infradead.org/">2026-08-30 "Matthew Wilcox (Oracle)" <a href="mailto:willy@infradead.org">willy@infradead.org</a> — [PATCH 5/9] ntfs: Remove FGP_NOFS from __ntfs_inode_resident_attr_pwrite()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260830041901.2668-10-willy@infradead.org/">2026-08-30 "Matthew Wilcox (Oracle)" <a href="mailto:willy@infradead.org">willy@infradead.org</a> — [PATCH 9/9] filemap: Remove FGP_NOFS</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260830041901.2668-9-willy@infradead.org/">2026-08-30 "Matthew Wilcox (Oracle)" <a href="mailto:willy@infradead.org">willy@infradead.org</a> — [PATCH 8/9] filemap: Remove redundant FGP_NOFS</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260830041901.2668-2-willy@infradead.org/">2026-08-30 "Matthew Wilcox (Oracle)" <a href="mailto:willy@infradead.org">willy@infradead.org</a> — [PATCH 1/9] mm: Improve memalloc_nofs_save() documentation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260830041901.2668-8-willy@infradead.org/">2026-08-30 "Matthew Wilcox (Oracle)" <a href="mailto:willy@infradead.org">willy@infradead.org</a> — [PATCH 7/9] squashfs: Remove use of FGP_NOFS</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260830041901.2668-4-willy@infradead.org/">2026-08-30 "Matthew Wilcox (Oracle)" <a href="mailto:willy@infradead.org">willy@infradead.org</a> — [PATCH 3/9] erofs: Remove redundant FGP_NOFS</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260830041901.2668-5-willy@infradead.org/">2026-08-30 "Matthew Wilcox (Oracle)" <a href="mailto:willy@infradead.org">willy@infradead.org</a> — [PATCH 4/9] nfs: Remove redundant FGP_NOFS</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260830041901.2668-1-willy@infradead.org/">2026-08-30 "Matthew Wilcox (Oracle)" <a href="mailto:willy@infradead.org">willy@infradead.org</a> — [PATCH 0/9] Remove FGP_NOFS</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/wriwrbwg3sx5kpl6s7yggam5x7ljml2sul5rz4dm7ftbyyoqyu@yqjepgxxtd3g/">2026-08-31 Jan Kara <a href="mailto:jack@suse.cz">jack@suse.cz</a> — Re: [PATCH 1/9] mm: Improve memalloc_nofs_save() documentation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/pfgtqekyfsprme6htklelwrvuiazrm45oimome6a3h3fhuvalo@p4mridqzxu42/">2026-08-31 Jan Kara <a href="mailto:jack@suse.cz">jack@suse.cz</a> — Re: [PATCH 2/9] ext4: Remove uses of FGP_NOFS</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/d3w3bedhmbl7d2ssfq2ov43safj7hynj7rpwztdiu22fkasrhm@e4qjbeohazgv/">2026-08-31 Jan Kara <a href="mailto:jack@suse.cz">jack@suse.cz</a> — Re: [PATCH 8/9] filemap: Remove redundant FGP_NOFS</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/6vnditkfrebo7ylr6g33kvzefn4iahstd3hlzzjvtcfk36dffq@zw4akv7ga6az/">2026-08-31 Jan Kara <a href="mailto:jack@suse.cz">jack@suse.cz</a> — Re: [PATCH 9/9] filemap: Remove FGP_NOFS</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/qabnsbfd2jknm6g6h2jqlavbpxiem3f2rfu6lwozmlt264aknw@6vxajyigvkaz/">2026-08-31 Jan Kara <a href="mailto:jack@suse.cz">jack@suse.cz</a> — Re: [PATCH 4/9] nfs: Remove redundant FGP_NOFS</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/7cb6z6bmqbk3dj7mwew3tiomxstzjigs5tel6qhbxmhej3rd3q@pajlpq7y25og/">2026-08-31 Jan Kara <a href="mailto:jack@suse.cz">jack@suse.cz</a> — Re: [PATCH 3/9] erofs: Remove redundant FGP_NOFS</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/kg2pupprlig5gqaqgjydpxfkrsi42bu2li6cingcmu3aidqhyp@afi5wxdrauk6/">2026-08-31 Jan Kara <a href="mailto:jack@suse.cz">jack@suse.cz</a> — Re: [PATCH 7/9] squashfs: Remove use of FGP_NOFS</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/156326be-7d4a-4bdf-b0c0-030dc951af2e@linux.alibaba.com/">2026-08-31 Baokun Li <a href="mailto:libaokun@linux.alibaba.com">libaokun@linux.alibaba.com</a> — Re: [PATCH 2/9] ext4: Remove uses of FGP_NOFS</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAKYAXd_zarKuogwNS=ZNDuyR4w_iB7yui+h+CqGvjZvzxPFpzw@mail.gmail.com/">2026-08-31 Namjae Jeon <a href="mailto:linkinjeon@kernel.org">linkinjeon@kernel.org</a> — Re: [PATCH 6/9] ntfs: Remove redundant FGP_NOFS from ntfs_wof_collect_dest()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/CAKYAXd8qgCe0Kt_Pmpd+228LP+hCtF2shmVqftazX1+xrSCkFQ@mail.gmail.com/">2026-08-31 Namjae Jeon <a href="mailto:linkinjeon@kernel.org">linkinjeon@kernel.org</a> — Re: [PATCH 5/9] ntfs: Remove FGP_NOFS from __ntfs_inode_resident_attr_pwrite()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/70d1f9a7-362a-4152-b323-58ae010ebbf6@huaweicloud.com/">2026-09-01 Zhang Yi <a href="mailto:yi.zhang@huaweicloud.com">yi.zhang@huaweicloud.com</a> — Re: [PATCH 2/9] ext4: Remove uses of FGP_NOFS</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/apZo3lDaDp3hQhRq@XiangdeMacBook-Pro.local/">2026-09-01 Gao Xiang <a href="mailto:xiang@kernel.org">xiang@kernel.org</a> — Re: [PATCH 3/9] erofs: Remove redundant FGP_NOFS</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/apmHuRN-r4gfWnTX@mit.edu/">2026-09-03 "Theodore Tso" <a href="mailto:tytso@mit.edu">tytso@mit.edu</a> — Re: [PATCH 2/9] ext4: Remove uses of FGP_NOFS</a></li>
+</ul>
+  </main>
+</body>
+</html>

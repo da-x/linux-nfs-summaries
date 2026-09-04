@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFSD listener_set v3: bound rpcbind hangs, error-class debate</title>
+  <meta name="description" content="This week Jeff Layton posted a 14-patch v3 series to stop NFSD&#39;s netlink LISTENER_SET path from hanging the server under a silent local rpcbind, then took a pointed review from Chuck Lever on how &quot;no answer&quot; is classified. The work is a…">
+  <meta property="og:title" content="NFSD listener_set v3: bound rpcbind hangs, error-class debate">
+  <meta property="og:description" content="This week Jeff Layton posted a 14-patch v3 series to stop NFSD&#39;s netlink LISTENER_SET path from hanging the server under a silent local rpcbind, then took a pointed review from Chuck Lever on how &quot;no answer&quot; is classified. The work is a…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-09-03T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFSD listener_set v3: bound rpcbind hangs, error-class debate">
+  <meta name="twitter:description" content="This week Jeff Layton posted a 14-patch v3 series to stop NFSD&#39;s netlink LISTENER_SET path from hanging the server under a silent local rpcbind, then took a pointed review from Chuck Lever on how &quot;no answer&quot; is classified. The work is a…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-09-03</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFSD listener_set v3: bound rpcbind hangs, error-class debate</h1>
+<h2>Summary</h2>
+<p>This week Jeff Layton posted a 14-patch v3 series to stop NFSD's netlink <code>LISTENER_SET</code> path from hanging the server under a silent local rpcbind, then took a pointed review from Chuck Lever on how "no answer" is classified. The work is a <strong>bug-fix and hardening</strong> series (syzbot hung-task reports against the listener netlink command), not a protocol change. It lives on the server and in SUNRPC; the client is only indirectly involved via the shared rpcbind client.</p>
+<h2>From v2 to v3: stop retrying a dead rpcbind</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260828-nfsd-nl-hang-v3-0-55026685c75d@kernel.org/">Layton's cover letter</a> opened by stressing how far v3 had moved:</p>
+<blockquote>
+<p>"This series is quite a bit different from v2. First, I cleaned things up along the lines of Chuck's review of v2, but then Olga suggested that we should just give up on trying to do new rpcbind registrations when one fails."</p>
+</blockquote>
+<p>That Olga Kornievskaia suggestion is the architectural hinge. A <code>LISTENER_SET</code> with many entries used to call <code>svc_register()</code> once per listener; a local rpcbind that accepted the connection and never replied therefore paid one timeout per entry, all under <code>nfsd_mutex</code>. With the new 1024-entry cap that stall could run to "about 34 minutes," as <a href="https://lore.kernel.org/linux-nfs/20260828-nfsd-nl-hang-v3-10-55026685c75d@kernel.org/">patch 10</a> put it — "roughly 17 times the hung-task threshold." Layton said the new give-up-after-first-failure rule "now seems to fix the reproducer that syzbot provided recently" and that he had "high hopes that it will fix the other syzbot hangs that have been reported." He asked for the series in v7.4, and noted it is also "a foundation for some other work I have that will move the rpcbind registration into userland."</p>
+<p>v3 also dropped v2's <code>svc_register()</code> unwind. rpcbind matches an UNSET on <code>[program, version, netid]</code>, and the v2 fallback ignored protocol, so the unwind "could therefore clear entries that belong to other live listeners. Chuck Lever found that." A failed registration stays fatal; patch 3 makes <code>CONFIG_NFS_LOCALIO=y</code> agree with <code>=n</code> on that point.</p>
+<h2>What the 14 patches actually change</h2>
+<p>The first half is input validation and timeout bounding, all aimed at work that today runs under <code>nfsd_mutex</code> or <code>sv_lock</code> with BHs disabled:</p>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-nfsd-nl-hang-v3-1-55026685c75d@kernel.org/">01/14</a> caps a <code>listener_set</code> request at <code>NFSD_NL_LISTENER_MAX</code> (1024) <em>before</em> taking any lock. The nested match loop is O(N×M); a huge userspace list could otherwise spin in atomic context. The patch does not cap M (existing sockets), and <code>__write_ports_addxprt()</code> can still push M past the cap.</li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-nfsd-nl-hang-v3-2-55026685c75d@kernel.org/">02/14</a> checks the transport name against <code>tcp</code>/<code>udp</code>/<code>rdma</code> before <code>nfsd_create_serv()</code>, so an arbitrary name no longer reaches <code>request_module("svc%s", name)</code> as a <code>TASK_KILLABLE</code> usermode helper <em>under</em> <code>nfsd_mutex</code>. The autoload for modular <code>svcrdma</code> is deliberately left in place. This is one of the patches tagged against the syzbot bug.</li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-nfsd-nl-hang-v3-3-55026685c75d@kernel.org/">03/14</a> makes <code>svc_register()</code> keep the <em>first</em> error instead of the last, so a later success cannot erase an earlier failure.</li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-nfsd-nl-hang-v3-4-55026685c75d@kernel.org/">04/14</a> bounds the local rpcbind client to a single 1s attempt (the defaults were 10s on AF_LOCAL and 60s on loopback TCP). Those calls are synchronous and sit under <code>nfsd_mutex</code>; a silent rpcbind was tripping <code>INFO: task hung in nfsd_nl_cache_flush_doit</code> on <em>other</em> NFSD netlink ops. Layton was explicit that this only shortens the stall:</li>
+</ul>
+<blockquote>
+<p>"This shortens the stall. It does not remove the stall, and it is not free. … An rpcbind that is merely slow to be scheduled can therefore now fail server startup, where it succeeded before. The real fix is to make the registration asynchronous."</p>
+</blockquote>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-nfsd-nl-hang-v3-5-55026685c75d@kernel.org/">05/14</a> reports listener-creation failures through netlink extack, naming both the attribute and the transport so a multi-entry request is not reduced to a bare "Address already in use."</li>
+</ul>
+<p>The second half is the "give up once rpcbind goes silent" machinery:</p>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-nfsd-nl-hang-v3-6-55026685c75d@kernel.org/">06/14</a> introduces <code>-ENAVAIL</code> for a local rpcbind call that got no answer, distinct from <code>-EACCES</code> (FALSE reply). <code>svc_generic_rpcbind_set()</code> lets <code>-ENAVAIL</code> past <code>vs_rpcb_optnl</code>; <code>svc_register()</code> then tallies it in <code>serv-&gt;sv_rpcb_failures</code>. Callers compare <code>svc_rpcb_failure_count()</code> as they go.</li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-nfsd-nl-hang-v3-7-55026685c75d@kernel.org/">07/14</a> stops the <em>program</em> loop in <code>svc_register()</code> on no-answer, not just the version loop, so an nfsd serv does not pay 2s (nfsd + nfsacl) for a dead rpcbind.</li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-nfsd-nl-hang-v3-8-55026685c75d@kernel.org/">08/14</a> and <a href="https://lore.kernel.org/linux-nfs/20260828-nfsd-nl-hang-v3-9-55026685c75d@kernel.org/">09/14</a> bound the unregistration side the same way: <code>svc_unregister()</code> gives up after the first silent call, and <code>svc_delete_xprt()</code> clears <code>XPT_RPCB_UNREG</code> on every remaining transport in the net once one UNSET gets no answer. One <code>LISTENER_SET</code> therefore pays one timeout in each direction rather than one per listener/program/version.</li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-nfsd-nl-hang-v3-10-55026685c75d@kernel.org/">10/14</a> is the NFSD consumer of that count: once <code>svc_rpcb_failure_count()</code> moves, the rest of the request is created with <code>SVC_SOCK_ANONYMOUS</code>. The entry that paid the timeout is retried anonymous rather than left out of the set; a silent rpcbind is reported as its own ack condition instead of being glued onto whatever unrelated error the last entry had. Suggested-by Olga Kornievskaia.</li>
+</ul>
+<p>Patches 01, 02 and 10 carry <code>Fixes: 16a471177496 ("NFSD: add listener-{set,get} netlink command")</code>. Several patches are marked <code>Assisted-by: LLM</code>.</p>
+<h2>Selftests: a per-netns rpcbind stub</h2>
+<p>The last four patches add <code>tools/testing/selftests/nfsd/nfsd_netlink_listener.c</code> (about 1.3k lines) and put the new directory in the NFSD MAINTAINERS entry.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260828-nfsd-nl-hang-v3-11-55026685c75d@kernel.org/">11/14</a> covers the pre-mutex validation: bad/absent transport name, missing address, truncated sockaddr, bad family, a malformed entry behind a well-formed one, more than 1024 entries, and <code>LISTENER_GET</code> on an empty netns. Each kselftest harness test runs in its own net and mount namespace with <code>/run</code> masked, because <code>unix_find_bsd()</code> has no <code>struct net</code> and a connect to <code>/var/run/rpcbind.sock</code> would otherwise hit the <em>host</em> rpcbind — and <code>svc_rpcb_setup()</code> opens with <code>svc_unregister()</code>, which would clear the host's nfsd registrations.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260828-nfsd-nl-hang-v3-12-55026685c75d@kernel.org/">12/14</a> is the interesting piece for anyone writing NFS server tests: a per-netns rpcbind stub bound to the abstract name <code>"\0/run/rpcbind.sock"</code> (that lookup <em>is</em> netns-local). The stub never decodes arguments; NULL gets success, SET/UNSET get TRUE, and it speaks RPCBVERS_4 as well as v2 so IPv6 listeners are not left unregistered. Mode and counters live in a shared page so a test can switch the stub to silent without killing the connection the kernel holds. Layton was careful that errno alone is a weak oracle — several tests exist "to catch a revert, not to describe the interface." <code>val_bad_transport</code> now also requires the stub saw <em>no</em> traffic; <code>sem_register_refused</code> re-reads the listener set because <code>-EACCES</code> can also come from bind; <code>func_empty_destroys</code> uses the connection count to distinguish a destroyed serv from a live serv with no permsocks.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260828-nfsd-nl-hang-v3-13-55026685c75d@kernel.org/">13/14</a> and <a href="https://lore.kernel.org/linux-nfs/20260828-nfsd-nl-hang-v3-14-55026685c75d@kernel.org/">14/14</a> then assert the new bound: a three-entry <code>listener_set</code> (or a three-listener removal) against a silent stub must not cost three timeouts; a v4-only server still comes up with a warning; the stop lasts for one request, so the next request after the stub starts answering reaches rpcbind again.</p>
+<h2>Chuck's review: <code>-ENAVAIL</code> is too coarse</h2>
+<p>The only technical review this week landed on patch 06. <a href="https://lore.kernel.org/linux-nfs/c42d685f-18e7-4f38-8ce2-3d8e5402e9f1@app.fastmail.com/">Chuck Lever</a> argued the new errno taxonomy does not match the code:</p>
+<blockquote>
+<p>"If I'm reading this correctly, rpcb_register_call() classifies every failure except -EPROTONOSUPPORT as "no answer"."</p>
+</blockquote>
+<p><code>rpc_call_sync()</code> can return <code>-ENOMEM</code>, <code>-ERESTARTSYS</code>, <code>-EPFNOSUPPORT</code>, <code>-EOPNOTSUPP</code>, <code>-EIO</code>, auth <code>-EACCES</code>, <code>-EKEYREJECTED</code> — "All of these show that rpcbind <em>did</em> answer." Those then become <code>-ENAVAIL</code>, get counted in <code>sv_rpcb_failures</code>, are silently converted to success for a <code>vs_rpcb_optnl</code> version, and reach userspace as a synthesized <code>-ETIMEDOUT</code> for mandatory versions.</p>
+<p>He listed three consequences. First, the commit message's claim that "<code>-EACCES</code> continues to mean a FALSE reply" is false once the RPC layer's auth <code>-EACCES</code> is rewritten. Second, "rpcbind not running" (<code>-ECONNREFUSED</code>/<code>-ENOENT</code>) and every other transport error become indistinguishable <code>ETIMEDOUT</code>/<code>ENAVAIL</code> in the listener_set ack, the <code>svc_register</code>/<code>svc_unregister</code> tracepoints, and the printk — "which IMO is an observability regression." Third, <code>-ERESTARTSYS -&gt; -ETIMEDOUT</code> "drops syscall-restart semantics on a fatal signal during registration." He closed with, "I'm probably missing something."</p>
+<p><a href="https://lore.kernel.org/linux-nfs/f298080d9c8690d0313a3ef16f2fff2f9576aae4.camel@kernel.org/">Layton's reply</a> did not contest the reading:</p>
+<blockquote>
+<p>"Fair point. I've mostly been trying to classify errors as to whether there is any point is attempting further registrations. For most of the errors besides -EACCES (aka rpc_auth_error), there is no point."</p>
+</blockquote>
+<p>He said he had already cleaned up the error handling, "so v4 should be a bit more explicit about how errors are handled."</p>
+<h2>Where it stands</h2>
+<p>No acks landed on v3 this week. The series is treated as the right <em>direction</em> — cap the request, validate before taking <code>nfsd_mutex</code>, bound the local rpcbind client, and stop walking listeners/programs once rpcbind is silent — but patch 06's "no answer" bucket is too wide, and Layton has already pointed at v4 for the fix. The 1s timeout remains a mitigation, not the end state; both the cover letter and patch 04 keep pointing at asynchronous (and eventually userland) rpcbind registration as the real cure for holding <code>nfsd_mutex</code> across a synchronous RPC.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-nfsd-nl-hang-v3-0-55026685c75d@kernel.org/">2026-08-28 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3 00/14] nfsd/sunrpc: harden the netlink listener set interface</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-nfsd-nl-hang-v3-1-55026685c75d@kernel.org/">2026-08-28 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3 01/14] NFSD: cap the number of listeners accepted in listener_set</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-nfsd-nl-hang-v3-2-55026685c75d@kernel.org/">2026-08-28 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3 02/14] NFSD: validate transport name in listener_set before serv creation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-nfsd-nl-hang-v3-3-55026685c75d@kernel.org/">2026-08-28 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3 03/14] SUNRPC: keep the first error in svc_register()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-nfsd-nl-hang-v3-4-55026685c75d@kernel.org/">2026-08-28 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3 04/14] SUNRPC: bound the local rpcbind client timeout to 1s</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-nfsd-nl-hang-v3-5-55026685c75d@kernel.org/">2026-08-28 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3 05/14] NFSD: report listener creation failures through extack</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-nfsd-nl-hang-v3-6-55026685c75d@kernel.org/">2026-08-28 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3 06/14] SUNRPC: report local rpcbind calls that get no answer</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-nfsd-nl-hang-v3-7-55026685c75d@kernel.org/">2026-08-28 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3 07/14] SUNRPC: stop svc_register() once rpcbind stops answering</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-nfsd-nl-hang-v3-8-55026685c75d@kernel.org/">2026-08-28 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3 08/14] SUNRPC: stop the svc_unregister() sweep once rpcbind stops answering</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-nfsd-nl-hang-v3-9-55026685c75d@kernel.org/">2026-08-28 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3 09/14] SUNRPC: stop unregistering listeners once rpcbind stops answering</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-nfsd-nl-hang-v3-10-55026685c75d@kernel.org/">2026-08-28 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3 10/14] NFSD: stop registering with rpcbind after a failure in listener_set</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-nfsd-nl-hang-v3-11-55026685c75d@kernel.org/">2026-08-28 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3 11/14] selftests/nfsd: exercise listener_set request validation</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-nfsd-nl-hang-v3-12-55026685c75d@kernel.org/">2026-08-28 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3 12/14] selftests/nfsd: add a per-netns rpcbind stub and the listener round-trips</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-nfsd-nl-hang-v3-13-55026685c75d@kernel.org/">2026-08-28 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3 13/14] selftests/nfsd: check that listener_set asks rpcbind once</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260828-nfsd-nl-hang-v3-14-55026685c75d@kernel.org/">2026-08-28 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH v3 14/14] selftests/nfsd: check that listener removal asks rpcbind once</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/c42d685f-18e7-4f38-8ce2-3d8e5402e9f1@app.fastmail.com/">2026-08-30 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH v3 06/14] SUNRPC: report local rpcbind calls that get no answer</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/f298080d9c8690d0313a3ef16f2fff2f9576aae4.camel@kernel.org/">2026-08-31 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH v3 06/14] SUNRPC: report local rpcbind calls that get no answer</a></li>
+</ul>
+  </main>
+</body>
+</html>

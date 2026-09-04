@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lever hardens cld and blocklayout rpc_pipefs waiters after KASAN</title>
+  <meta name="description" content="This week’s linux-nfs traffic on Farhad Alemi’s syzkaller report produced a bug-fix / hardening series, not a protocol change and not a new feature. Two days after Jeff Layton asked Alemi to retest 7.1-rc5 on a newer tree, Chuck Lever…">
+  <meta property="og:title" content="Lever hardens cld and blocklayout rpc_pipefs waiters after KASAN">
+  <meta property="og:description" content="This week’s linux-nfs traffic on Farhad Alemi’s syzkaller report produced a bug-fix / hardening series, not a protocol change and not a new feature. Two days after Jeff Layton asked Alemi to retest 7.1-rc5 on a newer tree, Chuck Lever…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-09-03T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Lever hardens cld and blocklayout rpc_pipefs waiters after KASAN">
+  <meta name="twitter:description" content="This week’s linux-nfs traffic on Farhad Alemi’s syzkaller report produced a bug-fix / hardening series, not a protocol change and not a new feature. Two days after Jeff Layton asked Alemi to retest 7.1-rc5 on a newer tree, Chuck Lever…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-09-03</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Lever hardens cld and blocklayout rpc_pipefs waiters after KASAN</h1>
+<h2>Summary</h2>
+<h1>Lever hardens cld and blocklayout rpc_pipefs waiters after KASAN</h1>
+<h2>Summary</h2>
+<p>This week’s linux-nfs traffic on Farhad Alemi’s syzkaller report produced a <strong>bug-fix / hardening series</strong>, not a protocol change and not a new feature. Two days after Jeff Layton asked Alemi to retest 7.1-rc5 on a newer tree, <a href="https://lore.kernel.org/linux-nfs/20260830-alemi-v1-0-463f80b9e9a8@kernel.org/">Chuck Lever posted</a> <code>[PATCH 0/5] Fix premature completion of rpc_pipefs upcalls</code> — a five-patch diagnosis of the KASAN vmalloc-out-of-bounds in <code>rpc_queue_upcall()</code>, plus two related cld holes he found while reading the downcall, plus a <strong>client-side pNFS blocklayout</strong> rewrite of the same waiter class. There are no replies in this thread in-window. The series is therefore an unreviewed v1, with Lever asking Alemi to close the loop.</p>
+<blockquote>
+<p>"Farhad, a run of your reproducer against this series would help."</p>
+</blockquote>
+<p>That matters to <strong>NFS client</strong> work more than the subject line suggests. Four in-tree consumers sit on <code>rpc_pipefs</code>. Lever’s cover letter draws the line explicitly: gss and idmap already keep <code>struct rpc_pipe_msg</code> in an object that outlives the waiter; cld and blocklayout do not. Patch 5 is the client patch. It is also the first on-list maintainer rewrite of <code>bl_resolve_deviceid()</code> after FAN YE’s lost-wakeup series treated <code>__cld_pipe_upcall()</code> as the <em>safe</em> waiter.</p>
+<h2>Prior week, in brief</h2>
+<p>Alemi of ASU’s SEFCOM lab mailed a syzkaller crash on Linux 7.1-rc5 whose subject already named the class: <code>[BUG] sunrpc: rpc_pipe_msg left queued on a stack frame (nfsd cld upcall)</code>. The splat was a KASAN vmalloc OOB in <code>__list_add_valid_or_report()</code> while NFSD was starting client tracking (<code>nfsd4_cld_grace_start</code> → <code>cld_pipe_upcall</code> → <code>rpc_queue_upcall</code>). Layton’s only in-thread reply, two days later, asked for a retest against Linus’ master or Lever’s <code>nfsd-testing</code> branch and did not identify a <code>Fixes:</code> candidate. Separately, FAN YE’s blocklayout v2 had replaced <code>bl_resolve_deviceid()</code>’s open-coded wait with a completion “the way <code>__cld_pipe_upcall()</code> waits,” and reset <code>bl_mount_reply</code> so a purged upcall could not return a stale device. Completions still do not make a stack <code>rpc_pipe_msg</code> safe if the waiter can return with the message linked. Lever’s series is the first posting that treats those two threads as the same bug class.</p>
+<h2>The diagnosis</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260830-alemi-v1-0-463f80b9e9a8@kernel.org/">Lever’s cover letter</a> restates Alemi’s crash as a matching-rule failure, not a generic unlink miss:</p>
+<blockquote>
+<p>"The cld downcall matches a reply to its upcall by xid alone. If a write arrives before nfsdcld has read the upcall, the waiter returns while its struct rpc_pipe_msg is still queued, and the pipe is left holding a list_head into a dead stack frame."</p>
+</blockquote>
+<p>The same pattern is on the client:</p>
+<blockquote>
+<p>"The blocklayout device upcall has the same bug, plus two of its own: the waiter can go to sleep after the reply has arrived, and a reply left over from a purged upcall is taken as a fresh one."</p>
+</blockquote>
+<p>He frames the series as hardening, not as an emergency, because the pipes are mode 0600:</p>
+<blockquote>
+<p>"rpc_pipefs pipes are mode 0600, so the writer is a daemon running as root. These patches guard against a broken or hostile daemon, which is unlikely. So consider the series as hardening rather than urgent."</p>
+</blockquote>
+<p>The gss and idmap consumers are the reference implementation:</p>
+<blockquote>
+<p>"The gss and idmap consumers keep their message in an object that lives as long as the upcall and do not have this problem. The cld and blocklayout fixes also complete only once the daemon has consumed the whole message, and keep the message somewhere that outlives the waiter."</p>
+</blockquote>
+<p>Reading <code>cld_pipe_downcall()</code> for that fix turned up two unrelated problems: a faulting <code>copy_from_user()</code> that strands the waiter (and hangs NFSD shutdown behind it), and an unchecked principal-hash length that reads past a stack array in <code>nfsd4_cld_check_v2()</code>. Those become patches 3 and 4. Base commit is <code>e3c3b1a8188b</code>; the change-id is <code>20260830-alemi-d9f420956e8d</code>. Net diff: 78 insertions, 41 deletions across <code>fs/nfsd/nfs4recover.c</code>, <code>fs/nfs/blocklayout/rpc_pipefs.c</code>, <code>fs/nfs/blocklayout/blocklayout.h</code>, and <code>fs/nfs/netns.h</code>.</p>
+<h2>Patch 1: do not complete a cld upcall the daemon has not read</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260830-alemi-v1-1-463f80b9e9a8@kernel.org/">Patch 1</a> is the direct fix for Alemi’s KASAN hit. <code>cld_pipe_downcall()</code> currently matches on xid alone, so a write that arrives before nfsdcld has read the upcall completes <code>__cld_pipe_upcall()</code> while <code>struct rpc_pipe_msg</code> is still queued. The waiter returns, its stack frame goes away, and the next <code>rpc_queue_upcall()</code> walks a <code>list_head</code> into dead vmalloc stack:</p>
+<blockquote>
+<p>"BUG: KASAN: vmalloc-out-of-bounds in __list_add_valid_or_report"</p>
+</blockquote>
+<p>The call chain in the splat is <code>rpc_queue_upcall</code> → <code>cld_pipe_upcall</code> → <code>nfsd4_cld_grace_start</code> → <code>nfsd4_cld_tracking_init</code>. Lever’s rule is: record whether the daemon has consumed the whole message, and complete only when it has. <code>cld_pipe_destroy_msg()</code> already runs on every path by which the pipe releases a message, so it can maintain that flag under <code>cn_lock</code>. The GraceStart record stream is the compatibility check:</p>
+<blockquote>
+<p>"nfsdcld sends its -EINPROGRESS downcalls only after reading the upcall, so the new check does not break the GraceStart record stream."</p>
+</blockquote>
+<p>Tagged <code>Fixes: f3f8014862d8 ("nfsd: add the infrastructure to handle the cld upcall")</code>, <code>Reported-by: Farhad Alemi</code>, and <code>Closes:</code> the original report.</p>
+<h2>Patch 2: get the cld message off the stack</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260830-alemi-v1-2-463f80b9e9a8@kernel.org/">Patch 2</a> is the lifetime half of the same bug. Completing only after the daemon has read the message is still not enough if the message itself lives in the waiter’s stack frame and the peer that drives those completion rules is userspace:</p>
+<blockquote>
+<p>"Only the completion rules keep that frame alive for as long as the pipe refers to it, and the peer that drives those rules is an untrusted userspace daemon. The gss and idmap upcalls do not take that on: each keeps the message in the object it already allocates."</p>
+</blockquote>
+<p>Lever puts <code>struct rpc_pipe_msg</code> in <code>struct cld_upcall</code>, beside the reply buffer it already carries. <code>cld_pipe_destroy_msg()</code> then reaches the upcall from the message directly rather than through <code>msg-&gt;data</code>. That is the same object-lifetime model the NFS <strong>client</strong> already uses for gssd and idmapd. No <code>Fixes:</code> tag; this is structural hardening on top of patch 1.</p>
+<h2>Patch 3: a faulting reply copy must still complete the waiter</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260830-alemi-v1-3-463f80b9e9a8@kernel.org/">Patch 3</a> is the first of the two holes Lever found while reading the downcall. <code>cld_pipe_downcall()</code> removes the matching upcall from <code>cn_list</code> <em>before</em> <code>copy_from_user()</code>. If that copy faults, the downcall returns <code>-EFAULT</code> without completing the upcall, and a retried write cannot find it because the xid is gone. The waiter is uninterruptible:</p>
+<blockquote>
+<p>"__cld_pipe_upcall() waits on cu_done uninterruptibly, so the nfsd thread that sent the upcall is stuck, and nfsd shutdown hangs behind it."</p>
+</blockquote>
+<p>The fix records the fault in the upcall’s pipe message and completes it, so the waiter returns the error to its client-tracking operation instead of hanging nfsd. Same <code>Fixes: f3f8014862d8</code> as patch 1. Client-visible impact is indirect: a wedged nfsd during <code>nfsdcld</code> misbehavior blocks reclaim and new mounts.</p>
+<h2>Patch 4: reject an oversized principal hash from nfsdcld</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260830-alemi-v1-4-463f80b9e9a8@kernel.org/">Patch 4</a> is a bounds check, not a pipefs lifetime fix. <code>__cld_pipe_inprogress_downcall()</code> takes the principal hash length from the daemon’s GraceStart downcall without checking it against the <code>cc_princhash</code> payload, which holds at most <code>SHA256_DIGEST_SIZE</code> bytes. The length is stored verbatim in the reclaim record. Later, <code>nfsd4_cld_check_v2()</code> hands it to <code>memcmp()</code> against a digest array of <code>SHA256_DIGEST_SIZE</code> on the stack:</p>
+<blockquote>
+<p>"A length up to U8_MAX reads past the end of that array, and the stray bytes can only make the comparison fail, denying the client its reclaim."</p>
+</blockquote>
+<p>That is a <strong>client-reclaim denial</strong>, not a crash: a hostile or broken nfsdcld can force every v2 reclaim to fail by overstating the hash length. Lever rejects a length larger than the wire field, matching the existing check on client-name length. Tagged <code>Fixes: 6ee95d1c8991 ("nfsd: add support for upcall version 2")</code>.</p>
+<h2>Patch 5: the NFS client fix — complete a blocklayout device upcall only on its own reply</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260830-alemi-v1-5-463f80b9e9a8@kernel.org/">Patch 5</a> is the important <strong>NFS client</strong> development in this thread. <code>bl_pipe_downcall()</code> currently wakes <code>bl_resolve_deviceid()</code> on any write of the right size, without checking that <code>blkmapd</code> has read the upcall being replied to. A write that arrives first returns the waiter while its stack <code>rpc_pipe_msg</code> is still queued — Alemi’s cld bug, on the pNFS blocklayout device-map pipe. Reaching that pipe takes root, so the trigger is a broken or hostile <code>blkmapd</code>.</p>
+<p>Lever lists two further client defects that FAN YE’s v2 had already named, and then goes further than a completion swap:</p>
+<blockquote>
+<p>"bl_resolve_deviceid() sets TASK_UNINTERRUPTIBLE only after rpc_queue_upcall() has made the message visible, so a reply that lands in between wakes a running task and the schedule() that follows sleeps forever holding bl_mutex. And nn-&gt;bl_mount_reply is never reset, so when the pipe purges an unread upcall the waiter takes the previous reply as its own."</p>
+</blockquote>
+<p>The rewrite:</p>
+<ul>
+<li>Moves the message into <code>struct nfs_net</code>, where <code>bl_mutex</code> already limits the pipe to one upcall per net namespace. That is the gss/idmap lifetime rule applied to blocklayout: the <code>rpc_pipe_msg</code> outlives the waiter.</li>
+<li>Accepts a reply only while <code>blkmapd</code> has read the whole message and no earlier reply has been taken; any other write is <code>-EINVAL</code>.</li>
+<li>Waits on a completion so the reply cannot slip past the sleep, and checks <code>msg-&gt;errno</code> before trusting it.</li>
+</ul>
+<blockquote>
+<p>"Move the message into struct nfs_net, where bl_mutex already limits the pipe to one upcall per net namespace. Accept a reply only while blkmapd has read the whole message and no earlier reply has been taken, and reject any other write with -EINVAL. Wait for that reply on a completion so it cannot slip past the sleep, and check msg-&gt;errno before trusting it."</p>
+</blockquote>
+<p>Tagged <code>Fixes: fe0a9b740881 ("pnfsblock: add device operations")</code> — the same origin commit FAN YE used. Relative to Ye’s v2, Lever’s patch is the superset: Ye closed the lost wakeup and the stale <code>bl_mount_reply</code>; Lever additionally refuses a downcall that does not belong to the current upcall, gets the message off the stack, and treats a hostile <code>blkmapd</code> as in-scope. Client-visible failures this closes are a kernel oops on the next <code>rpc_queue_upcall()</code>, a hang holding <code>bl_mutex</code> that serializes every later blocklayout device resolution, and a wrong device id after a purged upcall.</p>
+<h2>NFS client takeaway</h2>
+<p>The series is the first maintainer-level audit of the four <code>rpc_queue_upcall()</code> consumers against Alemi’s stack-queued <code>rpc_pipe_msg</code> class:</p>
+<ul>
+<li><strong>gss / idmap (client):</strong> already keep the message in a heap object that lives as long as the upcall. Lever cites them as the pattern. No change in this series.</li>
+<li><strong>cld (nfsd client tracking):</strong> xid-only matching plus a stack message. Patches 1–2 close the KASAN hole; patches 3–4 close a shutdown hang and a reclaim-denial bounds bug found on the same path.</li>
+<li><strong>pNFS blocklayout (client):</strong> same premature-completion bug, plus the lost-wakeup and stale-reply bugs Ye found. Patch 5 is the client fix, and it is a larger rewrite than Ye’s completion-only v2.</li>
+</ul>
+<p>This is not a wire-protocol change. <code>nfsdcld</code> and <code>blkmapd</code> still speak the same upcall/downcall messages. The new kernel-side rule is: do not complete, and do not trust a reply, until the daemon has consumed the whole upcall, and never let <code>rpc_pipe_msg</code> live on a stack frame whose waiter can return while the pipe still holds it.</p>
+<h2>Where things stand</h2>
+<ul>
+<li><strong>Kind of change:</strong> bug-fix / hardening series against SUNRPC <code>rpc_pipefs</code> waiters. Not a feature. Not a protocol change.</li>
+<li><strong>This week’s evolution:</strong> Alemi’s KASAN report and Layton’s retest request → Lever posts a five-patch v1 that names the matching-rule bug, moves both cld and blocklayout messages off the stack, and folds in two extra cld holes. No Reviewed-by, Acked-by, or tester reply landed on <em>this</em> thread before the week closed.</li>
+<li><strong>Client impact:</strong> pNFS blocklayout device resolution is the in-tree NFS client consumer being rewritten; gss and idmap are the reference; a hostile nfsdcld can still deny v2 reclaim via an oversized principal hash until patch 4 lands.</li>
+<li><strong>Open loop:</strong> Lever asked Alemi to rerun the reproducer against this series. Until that result, or a review, shows up, v1 is the on-list candidate and not yet merged from this thread.</li>
+</ul>
+<p>A later v2 of the same work appears as a separate thread later in the week; this v1 thread itself ends with Lever’s five patches and silence.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260830-alemi-v1-0-463f80b9e9a8@kernel.org/">2026-08-31 Chuck Lever — [PATCH 0/5] Fix premature completion of rpc_pipefs upcalls</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260830-alemi-v1-1-463f80b9e9a8@kernel.org/">2026-08-31 Chuck Lever — [PATCH 1/5] NFSD: Don't complete a cld upcall the daemon has not read</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260830-alemi-v1-2-463f80b9e9a8@kernel.org/">2026-08-31 Chuck Lever — [PATCH 2/5] NFSD: Move the cld upcall message out of the caller's stack frame</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260830-alemi-v1-3-463f80b9e9a8@kernel.org/">2026-08-31 Chuck Lever — [PATCH 3/5] NFSD: Complete a cld upcall when copying its reply fails</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260830-alemi-v1-4-463f80b9e9a8@kernel.org/">2026-08-31 Chuck Lever — [PATCH 4/5] NFSD: Reject an oversized principal hash from nfsdcld</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260830-alemi-v1-5-463f80b9e9a8@kernel.org/">2026-08-31 Chuck Lever — [PATCH 5/5] pnfs/blocklayout: Complete a device upcall only on its own reply</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260830-alemi-v1-0-463f80b9e9a8@kernel.org/">2026-08-31 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 0/5] Fix premature completion of rpc_pipefs upcalls</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260830-alemi-v1-1-463f80b9e9a8@kernel.org/">2026-08-31 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 1/5] NFSD: Don't complete a cld upcall the daemon has not read</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260830-alemi-v1-2-463f80b9e9a8@kernel.org/">2026-08-31 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 2/5] NFSD: Move the cld upcall message out of the caller's stack frame</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260830-alemi-v1-3-463f80b9e9a8@kernel.org/">2026-08-31 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 3/5] NFSD: Complete a cld upcall when copying its reply fails</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260830-alemi-v1-4-463f80b9e9a8@kernel.org/">2026-08-31 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 4/5] NFSD: Reject an oversized principal hash from nfsdcld</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260830-alemi-v1-5-463f80b9e9a8@kernel.org/">2026-08-31 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH 5/5] pnfs/blocklayout: Complete a device upcall only on its own reply</a></li>
+</ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nfsd: Accept backdated timestamps from delegation holders</title>
+  <meta name="description" content="Jeff Layton posted a targeted bug fix for NFSD&#39;s handling of delegated timestamps: when a client holding an attribute delegation reports a backdated atime or mtime at DELEGRETURN, the server currently discards the value and then stamps…">
+  <meta property="og:title" content="nfsd: Accept backdated timestamps from delegation holders">
+  <meta property="og:description" content="Jeff Layton posted a targeted bug fix for NFSD&#39;s handling of delegated timestamps: when a client holding an attribute delegation reports a backdated atime or mtime at DELEGRETURN, the server currently discards the value and then stamps…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-09-03T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="nfsd: Accept backdated timestamps from delegation holders">
+  <meta name="twitter:description" content="Jeff Layton posted a targeted bug fix for NFSD&#39;s handling of delegated timestamps: when a client holding an attribute delegation reports a backdated atime or mtime at DELEGRETURN, the server currently discards the value and then stamps…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-09-03</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>nfsd: Accept backdated timestamps from delegation holders</h1>
+<h2>Summary</h2>
+<h2>Summary</h2>
+<p>Jeff Layton posted a targeted <strong>bug fix</strong> for NFSD's handling of delegated timestamps: when a client holding an attribute delegation reports a backdated atime or mtime at <code>DELEGRETURN</code>, the server currently discards the value and then stamps c/mtime with "now," so tools that preserve timestamps (<code>cp -p</code>, <code>rsync -t</code>, <code>tar -x</code>) lose them. The patch treats the delegated client's <code>SETATTR</code> as authoritative. Chuck Lever immediately flagged a correctness hole in the ctime comparison, and Layton agreed to rework the logic in the VFS under consistent locking rather than land v1.</p>
+<p>This is a server-side change with a direct NFS <strong>client</strong> impact: it is the missing half of the delegated-timestamp story that lets Linux clients cache <code>utimensat()</code> locally instead of issuing an RPC for every timestamp rewrite.</p>
+<h2>The client-visible failure</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260901-delegts-v1-1-9937f7ee4370@kernel.org/">Layton's v1</a> describes a well-worn preservation path that currently fails against nfsd:</p>
+<blockquote>
+<p>"A client with an attribute delegation reports the file times in a SETATTR at DELEGRETURN. nfsd ignores a time that moves backwards. It then stamps the c/mtime with the current time, so the file keeps the DELEGRETURN time. cp -p, rsync -t and tar -x lose timestamps."</p>
+</blockquote>
+<p>The Linux NFS client is doing the right thing for a delegation holder. It applies an explicit <code>utimensat()</code> to its own inode and <strong>does not</strong> send a <code>SETATTR</code> while it still holds the delegation, so the backdated value reaches nfsd only as <code>TIME_DELEG_MODIFY</code> at return. The client <em>could</em> send an RPC for each time change, and that path already works, but it throws away the caching the delegation exists to provide.</p>
+<p>Layton's design argument is that the delegation makes the client the authority for those times, so nfsd should treat the report as a statement of fact. The same value would already be accepted without a check if the client sent an ordinary (non-delegated) <code>SETATTR</code>.</p>
+<p>The proposed rules:</p>
+<ul>
+<li>nfsd <strong>accepts</strong> a backwards atime or mtime from a delegation holder.</li>
+<li>An mtime that moves backwards sets the ctime to the current time. The ctime <strong>never</strong> moves backwards.</li>
+<li>nfsd still clamps a future time.</li>
+<li>The <code>CB_GETATTR</code> path keeps the old rule: a backwards time there is treated as a stale report, not as a SETATTR.</li>
+</ul>
+<p>The patch is tagged <code>Fixes: 3952f1cbcbc4 ("nfsd: fix SETATTR updates for delegated timestamps")</code>.</p>
+<h2>Client-side alternative, and why it was rejected</h2>
+<p>In the cover note, Layton considered fixing this purely on the client by always issuing an RPC for <code>utimensat()</code>:</p>
+<blockquote>
+<p>"We could fix this more correctly on the client by making it always issue an RPC for a utimensat(), but I think that would hurt untar-type workloads (which often backdate timestamps)."</p>
+</blockquote>
+<p>That is the important client-development trade-off this week. Earlier this year the Linux NFS client already had to punch a hole in delegated-timestamp caching for <strong>atime-only</strong> <code>utimensat()</code> (xfstest <code>generic/221</code>), because there is no protocol mechanism to update ctime from a delegated atime-only change. Expanding that "always RPC" policy to ordinary timestamp-preserving workloads would serialize <code>tar -x</code> / <code>rsync -t</code> / <code>cp -p</code> against the server for every file. Layton is choosing to keep the client cache-friendly and make the server honor the delegated report.</p>
+<p>One remaining semantic gap is acknowledged and left unfixed: nfsd cannot tell an explicit <code>utimensat()</code> from a report of a write. An mtime after the delegation grant and before "now" therefore sets ctime to that mtime instead of to the current time. RFC 9754 requires the "now" behavior; closing the gap would require the <strong>client</strong> to issue an RPC for the mtime. Layton is not taking that client hit for v1.</p>
+<h2>Protocol tension with RFC 9754</h2>
+<p>The commit message is explicit that this patch <strong>does not</strong> follow one sentence of RFC 9754 (the NFSv4.2 delegated-attribute spec), which says the server ignores a time before the original time. Layton argues that the same section also says the server MUST accept the change or MUST reject it with <code>NFS4ERR_DELAY</code>, and a silent discard does neither:</p>
+<blockquote>
+<p>"A retry after NFS4ERR_DELAY carries the same backdated value, so that option cannot succeed."</p>
+</blockquote>
+<p>In other words, the RFC's "ignore" rule is not a viable recovery path for a Linux client that is faithfully reporting a <code>utimensat()</code> it already applied locally. Accepting the backdated value is the option that actually interoperates.</p>
+<h2>Review: stale <code>dl_ctime</code> vs. multiple SETATTRs</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/d5af1492-5bc3-4ac8-b4e8-d454b7caafdf@app.fastmail.com/">Chuck Lever</a> treated an LLM-assisted review finding as a <strong>blocker</strong>. The new helper <code>nfsd4_vet_deleg_time()</code> compared the incoming ctime against <code>dp-&gt;dl_ctime</code>, which is sampled once when the delegation is granted in <code>nfs4_open_delegation()</code> and never refreshed:</p>
+<blockquote>
+<p>"Is dp-&gt;dl_ctime the right value to compare against here? It is sampled once, when the delegation is granted, and nothing refreshes it after that."</p>
+</blockquote>
+<p>He then asked the client-facing question that matters for attribute delegations: is there anything that stops a client from sending more than one <code>SETATTR</code> with <code>TIME_DELEG_MODIFY</code> while it still holds the delegation?</p>
+<p>His counter-example:</p>
+<ol>
+<li>First SETATTR carries mtime T5 later than grant-time <code>dl_ctime</code>. Vetting succeeds, <code>ATTR_CTIME_SET</code> stays set, inode ctime becomes T5.</li>
+<li>Second SETATTR backdates mtime to T3, where <code>dl_ctime &lt; T3 &lt; T5</code>. The comparison is still against the <strong>grant-time</strong> <code>dl_ctime</code>, so vetting succeeds again and T3 is carried into <code>ia_ctime</code>.</li>
+<li><code>notify_change()</code> → <code>setattr_copy()</code> → <code>inode_set_ctime_deleg()</code> then <strong>drops</strong> that update, because T3 is older than the T5 already in the inode.</li>
+</ol>
+<p>Result: mtime moves back to T3 and ctime stays at T5 — so ctime is neither carried from the mtime nor stamped with the current time. That contradicts both the comment in the patch and the commit message's claim that "An mtime that moves backwards sets the ctime to the current time."</p>
+<p>Lever's suggested fix: compare against the inode's <strong>current</strong> ctime (the inode is already in hand for the <code>current_time()</code> call at the top of <code>vet_deleg_attrs()</code>).</p>
+<h2>Conclusion this week: v1 withdrawn in favor of a VFS rework</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/6cf26aa1e2a4b92e94d425a014427d2fd8da1367.camel@kernel.org/">Layton agreed immediately</a>:</p>
+<blockquote>
+<p>"Yes, I think we do want to rework it to do that. Additionally, I noticed another race condition that we ought to fix while we're in here."</p>
+</blockquote>
+<blockquote>
+<p>"I'll be sending a v2, but I think we have to push some of this handling into the VFS layer so that it's done under more consistent locking and properly uses the mgtime infrastructure."</p>
+</blockquote>
+<p>v1 is therefore <strong>not</strong> landing. The discussion closed the same day it opened, with consensus that:</p>
+<ul>
+<li>The <strong>bug is real</strong> and client-visible (timestamp-preserving tools against a delegated NFS mount).</li>
+<li>The <strong>client should keep caching</strong> <code>utimensat()</code> under the attribute delegation; the server should accept the backdated report.</li>
+<li>The v1 nfsd-only helper is not sufficient: ctime vetting must track the live inode, not the grant-time snapshot, and the update must run under VFS locking / <code>mgtime</code> so a second delegated SETATTR cannot leave ctime stranded.</li>
+</ul>
+<p>A three-patch v2 (<code>[PATCH v2 0/3] fs/nfsd: accept a backdated timestamp from a delegation holder</code>) followed the next day as a separate thread, moving the stale-ctime stamp into <code>inode_set_ctime_deleg()</code> and comparing <code>CB_GETATTR</code> times against the inode. That series is out of scope for this v1 thread, but it is the direct continuation of the conclusion reached here.</p>
+<h2>Why this matters for NFS client development</h2>
+<p>Attribute delegations only pay off if the Linux client can apply local metadata updates — especially the backdated <code>utimensat()</code> storm from archive extraction — without a round trip per file. The current nfsd policy silently rewrites those times at <code>DELEGRETURN</code>, so a client that is correctly caching under <code>WRITE_ATTRS_DELEG</code> still fails userspace timestamp preservation. This week's v1 makes that failure explicit, rejects the "just RPC from the client" workaround as too expensive for untar-class workloads, and sets the requirement for the follow-on VFS change: honor the client's delegated times without breaking ctime monotonicity across multiple SETATTRs.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260901-delegts-v1-1-9937f7ee4370@kernel.org/">2026-09-01 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — [PATCH] nfsd: accept a backdated timestamp from a delegation holder</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/d5af1492-5bc3-4ac8-b4e8-d454b7caafdf@app.fastmail.com/">2026-09-01 "Chuck Lever" <a href="mailto:cel@kernel.org">cel@kernel.org</a> — Re: [PATCH] nfsd: accept a backdated timestamp from a delegation holder</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/6cf26aa1e2a4b92e94d425a014427d2fd8da1367.camel@kernel.org/">2026-09-01 Jeff Layton <a href="mailto:jlayton@kernel.org">jlayton@kernel.org</a> — Re: [PATCH] nfsd: accept a backdated timestamp from a delegation holder</a></li>
+</ul>
+  </main>
+</body>
+</html>

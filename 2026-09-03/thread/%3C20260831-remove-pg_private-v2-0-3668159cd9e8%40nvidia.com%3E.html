@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFS client rides along on v2 PG_private removal</title>
+  <meta name="description" content="Zi Yan posted PATCH v2 00/14 of a treewide MM series that deletes the PG_private page flag so the bit can be reused as upcoming PG_folio (PG_folio). Callers that used to test the flag now look at page/folio-&gt;private != NULL. This is…">
+  <meta property="og:title" content="NFS client rides along on v2 PG_private removal">
+  <meta property="og:description" content="Zi Yan posted PATCH v2 00/14 of a treewide MM series that deletes the PG_private page flag so the bit can be reused as upcoming PG_folio (PG_folio). Callers that used to test the flag now look at page/folio-&gt;private != NULL. This is…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-09-03T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NFS client rides along on v2 PG_private removal">
+  <meta name="twitter:description" content="Zi Yan posted PATCH v2 00/14 of a treewide MM series that deletes the PG_private page flag so the bit can be reused as upcoming PG_folio (PG_folio). Callers that used to test the flag now look at page/folio-&gt;private != NULL. This is…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-09-03</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>NFS client rides along on v2 PG_private removal</h1>
+<h2>Summary</h2>
+<p>Zi Yan posted <a href="https://lore.kernel.org/linux-nfs/20260831-remove-pg_private-v2-0-3668159cd9e8@nvidia.com/">PATCH v2 00/14</a> of a treewide MM series that deletes the <code>PG_private</code> page flag so the bit can be reused as upcoming <code>PG_folio</code> (<code>__PG_folio</code>). Callers that used to test the flag now look at <code>page</code>/<code>folio-&gt;private != NULL</code>. This is infrastructure work, not an NFS protocol change and not an NFS bug fix; the NFS client is an exceptional user whose writeback private data already lives in <code>folio-&gt;private</code> with its own refcount rules.</p>
+<p>The series is a follow-up to last month’s RFC. Yan kept the NFS diagnosis unchanged from v1:</p>
+<blockquote>
+<p>"fs/nfs/write.c: folio refcount maintenance is in a bigger scope than folio-&gt;private. So folio_attach/detach/get_private() is not used. Nothing to change."</p>
+</blockquote>
+<p>That is the important NFS-client point. Most filesystems can switch to <code>folio_attach/detach/change_private()</code> so the folio refcount rises and falls with <code>-&gt;private</code>. NFS does not: <code>nfs_page</code> (and related writeback state) is attached for a wider lifetime than a simple attach/detach pair, so the client continues to poke <code>folio-&gt;private</code> directly. The v2 NFS diffs are therefore mechanical cleanup, not a rewrite of dirty-page tracking.</p>
+<p>Two patches actually touch <code>fs/nfs</code> and are addressed to Trond Myklebust and Anna Schumaker:</p>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260831-remove-pg_private-v2-11-3668159cd9e8@nvidia.com/">PATCH v2 11/14</a> removes the now-noop <code>folio_set_private()</code> / <code>folio_clear_private()</code> helpers. <code>fs/nfs/write.c</code> loses two calls; Yan’s commit message is blunt: they “are no-ops now.” After <code>PG_private</code> itself is gone, those helpers no longer set a flag distinct from the pointer, so leaving them in the NFS writeback path would only obscure the real invariant (<code>folio-&gt;private</code> non-NULL means NFS private data is attached).</li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260831-remove-pg_private-v2-13-3668159cd9e8@nvidia.com/">PATCH v2 13/14</a> retargets comments that still named <code>PagePrivate</code> / <code>PG_private</code>. <code>fs/nfs/file.c</code> is a four-line comment tweak so the mmap/writeback notes talk about <code>page</code>/<code>folio-&gt;private</code> instead of the doomed flag.</li>
+</ul>
+<p>No other NFS files appear in the v2 diffstat (<code>file.c</code> +4/−, <code>write.c</code> −2). The treewide <code>PagePrivate()</code> → <code>page_private()</code> conversion does not need extra NFS call-site churn.</p>
+<p>Yan also introduces <code>folio_test_fs_private()</code> to mean “filesystem private data,” excluding swapcache (which overlays <code>swp_entry_t</code> on <code>-&gt;private</code>) and hugetlb (which stores its own flags there). v2 “converted more call sites” to that helper. NFS writeback should keep treating a non-NULL <code>folio-&gt;private</code> as <code>nfs_page</code> state; the new helper is the MM-side way to ask the same question without tripping over swap or hugetlb.</p>
+<p>v2’s other exceptional users (zsmalloc, perf AUX ring buffers, Xen grant-table, fscrypt bounce pages, erofs readahead/I/O counters, f2fs <code>PAGE_PRIVATE_NOT_POINTER</code>, hugetlb) are outside the NFS client. The NFS-relevant changelog items are the no-op helper removal and the comment retargeting; the rest of v2 tightens non-NFS conversions (open-coded zsmalloc checks, erofs I/O-counter bias so <code>folio-&gt;private</code> never goes NULL between attach and detach, and so on).</p>
+<p>Testing listed in the cover letter is allmodconfig, zsmalloc/erofs/fscrypt/f2fs workloads, and MM selftests. There is no NFS-specific test plan (no xfstests against an NFS mount, no writeback/unstable-page stress). That is a gap for client reviewers: NFS is called out as the filesystem that <em>cannot</em> use the standard attach/detach helpers, yet it is not in the test matrix.</p>
+<p>On 3 September the f2fs patchwork bot reported that Jaegeuk Kim applied [PATCH v2 06/14] (“f2fs: stop using PG_private”) to <code>jaegeuk/f2fs.git</code> (<code>dev</code>). That is subsystem uptake of the f2fs half, not an NFS ack. Nobody from linux-nfs replied in-window.</p>
+<p><strong>Bottom line for NFS client development:</strong> v2 still treats NFS writeback as a special case that already owns <code>folio-&gt;private</code> and its refcount, and it only deletes leftover <code>folio_set/clear_private()</code> calls plus <code>PagePrivate</code> comments. The series remains a page-flag reclamation for <code>PG_folio</code>, not an NFS bug fix. Client maintainers have not yet reviewed the two <code>fs/nfs</code> patches; until they do, the risk is comment/helper drift rather than a behavioral change in how <code>nfs_page</code> is stored on a folio.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260831-remove-pg_private-v2-0-3668159cd9e8@nvidia.com/">2026-08-31 Zi Yan <a href="mailto:ziy@nvidia.com">ziy@nvidia.com</a> — [PATCH v2 00/14] Remove PG_private by using page/folio-&gt;private checks instead</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260831-remove-pg_private-v2-13-3668159cd9e8@nvidia.com/">2026-08-31 Zi Yan <a href="mailto:ziy@nvidia.com">ziy@nvidia.com</a> — [PATCH v2 13/14] treewide: adjust comments on PagePrivate and PG_private</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260831-remove-pg_private-v2-11-3668159cd9e8@nvidia.com/">2026-08-31 Zi Yan <a href="mailto:ziy@nvidia.com">ziy@nvidia.com</a> — [PATCH v2 11/14] treewide: remove folio_set/clear_private()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/178845180715.3423963.14220073137991024856.git-patchwork-notify@kernel.org/">2026-09-03 patchwork-bot+f2fs@kernel.org — Re: [f2fs-dev] [PATCH v2 00/14] Remove PG_private by using page/folio-&gt;private checks instead</a></li>
+</ul>
+  </main>
+</body>
+</html>

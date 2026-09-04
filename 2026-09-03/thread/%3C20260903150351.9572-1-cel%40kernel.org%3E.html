@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>xdrgen gains pages and aggregate pragmas for v2/v3/ACL codecs</title>
+  <meta name="description" content="Chuck Lever posted a ten-patch new-feature series for the in-tree xdrgen code generator on 3 September, adding two specification-level directives that the forthcoming NFSv2, NFSv3, and NFS_ACL conversions need. This is not a protocol…">
+  <meta property="og:title" content="xdrgen gains pages and aggregate pragmas for v2/v3/ACL codecs">
+  <meta property="og:description" content="Chuck Lever posted a ten-patch new-feature series for the in-tree xdrgen code generator on 3 September, adding two specification-level directives that the forthcoming NFSv2, NFSv3, and NFS_ACL conversions need. This is not a protocol…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-09-03T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="xdrgen gains pages and aggregate pragmas for v2/v3/ACL codecs">
+  <meta name="twitter:description" content="Chuck Lever posted a ten-patch new-feature series for the in-tree xdrgen code generator on 3 September, adding two specification-level directives that the forthcoming NFSv2, NFSv3, and NFS_ACL conversions need. This is not a protocol…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-09-03</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>xdrgen gains pages and aggregate pragmas for v2/v3/ACL codecs</h1>
+<h2>Summary</h2>
+<h1>xdrgen gains pages and aggregate pragmas for v2/v3/ACL codecs</h1>
+<p>Chuck Lever posted a ten-patch <strong>new-feature</strong> series for the in-tree <code>xdrgen</code> code generator on 3 September, adding two specification-level directives that the forthcoming NFSv2, NFSv3, and NFS_ACL conversions need. This is not a protocol change and not a runtime bug fix: no in-tree <code>.x</code> file applies either directive yet, so generated codecs stay byte-identical. There were no replies in-window.</p>
+<h2>Why the tool had to grow</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260903150351.9572-1-cel@kernel.org/">The cover letter</a> names the two XDR shapes that still force hand-rolled codecs, and that therefore block converting the remaining NFS programs:</p>
+<blockquote>
+<p>"The first is a payload that resides in the Linux page cache. Currently the generated codec for a variable-length opaque copies through a data pointer, but a READ result already sits in the pages of rq_res and a WRITE payload arrives in the pages of the Receive buffer. Marshaling and unmarshaling this type of payload needs to avoid copying the payload's content."</p>
+</blockquote>
+<blockquote>
+<p>"The second is an array of non-scalar objects. Examples include the NFS_ACL aclent&lt;&gt; list, which is the on-the-wire form of the kernel's posix_acl, and the READDIR entry list, which is produced from a VFS iteration."</p>
+</blockquote>
+<p>Those two cases are exactly the ones a Linux NFS <strong>client</strong> also has to get right: <code>nfs.ko</code> already stages READ/WRITE through the page cache and already shares <code>fs/nfs_common/nfsacl.c</code> with the server. The series is server-shaped in its helpers (<code>svcxdr_*</code>), but the generator changes are the prerequisite for converting both sides of NFSv2/v3 and the shared ACL codec off hand-rolled XDR.</p>
+<p>The series is 23 files, +1043/−43, concentrated in <code>tools/net/sunrpc/xdrgen/</code> plus a thin SUNRPC runtime layer. Lever’s operational guarantee:</p>
+<blockquote>
+<p>"No in-tree XDR specification applies either directive yet, so the generated output remains unchanged across the whole series."</p>
+</blockquote>
+<h2>Runtime plumbing: a codec context on <code>xdr_stream</code></h2>
+<p>Generated functions take only an <code>xdr_stream</code>. Extra state as extra arguments would make every generated signature depend on a whole-spec analysis. <a href="https://lore.kernel.org/linux-nfs/20260903150351.9572-2-cel@kernel.org/">Patch 01/10</a> therefore adds <code>xdrgen_ctx</code> to <code>struct xdr_stream</code>, following <code>seq_file-&gt;private</code> and <code>netlink_callback-&gt;data</code>. Every initializer clears it, including the NFSv4 server encoder in <code>fs/nfsd/nfs4xdr.c</code> and the client-side paths in <code>net/sunrpc/xdr.c</code>, so a stack-allocated or recycled stream cannot leak a stale pointer.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260903150351.9572-3-cel@kernel.org/">Patch 02/10</a> then binds the server transaction into that slot from <code>svcxdr_init_decode()</code> / <code>svcxdr_init_encode()</code>, recovered through <code>svcxdr_rqst()</code> rather than an open-coded <code>void *</code> cast:</p>
+<blockquote>
+<p>"A client stream already records its transaction in the rqst field; a server stream records nothing, so each generated codec that needs the svc_rqst would have to store it in xdrgen_ctx itself, and every such site would decide on its own what the pointer means."</p>
+</blockquote>
+<p>The guarantee is scoped: other initializers leave <code>xdrgen_ctx</code> NULL, <code>svcxdr_rqst()</code> returns NULL there, and a codec that needs the <code>svc_rqst</code> has to name those two entry points in its <code>Context:</code> line. That is the client-relevant design choice: the shared <code>xdr_stream</code> grows a generic private pointer, but the server-only <code>svc_rqst</code> binding is not smuggled into client encode/decode.</p>
+<h2><code>pragma pages</code>: encode and decode bulk payloads by reference</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260903150351.9572-4-cel@kernel.org/">Patch 03/10</a> adds <code>svcxdr_encode_opaque_payload()</code>. Generated encoders currently call <code>xdr_stream_encode_opaque()</code>, which copies. On the server an NFS READ payload is already in <code>rqstp-&gt;rq_res</code> pages from the filesystem read:</p>
+<blockquote>
+<p>"Copying that payload into the RPC Reply buffer adds a data copy on every READ and prevents a transport capable of direct data placement from conveying the payload separately from the rest of the Reply."</p>
+</blockquote>
+<p>The helper encodes the length, splices the payload pages into the stream, and marks the byte range as a result payload. Parameters are only the stream and the length; the <code>svc_rqst</code> comes back through <code>svcxdr_rqst()</code>.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260903150351.9572-5-cel@kernel.org/">Patch 04/10</a> is the generator prerequisite: member encoder/decoder emitters, including the self-referential <code>_XdrPointer</code> path in <code>pointer.py</code>, now receive the containing struct name so a later directive can key on the <code>(struct, member)</code> pair. Output is still byte-identical.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260903150351.9572-6-cel@kernel.org/">Patch 05/10</a> introduces <code>pragma pages</code>. A marked variable-length opaque or string member emits <code>svcxdr_encode_opaque_payload()</code> instead of the copying encoder. The front end refuses a directive that names an undeclared type or member, a member that cannot carry a payload, or a second marked member of the same type:</p>
+<blockquote>
+<p>"svcxdr_encode_opaque_payload() consumes the whole page vector and moves the stream into the tail, so one encoder carries at most one payload."</p>
+</blockquote>
+<blockquote>
+<p>"A directive that binds to nothing would degrade silently to the copying encoder, so the front end rejects one…"</p>
+</blockquote>
+<p>That last rule is the anti-bug-fix: a typo in a <code>.x</code> file must not quietly reintroduce the copy the conversion is trying to delete.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260903150351.9572-7-cel@kernel.org/">Patch 06/10</a> is the decode-side counterpart, <code>svcxdr_decode_opaque_payload()</code>, for a WRITE-class argument that already sits in Receive-buffer pages. <a href="https://lore.kernel.org/linux-nfs/20260903150351.9572-8-cel@kernel.org/">Patch 07/10</a> lets the same <code>pragma pages</code> drive that decoder when the containing type is reachable from an RPC procedure argument. Reachability is closed over nested aggregates and typedef aliases before directives are checked. A decoded page-resident member is a <code>struct xdr_buf</code> so later stages can hand the payload to the VFS without a copy. A marked union arm of an argument type is rejected because the union generator still only emits the copying decoder.</p>
+<p>For the Linux NFS <strong>client</strong>, this is the missing piece for generated NFSv2/v3 READ/WRITE codecs: the server helpers are <code>svcxdr_*</code>, but the generator contract (one page-resident opaque per type, <code>xdr_buf</code> on decode, no silent fallback) is what a later client conversion would reuse rather than inventing a second copy-avoidance story.</p>
+<h2><code>pragma aggregate</code>: hook-driven arrays and optional-data lists</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260903150351.9572-9-cel@kernel.org/">Patch 08/10</a> attacks the other remaining hand-rolled island. A generated variable-length array currently materializes a C array and walks it. That is wasted traffic when the in-kernel object is not that array. Lever’s canonical example is shared client/server code:</p>
+<blockquote>
+<p>"The NFS_ACLv2 secattr aclent&lt;&gt; list is one such case: it is a Solaris wire form of the kernel's posix_acl. The hand-rolled codec that performs that transform forces its containing types to keep external linkage (pragma public), and that linkage collides at link time with the same generated types in a sibling program."</p>
+</blockquote>
+<p><code>pragma aggregate &lt;struct&gt; &lt;member&gt;</code> makes the generated codec own only the wire framing and call hand-written begin/item/end hooks, one element at a time. Interior codec signatures do not change. The loop is modelled on <code>xdr_encode_array2()</code> — “whose only remaining user is <code>fs/nfs_common/nfsacl.c</code>” — and on seq_file’s start/show/stop. Unlike those APIs, the consumer is known at generation time, so hooks bind by name at link time the way ASN.1 compiler actions do:</p>
+<blockquote>
+<p>"A missing hook is a link error, the emitted prototypes enforce the element type, and no indirect call is added per element."</p>
+</blockquote>
+<p>Item hooks return only success or failure, with no early “no more elements” return, so the same contract can later frame RFC 4506 optional-data lists. A bad marker is reported against its own source position rather than silently falling back to the array-walking codec.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260903150351.9572-10-cel@kernel.org/">Patch 09/10</a> extends that to optional-data (<code>type *name</code>) list members, the NFSv2 READDIR entry list being the example. There is no count on the wire; the loop uses value-follows framing, calling the element encoder once per entry and once more with NULL for the terminator. The generated decoder is linkage-only:</p>
+<blockquote>
+<p>"Decoding a value-follows list needs a presence-reporting element decoder, which this change does not add. NFSv2 READDIR only encodes its entry list, so the decode path is never exercised."</p>
+</blockquote>
+<p>That encode-only READDIR path is a <strong>server</strong> fact. A client still has to <em>decode</em> READDIR replies, so this series does not yet give <code>nfs.ko</code> a generated READDIR decoder; it unblocks the NFSD conversion and leaves a presence-reporting decoder as future generator work.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260903150351.9572-11-cel@kernel.org/">Patch 10/10</a> then stops requiring the begin hook to know the element count up front. The v9 optional-data encoder looped <code>cursor.count</code> times, which would force a streaming producer to materialize the whole list:</p>
+<blockquote>
+<p>"A producer that reads its elements while the reply is encoded -- NFSv2 READDIR streaming directory entries straight into the send buffer -- does not know that count in advance, and would have to materialize the whole list just to satisfy the loop bound."</p>
+</blockquote>
+<p>Because an optional-data list carries no count on the wire, the encoder is now driven from the item hook: a false return ends the list and the framing writes the terminator. The counted-array form and its hook contract are unchanged.</p>
+<h2>Client development and what this is not</h2>
+<ul>
+<li><strong>Type of change:</strong> generator <strong>feature</strong> plus a small SUNRPC runtime API (<code>xdrgen_ctx</code>, <code>svcxdr_rqst()</code>, <code>svcxdr_{en,de}code_opaque_payload()</code>). Not a wire-protocol change. Not a <code>Fixes:</code> candidate.</li>
+<li><strong>No behavioral change this week.</strong> Until an <code>.x</code> file uses <code>pragma pages</code> or <code>pragma aggregate</code>, every existing generated codec is identical. The README grows 136 lines documenting the new directives.</li>
+<li><strong>Linux <code>nfs.ko</code> is not converted here.</strong> Shared <code>struct xdr_stream</code> gains a cleared private pointer; client initializers already had a <code>rqst</code> field and are not rebound through <code>svcxdr_rqst()</code>. The important client-facing payoff is later: generated NFSv2/v3 READ/WRITE can avoid payload copies, and the shared <code>nfsacl.c</code> transform can drop <code>pragma public</code> (and the <code>xdr_encode_array2()</code> leftover) without colliding with a sibling program’s generated types.</li>
+<li><strong>READDIR decode is still a gap for the client.</strong> Optional-data aggregate encode can now stream; optional-data aggregate decode is a stub. NFSD READDIR only encodes, so that is enough for the server conversion Lever is staging. A client READDIR conversion still needs a presence-reporting element decoder that this series explicitly does not add.</li>
+<li><strong>Zero-copy / DDP.</strong> The pages helpers exist so a DDP-capable transport can keep the bulk payload out of the RPC header copy. That matters equally to a client WRITE and a server READ; only the server helpers are written so far.</li>
+</ul>
+<h2>Conclusions</h2>
+<p>The discussion is a v1 posting with no review yet. Lever’s design is conservative in the ways that matter for a code generator sitting under both NFS client and server:</p>
+<ol>
+<li>Directives that do not bind fail at parse time, never by silently emitting the old copying or array-walking codec.</li>
+<li>One page-resident payload per encoder, because the helper consumes the whole page vector.</li>
+<li>Aggregate hooks are link-time named functions, not a per-element ops vtable, so a missing NFS_ACL or READDIR hook is a build break rather than a NULL deref.</li>
+<li>Generated output is unchanged until the NFSv2/v3/NFS_ACL specs actually apply the pragmas.</li>
+</ol>
+<p>Watch for review of the <code>svcxdr_*</code> helpers and of the optional-data decoder stub, and for the follow-up series that first uses <code>pragma pages</code> on READ/WRITE and <code>pragma aggregate</code> on <code>aclent&lt;&gt;</code> / READDIR. Those are the patches that will start deleting hand-rolled codecs on the server and, later, on the client.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260903150351.9572-1-cel@kernel.org/">2026-09-03 Chuck Lever — [PATCH v1 00/10] New pragmas for the xdrgen tool</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260903150351.9572-2-cel@kernel.org/">2026-09-03 Chuck Lever — [PATCH v1 01/10] SUNRPC: Carry a generated-codec context pointer in struct xdr_stream</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260903150351.9572-3-cel@kernel.org/">2026-09-03 Chuck Lever — [PATCH v1 02/10] SUNRPC: Bind the svc_rqst to its XDR streams</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260903150351.9572-4-cel@kernel.org/">2026-09-03 Chuck Lever — [PATCH v1 03/10] SUNRPC: Add svcxdr_encode_opaque_payload()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260903150351.9572-5-cel@kernel.org/">2026-09-03 Chuck Lever — [PATCH v1 04/10] xdrgen: Pass the containing struct name to member codec emitters</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260903150351.9572-6-cel@kernel.org/">2026-09-03 Chuck Lever — [PATCH v1 05/10] xdrgen: Add a "pragma pages" directive</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260903150351.9572-7-cel@kernel.org/">2026-09-03 Chuck Lever — [PATCH v1 06/10] SUNRPC: Add svcxdr_decode_opaque_payload()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260903150351.9572-8-cel@kernel.org/">2026-09-03 Chuck Lever — [PATCH v1 07/10] xdrgen: Extend the pages directive to page-resident arguments</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260903150351.9572-9-cel@kernel.org/">2026-09-03 Chuck Lever — [PATCH v1 08/10] xdrgen: Add hook-driven aggregate codec for variable-length arrays</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260903150351.9572-10-cel@kernel.org/">2026-09-03 Chuck Lever — [PATCH v1 09/10] xdrgen: Extend the aggregate codec to optional-data list members</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260903150351.9572-11-cel@kernel.org/">2026-09-03 Chuck Lever — [PATCH v1 10/10] xdrgen: Stream optional-data aggregate lists during encode</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260903150351.9572-1-cel@kernel.org/">2026-09-03 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v1 00/10] New pragmas for the xdrgen tool</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260903150351.9572-3-cel@kernel.org/">2026-09-03 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v1 02/10] SUNRPC: Bind the svc_rqst to its XDR streams</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260903150351.9572-2-cel@kernel.org/">2026-09-03 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v1 01/10] SUNRPC: Carry a generated-codec context pointer in struct xdr_stream</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260903150351.9572-4-cel@kernel.org/">2026-09-03 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v1 03/10] SUNRPC: Add svcxdr_encode_opaque_payload()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260903150351.9572-5-cel@kernel.org/">2026-09-03 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v1 04/10] xdrgen: Pass the containing struct name to member codec emitters</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260903150351.9572-7-cel@kernel.org/">2026-09-03 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v1 06/10] SUNRPC: Add svcxdr_decode_opaque_payload()</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260903150351.9572-6-cel@kernel.org/">2026-09-03 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v1 05/10] xdrgen: Add a "pragma pages" directive</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260903150351.9572-8-cel@kernel.org/">2026-09-03 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v1 07/10] xdrgen: Extend the pages directive to page-resident arguments</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260903150351.9572-9-cel@kernel.org/">2026-09-03 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v1 08/10] xdrgen: Add hook-driven aggregate codec for variable-length arrays</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260903150351.9572-10-cel@kernel.org/">2026-09-03 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v1 09/10] xdrgen: Extend the aggregate codec to optional-data list members</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260903150351.9572-11-cel@kernel.org/">2026-09-03 Chuck Lever <a href="mailto:cel@kernel.org">cel@kernel.org</a> — [PATCH v1 10/10] xdrgen: Stream optional-data aggregate lists during encode</a></li>
+</ul>
+  </main>
+</body>
+</html>

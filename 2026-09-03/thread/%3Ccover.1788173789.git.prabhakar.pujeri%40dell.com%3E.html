@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Dell expands pNFS XDR hardening to leaks, version counts, and LAYOUTGET</title>
+  <meta name="description" content="This is an NFS client bug-fix / XDR-hardening series, not a protocol change and not a new pNFS layout feature. On 31 August, Prabhakar Pujeri of Dell posted [PATCH v2 0/7] NFS: harden pNFS XDR decoding, expanding last week&#39;s four-patch…">
+  <meta property="og:title" content="Dell expands pNFS XDR hardening to leaks, version counts, and LAYOUTGET">
+  <meta property="og:description" content="This is an NFS client bug-fix / XDR-hardening series, not a protocol change and not a new pNFS layout feature. On 31 August, Prabhakar Pujeri of Dell posted [PATCH v2 0/7] NFS: harden pNFS XDR decoding, expanding last week&#39;s four-patch…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-09-03T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Dell expands pNFS XDR hardening to leaks, version counts, and LAYOUTGET">
+  <meta name="twitter:description" content="This is an NFS client bug-fix / XDR-hardening series, not a protocol change and not a new pNFS layout feature. On 31 August, Prabhakar Pujeri of Dell posted [PATCH v2 0/7] NFS: harden pNFS XDR decoding, expanding last week&#39;s four-patch…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-09-03</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>Dell expands pNFS XDR hardening to leaks, version counts, and LAYOUTGET</h1>
+<h2>Summary</h2>
+<p>This is an NFS <strong>client bug-fix / XDR-hardening</strong> series, not a protocol change and not a new pNFS layout feature. On 31 August, <a href="https://lore.kernel.org/linux-nfs/cover.1788173789.git.prabhakar.pujeri@dell.com/">Prabhakar Pujeri</a> of Dell posted <strong>[PATCH v2 0/7] NFS: harden pNFS XDR decoding</strong>, expanding last week's four-patch GETDEVICEINFO address-decoder work into a seven-patch series that also plugs netid leaks and bounds flexfiles version and filehandle counts. There were <strong>no replies this window</strong>; the patches remain unreviewed.</p>
+<p>The threat model is now broader than malformed ports and unbounded multipath loops. Pujeri's cover letter states:</p>
+<blockquote>
+<p>"pNFS device and layout replies contain several counts and strings supplied by the server. The current decoders trust some of those values before the reply has proved that the corresponding XDR objects are present. A broken or malicious server can therefore provoke oversized allocations, very long decode loops, malformed data-server ports, or leaked netid strings on temporary-address cleanup paths."</p>
+</blockquote>
+<p>The series "makes those paths proportional to the received XDR length" and "validates both decimal port octets and uses the common data-server address destructor wherever a temporary address is discarded." All six functional patches carry <code>Fixes:</code> tags and <code>Cc: stable@vger.kernel.org</code>.</p>
+<h2>From last week's v1 to this v2</h2>
+<p>Last week Pujeri posted a four-patch series, "[PATCH 0/4] NFS: harden pNFS device address decoding," based on linux-next commit <code>10f307e525a1</code>. That v1 validated port octets, bounded file-layout and flexfiles multipath loops by remaining XDR, and added KUnit coverage (16 address cases, 3 flexfiles cases). It drew no review.</p>
+<p>v2 rebases onto <strong>v7.3-rc1</strong> (<code>cee9395acd8043be0644b25c34bfa86623f2b935</code>) and adds three new functional patches plus expanded tests. The cover letter lists the delta:</p>
+<blockquote>
+<p>"- rebase from the NFS client linux-next integration commit 10f307e525a1 to v7.3-rc1</p>
+<ul>
+<li>free da_netid on file-layout and flexfiles temporary-address paths</li>
+<li>bound flexfiles GETDEVICEINFO version_count before allocation</li>
+<li>bound flexfiles LAYOUTGET fh_count before allocation</li>
+<li>expand flexfiles KUnit coverage from three to six cases, including the cache-hit and malformed-version cleanup paths</li>
+<li>rename the test patch to reflect the broader XDR coverage"</li>
+</ul>
+</blockquote>
+<p>The test patch is now titled "add KUnit coverage for pNFS <strong>XDR</strong> decoding" rather than "address decoding," matching the wider decoder surface.</p>
+<h2>Patch 1: netid leak on temporary DS-address cleanup</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/89bb918bcf3e010d43bb2884a44a6afbc91a8ddb.1788173789.git.prabhakar.pujeri@dell.com/">Patch 1</a> is new in v2 and is a <strong>client memory-leak fix</strong> on the pNFS data-server address path. <code>nfs4_decode_mp_ds_addr()</code> transfers its <code>r_netid</code> allocation into <code>da_netid</code>. The generic destructor <code>nfs4_pnfs_ds_addr_free()</code> already releases that field, but the file-layout and flexfiles drivers open-coded disposal of <em>temporary</em> address objects and omitted it.</p>
+<blockquote>
+<p>"Cache hits and later decode failures therefore leak one netid string per discarded address."</p>
+</blockquote>
+<p>The fix exports <code>nfs4_pnfs_ds_addr_free()</code> to the layout modules (<code>fs/nfs/pnfs.h</code>) and uses it for every temporary address list in <code>filelayoutdev.c</code> and <code>flexfilelayoutdev.c</code>. <code>Fixes: 4be78d26810b ("NFSv4/pNFS: Store the transport type in struct nfs4_pnfs_ds_addr")</code>. This is the kind of leak that only shows up on cache-hit and decode-failure paths — exactly the cases the expanded KUnit suite now drives.</p>
+<h2>Patches 2 and 3: bound flexfiles version and filehandle counts before allocation</h2>
+<p>These two are the other v2 additions, both targeting <strong>oversized allocations from short replies</strong>.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/902b77d318450d18ae422a9aef7f54711826c043.1788173789.git.prabhakar.pujeri@dell.com/">Patch 2</a> hits the flexfiles <code>GETDEVICEINFO</code> decoder. It currently allocates <code>ds_versions</code> from a server-provided count <em>before</em> proving that the corresponding fixed-size XDR tuples are present.</p>
+<blockquote>
+<p>"A large count can therefore provoke an oversized allocation from a short reply."</p>
+</blockquote>
+<p>Each version tuple is five XDR words. The patch bounds the count by bytes remaining in the stream before allocating the array, and uses the same expression when decoding each tuple. <code>Fixes: d67ae825a59d ("pnfs/flexfiles: Add the FlexFile Layout Driver")</code>.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/e00ed21d7f259b6b609d004c32fb42e02c45906b.1788173789.git.prabhakar.pujeri@dell.com/">Patch 3</a> applies the same idea to flexfiles <strong>LAYOUTGET</strong>. <code>ff_layout_alloc_lseg()</code> allocates a filehandle-version array from the server-provided <code>fh_count</code> before checking that the layout body can contain that many filehandles.</p>
+<blockquote>
+<p>"Even an empty XDR opaque value consumes a length word. Bound fh_count by the number of length words remaining in the stream before allocating the array."</p>
+</blockquote>
+<p>Same <code>Fixes:</code> as patch 2 — this is original flexfiles-driver fallout, now treated as a stable-bound client robustness bug. Together, patches 2 and 3 close the "trust the count, then allocate" pattern on both the device-info and layout-get sides of flexfiles.</p>
+<h2>Patch 4: stop trusting sscanf() on data-server port octets</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/5bf0470b45d43c93515dffb286adb9e51db557eb.1788173789.git.prabhakar.pujeri@dell.com/">Patch 4</a> is v1's port-octet rewrite, carried forward. <code>nfs4_decode_mp_ds_addr()</code> parsed the two decimal port octets of a server-provided universal address with an unchecked <code>sscanf()</code>. A missing or non-numeric field left part of a temporary array uninitialized; values outside the octet range were silently folded into the resulting port.</p>
+<p>The replacement splits the two port fields at their delimiters and parses each with <code>kstrtou8()</code>:</p>
+<blockquote>
+<p>"This rejects missing fields, trailing garbage, integer overflow, and values outside 0 through 255 before constructing the data server socket address."</p>
+</blockquote>
+<p><code>Fixes: 6b7f3cf96364 ("nfs41: pull decode_ds_addr from file layout to generic pnfs")</code>. Because this is the generic pNFS helper, both file layout and flexfiles inherit the stricter parse.</p>
+<h2>Patches 5 and 6: bound multipath loops by remaining XDR, not U32_MAX</h2>
+<p>These are v1's most serious client bugs, restated unchanged.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/ffec82e3540ae23d46486ef9c7f50ea05d4b49db.1788173789.git.prabhakar.pujeri@dell.com/">Patch 5</a> hits file layout (<code>nfs4_fl_alloc_deviceid_node()</code>). That function already bounds the number of data-server <strong>multipath lists</strong>, but not the number of addresses <strong>inside</strong> each list. The inner count is server-supplied and can be <code>U32_MAX</code>. Once the XDR stream is exhausted, <code>nfs4_decode_mp_ds_addr()</code> returns <code>NULL</code> <strong>without consuming input</strong>.</p>
+<blockquote>
+<p>"The enclosing loop can therefore spin for billions of iterations in kernel context when decoding a malicious GETDEVICEINFO response."</p>
+</blockquote>
+<p>The chosen bound is not an arbitrary protocol cap. A <code>netaddr4</code> needs at least the two XDR length words for its netid and universal-address strings. The decoder now rejects a count that cannot fit that minimum representation in the remaining stream, so the loop is proportional to reply length. The existing file-layout multipath-<strong>list</strong> limit stays, because it is tied to the <code>u8</code> stripe-index representation. A helper is added in <code>fs/nfs/pnfs.h</code> so flexfiles can reuse the same check. <code>Fixes: 14f9a6076f53 ("NFS: Parse and store all multipath DS addresses")</code>.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/517ac6d5c035a9486b7aa39e85ee6f0d1eb80284.1788173789.git.prabhakar.pujeri@dell.com/">Patch 6</a> applies the same remaining-XDR bound to flexfiles (<code>nfs4_ff_alloc_deviceid_node()</code>), which previously did not validate the multipath address count at all.</p>
+<blockquote>
+<p>"This makes the loop bound proportional to the reply length without imposing an arbitrary protocol limit, matching the protection in the file-layout decoder."</p>
+</blockquote>
+<p><code>Fixes: d67ae825a59d ("pnfs/flexfiles: Add the FlexFile Layout Driver")</code>.</p>
+<h2>Patch 7: KUnit for address, GETDEVICEINFO, and LAYOUTGET</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/c3eac5239a6555b88e7d4bdb4daaa45c75c4b567.1788173789.git.prabhakar.pujeri@dell.com/">Patch 7</a> is the test investment that makes the first six patches reviewable without a pNFS MDS. It adds page-backed tests for <code>nfs4_decode_mp_ds_addr()</code> covering valid IPv4 and IPv6 universal addresses, boundary port values, missing fields, non-numeric fields, out-of-range values, integer overflow, and trailing garbage (<code>fs/nfs/tests/pnfs_decode_kunit.c</code>).</p>
+<p>The flexfiles suite (<code>fs/nfs/flexfilelayout/tests/deviceid_kunit.c</code>) grows from three cases to six:</p>
+<blockquote>
+<p>"Exercise the flexfiles GETDEVICEINFO decoder with valid device data, cache reuse, and zero or oversized multipath and version counts. Exercise the LAYOUTGET decoder with an oversized filehandle-version count. The cache-reuse and malformed-version cases also drive both temporary-address cleanup paths."</p>
+</blockquote>
+<p>That last sentence is the client-development point: the new leak fix and the version/fh_count bounds are not just described — the tests force the temporary-address destructor and the allocation-before-decode failure paths. Flexfiles decoder helpers are exported only when KUnit is enabled. Both suites sit behind guideline-compliant Kconfig entries that default with <code>KUNIT_ALL_TESTS</code>.</p>
+<h2>Validation and where things stand</h2>
+<p>Pujeri reports:</p>
+<ul>
+<li><code>nfs_pnfs_decode</code> KUnit suite: 16/16 passed</li>
+<li><code>nfs_flexfile_deviceid</code> KUnit suite: 6/6 passed (up from 3/3 in v1)</li>
+<li>GCC 16 and Clang 22 <code>W=1</code> builds of <code>fs/nfs/</code> with no NFS diagnostics</li>
+<li>Sparse <code>C=2</code> on every touched C source: clean</li>
+<li>GCC 16 <code>W=1</code> full kernel and modules build: passed</li>
+<li>per-patch checkpatch: no errors; patch 7 reports only the generic <code>FILE_PATH_CHANGES</code> warning for the new test files</li>
+</ul>
+<p>Unlike v1, this cover letter does not restate the "no pNFS-capable server" caveat, but the evidence is still the in-tree KUnit suites rather than a live MDS/DS topology.</p>
+<p><strong>Status this week:</strong> posted 31 August against v7.3-rc1; <strong>no Acked-by, Reviewed-by, or maintainer comment</strong>. Unmerged as of week-end. Until this lands, a broken or malicious pNFS server can still feed the client unbounded multipath/version/filehandle counts, an unchecked port parse, and leaked <code>da_netid</code> strings on cache-hit and decode-failure cleanup.</p>
+<ul>
+<li><strong>Kind of change:</strong> NFS <strong>client</strong> bug fix / XDR hardening. No protocol change.</li>
+<li><strong>Scope:</strong> generic <code>nfs4_decode_mp_ds_addr()</code> and <code>nfs4_pnfs_ds_addr_free()</code>, file-layout <code>GETDEVICEINFO</code>, flexfiles <code>GETDEVICEINFO</code> and <code>LAYOUTGET</code>, plus two KUnit modules.</li>
+<li><strong>Stable intent:</strong> all six functional patches are <code>Cc: stable</code> with <code>Fixes:</code> back to the original decoder, the multipath-address parser, the netid-in-<code>nfs4_pnfs_ds_addr</code> change, and the flexfiles driver.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/cover.1788173789.git.prabhakar.pujeri@dell.com/">2026-08-31 Prabhakar Pujeri <a href="mailto:prabhakar.pujeri@dell.com">prabhakar.pujeri@dell.com</a> — [PATCH v2 0/7] NFS: harden pNFS XDR decoding</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/89bb918bcf3e010d43bb2884a44a6afbc91a8ddb.1788173789.git.prabhakar.pujeri@dell.com/">2026-08-31 Prabhakar Pujeri <a href="mailto:prabhakar.pujeri@dell.com">prabhakar.pujeri@dell.com</a> — [PATCH v2 1/7] NFS: free netid when discarding pNFS DS addresses</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/902b77d318450d18ae422a9aef7f54711826c043.1788173789.git.prabhakar.pujeri@dell.com/">2026-08-31 Prabhakar Pujeri <a href="mailto:prabhakar.pujeri@dell.com">prabhakar.pujeri@dell.com</a> — [PATCH v2 2/7] NFS: bound flexfiles GETDEVICEINFO version count</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/e00ed21d7f259b6b609d004c32fb42e02c45906b.1788173789.git.prabhakar.pujeri@dell.com/">2026-08-31 Prabhakar Pujeri <a href="mailto:prabhakar.pujeri@dell.com">prabhakar.pujeri@dell.com</a> — [PATCH v2 3/7] NFS: bound flexfiles filehandle version count</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/5bf0470b45d43c93515dffb286adb9e51db557eb.1788173789.git.prabhakar.pujeri@dell.com/">2026-08-31 Prabhakar Pujeri <a href="mailto:prabhakar.pujeri@dell.com">prabhakar.pujeri@dell.com</a> — [PATCH v2 4/7] NFS: validate pNFS data server port octets</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/ffec82e3540ae23d46486ef9c7f50ea05d4b49db.1788173789.git.prabhakar.pujeri@dell.com/">2026-08-31 Prabhakar Pujeri <a href="mailto:prabhakar.pujeri@dell.com">prabhakar.pujeri@dell.com</a> — [PATCH v2 5/7] NFS: bound multipath address count in file-layout GETDEVICEINFO</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/517ac6d5c035a9486b7aa39e85ee6f0d1eb80284.1788173789.git.prabhakar.pujeri@dell.com/">2026-08-31 Prabhakar Pujeri <a href="mailto:prabhakar.pujeri@dell.com">prabhakar.pujeri@dell.com</a> — [PATCH v2 6/7] NFS: bound multipath address count in flexfiles GETDEVICEINFO</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/c3eac5239a6555b88e7d4bdb4daaa45c75c4b567.1788173789.git.prabhakar.pujeri@dell.com/">2026-08-31 Prabhakar Pujeri <a href="mailto:prabhakar.pujeri@dell.com">prabhakar.pujeri@dell.com</a> — [PATCH v2 7/7] NFS: add KUnit coverage for pNFS XDR decoding</a></li>
+</ul>
+  </main>
+</body>
+</html>

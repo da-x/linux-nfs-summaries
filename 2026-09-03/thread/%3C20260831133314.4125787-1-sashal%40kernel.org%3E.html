@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AUTOSEL backports NFS fallocate EOF fix and xprtrdma pool slack</title>
+  <meta name="description" content="Sasha Levin’s AUTOSEL machinery dropped two NFS client bug-fix backports onto linux-nfs on 31 August, both already signed off upstream by NFS maintainer Anna Schumaker. There is no review traffic in-window: no Acked-by, no NACK, no “please…">
+  <meta property="og:title" content="AUTOSEL backports NFS fallocate EOF fix and xprtrdma pool slack">
+  <meta property="og:description" content="Sasha Levin’s AUTOSEL machinery dropped two NFS client bug-fix backports onto linux-nfs on 31 August, both already signed off upstream by NFS maintainer Anna Schumaker. There is no review traffic in-window: no Acked-by, no NACK, no “please…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-09-03T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="AUTOSEL backports NFS fallocate EOF fix and xprtrdma pool slack">
+  <meta name="twitter:description" content="Sasha Levin’s AUTOSEL machinery dropped two NFS client bug-fix backports onto linux-nfs on 31 August, both already signed off upstream by NFS maintainer Anna Schumaker. There is no review traffic in-window: no Acked-by, no NACK, no “please…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-09-03</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>AUTOSEL backports NFS fallocate EOF fix and xprtrdma pool slack</h1>
+<h2>Summary</h2>
+<h1>AUTOSEL backports NFS fallocate EOF fix and xprtrdma pool slack</h1>
+<h2>Summary</h2>
+<p>Sasha Levin’s AUTOSEL machinery dropped two <strong>NFS client bug-fix</strong> backports onto linux-nfs on 31 August, both already signed off upstream by NFS maintainer Anna Schumaker. There is no review traffic in-window: no Acked-by, no NACK, no “please drop this from stable.” The week’s story is therefore the content of the fixes themselves — a stale-<code>i_size</code> hole in the NFSv4.2 fallocate path, and a request-pool undersize that can stall RPC/RDMA slot allocation after Send-gated recycling — and the fact that AUTOSEL is now pushing them into long-lived stable trees.</p>
+<p>The cover for the batch, Message-ID <code>&lt;20260831133314.4125787-1-sashal@kernel.org&gt;</code>, is not present as a standalone linux-nfs post. The two patches that did land on the list sit in that same AUTOSEL series: Dai Ngo’s NFSv4.2 EOF update for 6.18–6.1, and Chuck Lever’s xprtrdma pool slack for 6.18–5.10.</p>
+<h2>Type of change</h2>
+<p>Both postings are <strong>stable backports of client bug fixes</strong>. Neither is a protocol change, a new userspace API, or a feature. One is metadata-cache correctness in <code>nfs.ko</code>; the other is transport-pool sizing in <code>xprtrdma</code>.</p>
+<h2>NFS: stale EOF after NFSv4.2 fallocate / ZERO_RANGE</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260831133314.4125787-564-sashal@kernel.org/">Levin’s AUTOSEL 6.18–6.1 posting</a> is Dai Ngo’s <code>fs/nfs/nfs42proc.c</code> fix, upstream commit <code>35168eb947f230aaa35fd8416a30563ef89f5421</code>. The original April posting is <a href="https://lore.kernel.org/linux-nfs/20260423175233.4175269-1-dai.ngo@oracle.com/">Ngo’s v1</a>. The failure mode is a client-side size mismatch that xfstests <code>generic/075</code> hits whenever the client holds an NFSv4 write delegation:</p>
+<blockquote>
+<p>"Generic/075 reliably exposes a regression when the client holds an NFSv4 write delegation: ZERO_RANGE/ALLOCATE extends the file on the server, but the local inode keeps the old i_size."</p>
+</blockquote>
+<p>The post-op WCC refresh is not a safety net here. Ngo’s diagnosis is that the client <em>initiated</em> the size change, then asked the attribute path to learn it from the server — and that path is designed <em>not</em> to overwrite <code>i_size</code> while a delegation is outstanding:</p>
+<blockquote>
+<p>"The test then fails with 'Size error' because the post-op attribute refresh refuses to touch i_size while a delegation is outstanding, and the cached EOF was never marked stale."</p>
+</blockquote>
+<p>The surgical fix is in <code>_nfs42_proc_fallocate()</code>, the common success path for NFSv4.2 <code>ALLOCATE</code>, <code>DEALLOCATE</code>, and <code>ZERO_RANGE</code>. On RPC success the client now:</p>
+<ul>
+<li>computes <code>newsize = offset + len</code> and bumps <code>i_size</code> when the operation extends the file, under <code>inode-&gt;i_lock</code>;</li>
+<li>always marks <code>NFS_INO_INVALID_BLOCKS</code>, because the on-disk block count can change even when size does not (hole punch / deallocate);</li>
+<li>keeps the existing suid-stripping invalidation in that same lock region, then still calls <code>nfs_post_op_update_inode_force_wcc()</code>.</li>
+</ul>
+<p>That is the same “update locally when delegation blocks server-driven refresh” pattern the writeback path already uses. DEALLOCATE does not spuriously grow the file: the <code>newsize &gt; i_size_read()</code> guard is false when punching a hole. Ngo reports:</p>
+<blockquote>
+<p>"Tested with xfstests generic/075 over NFSv4.2."</p>
+</blockquote>
+<p>Anna Schumaker’s Signed-off-by is on the AUTOSEL copy. There is still no <code>Fixes:</code> tag, which is why AUTOSEL rather than an explicit <code>Cc: stable</code> is doing the backport work. The range — <strong>6.18 back through 6.1</strong> — is the interesting client-development fact this week: <code>_nfs42_proc_fallocate()</code> and write delegations have been in those trees for years, so a stale EOF after <code>fallocate(2)</code> extend is not a 6.18-only regression. <code>FALLOC_FL_ZERO_RANGE</code> made the path more visible, but ALLOCATE with a write delegation was already enough to leave <code>i_size</code> behind.</p>
+<p>For NFS client users this is a <strong>medium-severity metadata bug</strong>, not a crash. Applications that <code>fallocate()</code>-extend a delegated NFSv4.2 file and then trust <code>stat()</code> / <code>lseek(SEEK_END)</code> can see the old length, mis-size subsequent I/O, or fail tests that check size. Unprivileged writers can trigger it; it is deterministic, not a race. The AUTOSEL posting did not attract a “too risky for 6.1” objection in-window.</p>
+<h2>xprtrdma: request-pool slack after delayed recycling</h2>
+<p>Thirty seconds later Levin posted <a href="https://lore.kernel.org/linux-nfs/20260831133314.4125787-582-sashal@kernel.org/">AUTOSEL 6.18–5.10</a> of Chuck Lever’s <code>net/sunrpc/xprtrdma/verbs.c</code> change, upstream <code>64bf6892057b746c55bcc045b9492741b72d8d27</code>. This is patch 3 of Lever’s May series “[PATCH v3 0/5] xprtrdma: Decouple req recycling from RPC completion” (<a href="https://lore.kernel.org/linux-nfs/20260526141405.39877-1-cel@kernel.org/">cover</a>, <a href="https://lore.kernel.org/linux-nfs/20260526141405.39877-4-cel@kernel.org/">patch 3</a>).</p>
+<p>The parent series is a real client transport correctness fix. <code>rl_kref</code> had been doing two jobs at once: waking the RPC task from the Reply, and returning the <code>rpcrdma_req</code> to the free pool. Lever’s cover stated the use-after-free / wrong-bytes-on-the-wire failure:</p>
+<blockquote>
+<p>"rl_kref currently conflates two lifetimes through one refcount: it gates when a Reply can wake its RPC task, and it gates when an rpcrdma_req can return to its free pool."</p>
+</blockquote>
+<p>A Send that used only pre-registered buffers took no Send-side reference. If the Reply arrived first, the handler dropped <code>rl_kref</code> to zero and freed the req <strong>while the HCA could still be DMA-reading the send buffer</strong>. A retransmission could then put different bytes on the wire. The series makes recycling wait for Send completion.</p>
+<p>That wait is the reason the pool must grow. Once a completed RPC’s <code>rpcrdma_req</code> can sit pinned on the sendctx ring until the next <em>signaled</em> Send completion, a credit-window-legal new RPC can fail to allocate a req. Lever’s AUTOSEL commit message is explicit that this is slack, not a higher flight ceiling:</p>
+<blockquote>
+<p>"After the previous patch gates req recycling on Send completion, a completed RPC's rpcrdma_req can remain pinned by the sendctx ring until the next signaled Send completion releases it."</p>
+</blockquote>
+<blockquote>
+<p>"The req pool, however, must exceed max_reqs by enough that this recycle delay does not stall a slot allocation that the credit window would admit."</p>
+</blockquote>
+<p>The bound is the existing Send-signaling batch: <code>frwr_open()</code> sets <code>re_send_batch</code> to <code>re_max_requests &gt;&gt; 3</code> (one signaled Send in eight). Worst case, <code>max_reqs / 8</code> reqs are pinned, with a one-slot floor when the shift rounds to zero. The sendctx ring and the hardware Send Queue stay sized for <code>re_max_requests</code>; <code>xprt_request_get_cong()</code> still gates against <code>xprt-&gt;cwnd</code>. Lever’s operational claim:</p>
+<blockquote>
+<p>"The pool slack does not raise that ceiling -- it only lets allocation keep pace with the credit window during the brief interval in which earlier reqs are pinned waiting for the next signaled completion."</p>
+</blockquote>
+<p>The code change is one allocation site in <code>verbs.c</code>: allocate <code>max_reqs + DIV_ROUND_UP(max_reqs, 8)</code> request objects, and name that slack at the call site so it stays tied to the 1/8 signaling batch. Anna Schumaker signed off. AUTOSEL’s <strong>6.18–5.10</strong> range is wider than the fallocate fix, which is consistent with xprtrdma living in those stables — but it only makes sense if the prerequisite “decouple recycling from RPC completion” patch is already in those trees (or travels with this one). Nobody on linux-nfs raised that dependency question this week.</p>
+<h2>Evolution of the discussion</h2>
+<p>There is no evolution on-list this week. Levin posted the two AUTOSEL patches; the list was silent. The technical arguments are therefore the ones already frozen in the upstream commit messages:</p>
+<ul>
+<li>Ngo: local <code>i_size</code> / <code>NFS_INO_INVALID_BLOCKS</code> update on fallocate success, because delegated attribute refresh will not do it.</li>
+<li>Lever: extra <code>max_reqs/8</code> req objects so Send-gated recycling cannot starve a credit-window-admitted RPC.</li>
+</ul>
+<p>Prior-week context is only the original postings (April for Ngo, May v3 for Lever). Neither original thread is active this week.</p>
+<h2>Client-development takeaways</h2>
+<p>These are the NFS <strong>client</strong> fixes that matter this week, even though they arrived as stable spam rather than a new patch series:</p>
+<ol>
+<li><strong><code>nfs.ko</code> fallocate + write delegations.</strong> Anyone running NFSv4.2 with delegations (the common enterprise case) can extend a file via <code>fallocate()</code> / <code>FALLOC_FL_ZERO_RANGE</code> and keep a stale EOF until something else invalidates the inode. The fix belongs in every stable that has <code>_nfs42_proc_fallocate()</code>. Watch 6.1, 6.6, 6.12, and 6.18 for the commit; <code>generic/075</code> is the regression test.</li>
+<li><strong>xprtrdma request lifetime.</strong> The slack patch is the operational half of a UAF-class transport bug: recycling must wait for Send DMA, and the pool must be large enough that waiting does not look like congestion. NFS/RDMA client deployments on 5.10–6.18 should see both the decoupling patch and this slack, not one without the other.</li>
+<li><strong>No protocol work.</strong> Wire ALLOCATE / ZERO_RANGE / RPC-RDMA credits are unchanged. This is cache coherency and transport resource accounting.</li>
+</ol>
+<h2>Conclusions</h2>
+<ul>
+<li><strong>Bug fixes, not features.</strong> AUTOSEL is backporting two already-merged NFS client corrections.</li>
+<li><strong>Fallocate EOF:</strong> on successful NFSv4.2 ALLOCATE/ZERO_RANGE, the client must itself extend <code>i_size</code> and invalidate block counts; post-op attributes will not, while a write delegation is held. Quote of record remains Ngo’s “Size error” / generic/075 report.</li>
+<li><strong>xprtrdma slack:</strong> after Send-gated recycling, allocate <code>max_reqs + DIV_ROUND_UP(max_reqs, 8)</code> reqs so pinned sendctxes cannot stall a credit-legal RPC. The SQ and sendctx ring stay at <code>re_max_requests</code>.</li>
+<li><strong>This week’s list conclusion:</strong> none. No reviewer objected, and no reviewer confirmed. The patches sit in AUTOSEL queues for 6.18–6.1 (fallocate) and 6.18–5.10 (xprtrdma) unless a stable maintainer drops them off-list.</li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260831133314.4125787-564-sashal@kernel.org/">2026-08-31 Sasha Levin — [PATCH AUTOSEL 6.18-6.1] NFS: fix eof updates after NFSv4.2 fallocate/zero-range</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260831133314.4125787-582-sashal@kernel.org/">2026-08-31 Sasha Levin — [PATCH AUTOSEL 6.18-5.10] xprtrdma: Add request-pool slack for delayed recycling</a></li>
+</ul>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260831133314.4125787-564-sashal@kernel.org/">2026-08-31 Sasha Levin <a href="mailto:sashal@kernel.org">sashal@kernel.org</a> — [PATCH AUTOSEL 6.18-6.1] NFS: fix eof updates after NFSv4.2 fallocate/zero-range</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260831133314.4125787-582-sashal@kernel.org/">2026-08-31 Sasha Levin <a href="mailto:sashal@kernel.org">sashal@kernel.org</a> — [PATCH AUTOSEL 6.18-5.10] xprtrdma: Add request-pool slack for delayed recycling</a></li>
+</ul>
+  </main>
+</body>
+</html>

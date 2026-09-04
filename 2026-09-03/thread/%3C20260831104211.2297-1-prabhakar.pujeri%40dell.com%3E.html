@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>gssd and idmapd name-validation bug fixes</title>
+  <meta name="description" content="Dell engineer Prabhakar Pujeri posted a three-patch nfs-utils series that hardens the NFS client user-space daemons against untrusted names coming from kernel upcalls and error paths. The work is a bug-fix series, not a protocol change or…">
+  <meta property="og:title" content="gssd and idmapd name-validation bug fixes">
+  <meta property="og:description" content="Dell engineer Prabhakar Pujeri posted a three-patch nfs-utils series that hardens the NFS client user-space daemons against untrusted names coming from kernel upcalls and error paths. The work is a bug-fix series, not a protocol change or…">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="NFS Weekly Summaries">
+  <meta property="article:published_time" content="2026-09-03T00:00:00Z">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="gssd and idmapd name-validation bug fixes">
+  <meta name="twitter:description" content="Dell engineer Prabhakar Pujeri posted a three-patch nfs-utils series that hardens the NFS client user-space daemons against untrusted names coming from kernel upcalls and error paths. The work is a bug-fix series, not a protocol change or…">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <p class="site-title"><a href="../../index.html">NFS Weekly Summaries</a></p>
+      <ol class="crumbs">
+        <li><a href="../../index.html">Summaries</a></li>
+        <li class="crumbs__sep" aria-hidden="true">/</li>
+        <li><a href="../index.html">Week ending 2026-09-03</a></li>
+      </ol>
+    </div>
+  </header>
+  <main class="content">
+<h1>gssd and idmapd name-validation bug fixes</h1>
+<h2>Summary</h2>
+<p>Dell engineer Prabhakar Pujeri posted a three-patch nfs-utils series that hardens the NFS client user-space daemons against untrusted names coming from kernel upcalls and error paths. The work is a <strong>bug-fix</strong> series, not a protocol change or new feature: it stops <code>rpc.gssd</code> and <code>rpc.idmapd</code> from treating externally supplied buffers as C strings before those buffers have been shown to be NUL-terminated and to fit in their destination arrays.</p>
+<p><a href="https://lore.kernel.org/linux-nfs/20260831104211.2297-1-prabhakar.pujeri@dell.com/">In the cover letter</a>, Pujeri framed the series as a single class of defects:</p>
+<blockquote>
+<p>"These fixes validate externally supplied names before treating them as C strings. They correct an uninitialized read in an error path, keep idmapd inside the fixed NAMETOID field, and reject server hostnames that do not fit in gssd's destination buffer."</p>
+</blockquote>
+<p>The series is based on current nfs-utils master. Pujeri reported a clean autotools rebuild and <code>make check</code>; the statd integration test is skipped when its service environment is missing. The three patches together touch only 11 insertions and 7 deletions across <code>utils/gssd/gssd.c</code>, <code>utils/gssd/krb5_util.c</code>, and <code>utils/idmapd/idmapd.c</code>. No reviews, acks, or nacks landed in this week's window.</p>
+<h2>Patch 1: gssd error path dumps uninitialized heap</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260831104211.2297-2-prabhakar.pujeri@dell.com/">Patch 1</a> is a one-line fix in <code>gssd_get_topdir()</code>. On <code>inotify_add_watch()</code> failure the code printed <code>tdi-&gt;name</code>, but that flexible-array member is filled only by a later <code>strcpy()</code>. The error path therefore logged uninitialized heap and could walk past the allocation if no NUL happened to sit nearby.</p>
+<p>Pujeri's diagnosis is blunt:</p>
+<blockquote>
+<p>"gssd_get_topdir() prints tdi-&gt;name in the inotify_add_watch() error path, but that flexible array member is only filled in by the strcpy() after the call. The message ends up dumping uninitialized heap memory and can even read past the allocation if no NUL byte is nearby."</p>
+</blockquote>
+<p>The fix prints the caller-supplied <code>name</code> argument instead — the directory the watch was actually being added for. That is a client-side robustness fix for rpc.gssd's pipefs/inotify setup, not a change in Kerberos or NFS protocol behavior.</p>
+<h2>Patch 2: idmapd NAMETOID names must terminate inside the field</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260831104211.2297-3-prabhakar.pujeri@dell.com/">Patch 2</a> repairs <code>imconv()</code> in <code>rpc.idmapd</code>. The old code capped <code>len</code> at <code>IDMAP_NAMESZ - 1</code> and then inspected <code>im_name[len + 1]</code>. An unterminated name therefore read one byte past the fixed field; a properly terminated name could still be rejected based on the unrelated byte <em>after</em> its NUL.</p>
+<p>Pujeri replaced that with <code>strnlen()</code> so a terminator is required <em>inside</em> <code>im_name</code>:</p>
+<blockquote>
+<p>"Use strnlen() to require a terminator within im_name. Mark an unterminated request as invalid before returning it to the kernel."</p>
+</blockquote>
+<p>That is an important NFS client idmapping bug fix. Kernel NAMETOID upcalls arrive in a fixed-size <code>IDMAP_NAMESZ</code> slot; idmapd must not assume a C string and must not bounce a conversion based on memory outside that slot. Unterminated names are now marked invalid and returned to the kernel rather than being walked off the end of the buffer.</p>
+<h2>Patch 3: gssd rejects overlong server hostnames</h2>
+<p><a href="https://lore.kernel.org/linux-nfs/20260831104211.2297-4-prabhakar.pujeri@dell.com/">Patch 3</a> is the most security-relevant client change. <code>find_keytab_entry()</code> copied a hostname from the kernel upcall into a stack <code>NI_MAXHOST</code> buffer with <code>strcpy()</code>, so an overlong name could smash the stack. The patch switches to <code>snprintf()</code> and checks the result:</p>
+<blockquote>
+<p>"Use snprintf() and check its result. Reject a truncated hostname with ENAMETOOLONG instead of performing a keytab lookup with a different name. The verified string also fits in the following myhostad copy."</p>
+</blockquote>
+<p>Truncation is treated as failure, not as a silent rename. That avoids looking up a Kerberos keytab principal for a <em>different</em> hostname than the kernel asked for — a correctness and security property for NFSv4/krb5 mounts — and it also keeps the subsequent <code>myhostad</code> copy in bounds.</p>
+<h2>Status this week</h2>
+<p>This is a new series posted on 31 August 2026. There were no replies, tags, or follow-up revisions in the week ending 3 September. The three patches stand as a compact nfs-utils client hardening set: stop logging uninitialized memory in gssd, keep idmapd inside the NAMETOID field, and refuse hostnames that do not fit gssd's keytab lookup buffer. Reviewers have not yet weighed in on whether <code>ENAMETOOLONG</code> is the right errno to surface to the kernel upcall, or whether similar <code>strcpy()</code> sites elsewhere in gssd/idmapd need the same treatment.</p>
+<h2>Messages this week</h2>
+<ul>
+<li><a href="https://lore.kernel.org/linux-nfs/20260831104211.2297-1-prabhakar.pujeri@dell.com/">2026-08-31 Prabhakar Pujeri <a href="mailto:prabhakar.pujeri@dell.com">prabhakar.pujeri@dell.com</a> — [PATCH 0/3] gssd, idmapd: validate names before using them</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260831104211.2297-2-prabhakar.pujeri@dell.com/">2026-08-31 Prabhakar Pujeri <a href="mailto:prabhakar.pujeri@dell.com">prabhakar.pujeri@dell.com</a> — [PATCH 1/3] gssd: fix use of uninitialized memory in error message</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260831104211.2297-3-prabhakar.pujeri@dell.com/">2026-08-31 Prabhakar Pujeri <a href="mailto:prabhakar.pujeri@dell.com">prabhakar.pujeri@dell.com</a> — [PATCH 2/3] idmapd: validate NAMETOID names within their fixed-size field</a></li>
+<li><a href="https://lore.kernel.org/linux-nfs/20260831104211.2297-4-prabhakar.pujeri@dell.com/">2026-08-31 Prabhakar Pujeri <a href="mailto:prabhakar.pujeri@dell.com">prabhakar.pujeri@dell.com</a> — [PATCH 3/3] gssd: reject server hostnames that do not fit</a></li>
+</ul>
+  </main>
+</body>
+</html>
